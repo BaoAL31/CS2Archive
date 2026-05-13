@@ -17,7 +17,7 @@ from rich.console import Console
 
 from config import settings
 from downloader import (
-    cleanup_temp, download_file, extract_demo, file_size_mb,
+    build_demo_path, cleanup_temp, download_file, extract_demo, file_size_mb,
     is_already_downloaded, record_download,
 )
 from models import DemoSource, DownloadResult, DownloadStatus, MatchInfo
@@ -231,8 +231,16 @@ class FACEITClient:
 
             # Extract
             console.print("[cyan]   [EXTRACT] Extracting .dem file...[/cyan]")
-            dem_path = extract_demo(temp_path, settings.faceit_demo_dir)
+            dem_path = extract_demo(temp_path, settings.temp_dir)
             cleanup_temp(temp_path)
+
+            import shutil
+            organized_path = build_demo_path(match_info)
+            organized_path.parent.mkdir(parents=True, exist_ok=True)
+            if organized_path.exists():
+                organized_path.unlink()
+            shutil.move(str(dem_path), str(organized_path))
+            dem_path = organized_path
 
             result = DownloadResult(
                 match=match_info, status=DownloadStatus.COMPLETED,

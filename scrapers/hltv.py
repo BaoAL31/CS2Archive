@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin
 
+import httpx
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, Browser, BrowserContext
 from rich.console import Console
@@ -22,7 +23,7 @@ from rich.console import Console
 from config import settings
 from downloader import (
     build_demo_path, cleanup_temp, download_file, extract_demo, file_size_mb,
-    is_already_downloaded, record_download,
+    is_already_downloaded, record_download, _make_download_progress
 )
 from models import DemoSource, DownloadResult, DownloadStatus, MatchInfo
 
@@ -95,20 +96,25 @@ class HLTVScraper:
         return self._parse_match_info(soup, match_url)
 
     async def get_match_demo(self, match_url: str) -> DownloadResult:
-        """Download the GOTV demo from an HLTV match page."""
+        """Download the GOTV demo from an HLTV match page using Playwright."""
         started = datetime.now()
         match_info = MatchInfo(match_id="", source=DemoSource.HLTV, url=match_url)
 
         try:
-            console.print(f"\n[bold cyan][>>] Scraping match page:[/bold cyan] {match_url}")
-            html = await self._get_page_content(match_url)
-            soup = BeautifulSoup(html, "lxml")
+            console.print(f"\n[bold cyan][>>] Downloading from:[/bold cyan] {match_url}")
+            context = await self._ensure_browser()
+            page = await context.new_page()
+            await page.goto(match_url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(3000)
 
+            html = await page.content()
+            soup = BeautifulSoup(html, "lxml")
             match_info = self._parse_match_info(soup, match_url)
             console.print(f"[green]   [OK] {match_info.display_name}[/green]")
 
             existing = is_already_downloaded(match_info.match_id, DemoSource.HLTV)
             if existing:
+                await page.close()
                 console.print(f"[yellow]   [SKIP] Already downloaded: {existing}[/yellow]")
                 return DownloadResult(
                     match=match_info, status=DownloadStatus.SKIPPED,
@@ -116,22 +122,53 @@ class HLTVScraper:
                     started_at=started, completed_at=datetime.now(),
                 )
 
-            demo_id = self._extract_demo_id(soup)
-            if not demo_id:
-                raise ValueError("Could not find demo download link on match page")
+            demo_btn = await page.query_selector("a[data-demo-link]")
+            if not demo_btn:
+                await page.close()
+                raise ValueError("Could not find demo download button on match page")
 
-            console.print(f"[cyan]   [INFO] Demo ID: {demo_id}[/cyan]")
-            download_url = f"{settings.hltv_demo_download_url}?demoid={demo_id}"
-            temp_path = settings.temp_dir / f"hltv_{match_info.match_id}_{demo_id}"
+            match_slug = re.search(r"/matches/\d+/(.+)", match_url)
+            base_name = (match_slug.group(1) if match_slug else "demo") + ".rar"
+            dest_dir = settings.demo_storage_dir / DemoSource.HLTV.value
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest_path = dest_dir / base_name
 
-            console.print("[cyan]   [DL] Downloading demo archive...[/cyan]")
+            console.print("[cyan]   [DL] Clicking demo download button...[/cyan]")
             await self._rate_limit()
-            await download_file(url=download_url, dest=temp_path, description=f"HLTV Demo {demo_id}")
 
-            actual_path = self._detect_and_rename_archive(temp_path)
-            console.print("[cyan]   [EXTRACT] Extracting .dem file...[/cyan]")
-            dem_path = extract_demo(actual_path, settings.hltv_demo_dir)
-            cleanup_temp(actual_path)
+            from playwright._impl._errors import TimeoutError as PwTimeout
+            downloaded = False
+            try:
+                async with page.expect_download(timeout=15000) as dl_info:
+                    await demo_btn.scroll_into_view_if_needed()
+                    await page.wait_for_timeout(500)
+                    await demo_btn.dispatch_event("click")
+                dl = await dl_info.value
+                suggested = dl.suggested_filename
+                if suggested:
+                    dest_path = dest_dir / suggested
+                await dl.save_as(str(dest_path))
+                await page.close()
+                dem_path = dest_path
+                downloaded = True
+            except PwTimeout:
+                console.print("[yellow]   Playwright click didn't trigger download, trying direct...[/yellow]")
+                await page.close()
+
+            if not downloaded:
+                demo_id = self._extract_demo_id(soup)
+                if not demo_id:
+                    raise ValueError("Could not find demo ID")
+                import cloudscraper
+                dl_url = f"{settings.hltv_base_url}/download/demo/{demo_id}"
+                scraper = cloudscraper.create_scraper()
+                resp = scraper.get(dl_url, allow_redirects=True, timeout=600)
+                if resp.status_code != 200:
+                    raise ValueError(f"CDN returned {resp.status_code} — demo token likely consumed")
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(dest_path, "wb") as f:
+                    f.write(resp.content)
+                dem_path = dest_path
 
             result = DownloadResult(
                 match=match_info, status=DownloadStatus.COMPLETED,
@@ -139,7 +176,7 @@ class HLTVScraper:
                 started_at=started, completed_at=datetime.now(),
             )
             record_download(result)
-            console.print(f"[bold green]   [DONE] Saved: {dem_path.name} ({result.file_size_mb:.1f} MB)[/bold green]")
+            console.print(f"[bold green]   [DONE] Saved: {dest_path.name} ({result.file_size_mb:.1f} MB)[/bold green]")
             return result
 
         except Exception as e:
@@ -317,17 +354,35 @@ class HLTVScraper:
     def _extract_demo_id(self, soup: BeautifulSoup) -> Optional[str]:
         for link in soup.find_all("a", href=True):
             href = link["href"]
+            m = re.search(r"/download/demo/(\d+)", href)
+            if m:
+                return m.group(1)
             if "demoid=" in href:
-                match = re.search(r"demoid=(\d+)", href)
-                if match:
-                    return match.group(1)
+                m = re.search(r"demoid=(\d+)", href)
+                if m:
+                    return m.group(1)
         for el in soup.find_all(attrs={"data-demoid": True}):
             return el["data-demoid"]
         for script in soup.find_all("script"):
             text = script.string or ""
-            match = re.search(r"demoid['\"]?\s*[:=]\s*['\"]?(\d+)", text)
-            if match:
-                return match.group(1)
+            m = re.search(r"/download/demo/(\d+)", text)
+            if m:
+                return m.group(1)
+            m = re.search(r"demoid['\"]?\s*[:=]\s*['\"]?(\d+)", text)
+            if m:
+                return m.group(1)
+        return None
+
+    def _extract_cdn_url(self, soup: BeautifulSoup) -> Optional[str]:
+        for link in soup.find_all("a", href=True):
+            href = link["href"]
+            if "r2-demos.hltv.org" in href:
+                return href
+        for script in soup.find_all("script"):
+            text = script.string or ""
+            m = re.search(r'(https?://r2-demos\.hltv\.org[^\s"\'<>]+)', text)
+            if m:
+                return m.group(1)
         return None
 
     def _detect_and_rename_archive(self, path: Path) -> Path:

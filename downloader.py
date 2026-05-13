@@ -10,14 +10,15 @@ from __future__ import annotations
 import gzip
 import json
 import shutil
-import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import httpx
-import rarfile
+import patoolib
 import zstandard
+import os
+import tempfile
 from rich.progress import (
     BarColumn,
     DownloadColumn,
@@ -157,10 +158,8 @@ def extract_demo(archive_path: Path, dest_dir: Path) -> Path:
         return _extract_gz(archive_path, dest_dir)
     elif suffix == ".zst":
         return _extract_zst(archive_path, dest_dir)
-    elif suffix == ".zip":
-        return _extract_zip(archive_path, dest_dir)
-    elif suffix == ".rar":
-        return _extract_rar(archive_path, dest_dir)
+    elif suffix in (".zip", ".rar", ".7z"):
+        return _extract_with_patool(archive_path, dest_dir)
     elif suffix == ".dem":
         # Already a .dem file, just move it
         final_path = dest_dir / archive_path.name
@@ -200,27 +199,40 @@ def _extract_zst(archive_path: Path, dest_dir: Path) -> Path:
     return output_path
 
 
-def _extract_zip(archive_path: Path, dest_dir: Path) -> Path:
-    """Extract the first .dem file from a .zip archive."""
-    with zipfile.ZipFile(archive_path, "r") as zf:
-        dem_files = [f for f in zf.namelist() if f.lower().endswith(".dem")]
-        if not dem_files:
+def _extract_with_patool(archive_path: Path, dest_dir: Path) -> Path:
+    """Extract the first .dem file from an archive using patool."""
+    # Create a safe temporary directory
+    temp_dir = tempfile.mkdtemp(prefix="demo_extract_")
+    try:
+        # Extract archive to the temporary directory
+        # interactive=False ensures it doesn't prompt for passwords or overwrites
+        patoolib.extract_archive(str(archive_path), outdir=temp_dir, interactive=False)
+        
+        # Walk through the temp directory to find the .dem file
+        dem_path = None
+        for root, _, files in os.walk(temp_dir):
+            for file in files:
+                if file.lower().endswith(".dem"):
+                    dem_path = Path(root) / file
+                    break
+            if dem_path:
+                break
+                
+        if not dem_path:
             raise FileNotFoundError(f"No .dem file found in {archive_path.name}")
-
-        # Extract the first (usually only) .dem file
-        zf.extract(dem_files[0], dest_dir)
-        return dest_dir / dem_files[0]
-
-
-def _extract_rar(archive_path: Path, dest_dir: Path) -> Path:
-    """Extract the first .dem file from a .rar archive."""
-    with rarfile.RarFile(archive_path, "r") as rf:
-        dem_files = [f for f in rf.namelist() if f.lower().endswith(".dem")]
-        if not dem_files:
-            raise FileNotFoundError(f"No .dem file found in {archive_path.name}")
-
-        rf.extract(dem_files[0], dest_dir)
-        return dest_dir / dem_files[0]
+            
+        # Move the found .dem file to the final destination
+        final_dest = dest_dir / dem_path.name
+        
+        # Handle case where file already exists
+        if final_dest.exists():
+            final_dest.unlink()
+            
+        shutil.move(str(dem_path), str(final_dest))
+        return final_dest
+    finally:
+        # Ensure we always clean up the temporary directory
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
@@ -235,18 +247,14 @@ def _sanitize(name: str) -> str:
     return name[:120]
 
 
-def build_demo_path(match: MatchInfo) -> Path:
-    """Build organized demo path: demos/<source>/<event>/<teams> - <map>.dem"""
-    event_dir = _sanitize(match.event) if match.event and match.event != "Unknown" else "unknown"
-
-    parts = [match.team1, match.team2]
-    if match.map_name and match.map_name != "Unknown":
-        parts.append(match.map_name)
-    filename = " vs ".join(parts) + ".dem"
-    filename = _sanitize(filename)
+def build_demo_path(match: MatchInfo, suffix: str = ".dem") -> Path:
+    """Build demo path: demos/<source>/<filename><suffix>"""
+    teams = f"{match.team1} vs {match.team2}"
+    map_part = f" - {match.map_name}" if match.map_name and match.map_name != "Unknown" else ""
+    filename = _sanitize(f"{teams}{map_part}{suffix}")
 
     base = settings.demo_storage_dir / match.source.value
-    return base / event_dir / filename
+    return base / filename
 
 
 def file_size_mb(path: Path) -> float:
