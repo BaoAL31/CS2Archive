@@ -62,12 +62,12 @@ def _list() -> None:
     table.add_column("#", style="dim", width=4)
     table.add_column("Nickname", style="cyan", width=16)
     table.add_column("Faceit", style="white", min_width=20)
-    table.add_column("Steam", style="white", min_width=20)
+    table.add_column("Steam ID", style="white", width=20)
 
     for i, acc in enumerate(accounts, 1):
         faceit = acc.faceit_nickname or acc.faceit_url or "[dim]—[/dim]"
-        steam = acc.steam_url or "[dim]—[/dim]"
-        table.add_row(str(i), acc.nickname, faceit, steam)
+        sid = acc.steam_id or "[dim]—[/dim]"
+        table.add_row(str(i), acc.nickname, faceit, sid)
 
     console.print()
     console.print(table)
@@ -98,6 +98,8 @@ def _print_account(account) -> None:
         lines.append(f"[dim]  {account.faceit_url}[/dim]")
     if account.steam_url:
         lines.append(f"[bold]Steam:[/bold] {account.steam_url}")
+        if account.steam_id:
+            lines.append(f"[dim]  Steam ID: {account.steam_id}[/dim]")
     lines.append(f"[dim]Saved: {account.created_at.strftime('%Y-%m-%d %H:%M')}[/dim]")
 
     console.print()

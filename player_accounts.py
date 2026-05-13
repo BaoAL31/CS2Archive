@@ -13,6 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import httpx
+
 from models import PlayerAccount
 
 ACCOUNTS_FILE = Path("player_accounts.json")
@@ -40,6 +42,25 @@ def extract_faceit_nickname(url: str) -> Optional[str]:
     return None
 
 
+def extract_steam_id(steam_url: str) -> str:
+    m = re.search(r"steamcommunity\.com/profiles/(\d{17})", steam_url)
+    if m:
+        return m.group(1)
+    m = re.search(r"steamcommunity\.com/id/([^/?#]+)", steam_url)
+    if m:
+        vanity = m.group(1)
+        try:
+            with httpx.Client(follow_redirects=True, timeout=15) as client:
+                resp = client.get(f"https://steamcommunity.com/id/{vanity}")
+                final = str(resp.url)
+                m2 = re.search(r"/profiles/(\d{17})", final)
+                if m2:
+                    return m2.group(1)
+        except Exception:
+            pass
+    return ""
+
+
 def add_account(
     nickname: str,
     faceit_url: str = "",
@@ -48,12 +69,14 @@ def add_account(
     records = _load_accounts()
     now = datetime.now()
     faceit_nickname = extract_faceit_nickname(faceit_url) if faceit_url else ""
+    steam_id = extract_steam_id(steam_url) if steam_url else ""
 
     existing = next((r for r in records if r["nickname"] == nickname), None)
     if existing:
         existing["faceit_url"] = faceit_url
         existing["faceit_nickname"] = faceit_nickname
         existing["steam_url"] = steam_url
+        existing["steam_id"] = steam_id
         existing["updated_at"] = now
     else:
         records.append({
@@ -61,6 +84,7 @@ def add_account(
             "faceit_url": faceit_url,
             "faceit_nickname": faceit_nickname,
             "steam_url": steam_url,
+            "steam_id": steam_id,
             "created_at": now,
             "updated_at": now,
         })

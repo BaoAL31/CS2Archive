@@ -21,7 +21,7 @@ from rich.console import Console
 
 from config import settings
 from downloader import (
-    cleanup_temp, download_file, extract_demo, file_size_mb,
+    build_demo_path, cleanup_temp, download_file, extract_demo, file_size_mb,
     is_already_downloaded, record_download,
 )
 from models import DemoSource, DownloadResult, DownloadStatus, MatchInfo
@@ -88,6 +88,12 @@ class HLTVScraper:
         finally:
             await page.close()
 
+    async def get_match_info(self, match_url: str) -> MatchInfo:
+        """Parse match metadata from an HLTV match page without downloading."""
+        html = await self._get_page_content(match_url)
+        soup = BeautifulSoup(html, "lxml")
+        return self._parse_match_info(soup, match_url)
+
     async def get_match_demo(self, match_url: str) -> DownloadResult:
         """Download the GOTV demo from an HLTV match page."""
         started = datetime.now()
@@ -143,17 +149,24 @@ class HLTVScraper:
                 error=str(e), started_at=started, completed_at=datetime.now(),
             )
 
-    async def search_player_matches(self, player_name: str, count: int = 5) -> list[MatchInfo]:
-        """Search for a player's recent matches on HLTV."""
-        console.print(f"\n[bold cyan][>>] Searching HLTV for player:[/bold cyan] {player_name}")
-        search_url = f"{settings.hltv_base_url}/search?query={player_name}"
+    async def search_player_matches(self, player_name: str, count: int = 5, steam_id: str = "") -> list[MatchInfo]:
+        """Search for a player's recent matches on HLTV.
+
+        Uses steam_id for more accurate search when available,
+        falls back to name-based search.
+        """
+        query = steam_id if steam_id else player_name
+        label = f"{player_name} (Steam: {steam_id})" if steam_id else player_name
+        console.print(f"\n[bold cyan][>>] Searching HLTV for player:[/bold cyan] {label}")
+        search_url = f"{settings.hltv_base_url}/search?query={query}"
         html = await self._get_page_content(search_url)
         soup = BeautifulSoup(html, "lxml")
 
         player_link = None
+        search_text = player_name.lower()
         for link in soup.find_all("a", href=True):
             href = link["href"]
-            if "/player/" in href and player_name.lower() in link.get_text().lower():
+            if "/player/" in href and search_text in link.get_text().lower():
                 player_link = urljoin(settings.hltv_base_url, href)
                 break
 
@@ -207,6 +220,56 @@ class HLTVScraper:
                         ))
 
         console.print(f"[green]   [OK] Found {len(matches)} match(es) in event[/green]")
+        return matches
+
+    async def search_matches_by_query(self, query: str, count: int = 5) -> list[MatchInfo]:
+        """Search HLTV for matches matching a query (e.g. 'Liquid vs M80')."""
+        console.print(f"\n[bold cyan][>>] Searching HLTV:[/bold cyan] {query}")
+        search_url = f"{settings.hltv_base_url}/search?query={query}"
+        html = await self._get_page_content(search_url)
+        soup = BeautifulSoup(html, "lxml")
+
+        query_teams = [t.strip().lower() for t in re.split(r"\s+vs\.?\s+", query, maxsplit=1)]
+
+        all_match_links = []
+        seen = set()
+        for link in soup.find_all("a", href=True):
+            href = link["href"]
+            m = re.match(r".*/matches/(\d+)/(.*)", href)
+            if not m or href in seen:
+                continue
+            seen.add(href)
+            text = link.get_text(" ", strip=True).lower()
+            all_match_links.append((link, href, m.group(1), m.group(2), text))
+
+        ranked = []
+        for link, href, mid, slug, link_text in all_match_links:
+            slug_lower = slug.lower()
+            score = 0
+            for qt in query_teams:
+                if qt in slug_lower:
+                    score += 2
+                if qt in link_text:
+                    score += 1
+            if score > 0:
+                ranked.append((score, href, mid, slug))
+
+        ranked.sort(key=lambda x: -x[0])
+
+        if not ranked:
+            for _, href, mid, slug, _ in all_match_links[:count]:
+                ranked.append((0, href, mid, slug))
+
+        matches = []
+        for score, href, mid, slug in ranked[:count]:
+            display = slug.replace("-vs-", " vs ").replace("-", " ").title()
+            full_url = urljoin(settings.hltv_base_url, href)
+            matches.append(MatchInfo(
+                match_id=mid, source=DemoSource.HLTV, url=full_url, team1=display,
+            ))
+
+        if matches:
+            console.print(f"[green]   [OK] Found {len(matches)} match(es)[/green]")
         return matches
 
     # ── HTML Parsing Helpers ──────────────────────────────────────────────

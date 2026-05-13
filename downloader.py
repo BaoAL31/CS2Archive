@@ -226,6 +226,29 @@ def _extract_rar(archive_path: Path, dest_dir: Path) -> Path:
 # ── Utilities ─────────────────────────────────────────────────────────────────
 
 
+def _sanitize(name: str) -> str:
+    """Remove characters that are invalid in folder/file names."""
+    invalid = r'<>:"/\|?*'
+    for c in invalid:
+        name = name.replace(c, "")
+    name = name.strip().rstrip(". ")
+    return name[:120]
+
+
+def build_demo_path(match: MatchInfo) -> Path:
+    """Build organized demo path: demos/<source>/<event>/<teams> - <map>.dem"""
+    event_dir = _sanitize(match.event) if match.event and match.event != "Unknown" else "unknown"
+
+    parts = [match.team1, match.team2]
+    if match.map_name and match.map_name != "Unknown":
+        parts.append(match.map_name)
+    filename = " vs ".join(parts) + ".dem"
+    filename = _sanitize(filename)
+
+    base = settings.demo_storage_dir / match.source.value
+    return base / event_dir / filename
+
+
 def file_size_mb(path: Path) -> float:
     """Get file size in megabytes."""
     if path.exists():

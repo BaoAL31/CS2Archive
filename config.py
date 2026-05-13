@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     # ── API Keys ──────────────────────────────────────────────────────────
     faceit_api_key: str = Field(default="", description="FACEIT Data API key")
     faceit_downloads_token: str = Field(default="", description="FACEIT Downloads API token")
+    youtube_api_key: str = Field(default="", description="YouTube Data API v3 key")
 
     # ── Paths ─────────────────────────────────────────────────────────────
     demo_storage_dir: Path = Field(default=Path("./demos"), description="Root directory for downloaded demos")
