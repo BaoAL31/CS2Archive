@@ -1,0 +1,285 @@
+"""
+CS2Archive — HLTV Scraper
+
+Scrapes HLTV.org match pages to extract GOTV demo download links.
+Uses Playwright with stealth settings to bypass Cloudflare protection.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import random
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+from urllib.parse import urljoin
+
+from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright, Browser, BrowserContext
+from rich.console import Console
+
+from config import settings
+from downloader import (
+    cleanup_temp, download_file, extract_demo, file_size_mb,
+    is_already_downloaded, record_download,
+)
+from models import DemoSource, DownloadResult, DownloadStatus, MatchInfo
+
+console = Console(force_terminal=True)
+
+
+class HLTVScraper:
+    """Scrapes HLTV.org for CS2 match data and GOTV demo downloads."""
+
+    def __init__(self):
+        self._browser: Optional[Browser] = None
+        self._context: Optional[BrowserContext] = None
+
+    async def _ensure_browser(self) -> BrowserContext:
+        if self._context:
+            return self._context
+        pw = await async_playwright().start()
+        self._browser = await pw.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        )
+        self._context = await self._browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            locale="en-US",
+        )
+        await self._context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            window.chrome = { runtime: {} };
+        """)
+        return self._context
+
+    async def close(self) -> None:
+        if self._context:
+            await self._context.close()
+        if self._browser:
+            await self._browser.close()
+        self._context = None
+        self._browser = None
+
+    async def _rate_limit(self) -> None:
+        delay = random.uniform(settings.hltv_request_delay_min, settings.hltv_request_delay_max)
+        await asyncio.sleep(delay)
+
+    async def _get_page_content(self, url: str) -> str:
+        context = await self._ensure_browser()
+        page = await context.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(2000)
+            content = await page.content()
+            if "Checking your browser" in content or "cf-challenge" in content:
+                console.print("[yellow]   [WAIT] Cloudflare challenge detected, waiting...[/yellow]")
+                await page.wait_for_timeout(8000)
+                content = await page.content()
+            return content
+        finally:
+            await page.close()
+
+    async def get_match_demo(self, match_url: str) -> DownloadResult:
+        """Download the GOTV demo from an HLTV match page."""
+        started = datetime.now()
+        match_info = MatchInfo(match_id="", source=DemoSource.HLTV, url=match_url)
+
+        try:
+            console.print(f"\n[bold cyan][>>] Scraping match page:[/bold cyan] {match_url}")
+            html = await self._get_page_content(match_url)
+            soup = BeautifulSoup(html, "lxml")
+
+            match_info = self._parse_match_info(soup, match_url)
+            console.print(f"[green]   [OK] {match_info.display_name}[/green]")
+
+            existing = is_already_downloaded(match_info.match_id, DemoSource.HLTV)
+            if existing:
+                console.print(f"[yellow]   [SKIP] Already downloaded: {existing}[/yellow]")
+                return DownloadResult(
+                    match=match_info, status=DownloadStatus.SKIPPED,
+                    demo_path=existing, file_size_mb=file_size_mb(existing),
+                    started_at=started, completed_at=datetime.now(),
+                )
+
+            demo_id = self._extract_demo_id(soup)
+            if not demo_id:
+                raise ValueError("Could not find demo download link on match page")
+
+            console.print(f"[cyan]   [INFO] Demo ID: {demo_id}[/cyan]")
+            download_url = f"{settings.hltv_demo_download_url}?demoid={demo_id}"
+            temp_path = settings.temp_dir / f"hltv_{match_info.match_id}_{demo_id}"
+
+            console.print("[cyan]   [DL] Downloading demo archive...[/cyan]")
+            await self._rate_limit()
+            await download_file(url=download_url, dest=temp_path, description=f"HLTV Demo {demo_id}")
+
+            actual_path = self._detect_and_rename_archive(temp_path)
+            console.print("[cyan]   [EXTRACT] Extracting .dem file...[/cyan]")
+            dem_path = extract_demo(actual_path, settings.hltv_demo_dir)
+            cleanup_temp(actual_path)
+
+            result = DownloadResult(
+                match=match_info, status=DownloadStatus.COMPLETED,
+                demo_path=dem_path, file_size_mb=file_size_mb(dem_path),
+                started_at=started, completed_at=datetime.now(),
+            )
+            record_download(result)
+            console.print(f"[bold green]   [DONE] Saved: {dem_path.name} ({result.file_size_mb:.1f} MB)[/bold green]")
+            return result
+
+        except Exception as e:
+            console.print(f"[bold red]   [ERR] Error: {e}[/bold red]")
+            return DownloadResult(
+                match=match_info, status=DownloadStatus.FAILED,
+                error=str(e), started_at=started, completed_at=datetime.now(),
+            )
+
+    async def search_player_matches(self, player_name: str, count: int = 5) -> list[MatchInfo]:
+        """Search for a player's recent matches on HLTV."""
+        console.print(f"\n[bold cyan][>>] Searching HLTV for player:[/bold cyan] {player_name}")
+        search_url = f"{settings.hltv_base_url}/search?query={player_name}"
+        html = await self._get_page_content(search_url)
+        soup = BeautifulSoup(html, "lxml")
+
+        player_link = None
+        for link in soup.find_all("a", href=True):
+            href = link["href"]
+            if "/player/" in href and player_name.lower() in link.get_text().lower():
+                player_link = urljoin(settings.hltv_base_url, href)
+                break
+
+        if not player_link:
+            console.print(f"[red]   [ERR] Player '{player_name}' not found on HLTV[/red]")
+            return []
+
+        console.print(f"[green]   [OK] Found player page: {player_link}[/green]")
+        await self._rate_limit()
+
+        player_html = await self._get_page_content(player_link)
+        player_soup = BeautifulSoup(player_html, "lxml")
+
+        matches = []
+        match_links = set()
+        for link in player_soup.find_all("a", href=True):
+            href = link["href"]
+            if "/matches/" in href and href not in match_links:
+                if re.match(r".*/matches/\d+/.*", href):
+                    match_links.add(href)
+                    full_url = urljoin(settings.hltv_base_url, href)
+                    mid = re.search(r"/matches/(\d+)/", href)
+                    matches.append(MatchInfo(
+                        match_id=mid.group(1) if mid else href,
+                        source=DemoSource.HLTV, url=full_url,
+                    ))
+                    if len(matches) >= count:
+                        break
+
+        console.print(f"[green]   [OK] Found {len(matches)} match(es)[/green]")
+        return matches
+
+    async def search_event_matches(self, event_url: str) -> list[MatchInfo]:
+        """Get all matches from an HLTV event/tournament page."""
+        console.print(f"\n[bold cyan][>>] Scraping event matches:[/bold cyan] {event_url}")
+        html = await self._get_page_content(event_url)
+        soup = BeautifulSoup(html, "lxml")
+
+        matches = []
+        match_links = set()
+        for link in soup.find_all("a", href=True):
+            href = link["href"]
+            if "/matches/" in href and href not in match_links:
+                if re.match(r".*/matches/\d+/.*", href):
+                    match_links.add(href)
+                    full_url = urljoin(settings.hltv_base_url, href)
+                    mid = re.search(r"/matches/(\d+)/", href)
+                    if mid:
+                        matches.append(MatchInfo(
+                            match_id=mid.group(1), source=DemoSource.HLTV, url=full_url,
+                        ))
+
+        console.print(f"[green]   [OK] Found {len(matches)} match(es) in event[/green]")
+        return matches
+
+    # ── HTML Parsing Helpers ──────────────────────────────────────────────
+
+    def _parse_match_info(self, soup: BeautifulSoup, url: str) -> MatchInfo:
+        match_id = ""
+        id_match = re.search(r"/matches/(\d+)/", url)
+        if id_match:
+            match_id = id_match.group(1)
+
+        team_names = [el.get_text(strip=True) for el in soup.select(".teamName")]
+        team1 = team_names[0] if len(team_names) > 0 else "Unknown"
+        team2 = team_names[1] if len(team_names) > 1 else "Unknown"
+
+        score = ""
+        score_els = soup.select(".team1-gradient .won, .team2-gradient .won, "
+                                ".team1-gradient .lost, .team2-gradient .lost")
+        if len(score_els) >= 2:
+            score = f"{score_els[0].get_text(strip=True)}-{score_els[1].get_text(strip=True)}"
+
+        map_name = "Unknown"
+        map_el = soup.select_one(".mapName")
+        if map_el:
+            map_name = map_el.get_text(strip=True)
+
+        event = ""
+        event_el = soup.select_one(".event a")
+        if event_el:
+            event = event_el.get_text(strip=True)
+
+        date = None
+        date_el = soup.select_one("[data-unix]")
+        if date_el:
+            try:
+                date = datetime.fromtimestamp(int(date_el["data-unix"]) / 1000)
+            except (ValueError, KeyError):
+                pass
+
+        return MatchInfo(
+            match_id=match_id, source=DemoSource.HLTV,
+            team1=team1, team2=team2, score=score, map_name=map_name,
+            date=date, event=event, url=url,
+        )
+
+    def _extract_demo_id(self, soup: BeautifulSoup) -> Optional[str]:
+        for link in soup.find_all("a", href=True):
+            href = link["href"]
+            if "demoid=" in href:
+                match = re.search(r"demoid=(\d+)", href)
+                if match:
+                    return match.group(1)
+        for el in soup.find_all(attrs={"data-demoid": True}):
+            return el["data-demoid"]
+        for script in soup.find_all("script"):
+            text = script.string or ""
+            match = re.search(r"demoid['\"]?\s*[:=]\s*['\"]?(\d+)", text)
+            if match:
+                return match.group(1)
+        return None
+
+    def _detect_and_rename_archive(self, path: Path) -> Path:
+        with open(path, "rb") as f:
+            magic = f.read(8)
+        if magic[:4] == b"Rar!":
+            new_path = path.with_suffix(".rar")
+        elif magic[:2] == b"PK":
+            new_path = path.with_suffix(".zip")
+        elif magic[:2] == b"\x1f\x8b":
+            new_path = path.with_suffix(".dem.gz")
+        elif magic[:8] == b"HL2DEMO\x00":
+            new_path = path.with_suffix(".dem")
+        else:
+            new_path = path.with_suffix(".rar")
+        if new_path != path:
+            path.rename(new_path)
+        return new_path

@@ -1,0 +1,26 @@
+# Environment
+.env
+
+# Demos (large binary files)
+demos/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Download state
+download_history.json
