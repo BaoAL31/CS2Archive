@@ -1,8 +1,8 @@
 """
 CS2Archive — Player Profile Image Scraper
 
-Gets player avatars from HLTV match pages.
-Uses ui-avatars.com since HLTV CDN blocks direct downloads.
+Downloads real HLTV player body shots.
+First loads the match page (to get cookies), then grabs each CDN image.
 """
 
 from __future__ import annotations
@@ -10,8 +10,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import httpx
-from bs4 import BeautifulSoup
 from rich.console import Console
 
 from config import settings
@@ -22,7 +20,7 @@ AVATAR_DIR = settings.demo_storage_dir / "avatars"
 
 
 async def get_player_avatars(match_url: str) -> dict[str, Path]:
-    """Generate avatar images for all match participants."""
+    """Download real HLTV player body shots."""
     from scrapers.hltv import HLTVScraper
 
     AVATAR_DIR.mkdir(parents=True, exist_ok=True)
@@ -30,41 +28,60 @@ async def get_player_avatars(match_url: str) -> dict[str, Path]:
 
     scraper = HLTVScraper()
     try:
-        html = await scraper._get_page_content(match_url)
-        soup = BeautifulSoup(html, "lxml")
+        context = await scraper._ensure_browser()
+        page = await context.new_page()
 
-        player_links = set()
-        for table in soup.select("table.totalstats"):
-            for row in table.select("tr"):
-                for link in row.select("a[href*='/player/']"):
-                    href = link["href"]
-                    m = re.match(r"/player/(\d+)/([^/?#]+)", href)
-                    if m:
-                        player_links.add((m.group(1), m.group(2)))
+        await page.goto(match_url, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(3000)
 
-        if not player_links:
-            console.print("[yellow]   No player links found[/yellow]")
+        body_shots = await page.evaluate("""
+            () => {
+                const imgs = document.querySelectorAll('img.player-photo');
+                return Array.from(imgs).map(img => {
+                    const alt = img.alt || '';
+                    const m = alt.match(/'([^']+)'/);
+                    const nick = m ? m[1].toLowerCase() : alt.split(' ').pop().toLowerCase();
+                    return { nickname: nick, src: img.src };
+                });
+            }
+        """)
+
+        if not body_shots:
+            console.print("[yellow]   No player photos found[/yellow]")
+            await page.close()
             return result
 
-        console.print(f"[dim]   Fetching {len(player_links)} avatars...[/dim]")
+        console.print(f"[dim]   Downloading {len(body_shots)} player photos...[/dim]")
 
-        for player_id, nickname in sorted(player_links):
+        for entry in body_shots:
+            nickname = entry["nickname"]
+            src = entry["src"]
             local_path = AVATAR_DIR / f"{nickname}.jpg"
             if local_path.exists():
                 result[nickname] = local_path
                 continue
 
-            try:
-                url = f"https://ui-avatars.com/api/?name={nickname}&size=200&background=random&format=png"
-                async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-                    resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-                    resp.raise_for_status()
-                local_path.write_bytes(resp.content)
-                result[nickname] = local_path
-                console.print(f"[green]   [OK] {nickname}.jpg ({len(resp.content) / 1024:.0f} KB)[/green]")
-            except Exception as e:
-                console.print(f"[yellow]   [{nickname}] {e}[/yellow]")
+            img_data = await page.evaluate(f"""
+                async () => {{
+                    try {{
+                        const resp = await fetch('{src}');
+                        if (!resp.ok) return null;
+                        const blob = await resp.blob();
+                        if (blob.size < 10000) return null;
+                        const buf = await blob.arrayBuffer();
+                        return Array.from(new Uint8Array(buf));
+                    }} catch(e) {{ return null; }}
+                }}
+            """)
 
+            if img_data:
+                local_path.write_bytes(bytes(img_data))
+                result[nickname] = local_path
+                console.print(f"[green]   [OK] {nickname}.jpg ({len(img_data) / 1024:.0f} KB)[/green]")
+            else:
+                console.print(f"[yellow]   [{nickname}] CDN blocked[/yellow]")
+
+        await page.close()
         return result
     finally:
         await scraper.close()
