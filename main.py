@@ -12,6 +12,8 @@ Usage:
     python main.py player show <nickname>
     python main.py player remove <nickname>
     python main.py status
+    python main.py ratings <url> [--top N]
+    python main.py test-pipeline
     python main.py trending [--url-only]
 """
 
@@ -28,7 +30,7 @@ if sys.platform == "win32":
 
 from rich.console import Console
 
-from commands import hltv, faceit, player, status, trending
+from commands import hltv, faceit, player, ratings, status, tests, trending
 
 console = Console(force_terminal=True)
 
@@ -50,7 +52,9 @@ def build_parser() -> argparse.ArgumentParser:
     hltv.register_subparser(subparsers)
     faceit.register_subparser(subparsers)
     player.register_subparser(subparsers)
+    ratings.register_subparser(subparsers)
     status.register_subparser(subparsers)
+    tests.register_subparser(subparsers)
     trending.register_subparser(subparsers)
 
     return parser
@@ -70,7 +74,9 @@ def main() -> None:
         "hltv": hltv,
         "faceit": faceit,
         "player": player,
+        "ratings": ratings,
         "status": status,
+        "test-pipeline": tests,
         "trending": trending,
     }
 

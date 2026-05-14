@@ -1,8 +1,12 @@
 # Environment
 .env
-
-# Demos (large binary files)
+__pycache__/
+*.pyc
+.dem
+.rar
 demos/
+pgdata/
+pg.log
 
 # Python
 __pycache__/
