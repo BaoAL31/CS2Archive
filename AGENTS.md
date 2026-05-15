@@ -5,13 +5,13 @@
 > **HLTV only.** FACEIT workflow may differ — not documented yet.
 
 1. **`python main.py trending`** — Find top trending CS2 matches from YouTube highlight channels (matched to HLTV). Pick the match URL.
-2. **Demo Download** — `python main.py hltv match <url>` downloads the demo. If 403'd, manually download `.rar` from browser, then cut from Downloads → `demos/hltv/` → extract with WinRAR.
+2. **Demo Download** — `python main.py hltv match <url>` downloads the demo. If 403'd, manually download `.rar` from browser, then cut from Downloads → `demos/hltv/` → extract with WinRAR (`patoolib` wraps WinRAR in `downloader.py`).
 3. **Ratings** — `python main.py ratings <url>` scrapes HLTV Rating 3.0 for the match (saves to `demos/analysis/`).
     - Check top players: `python scripts/best_per_map.py demos/analysis/{slug}_ratings.json`
 4. **Avatars** — Avatars are auto-downloaded by `test-pipeline` or manually via `scrapers/player_images.py`. Background is automatically removed and saved as `{nickname}.png`. Check `demos/avatars/`.
 5. **Player Steam ID** — `python main.py player add <nickname> --steam <url>` or check existing with `python main.py player list`. If you have the demo file, you can extract Steam IDs directly with `python scripts/extract_steamids.py <demo_path>`.
-6. **CSDM Analysis** — `csdm analyze` the demo so video rendering can find events.
-7. **Render POV Clip** — `python scripts/render_pov.py <demo_path> <steam_id>` renders each round as a separate clip (full HUD, no x-ray). To resume from a specific round: `--rounds 10-18`. For kill compilations instead of rounds, use `csdm video "<demo_path>" --mode player --steamids <id> --event kills --start-seconds-before 2 --end-seconds-after 2 --output "demos/renders"`.
+6. **CSDM Analysis** — `csdm analyze` the demo so video rendering can find events. For PGL demos (PBDEMS2 format), use `csdm analyze <demo> --source challengermode`.
+7. **Render POV Clip** — `python scripts/render_pov.py <demo_path> <steam_id>` renders each round as a separate clip (full HUD, no x-ray). To resume from a specific round: `--rounds 10-18`. For kill compilations instead of rounds, use `csdm video "<demo_path>" --mode player --steamids <id> --event kills --start-seconds-before 2 --end-seconds-after 2 --output "demos/renders" --cfg assets/cs2_pov.cfg`.
 8. **Concatenate Rounds** — `python scripts/concat_rounds.py <renders_folder>` joins all round-NNN clips into `combined.mp4`.
 9. **Move to YouTube** — Place `combined.mp4` (renamed `video.mp4`) and the thumbnail into `youtube/{match-slug}_{player}_{map}/`.
 10. **Cleanup Renders** — `python scripts/cleanup_renders.py <renders_folder> --youtube <youtube_folder>` removes the entire renders folder after confirming the video is in youtube/.
@@ -48,14 +48,14 @@ Available commands:
 
 ## Demo Video Rendering
 
-Uses **CS2 Demo Manager (csdm)** CLI to render POV videos. Installed at:
+Uses **CS2 Demo Manager (csdm)** CLI to render POV videos (csdm launches CS2 automatically, no need to start it manually). Installed at:
 ```
 C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd
 ```
 
 Basic tick-range render:
 ```powershell
-& "C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd" video "<demo_path>" <start_tick> <end_tick> --output "demos\renders" --framerate 60 --width 1920 --height 1080 --recording-system CS --close-game-after-recording --ffmpeg-video-container mp4 --ffmpeg-video-codec libx264
+& "C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd" video "<demo_path>" <start_tick> <end_tick> --output "demos\renders" --framerate 60 --width 1920 --height 1080 --recording-system CS --close-game-after-recording --ffmpeg-video-container mp4 --ffmpeg-video-codec libx264 --ffmpeg-crf 18 --ffmpeg-output-parameters "-profile:v high -pix_fmt yuv420p -level 4.2"
 ```
 
 Tick ≈ 1/64 sec (most CS2 servers). For a 5-second clip use ~320 ticks.
@@ -65,7 +65,7 @@ Tick ≈ 1/64 sec (most CS2 servers). For a 5-second clip use ~320 ticks.
 For rendering a player's POV with full HUD (radar, health, ammo) and no x-ray, one round at a time to avoid disk I/O saturation:
 
 ```powershell
-& "C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd" video "<demo_path>" --mode player --steamids <steam64_id> --event rounds --rounds <N> --perspective player --no-show-x-ray --output "demos\renders\pov-folder" --framerate 30 --width 1920 --height 1080 --recording-system CS --close-game-after-recording --no-show-only-death-notices --show-assists --record-audio --concatenate-sequences --ffmpeg-video-codec libx264 --ffmpeg-crf 18
+& "C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd" video "<demo_path>" --mode player --steamids <steam64_id> --event rounds --rounds <N> --perspective player --no-show-x-ray --output "demos\renders\pov-folder" --framerate 60 --width 1920 --height 1080 --recording-system CS --close-game-after-recording --no-show-only-death-notices --show-assists --record-audio --concatenate-sequences --ffmpeg-video-codec libx264 --ffmpeg-crf 18 --cfg assets/cs2_pov.cfg
 ```
 
 Use `python scripts/render_pov.py <demo_path> <steam_id>` instead — it wraps the above command with auto round-detection, p1/p2 split handling, and per-round output naming.
@@ -93,11 +93,12 @@ Output is `combined.mp4` in the same folder. Uses ffmpeg stream copy (no re-enco
 
 - **Demo downloads from HLTV fail with 403** — HLTV CDN issues one-time signed URLs consumed after first download. IP gets blocked after repeated requests. Download manually from browser, cut `.rar` from Downloads → `demos/hltv/` → extract with WinRAR (`patoolib` wraps WinRAR in `downloader.py`).
 - **Split demos (p1, p2)** — IEM tournaments sometimes split single-map demos into parts (`-p1`, `-p2`). `render_pov.py` handles this automatically. The `.rar` may contain multiple `.dem` files — `extract_demo()` in `downloader.py` now extracts all of them.
-- **PBDEMS2 format** — PGL tournaments use a custom demo format (`PBDEMS2` header instead of `HL2DEMO`). Not parseable by CS2 Demo Manager or awpy. Only watchable via `playdemo` in CS2.
+- **PBDEMS2 format** — PGL tournaments use a custom demo format. csdm now supports it (requires `--source challengermode` for analyze). Use `csdm analyze <demo> --source challengermode`.
 - **HLTV CDN blocks image downloads** — Player body shots must be scraped via Playwright browser context (not httpx). Use `scrapers/player_images.py`.
 - **Background removal at download time** — `rembg` runs during avatar download (step 4), not during thumbnail generation. Cutout PNGs are saved as `{nickname}.png` in `demos/avatars/`.
 - **Thumbnail background auto-extraction** — When using `--demo` + `--steam-id`, the thumbnail generator renders a 1-second clip of a random kill, extracts the first frame, blurs it (radius 6), and uses it as background.
 - **Quality settings** — All renders use `libx264` with `--ffmpeg-crf 18` (high quality) at 1080p60. NVENC was tried but produced worse quality.
+- **YouTube encoding** — Use `--ffmpeg-output-parameters "-profile:v high -pix_fmt yuv420p -level 4.2"` for YouTube compatibility. YouTube may still take 30-60 min to process 1080p60 after upload.
 - **Windows PowerShell** — does not support `&&`, `||`, `tail`. Use `; if ($?) { }` for chaining. Use `Select-String -Last 3` instead of `tail -3`. `@'...'@` heredocs broken with f-strings — write Python scripts to files instead.
 - **RAR extraction** — `rarfile` library doesn't work on Windows. Use `patoolib` (via `patool` pip package) which wraps WinRAR.
 - **All async** — every scraper/command is `asyncio.run()`. Any new command must follow `async def` + `register_subparser` + `handle` pattern in `commands/`.

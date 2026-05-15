@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import shutil
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -17,8 +19,6 @@ from typing import Optional
 import httpx
 import patoolib
 import zstandard
-import os
-import tempfile
 from rich.progress import (
     BarColumn,
     DownloadColumn,
@@ -206,7 +206,9 @@ def _extract_zst(archive_path: Path, dest_dir: Path) -> Path:
 
 def _extract_with_patool(archive_path: Path, dest_dir: Path) -> list[Path]:
     """Extract all .dem files from an archive and validate them."""
-    temp_dir = tempfile.mkdtemp(prefix="demo_extract_")
+    opencode_tmp = Path(os.environ.get("TMPDIR", "C:/Users/jembo/AppData/Local/Temp/opencode"))
+    opencode_tmp.mkdir(parents=True, exist_ok=True)
+    temp_dir = tempfile.mkdtemp(prefix="demo_extract_", dir=str(opencode_tmp))
     try:
         patoolib.extract_archive(str(archive_path), outdir=temp_dir, interactive=False)
 

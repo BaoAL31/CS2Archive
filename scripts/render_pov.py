@@ -14,12 +14,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+
+TMP_DIR = Path(os.environ.get("TMPDIR", "C:/Users/jembo/AppData/Local/Temp/opencode"))
+TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 CSDM = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
 
@@ -33,6 +37,7 @@ BASE_FLAGS = [
     "--concatenate-sequences",
     "--ffmpeg-video-codec", "libx264",
     "--ffmpeg-crf", "18",
+    "--ffmpeg-output-parameters", "-profile:v high -pix_fmt yuv420p -level 4.2",
     "--recording-system", "CS",
     "--close-game-after-recording",
     "--cfg", "assets/cs2_pov.cfg",
@@ -60,7 +65,7 @@ def find_demo_parts(demo_path: str) -> list[str]:
 
 
 def get_round_count(demo_path: str) -> int:
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(dir=TMP_DIR) as tmp:
         result = subprocess.run(
             [CSDM, "json", demo_path, "--output-folder", tmp],
             capture_output=True, text=True, timeout=300,

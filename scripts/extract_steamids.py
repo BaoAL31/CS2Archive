@@ -10,10 +10,14 @@ Depends on csdm CLI being installed and the demo being analyzed.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+TMP_DIR = Path(os.environ.get("TMPDIR", "C:/Users/jembo/AppData/Local/Temp/opencode"))
+TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def extract_steamids(demo_path: str) -> dict[str, str]:
@@ -24,7 +28,7 @@ def extract_steamids(demo_path: str) -> dict[str, str]:
 
     csdm = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory(dir=TMP_DIR) as tmpdir:
         result = subprocess.run(
             [csdm, "json", str(demo), "--output-folder", tmpdir],
             capture_output=True, text=True, timeout=300,
