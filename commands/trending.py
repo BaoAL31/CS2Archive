@@ -42,14 +42,16 @@ async def _cmd(url_only: bool, count: int) -> None:
 
     table = Table(title="Trending CS2 Matches (last 24h)", show_lines=True)
     table.add_column("#", style="dim", width=3)
-    table.add_column("Channel", style="cyan", width=22)
-    table.add_column("Views", style="green", width=10, justify="right")
-    table.add_column("Match", style="white", min_width=30)
-    table.add_column("HLTV", width=45)
+    table.add_column("Channel", style="cyan")
+    table.add_column("Views", style="green", justify="right")
+    table.add_column("Match", style="white")
 
     for i, r in enumerate(results, 1):
         t1, t2 = r["teams"]
-        table.add_row(str(i), r["channel"], f"{r['views']:,}", f"{t1} vs {t2}", r["hltv_url"])
+        table.add_row(str(i), r["channel"], f"{r['views']:,}", f"{t1} vs {t2}")
 
     console.print()
     console.print(table)
+    console.print()
+    for i, r in enumerate(results, 1):
+        console.print(f"  {i}. {r['hltv_url']}")

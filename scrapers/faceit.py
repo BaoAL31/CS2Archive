@@ -231,7 +231,8 @@ class FACEITClient:
 
             # Extract
             console.print("[cyan]   [EXTRACT] Extracting .dem file...[/cyan]")
-            dem_path = extract_demo(temp_path, settings.temp_dir)
+            dem_paths = extract_demo(temp_path, settings.temp_dir)
+            dem_path = dem_paths[0]
             cleanup_temp(temp_path)
 
             import shutil

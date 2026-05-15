@@ -32,10 +32,17 @@ async def get_match_ratings(match_url: str) -> Optional[dict]:
         match_name_el = soup.select_one(".match-header-title")
         match_name = match_name_el.get_text(strip=True) if match_name_el else "Unknown Match"
 
+        map_names: dict[str, str] = {}
+        for el in soup.find_all("div", class_="dynamic-map-name-full"):
+            cid = el.get("id", "")
+            if cid:
+                map_names[cid] = el.get_text(strip=True)
+        map_names["all"] = "Series Overall"
+
         series_stats: list[dict] = []
         tables = soup.select("table.totalstats")
 
-        current_map = "Overall"
+        current_map = "Series Overall"
         for table in tables:
             parent = table.find_parent(["div", "section"])
             if parent and parent.select_one(".stats-tabs, .stats-tab-content"):
@@ -54,6 +61,10 @@ async def get_match_ratings(match_url: str) -> Optional[dict]:
 
             td = table.select_one("td")
             team_name = td.get_text(strip=True) if td else ""
+
+            parent_id = table.parent.get("id", "") if table.parent else ""
+            content_id = parent_id.replace("-content", "")
+            map_name = map_names.get(content_id, content_id if content_id and content_id != "all" else "Series Overall")
 
             team_players = []
             for row in rows[1:]:
@@ -104,7 +115,7 @@ async def get_match_ratings(match_url: str) -> Optional[dict]:
 
             if team_players:
                 series_stats.append({
-                    "map": current_map,
+                    "map": map_name,
                     "team": team_name or "",
                     "players": team_players,
                 })

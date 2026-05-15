@@ -2,11 +2,22 @@
 .env
 __pycache__/
 *.pyc
-.dem
-.rar
+
+# Demo files
+*.dem
+*.rar
 demos/
-pgdata/
-pg.log
+
+# Output
+youtube/
+
+# Secrets & credentials
+client_secret.json
+token_youtube.json
+
+# App data
+player_accounts.json
+download_history.json
 
 # Python
 __pycache__/
@@ -18,6 +29,9 @@ build/
 .venv/
 venv/
 
+# Temp scripts
+tmp_*.py
+
 # IDE
 .vscode/
 .idea/
@@ -26,5 +40,10 @@ venv/
 Thumbs.db
 .DS_Store
 
-# Download state
-download_history.json
+# Other
+graphify-out/
+.agents/
+SKILLS.md
+skills-lock.json
+pgdata/
+pg.log

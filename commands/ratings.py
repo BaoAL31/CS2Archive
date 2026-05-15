@@ -9,11 +9,23 @@ from __future__ import annotations
 
 import asyncio
 import argparse
+import json
+import re
+from pathlib import Path
 
 from rich.console import Console
 from rich.table import Table
 
 console = Console(force_terminal=True)
+
+ANALYSIS_DIR = Path("demos/analysis")
+
+
+def _slug_from_url(url: str) -> str | None:
+    m = re.search(r"/matches/\d+/([^/?#]+)", url)
+    if m:
+        return m.group(1)
+    return None
 
 
 def register_subparser(subparsers: argparse._SubParsersAction) -> None:
@@ -36,6 +48,13 @@ async def _cmd(url: str, top: int) -> None:
     if not result:
         console.print("[red]No ratings found[/red]")
         return
+
+    slug = _slug_from_url(url)
+    if slug:
+        ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
+        ratings_path = ANALYSIS_DIR / f"{slug}_ratings.json"
+        ratings_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        console.print(f"[dim]  Saved to {ratings_path}[/dim]")
 
     seen = set()
     for table in result["tables"]:

@@ -1,15 +1,16 @@
 """
 CS2Archive — Player Profile Image Scraper
 
-Downloads real HLTV player body shots.
-First loads the match page (to get cookies), then grabs each CDN image.
+Downloads real HLTV player body shots and removes their backgrounds.
 """
 
 from __future__ import annotations
 
-import re
+import asyncio
 from pathlib import Path
 
+from PIL import Image
+from rembg import remove
 from rich.console import Console
 
 from config import settings
@@ -19,8 +20,19 @@ console = Console(force_terminal=True)
 AVATAR_DIR = settings.demo_storage_dir / "avatars"
 
 
+def _cutout_bg(jpg_path: Path, png_path: Path) -> bool:
+    try:
+        raw = Image.open(jpg_path).convert("RGBA")
+        cut = remove(raw)
+        cut.save(png_path, "PNG")
+        return True
+    except Exception as e:
+        console.print(f"[yellow]   [{jpg_path.stem}] cutout failed: {e}[/yellow]")
+        return False
+
+
 async def get_player_avatars(match_url: str) -> dict[str, Path]:
-    """Download real HLTV player body shots."""
+    """Download real HLTV player body shots and save cutout PNGs."""
     from scrapers.hltv import HLTVScraper
 
     AVATAR_DIR.mkdir(parents=True, exist_ok=True)
@@ -56,9 +68,11 @@ async def get_player_avatars(match_url: str) -> dict[str, Path]:
         for entry in body_shots:
             nickname = entry["nickname"]
             src = entry["src"]
-            local_path = AVATAR_DIR / f"{nickname}.jpg"
-            if local_path.exists():
-                result[nickname] = local_path
+            png_path = AVATAR_DIR / f"{nickname}.png"
+            jpg_path = AVATAR_DIR / f"{nickname}.jpg"
+
+            if png_path.exists():
+                result[nickname] = png_path
                 continue
 
             img_data = await page.evaluate(f"""
@@ -74,12 +88,21 @@ async def get_player_avatars(match_url: str) -> dict[str, Path]:
                 }}
             """)
 
-            if img_data:
-                local_path.write_bytes(bytes(img_data))
-                result[nickname] = local_path
-                console.print(f"[green]   [OK] {nickname}.jpg ({len(img_data) / 1024:.0f} KB)[/green]")
-            else:
+            if not img_data:
                 console.print(f"[yellow]   [{nickname}] CDN blocked[/yellow]")
+                continue
+
+            jpg_path.write_bytes(bytes(img_data))
+            kb = len(img_data) / 1024
+            console.print(f"[green]   [OK] {nickname}.jpg ({kb:.0f} KB)[/green]")
+
+            loop = asyncio.get_event_loop()
+            ok = await loop.run_in_executor(None, _cutout_bg, jpg_path, png_path)
+            if ok:
+                console.print(f"[green]         {nickname}.png cutout ({png_path.stat().st_size / 1024:.0f} KB)[/green]")
+                result[nickname] = png_path
+            else:
+                result[nickname] = jpg_path
 
         await page.close()
         return result

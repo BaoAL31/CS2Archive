@@ -146,92 +146,94 @@ async def download_file(
 # ── Archive Extraction ────────────────────────────────────────────────────────
 
 
-def extract_demo(archive_path: Path, dest_dir: Path) -> Path:
+DEM_HEADERS = {b"HL2DEMO", b"PBDEMS2"}
+
+
+def _is_valid_dem(path: Path) -> bool:
+    """Check if a file looks like a valid CS2 demo by its header."""
+    try:
+        with open(path, "rb") as f:
+            h = f.read(7)
+        return h in DEM_HEADERS
+    except OSError:
+        return False
+
+
+def extract_demo(archive_path: Path, dest_dir: Path) -> list[Path]:
     """
-    Extract a .dem file from an archive (.rar, .zip, or .gz).
-    Returns the path to the extracted .dem file.
+    Extract .dem files from an archive (.rar, .zip, or .gz).
+    Returns a list of paths to extracted .dem files.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     suffix = archive_path.suffix.lower()
 
     if suffix == ".gz":
-        return _extract_gz(archive_path, dest_dir)
+        return [_extract_gz(archive_path, dest_dir)]
     elif suffix == ".zst":
-        return _extract_zst(archive_path, dest_dir)
+        return [_extract_zst(archive_path, dest_dir)]
     elif suffix in (".zip", ".rar", ".7z"):
         return _extract_with_patool(archive_path, dest_dir)
     elif suffix == ".dem":
-        # Already a .dem file, just move it
         final_path = dest_dir / archive_path.name
         shutil.move(str(archive_path), str(final_path))
-        return final_path
+        return [final_path]
     else:
         raise ValueError(f"Unsupported archive format: {suffix}")
 
 
 def _extract_gz(archive_path: Path, dest_dir: Path) -> Path:
-    """Extract a .dem.gz file."""
-    # Strip .gz to get the output filename
-    stem = archive_path.stem  # e.g., "match.dem"
+    stem = archive_path.stem
     if not stem.endswith(".dem"):
         stem += ".dem"
     output_path = dest_dir / stem
-
     with gzip.open(archive_path, "rb") as gz_in:
         with open(output_path, "wb") as f_out:
             shutil.copyfileobj(gz_in, f_out)
-
     return output_path
 
 
 def _extract_zst(archive_path: Path, dest_dir: Path) -> Path:
-    """Extract a .dem.zst file."""
     stem = archive_path.stem
     if stem.endswith(".dem"):
         stem = stem[:-4]
     output_path = dest_dir / f"{stem}.dem"
-
     dctx = zstandard.ZstdDecompressor()
     with open(archive_path, "rb") as zst_in:
         with open(output_path, "wb") as f_out:
             dctx.copy_stream(zst_in, f_out)
-
     return output_path
 
 
-def _extract_with_patool(archive_path: Path, dest_dir: Path) -> Path:
-    """Extract the first .dem file from an archive using patool."""
-    # Create a safe temporary directory
+def _extract_with_patool(archive_path: Path, dest_dir: Path) -> list[Path]:
+    """Extract all .dem files from an archive and validate them."""
     temp_dir = tempfile.mkdtemp(prefix="demo_extract_")
     try:
-        # Extract archive to the temporary directory
-        # interactive=False ensures it doesn't prompt for passwords or overwrites
         patoolib.extract_archive(str(archive_path), outdir=temp_dir, interactive=False)
-        
-        # Walk through the temp directory to find the .dem file
-        dem_path = None
+
+        dem_files: list[Path] = []
         for root, _, files in os.walk(temp_dir):
             for file in files:
                 if file.lower().endswith(".dem"):
-                    dem_path = Path(root) / file
-                    break
-            if dem_path:
-                break
-                
-        if not dem_path:
+                    dem_files.append(Path(root) / file)
+
+        if not dem_files:
             raise FileNotFoundError(f"No .dem file found in {archive_path.name}")
-            
-        # Move the found .dem file to the final destination
-        final_dest = dest_dir / dem_path.name
-        
-        # Handle case where file already exists
-        if final_dest.exists():
-            final_dest.unlink()
-            
-        shutil.move(str(dem_path), str(final_dest))
-        return final_dest
+
+        valid: list[Path] = []
+        for df in dem_files:
+            if not _is_valid_dem(df):
+                raise ValueError(
+                    f"Extracted file {df.name} has invalid demo header "
+                    f"(expected HL2DEMO or PBDEMS2)"
+                )
+            final_dest = dest_dir / df.name
+            if final_dest.exists():
+                final_dest.unlink()
+            shutil.move(str(df), str(final_dest))
+            valid.append(final_dest)
+
+        return valid
     finally:
-        # Ensure we always clean up the temporary directory
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
