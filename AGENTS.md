@@ -18,7 +18,11 @@
 11. **Generate Thumbnail** — `python -m thumbnail <match_url> --player <nickname> --map <mapname> --demo <demo_path> --steam-id <id> [--tournament "IEM Atlanta 2026"]`
     Auto-extracts a random kill frame as blurred background. Or use `--background <frame.jpg>` to specify manually.
     Example: `python -m thumbnail "https://www.hltv.org/matches/2394166/faze-vs-vitality-iem-atlanta-2026" --player ropz --map Nuke --demo demos/hltv/.../faze-vs-vitality-m1-nuke-p2.dem --steam-id 76561197991272318 --tournament "IEM Atlanta 2026"`
-12. **Upload to YouTube** — `python scripts/upload_youtube.py <video_path> --thumbnail <thumbnail.png> --title <title> --description <desc> --privacy public`
+12. **Generate Title & Description** — `python scripts/generate_title.py <ratings_json> --player <nickname> --map <mapname> [--tournament "IEM Atlanta 2026"]`
+    Outputs JSON with `title` and `description` fields derived from ratings data (team names, map-specific rating, K-D, ADR, KAST).
+    Example: `python scripts/generate_title.py "demos/analysis/natus-vincere-vs-vitality-iem-atlanta-2026_ratings.json" --player w0nderful --map Anubis --tournament "IEM Atlanta 2026"`
+13. **Upload to YouTube** — `python scripts/upload_youtube.py <video_path> --thumbnail <thumbnail.png> --title <title> --description <desc> --privacy public`
+    Use `generate_title.py` to generate title and description.
 
     Requires a Google Cloud project with YouTube Data API v3 enabled and OAuth 2.0 desktop credentials
     (`client_secret.json` in project root). First-time auth opens a browser for Google login. Your YouTube account
@@ -40,7 +44,7 @@ Runs steps 1-10 in order. Resumable — state saved to `.pipeline_{run_id}.json`
 | 6 | render | Render all rounds as POV clips |
 | 7 | concat | Concatenate rounds, copy to youtube/ |
 | 8 | thumbnail | Generate 1280x720 thumbnail |
-| 9 | upload | Upload to YouTube (--privacy) |
+| 9 | upload | Upload to YouTube (--privacy, auto-generates title + description) |
 | 10 | cleanup | Remove renders folder + pipeline state |
 
 Example:

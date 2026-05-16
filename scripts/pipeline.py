@@ -3,7 +3,7 @@ End-to-end pipeline: demo -> render -> thumbnail -> upload.
 Resumable — tracks progress in a .pipeline_state.json per run.
 
 Usage:
-    python scripts/pipeline.py <rar_or_dem> <player> <map> <hltv_url> [--steam-id <id>] [--tournament "IEM Atlanta 2026"] [--step 1] [--privacy unlisted]
+    python scripts/pipeline.py <rar_or_dem> <player> <map> <hltv_url> [--steam-id <id>] [--tournament "IEM Atlanta 2026"] [--step 1] [--privacy public]
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ os.chdir(str(PROJECT_ROOT))
 
 sys.path.insert(0, str(PROJECT_ROOT))
 
+CSDM = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
 RENDER_DIR = PROJECT_ROOT / "demos" / "renders"
 YOUTUBE_DIR = PROJECT_ROOT / "youtube"
 
@@ -229,6 +230,28 @@ class Pipeline:
             print(f"[ERROR] Render dir not found: {render_path}")
             sys.exit(1)
 
+        render_files = sorted(render_path.glob("round-*.mp4"))
+        rendered_count = len(render_files)
+        print(f"  Found {rendered_count} rendered round(s)")
+
+        round_count = 0
+        demo = self.state["data"].get("demo_path") or str(self.demo_path)
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(
+                [CSDM, "json", demo, "--output-folder", tmp],
+                capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode == 0:
+                json_files = list(Path(tmp).glob("*.json"))
+                if json_files:
+                    data = json.loads(json_files[0].read_text())
+                    round_count = len(data.get("rounds", []))
+
+        if round_count > 0 and rendered_count != round_count:
+            print(f"[ERROR] Renders ({rendered_count}) don't match demo rounds ({round_count})")
+            print(f"  Missing or extra renders — check the output before continuing")
+            sys.exit(1)
+
         combined = render_path / "combined.mp4"
         if combined.exists():
             print("  combined.mp4 already exists, skipping")
@@ -286,12 +309,30 @@ class Pipeline:
             print(f"[ERROR] video.mp4 not found: {video}")
             sys.exit(1)
 
-        title = f"{self.args.player} | NAVI vs Vitality | {self.args.map} | {self.args.tournament or 'IEM Atlanta 2026'}"
+        slug = self.args.hltv_url.rstrip("/").split("/")[-1].replace("-", "_")
+        ratings_json = PROJECT_ROOT / "demos" / "analysis" / f"{slug}_ratings.json"
+        title_cmd = [
+            sys.executable, "scripts/generate_title.py", str(ratings_json),
+            "--player", self.args.player,
+            "--map", self.args.map,
+        ]
+        if self.args.tournament:
+            title_cmd += ["--tournament", self.args.tournament]
+        title_result = subprocess.run(title_cmd, capture_output=True, text=True, timeout=15)
+        meta = {}
+        if title_result.returncode == 0 and title_result.stdout.strip():
+            try:
+                meta = json.loads(title_result.stdout.strip())
+            except json.JSONDecodeError:
+                pass
+        title = meta.get("title") or f"{self.args.player} | {self.args.map} | {self.args.tournament or self.args.hltv_url}"
+        description = meta.get("description", "")
 
         cmd = [
             sys.executable, "scripts/upload_youtube.py",
             str(video),
             "--title", title,
+            "--description", description,
             "--privacy", self.args.privacy,
         ]
         if thumb.exists():
@@ -325,7 +366,7 @@ def main() -> None:
     parser.add_argument("--steam-id", help="Steam64 ID (auto-extracted if omitted)")
     parser.add_argument("--tournament", default="", help="Tournament name (e.g. IEM Atlanta 2026)")
     parser.add_argument("--step", type=int, default=1, help="Start from step N  (1=extract, 2=ratings, 3=steam_id, 4=avatar, 5=analyze, 6=render, 7=concat, 8=thumbnail, 9=upload, 10=cleanup)")
-    parser.add_argument("--privacy", choices=["private", "unlisted", "public"], default="unlisted")
+    parser.add_argument("--privacy", choices=["private", "unlisted", "public"], default="public")
     args = parser.parse_args()
 
     print(f"{'='*60}")
