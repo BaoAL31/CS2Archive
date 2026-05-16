@@ -32,6 +32,7 @@ def generate(
     map_name: str,
     match_detail: str,
     tournament: str = "",
+    stage: str = "",
 ) -> Image.Image:
     bg = load_background(bg_path)
 
@@ -56,6 +57,8 @@ def generate(
         (map_name, FONT_SIZES["small"]),
         (match_detail, FONT_SIZES["small"]),
     ]
+    if stage:
+        lines.append((stage, FONT_SIZES["tiny"]))
     if tournament:
         lines.append((tournament, FONT_SIZES["tiny"]))
 

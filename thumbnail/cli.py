@@ -184,7 +184,10 @@ def main() -> None:
     console.print(f"  Map:    [cyan]{args.map}[/cyan]")
     console.print(f"  K-D:    [green]{player_info['kd']}[/green]")
     console.print(f"  Rating: [green]{player_info['rating']}[/green]")
+    stage = ratings.get("match_stage", "")
     console.print(f"  Match:  [cyan]{team1} vs {team2}[/cyan]")
+    if stage:
+        console.print(f"  Stage:  [cyan]{stage}[/cyan]")
     console.print(f"  Avatar: [dim]{avatar_path.name}[/dim]")
     console.print(f"  BG:     [dim]{bg_path.name}[/dim]")
 
@@ -202,6 +205,7 @@ def main() -> None:
         args.map,
         f"{team1} vs {team2}",
         tournament=args.tournament or "",
+        stage=stage,
     )
     img.save(output_path, "PNG")
 

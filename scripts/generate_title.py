@@ -100,18 +100,23 @@ def main() -> None:
         if m:
             tournament = m.group(1)
 
+    stage = data.get("match_stage", "") if isinstance(data, dict) else ""
+
     title = " | ".join(filter(None, [
         args.player,
         f"{rating} Rating" if rating != "?.??" else "",
         f"{team_a_short} vs {team_b_short}",
         args.map,
+        stage or None,
         tournament or None,
     ]))
 
     desc_lines = [
         f"{args.player}'s POV on {args.map}",
     ]
-    if tournament:
+    if stage:
+        desc_lines.append(f"{tournament} — {stage}" if tournament else stage)
+    elif tournament:
         desc_lines.append(tournament)
     if team_a and team_b:
         desc_lines.append(f"{team_a} vs {team_b}")

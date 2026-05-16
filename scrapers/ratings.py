@@ -32,6 +32,17 @@ async def get_match_ratings(match_url: str) -> Optional[dict]:
         match_name_el = soup.select_one(".match-header-title")
         match_name = match_name_el.get_text(strip=True) if match_name_el else "Unknown Match"
 
+        match_stage = ""
+        stage_el = soup.select_one("div.map-info-wrap ul li")
+        if not stage_el:
+            stage_el = soup.select_one("div.match-info-box div.text")
+        if not stage_el:
+            m = re.search(r"\*\s*(.+?(?:final|playoff|group|stage|qualifier|round|decider|match))", html, re.IGNORECASE)
+            if m:
+                match_stage = m.group(1).strip()
+        else:
+            match_stage = stage_el.get_text(strip=True)
+
         map_names: dict[str, str] = {}
         for el in soup.find_all("div", class_="dynamic-map-name-full"):
             cid = el.get("id", "")
@@ -123,6 +134,7 @@ async def get_match_ratings(match_url: str) -> Optional[dict]:
         return {
             "match_name": match_name,
             "url": match_url,
+            "match_stage": match_stage,
             "tables": series_stats,
         }
 
