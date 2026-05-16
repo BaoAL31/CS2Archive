@@ -1,15 +1,26 @@
 """
-End-to-end pipeline: demo -> render -> thumbnail -> upload.
-Resumable — tracks progress in a .pipeline_state.json per run.
+E2E pipeline: .rar/.dem -> analyze -> render -> concat -> thumbnail -> upload.
+Structured errors for agent parsing.
 
 Usage:
-    python scripts/pipeline.py <rar_or_dem> <player> <map> <hltv_url> [--steam-id <id>] [--tournament "IEM Atlanta 2026"] [--step 1] [--privacy public]
+    python scripts/pipeline.py <player> <map> <hltv_url> --steam-id <id> --demo <dem_path> [options]
+
+Steps (use --step N to start at a specific step):
+  1 = extract     Extract .rar, find the right .dem for the map
+  2 = ratings     Scrape HLTV Rating 3.0
+  3 = steam_id    Save player Steam64 to player list
+  4 = avatar      Download player cutout PNG from HLTV
+  5 = analyze     csdm analyze the demo
+  6 = render      Render all rounds as POV clips
+  7 = concat      Concatenate rounds, copy to youtube/
+  8 = thumbnail   Generate 1280x720 thumbnail
+  9 = upload      Upload to YouTube (--privacy, auto-generates title + description)
+  10 = cleanup    Remove renders folder + pipeline state
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import os
 import re
@@ -23,14 +34,11 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 os.chdir(str(PROJECT_ROOT))
 
-sys.path.insert(0, str(PROJECT_ROOT))
-
 CSDM = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
-RENDER_DIR = PROJECT_ROOT / "demos" / "renders"
-YOUTUBE_DIR = PROJECT_ROOT / "youtube"
+PY = sys.executable
 
 STEPS = {
-    1: "extract_rar",
+    1: "extract",
     2: "ratings",
     3: "steam_id",
     4: "avatar",
@@ -41,6 +49,23 @@ STEPS = {
     9: "upload",
     10: "cleanup",
 }
+
+
+def pipeline_error(step: int, code: str, message: str) -> str:
+    """Return structured JSON error line for agent parsing."""
+    payload = json.dumps({
+        "error": True,
+        "step": step,
+        "step_name": STEPS.get(step, "unknown"),
+        "code": code,
+        "message": message,
+    })
+    return f"[PIPELINE_ERROR] {payload}"
+
+
+def fail(step: int, code: str, message: str) -> None:
+    print(pipeline_error(step, code, message))
+    sys.exit(1)
 
 
 def load_state(run_id: str) -> dict:
@@ -55,31 +80,49 @@ def save_state(run_id: str, state: dict) -> None:
 
 
 def run_id_from_name(name: str) -> str:
-    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
-    return safe[:80].strip("_")
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", name)[:80].strip("_")
+
+
+def _find_steam_cmd() -> str | None:
+    for p in [r"C:\Program Files (x86)\Steam\steam.exe", r"C:\Program Files\Steam\steam.exe"]:
+        if Path(p).exists():
+            return p
+    return None
 
 
 class Pipeline:
     def __init__(self, args: argparse.Namespace):
         self.args = args
-        self.run_id = run_id_from_name(f"{Path(args.demo).stem}_{args.player}_{args.map}")
-        self.state = load_state(self.run_id)
+        self.steam_id = args.steam_id
         self.start_step = args.step
-        self.rar_path: Path | None = None
-        self.demo_path: Path | None = None
-        self.demo_folder: Path | None = None
-        self.steam_id: str = args.steam_id or ""
-        self.output_dir: Path | None = None
-        self.youtube_dir: Path | None = None
 
+        slug = args.hltv_url.rstrip("/").split("/")[-1].replace("-", "_")
+        self.ratings_json = PROJECT_ROOT / "demos" / "analysis" / f"{slug}_ratings.json"
+
+        self.demo_path: Path | None = None
+        self.rar_path: Path | None = None
         src = Path(args.demo)
-        if src.suffix.lower() == ".rar":
-            self.rar_path = src
-        elif src.suffix.lower() == ".dem":
+        if src.suffix.lower() == ".dem":
             self.demo_path = src
+        elif src.suffix.lower() == ".rar":
+            self.rar_path = src
         else:
-            print(f"[ERROR] Unsupported file: {src.suffix} (use .rar or .dem)")
-            sys.exit(1)
+            fail(0, "INVALID_DEMO_PATH", f"Unsupported file: {src.suffix} (use .rar or .dem)")
+
+        stem = (self.demo_path or self.rar_path).stem
+        self.run_id = run_id_from_name(f"{stem}_{args.player}_{args.map}")
+        self.state = load_state(self.run_id)
+        self.state.setdefault("data", {})
+
+        if self.state["data"].get("demo_path"):
+            self.demo_path = Path(self.state["data"]["demo_path"])
+
+        dp = self.state["data"].get("demo_path") or (str(self.demo_path) if self.demo_path else "")
+        dem_stem = Path(dp).stem if dp else stem
+        self.render_dir = PROJECT_ROOT / "demos" / "renders" / f"pov-{dem_stem}"
+        self.youtube_dir = PROJECT_ROOT / "youtube" / self.run_id
+        self.state["data"]["render_dir"] = str(self.render_dir)
+        self.state["data"]["youtube_dir"] = str(self.youtube_dir)
 
     def run(self) -> None:
         for step_num in range(self.start_step, max(STEPS.keys()) + 1):
@@ -87,249 +130,285 @@ class Pipeline:
             print(f"\n{'='*60}")
             print(f"  Step {step_num}/{max(STEPS.keys())}: {step_name}")
             print(f"{'='*60}")
-
             try:
                 getattr(self, f"step_{step_name}")()
                 self.state["step"] = step_num + 1
                 save_state(self.run_id, self.state)
-            except StopIteration:
-                break
+            except Exception as e:
+                fail(step_num, f"STEP_{step_name.upper()}_EXCEPTION", f"{e}")
 
-        print(f"\nPipeline complete. youtube/{self.run_id}/")
+        print(f"\n  [OK] Pipeline complete -> {self.youtube_dir}/")
 
-    def step_extract_rar(self) -> None:
+    def _run_py(self, args: list[str], **kwargs) -> subprocess.CompletedProcess:
+        return subprocess.run([PY] + args, **kwargs)
+
+    # ── Step 1: Extract ──────────────────────────────────────────────────
+
+    def step_extract(self) -> None:
         if self.demo_path:
-            print("  Demo already extracted, skipping")
+            print("  Already a .dem, skipping")
             return
-        if not self.rar_path:
-            return
+
+        if self.rar_path is None:
+            fail(1, "EXTRACT_NO_RAR", "no .rar path set")
 
         import patoolib
-
         out = PROJECT_ROOT / "demos" / "hltv"
         out.mkdir(parents=True, exist_ok=True)
-        patoolib.extract_archive(str(self.rar_path), outdir=str(out))
-        files = sorted(out.glob("*.dem"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if not files:
-            print("[ERROR] No .dem files found in archive")
-            sys.exit(1)
 
-        target = [f for f in files if self.args.map.lower() in f.stem.lower()]
-        if target:
-            self.demo_path = target[0]
-        else:
-            self.demo_path = files[0]
-            print(f"  No exact map match, using: {self.demo_path.name}")
+        try:
+            patoolib.extract_archive(str(self.rar_path), outdir=str(out))
+        except Exception as e:
+            fail(1, "EXTRACT_RAR_FAILED", f"patool extract failed: {e}")
 
+        files = sorted(out.glob(f"*{self.args.map.lower()}*.dem"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if len(files) == 0:
+            fail(1, "EXTRACT_MAP_NOT_FOUND", f"no .dem for map '{self.args.map}' in {self.rar_path.name}")
+
+        self.demo_path = files[0]
         self.state["data"]["demo_path"] = str(self.demo_path)
-        print(f"  Demo: {self.demo_path.name}")
+        self.render_dir = PROJECT_ROOT / "demos" / "renders" / f"pov-{self.demo_path.stem}"
+        self.state["data"]["render_dir"] = str(self.render_dir)
+        print(f"  [OK] Extracted: {self.demo_path.name}")
 
-        if self.args.steam_id:
-            self.steam_id = self.args.steam_id
+        # Post-step validation
+        if not self.demo_path.exists():
+            fail(1, "EXTRACT_DEM_MISSING", f"dem file vanished after extract: {self.demo_path}")
+        if self.demo_path.stat().st_size < 1024:
+            fail(1, "EXTRACT_DEM_TOO_SMALL", f"dem file suspiciously small: {self.demo_path.stat().st_size} bytes")
+
+    # ── Step 2: Ratings ──────────────────────────────────────────────────
 
     def step_ratings(self) -> None:
-        result = subprocess.run(
-            [sys.executable, "main.py", "ratings", self.args.hltv_url],
-            capture_output=True, text=True, timeout=60,
-        )
-        if result.returncode != 0:
-            print(f"  [WARN] ratings returned {result.returncode}: {result.stderr[:200]}")
-        else:
-            print("  Ratings saved")
+        r = self._run_py(["main.py", "ratings", self.args.hltv_url], capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            fail(2, "RATINGS_SUBPROCESS_FAILED", f"ratings cmd failed: {r.stderr[:300]}")
+
+        if not self.ratings_json.exists():
+            fail(2, "RATINGS_JSON_MISSING", f"ratings JSON not created: {self.ratings_json}")
+
+        raw = self.ratings_json.read_text()
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            fail(2, "RATINGS_JSON_INVALID", f"ratings JSON parse error: {e}")
+
+        if not data.get("tables"):
+            fail(2, "RATINGS_NO_TABLES", f"ratings JSON has no player stat tables: {self.ratings_json.name}")
+        print(f"  [OK] Ratings: {self.ratings_json.name} ({len(data.get('tables', []))} tables)")
+
+    # ── Step 3: Steam ID ─────────────────────────────────────────────────
 
     def step_steam_id(self) -> None:
-        if self.steam_id:
-            print(f"  Steam ID provided: {self.steam_id}")
-            return
-
-        if not self.demo_path:
-            print("[ERROR] No demo path for steam ID extraction")
-            sys.exit(1)
-
-        result = subprocess.run(
-            [sys.executable, "scripts/extract_steamids.py", str(self.demo_path)],
-            capture_output=True, text=True, timeout=120,
-        )
-        out = (result.stdout or "") + (result.stderr or "")
-        for line in out.splitlines():
-            if self.args.player.lower() in line.lower():
-                parts = line.split()
-                for p in parts:
-                    if p.isdigit() and len(p) == 17:
-                        self.steam_id = p
-                        break
-                if self.steam_id:
-                    break
-
-        if not self.steam_id:
-            print(f"[ERROR] Could not find steam ID for '{self.args.player}'")
-            sys.exit(1)
-
-        result = subprocess.run(
-            [sys.executable, "main.py", "player", "add", self.args.player, "--steam", self.steam_id],
-            capture_output=True, text=True, timeout=15,
-        )
+        r = self._run_py(["main.py", "player", "add", self.args.player, "--steam", self.steam_id],
+                         capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            fail(3, "STEAM_ID_ADD_FAILED", f"player add cmd failed: {r.stderr[:300]}")
         self.state["data"]["steam_id"] = self.steam_id
-        print(f"  Steam ID: {self.steam_id}")
+
+        # Verify by listing
+        r2 = self._run_py(["main.py", "player", "list"], capture_output=True, text=True, timeout=10)
+        if self.args.player not in r2.stdout:
+            fail(3, "STEAM_ID_NOT_FOUND", f"player '{self.args.player}' not found in list after add")
+        print(f"  [OK] Steam ID saved: {self.steam_id}")
+
+    # ── Step 4: Avatar ───────────────────────────────────────────────────
 
     def step_avatar(self) -> None:
-        from scrapers.player_images import get_player_avatars
+        r = self._run_py(["-c", f"""
+import asyncio
+from scrapers.player_images import get_player_avatars
+asyncio.run(get_player_avatars("{self.args.hltv_url}"))
+"""], capture_output=True, text=True, timeout=120)
+        out = (r.stdout or "") + (r.stderr or "")
+        print(out[:500] if out else "  (no output)")
 
-        avatars = asyncio.run(get_player_avatars(self.args.hltv_url))
-        if self.args.player.lower() in avatars:
-            print(f"  Avatar: {avatars[self.args.player.lower()]}")
-        else:
-            print(f"  [WARN] No avatar for {self.args.player}")
+        avatar_dir = PROJECT_ROOT / "demos" / "avatars"
+        avatar_path = avatar_dir / f"{self.args.player.lower()}.png"
+        if not avatar_path.exists():
+            fail(4, "AVATAR_MISSING", f"avatar PNG not found: {avatar_path}")
+        if avatar_path.stat().st_size < 500:
+            fail(4, "AVATAR_TOO_SMALL", f"avatar PNG too small: {avatar_path.stat().st_size} bytes")
+
+        self.state["data"]["avatar_path"] = str(avatar_path)
+        print(f"  [OK] Avatar: {avatar_path.name}")
+
+    # ── Step 5: Analyze ──────────────────────────────────────────────────
 
     def step_analyze(self) -> None:
-        if not self.demo_path:
-            print("[ERROR] No demo path for analysis")
-            sys.exit(1)
+        if not self.demo_path or not self.demo_path.exists():
+            fail(5, "ANALYZE_DEMO_MISSING", f"demo not found: {self.demo_path}")
 
-        from config import settings
+        r = subprocess.run(["csdm", "analyze", str(self.demo_path)], capture_output=True, text=True, timeout=600)
+        combined = (r.stdout or "") + (r.stderr or "")
 
-        result = subprocess.run(
-            ["csdm", "analyze", str(self.demo_path)],
-            capture_output=True, text=True, timeout=300,
-        )
-        out = (result.stdout or "") + (result.stderr or "")
-        if "already in database" in out:
-            print("  Already analyzed")
-        elif result.returncode == 0:
-            print("  Analysis done")
+        if "already in database" in combined:
+            print("  [OK] Already analyzed")
+        elif r.returncode == 0:
+            print("  [OK] Analysis done")
         else:
-            print(f"  [WARN] Analyze returned {result.returncode}")
+            fail(5, "ANALYZE_FAILED", f"csdm analyze returned {r.returncode}: {combined[:300]}")
+
+        # Verify csdm has data for this demo
+        with tempfile.TemporaryDirectory() as tmp:
+            r2 = subprocess.run([CSDM, "json", str(self.demo_path), "--output-folder", tmp],
+                                capture_output=True, text=True, timeout=300)
+            if r2.returncode != 0:
+                fail(5, "ANALYZE_JSON_FAILED", f"csdm json export failed: {r2.stderr[:200]}")
+            jf = list(Path(tmp).glob("*.json"))
+            if not jf:
+                fail(5, "ANALYZE_NO_JSON", "csdm json produced no output files")
+            data = json.loads(jf[0].read_text())
+            rounds = data.get("rounds", [])
+            kills = data.get("kills", [])
+            print(f"  [OK] Rounds: {len(rounds)}, Kills: {len(kills)}")
+            if len(rounds) == 0:
+                fail(5, "ANALYZE_NO_ROUNDS", "csdm analysis has zero rounds")
+            self.state["data"]["round_count"] = len(rounds)
+
+    # ── Step 6: Render ───────────────────────────────────────────────────
 
     def step_render(self) -> None:
-        if not self.demo_path:
-            print("[ERROR] No demo path for rendering")
-            sys.exit(1)
-        if not self.steam_id:
-            print("[ERROR] No steam ID for rendering")
-            sys.exit(1)
+        if not self.demo_path or not self.demo_path.exists():
+            fail(6, "RENDER_DEMO_MISSING", f"demo not found: {self.demo_path}")
 
-        result = subprocess.run(
-            [sys.executable, "scripts/render_pov.py", str(self.demo_path), self.steam_id],
-            timeout=7200,
-        )
-        if result.returncode != 0 and result.returncode != 1:
-            print(f"  [WARN] render returned exit code {result.returncode}")
+        # Verify Steam is running
+        steam_check = subprocess.run(["tasklist", "/FI", "IMAGENAME eq steam.exe"],
+                                     capture_output=True, text=True, timeout=10)
+        if "steam.exe" not in steam_check.stdout:
+            fail(6, "RENDER_STEAM_NOT_RUNNING", "Steam must be running before rendering")
 
-        stem = self.demo_path.stem
-        self.output_dir = RENDER_DIR / f"pov-{stem}"
-        if self.output_dir.exists():
-            self.state["data"]["render_dir"] = str(self.output_dir)
-            print(f"  Render output: {self.output_dir}")
+        r = self._run_py(["scripts/render_pov.py", str(self.demo_path), self.steam_id], timeout=7200)
+        if r.returncode != 0:
+            fail(6, "RENDER_FAILED", f"render_pov.py exited {r.returncode}")
+
+        rendered = sorted(self.render_dir.glob("round-*.mp4"))
+        if len(rendered) == 0:
+            fail(6, "RENDER_NO_CLIPS", f"no round-*.mp4 files produced in {self.render_dir}")
+
+        # Check round count vs expected
+        expected = self.state["data"].get("round_count", 0)
+        if expected > 0 and len(rendered) != expected:
+            fail(6, "RENDER_ROUND_MISMATCH",
+                 f"rendered {len(rendered)} clips but expected {expected} rounds")
+
+        # Check first clip is valid
+        if rendered[0].stat().st_size < 50000:
+            fail(6, "RENDER_CLIP_TOO_SMALL", f"first round clip too small: {rendered[0].stat().st_size} bytes")
+
+        print(f"  [OK] Rendered {len(rendered)} round clip(s)")
+
+    # ── Step 7: Concat ───────────────────────────────────────────────────
 
     def step_concat(self) -> None:
-        render_dir = self.state["data"].get("render_dir") or str(
-            RENDER_DIR / f"pov-{self.demo_path.stem}"
-        )
-        render_path = Path(render_dir)
-        if not render_path.exists():
-            print(f"[ERROR] Render dir not found: {render_path}")
-            sys.exit(1)
+        if not self.render_dir.exists():
+            fail(7, "CONCAT_RENDER_DIR_MISSING", f"render dir not found: {self.render_dir}")
 
-        render_files = sorted(render_path.glob("round-*.mp4"))
-        rendered_count = len(render_files)
-        print(f"  Found {rendered_count} rendered round(s)")
+        rendered = sorted(self.render_dir.glob("round-*.mp4"))
+        if len(rendered) == 0:
+            fail(7, "CONCAT_NO_RENDERS", f"no round-*.mp4 files in {self.render_dir}")
 
-        round_count = 0
-        demo = self.state["data"].get("demo_path") or str(self.demo_path)
-        with tempfile.TemporaryDirectory() as tmp:
-            result = subprocess.run(
-                [CSDM, "json", demo, "--output-folder", tmp],
-                capture_output=True, text=True, timeout=300,
-            )
-            if result.returncode == 0:
-                json_files = list(Path(tmp).glob("*.json"))
-                if json_files:
-                    data = json.loads(json_files[0].read_text())
-                    round_count = len(data.get("rounds", []))
+        # Verify round count matches demo if we have expected count
+        expected = self.state["data"].get("round_count", 0)
+        if expected > 0:
+            with tempfile.TemporaryDirectory() as tmp:
+                r = subprocess.run([CSDM, "json", str(self.demo_path), "--output-folder", tmp],
+                                   capture_output=True, text=True, timeout=300)
+                if r.returncode == 0:
+                    jf = list(Path(tmp).glob("*.json"))
+                    if jf:
+                        data = json.loads(jf[0].read_text())
+                        actual_rounds = len(data.get("rounds", []))
+                        if actual_rounds > 0 and len(rendered) != actual_rounds:
+                            fail(7, "CONCAT_ROUND_MISMATCH",
+                                 f"renders ({len(rendered)}) != demo rounds ({actual_rounds})")
 
-        if round_count > 0 and rendered_count != round_count:
-            print(f"[ERROR] Renders ({rendered_count}) don't match demo rounds ({round_count})")
-            print(f"  Missing or extra renders — check the output before continuing")
-            sys.exit(1)
-
-        combined = render_path / "combined.mp4"
+        combined = self.render_dir / "combined.mp4"
         if combined.exists():
-            print("  combined.mp4 already exists, skipping")
+            print("  combined.mp4 exists, skipping concat")
         else:
-            result = subprocess.run(
-                [sys.executable, "scripts/concat_rounds.py", str(render_path)],
-                capture_output=True, text=True, timeout=600,
-            )
-            print((result.stdout or "") + (result.stderr or ""))
+            r = self._run_py(["scripts/concat_rounds.py", str(self.render_dir)], timeout=600)
+            if r.returncode != 0:
+                fail(7, "CONCAT_FAILED", f"concat_rounds.py exited {r.returncode}")
 
-        self.youtube_dir = YOUTUBE_DIR / self.run_id
+        if not combined.exists():
+            fail(7, "CONCAT_OUTPUT_MISSING", "combined.mp4 not created after concat")
+        if combined.stat().st_size < 100000:
+            fail(7, "CONCAT_OUTPUT_TOO_SMALL", f"combined.mp4 suspiciously small: {combined.stat().st_size} bytes")
+
         self.youtube_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(combined), str(self.youtube_dir / "video.mp4"))
 
-        if combined.exists():
-            dst = self.youtube_dir / "video.mp4"
-            shutil.copy2(str(combined), str(dst))
-            print(f"  Copied video.mp4 ({dst.stat().st_size / 1e9:.1f} GB)")
-        self.state["data"]["youtube_dir"] = str(self.youtube_dir)
+        vid_size = (self.youtube_dir / "video.mp4").stat().st_size
+        print(f"  [OK] Copied video.mp4 ({vid_size / 1e9:.1f} GB)")
+
+    # ── Step 8: Thumbnail ────────────────────────────────────────────────
 
     def step_thumbnail(self) -> None:
-        if not self.youtube_dir:
-            self.youtube_dir = YOUTUBE_DIR / self.run_id
-            self.youtube_dir.mkdir(parents=True, exist_ok=True)
-
+        self.youtube_dir.mkdir(parents=True, exist_ok=True)
         thumb = self.youtube_dir / "thumbnail.png"
-        if thumb.exists():
-            print("  thumbnail.png already exists, skipping")
-            return
-
-        demo = self.state["data"].get("demo_path") or str(self.demo_path)
-        extra = []
-        if self.args.tournament:
-            extra += ["--tournament", self.args.tournament]
 
         cmd = [
-            sys.executable, "-m", "thumbnail",
+            "-m", "thumbnail",
             self.args.hltv_url,
             "--player", self.args.player,
             "--map", self.args.map,
-            "--demo", demo,
+            "--demo", str(self.demo_path),
             "--steam-id", self.steam_id,
-        ] + extra
+        ]
+        if self.args.tournament:
+            cmd += ["--tournament", self.args.tournament]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        print((result.stdout or "") + (result.stderr or ""))
+        r = self._run_py(cmd, timeout=300)
+        if r.returncode != 0:
+            fail(8, "THUMBNAIL_FAILED", f"thumbnail generator exited {r.returncode}")
+
+        if not thumb.exists():
+            fail(8, "THUMBNAIL_MISSING", f"thumbnail.png not created at {thumb}")
+        if thumb.stat().st_size < 1000:
+            fail(8, "THUMBNAIL_TOO_SMALL", f"thumbnail.png too small: {thumb.stat().st_size} bytes")
+
+        # Verify dimensions via Pillow
+        try:
+            from PIL import Image
+            im = Image.open(thumb)
+            if im.size != (1280, 720):
+                fail(8, "THUMBNAIL_BAD_SIZE", f"thumbnail dimensions {im.size} != expected 1280x720")
+        except ImportError:
+            pass
+
+        print(f"  [OK] Thumbnail: {thumb.name}")
+
+    # ── Step 9: Upload ──────────────────────────────────────────────────
 
     def step_upload(self) -> None:
-        if not self.youtube_dir:
-            self.youtube_dir = YOUTUBE_DIR / self.run_id
-
         video = self.youtube_dir / "video.mp4"
         thumb = self.youtube_dir / "thumbnail.png"
 
         if not video.exists():
-            print(f"[ERROR] video.mp4 not found: {video}")
-            sys.exit(1)
+            fail(9, "UPLOAD_VIDEO_MISSING", f"video not found: {video}")
+        if video.stat().st_size < 100000:
+            fail(9, "UPLOAD_VIDEO_TOO_SMALL", f"video too small: {video.stat().st_size} bytes")
 
-        slug = self.args.hltv_url.rstrip("/").split("/")[-1].replace("-", "_")
-        ratings_json = PROJECT_ROOT / "demos" / "analysis" / f"{slug}_ratings.json"
-        title_cmd = [
-            sys.executable, "scripts/generate_title.py", str(ratings_json),
+        r = self._run_py([
+            "scripts/generate_title.py", str(self.ratings_json),
             "--player", self.args.player,
             "--map", self.args.map,
-        ]
-        if self.args.tournament:
-            title_cmd += ["--tournament", self.args.tournament]
-        title_result = subprocess.run(title_cmd, capture_output=True, text=True, timeout=15)
+        ] + (["--tournament", self.args.tournament] if self.args.tournament else []),
+            capture_output=True, text=True, timeout=15)
+
         meta = {}
-        if title_result.returncode == 0 and title_result.stdout.strip():
+        if r.returncode == 0 and r.stdout.strip():
             try:
-                meta = json.loads(title_result.stdout.strip())
+                meta = json.loads(r.stdout.strip())
             except json.JSONDecodeError:
                 pass
-        title = meta.get("title") or f"{self.args.player} | {self.args.map} | {self.args.tournament or self.args.hltv_url}"
+
+        title = meta.get("title") or f"{self.args.player} | {self.args.map}"
         description = meta.get("description", "")
 
         cmd = [
-            sys.executable, "scripts/upload_youtube.py",
+            "scripts/upload_youtube.py",
             str(video),
             "--title", title,
             "--description", description,
@@ -338,49 +417,67 @@ class Pipeline:
         if thumb.exists():
             cmd += ["--thumbnail", str(thumb)]
 
-        result = subprocess.run(cmd, capture_output=False, text=True, timeout=7200)
-        if result.stdout:
-            for line in result.stdout.splitlines():
-                print(line)
+        r2 = self._run_py(cmd, capture_output=True, text=True, timeout=7200)
+        out = (r2.stdout or "") + (r2.stderr or "")
+
+        if r2.returncode != 0:
+            fail(9, "UPLOAD_FAILED", f"upload exited {r2.returncode}: {out[:300]}")
+
+        # Extract video ID
+        m = re.search(r"https://youtu\.be/([a-zA-Z0-9_-]+)", out)
+        if m:
+            vid_id = m.group(1)
+            self.state["data"]["youtube_id"] = vid_id
+            print(f"  [OK] Uploaded: https://youtu.be/{vid_id}")
+        else:
+            fail(9, "UPLOAD_NO_VIDEO_ID", f"could not extract video ID from output: {out[:200]}")
+
+    # ── Step 10: Cleanup ─────────────────────────────────────────────────
 
     def step_cleanup(self) -> None:
-        render_dir = self.state["data"].get("render_dir")
-        if render_dir and Path(render_dir).exists():
-            shutil.rmtree(render_dir)
-            print(f"  Removed: {render_dir}")
-        else:
-            print("  No render dir to clean")
+        removed = []
+        if self.render_dir.exists():
+            shutil.rmtree(self.render_dir)
+            removed.append(str(self.render_dir))
+            print(f"  Removed: {self.render_dir.name}")
 
         state_path = PROJECT_ROOT / f".pipeline_{self.run_id}.json"
         if state_path.exists():
             state_path.unlink()
-            print("  Pipeline state cleaned up")
+            removed.append(f".pipeline_{self.run_id}.json")
+
+        # Verify removal
+        if self.render_dir.exists():
+            fail(10, "CLEANUP_RENDER_DIR_FAILED", f"render dir still exists after rmtree: {self.render_dir}")
+        if state_path.exists():
+            fail(10, "CLEANUP_STATE_FAILED", f"pipeline state file still exists: {state_path}")
+        if not removed:
+            print("  Nothing to clean up")
+        else:
+            print(f"  [OK] Removed {len(removed)} item(s)")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="E2E Pipeline: demo -> render -> upload")
-    parser.add_argument("demo", help="Path to .rar or .dem file")
+    parser = argparse.ArgumentParser(description="E2E Pipeline: .dem -> render -> thumbnail -> upload")
     parser.add_argument("player", help="Player nickname (e.g. w0nderful)")
     parser.add_argument("map", help="Map name (e.g. Anubis)")
     parser.add_argument("hltv_url", help="HLTV match URL")
-    parser.add_argument("--steam-id", help="Steam64 ID (auto-extracted if omitted)")
+    parser.add_argument("--steam-id", required=True, help="Steam64 ID")
+    parser.add_argument("--demo", required=True, help="Path to .dem file")
     parser.add_argument("--tournament", default="", help="Tournament name (e.g. IEM Atlanta 2026)")
-    parser.add_argument("--step", type=int, default=1, help="Start from step N  (1=extract, 2=ratings, 3=steam_id, 4=avatar, 5=analyze, 6=render, 7=concat, 8=thumbnail, 9=upload, 10=cleanup)")
+    parser.add_argument("--step", type=int, default=1, choices=range(1, 11),
+                        help="Start from step N (1=extract..10=cleanup)")
     parser.add_argument("--privacy", choices=["private", "unlisted", "public"], default="public")
     args = parser.parse_args()
 
     print(f"{'='*60}")
     print(f"  CS2Archive Pipeline")
     print(f"  Player: {args.player} | Map: {args.map}")
-    print(f"  Starting at step {args.step}")
+    print(f"  Demo:   {args.demo}")
+    print(f"  Step:   {args.step}")
     print(f"{'='*60}")
 
-    pipeline = Pipeline(args)
-    pipeline.run()
-
-    url_file = YOUTUBE_DIR / pipeline.run_id / "url.txt"
-    if url_file.exists():
-        print(f"  URL: {url_file.read_text().strip()}")
+    Pipeline(args).run()
 
 
 if __name__ == "__main__":

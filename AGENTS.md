@@ -1,56 +1,64 @@
 # AGENTS.md — CS2Archive
 
-## Pipeline (YouTube Thumbnail Workflow)
+> **ALWAYS use `scripts/pipeline.py` as the primary entry point.** Individual step scripts exist for debugging or resuming a failed step — see below.
 
-> **HLTV only.** FACEIT workflow may differ — not documented yet.
+## Pipeline (Primary Entry Point)
 
-1. **`python main.py trending`** — Find top trending CS2 matches from YouTube highlight channels (matched to HLTV). Pick the match URL.
-2. **Demo Download** — `python main.py hltv match <url>` downloads the demo. If 403'd, manually download `.rar` from browser, then cut from Downloads → `demos/hltv/` → extract with WinRAR (`patoolib` wraps WinRAR in `downloader.py`).
-3. **Ratings** — `python main.py ratings <url>` scrapes HLTV Rating 3.0 for the match (saves to `demos/analysis/`).
-    - Check top players: `python scripts/best_per_map.py demos/analysis/{slug}_ratings.json`
-4. **Avatars** — Avatars are auto-downloaded by `test-pipeline` or manually via `scrapers/player_images.py`. Background is automatically removed and saved as `{nickname}.png`. Check `demos/avatars/`.
-5. **Player Steam ID** — `python main.py player add <nickname> --steam <url>` or check existing with `python main.py player list`. If you have the demo file, you can extract Steam IDs directly with `python scripts/extract_steamids.py <demo_path>`.
-6. **CSDM Analysis** — `csdm analyze` the demo so video rendering can find events. For PGL demos (PBDEMS2 format), use `csdm analyze <demo> --source challengermode`.
-7. **Render POV Clip** — `python scripts/render_pov.py <demo_path> <steam_id>` renders each round as a separate clip (full HUD, no x-ray). To resume from a specific round: `--rounds 10-18`. For kill compilations instead of rounds, use `csdm video "<demo_path>" --mode player --steamids <id> --event kills --start-seconds-before 2 --end-seconds-after 2 --output "demos/renders" --cfg assets/cs2_pov.cfg`.
-8. **Concatenate Rounds** — `python scripts/concat_rounds.py <renders_folder>` joins all round-NNN clips into `combined.mp4`.
-9. **Move to YouTube** — Place `combined.mp4` (renamed `video.mp4`) and the thumbnail into `youtube/{match-slug}_{player}_{map}/`.
-10. **Cleanup Renders** — `python scripts/cleanup_renders.py <renders_folder> --youtube <youtube_folder>` removes the entire renders folder after confirming the video is in youtube/.
-11. **Generate Thumbnail** — `python -m thumbnail <match_url> --player <nickname> --map <mapname> --demo <demo_path> --steam-id <id> [--tournament "IEM Atlanta 2026"]`
-    Auto-extracts a random kill frame as blurred background. Or use `--background <frame.jpg>` to specify manually.
-    Example: `python -m thumbnail "https://www.hltv.org/matches/2394166/faze-vs-vitality-iem-atlanta-2026" --player ropz --map Nuke --demo demos/hltv/.../faze-vs-vitality-m1-nuke-p2.dem --steam-id 76561197991272318 --tournament "IEM Atlanta 2026"`
-12. **Generate Title & Description** — `python scripts/generate_title.py <ratings_json> --player <nickname> --map <mapname> [--tournament "IEM Atlanta 2026"]`
-    Outputs JSON with `title` and `description` fields derived from ratings data (team names, map-specific rating, K-D, ADR, KAST).
-    Example: `python scripts/generate_title.py "demos/analysis/natus-vincere-vs-vitality-iem-atlanta-2026_ratings.json" --player w0nderful --map Anubis --tournament "IEM Atlanta 2026"`
-13. **Upload to YouTube** — `python scripts/upload_youtube.py <video_path> --thumbnail <thumbnail.png> --title <title> --description <desc> --privacy public`
-    Use `generate_title.py` to generate title and description.
+`python scripts/pipeline.py <player> <map> <hltv_url> --steam-id <id> --demo <dem_path> [--tournament "IEM Atlanta 2026"] [--step N] [--privacy public]`
 
-    Requires a Google Cloud project with YouTube Data API v3 enabled and OAuth 2.0 desktop credentials
-    (`client_secret.json` in project root). First-time auth opens a browser for Google login. Your YouTube account
-    must be verified (phone verify) to set custom thumbnails.
+Runs steps 1-10 in order. Resumable — state saved to `.pipeline_{run_id}.json`. Use `--step N` to start at a specific step.
 
-### E2E Pipeline Script
-
-`python scripts/pipeline.py <rar_or_dem> <player> <map> <hltv_url> [--steam-id <id>] [--tournament "IEM Atlanta 2026"] [--step N] [--privacy unlisted]`
-
-Runs steps 1-10 in order. Resumable — state saved to `.pipeline_{run_id}.json`. Use `--step N` to start at a specific step:
-
-| Step | Name | What it does |
+| Step | Name | Script for manual use / debugging |
 |---|---|---|
-| 1 | extract_rar | Extract .rar to find the .dem |
-| 2 | ratings | Scrape HLTV Rating 3.0 |
-| 3 | steam_id | Extract Steam64 from demo, save to player list |
-| 4 | avatar | Download player cutout PNG from HLTV |
-| 5 | analyze | csdm analyze the demo |
-| 6 | render | Render all rounds as POV clips |
-| 7 | concat | Concatenate rounds, copy to youtube/ |
-| 8 | thumbnail | Generate 1280x720 thumbnail |
-| 9 | upload | Upload to YouTube (--privacy, auto-generates title + description) |
-| 10 | cleanup | Remove renders folder + pipeline state |
+| 1 | extract | `patoolib` wraps WinRAR in `downloader.py` |
+| 2 | ratings | `python main.py ratings <url>` → `demos/analysis/` |
+| 3 | steam_id | `python main.py player add <nick> --steam <id>` |
+| 4 | avatar | `scrapers/player_images.py` → `demos/avatars/{nick}.png` |
+| 5 | analyze | `csdm analyze <demo>` |
+| 6 | render | `python scripts/render_pov.py <demo> <steam_id>` |
+| 7 | concat | `python scripts/concat_rounds.py <renders_folder>` |
+| 8 | thumbnail | `python -m thumbnail <url> --player <nick> --map <map> --demo <dem> --steam-id <id>` |
+| 9 | upload | `python scripts/upload_youtube.py <video> --title <t> --thumbnail <thumb.png>` |
+| 10 | cleanup | `python scripts/cleanup_renders.py <renders_folder>` |
 
-Example:
+### Structured Errors (agent-parseable)
+
+Every pipeline step validates its output and exits with a single JSON error line on failure:
+
 ```
-python scripts/pipeline.py "demos/hltv/iem-atlanta-2026-natus-vincere-vs-vitality-bo3-....rar" w0nderful Anubis "https://www.hltv.org/matches/2394174/natus-vincere-vs-vitality-iem-atlanta-2026" --tournament "IEM Atlanta 2026" --step 7
+[PIPELINE_ERROR] {"error":true,"step":5,"step_name":"analyze","code":"ANALYZE_NO_ROUNDS","message":"csdm analysis has zero rounds"}
 ```
+
+Grep for `[PIPELINE_ERROR]` and parse the JSON. Each error has a unique `code` for programmatic handling (e.g. `RENDER_STEAM_NOT_RUNNING`, `THUMBNAIL_MISSING`, `UPLOAD_NO_VIDEO_ID`).
+
+### Example
+
+```
+python scripts/pipeline.py w0nderful Anubis "https://www.hltv.org/matches/2394174/natus-vincere-vs-vitality-iem-atlanta-2026" --steam-id 76561199063068840 --demo demos/hltv/natus-vincere-vs-vitality-m2-anubis.dem --tournament "IEM Atlanta 2026" --step 7
+```
+
+### Notes
+
+- Pipeline requires `--steam-id` (no auto-extraction).
+- `--demo` accepts `.dem` or `.rar` (auto-extracts matching map).
+- Render step verifies Steam is running before starting.
+- Each step validates its output before proceeding — failures halt the pipeline.
+
+## Individual Step Scripts (Debugging / Manual Use)
+
+Use these when debugging a specific pipeline step failure or running steps manually:
+
+1. **Demo Download** — `python main.py hltv match <url>` | If 403'd, manually download `.rar` from browser, cut from Downloads → `demos/hltv/` → extract with WinRAR (`patoolib` wraps WinRAR in `downloader.py`).
+2. **Ratings** — `python main.py ratings <url>` scrapes HLTV Rating 3.0 for the match (saves to `demos/analysis/`). Check top players: `python scripts/best_per_map.py demos/analysis/{slug}_ratings.json`
+3. **Avatars** — `scrapers/player_images.py`. Uses Playwright + `rembg` — **must run from browser context** (CDN requires page session). Body shots with `bg` URL param need rembg for background removal. Saved as `{nickname}.png` in `demos/avatars/`.
+4. **Player Steam ID** — `python main.py player add <nickname> --steam <url>` or `python main.py player list`. Extract from demo: `python scripts/extract_steamids.py <demo_path>`.
+5. **CSDM Analysis** — `csdm analyze <demo>`. For PGL demos (PBDEMS2 format): `csdm analyze <demo> --source challengermode`.
+6. **Render POV Clip** — `python scripts/render_pov.py <demo_path> <steam_id>`. Renders each round as separate clip. Resume from specific round: `--rounds 10-18`. For kill compilations: `csdm video "<demo_path>" --mode player --steamids <id> --event kills ...`
+7. **Concatenate Rounds** — `python scripts/concat_rounds.py <renders_folder>` → `combined.mp4` (ffmpeg stream copy, lossless).
+8. **Generate Thumbnail** — `python -m thumbnail <match_url> --player <nick> --map <map> --demo <dem> --steam-id <id> [--tournament "IEM Atlanta 2026"]`. Auto-extracts random kill frame as blurred background. Or `--background <frame.jpg>`.
+   Example: `python -m thumbnail "https://www.hltv.org/matches/2394166/faze-vs-vitality-iem-atlanta-2026" --player ropz --map Nuke --demo demos/hltv/.../faze-vs-vitality-m1-nuke-p2.dem --steam-id 76561197991272318 --tournament "IEM Atlanta 2026"`
+9. **Generate Title & Description** — `python scripts/generate_title.py <ratings_json> --player <nick> --map <map> [--tournament "..."]`. Outputs JSON with `title` and `description` from ratings data.
+10. **Upload to YouTube** — `python scripts/upload_youtube.py <video_path> --thumbnail <thumb.png> --title <title> --description <desc> --privacy public`. Requires Google Cloud OAuth (`client_secret.json`). First-time auth opens browser. Account must be phone-verified for custom thumbnails.
 
 ## CLI Entry Point
 
@@ -132,6 +140,8 @@ Output is `combined.mp4` in the same folder. Uses ffmpeg stream copy (no re-enco
 - **CS2 launch for rendering** — csdm may fail to auto-launch CS2 if Steam is on a secondary drive. Just open CS2 manually to any menu before running `render_pov.py`.
 - **All async** — every scraper/command is `asyncio.run()`. Any new command must follow `async def` + `register_subparser` + `handle` pattern in `commands/`.
 - **YouTube verification** — To set custom thumbnails, your YouTube account must be verified (phone verify) at https://www.youtube.com/verify.
+- **Wrong HLTV match URL ID** — If the ratings scraper returns "Unknown Match" or empty tables, the match URL's numeric ID is wrong. HLTV uses SPAs where the JS routing matches the ID to the match. Check the correct ID by visiting the match page in a browser (the sidebar "Related matches" links have correct IDs).
+- **Agent error parsing** — Grep for `[PIPELINE_ERROR]` and parse the JSON. Each error has a unique `code` for programmatic handling. Common codes: `EXTRACT_MAP_NOT_FOUND`, `RATINGS_NO_TABLES`, `ANALYZE_NO_ROUNDS`, `RENDER_STEAM_NOT_RUNNING`, `CONCAT_ROUND_MISMATCH`, `THUMBNAIL_MISSING`, `UPLOAD_NO_VIDEO_ID`.
 
 ## Output Directory Structure
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -26,12 +27,12 @@ def main() -> None:
     folder = Path(args.folder)
     if not folder.is_dir():
         print(f"[ERROR] Folder not found: {folder}")
-        return
+        sys.exit(1)
 
     files = sorted(folder.glob("round-*.mp4"))
     if not files:
         print("[ERROR] No round-*.mp4 files found")
-        return
+        sys.exit(1)
 
     print(f"Found {len(files)} round files")
 
@@ -55,6 +56,7 @@ def main() -> None:
             print(f"Done: {mb:.0f} MB")
         else:
             print(f"[ERROR] ffmpeg failed: {result.stderr[-300:]}")
+            sys.exit(1)
 
 
 if __name__ == "__main__":
