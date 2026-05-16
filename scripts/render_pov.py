@@ -37,7 +37,7 @@ BASE_FLAGS = [
     "--concatenate-sequences",
     "--ffmpeg-video-codec", "libx264",
     "--ffmpeg-crf", "18",
-    "--ffmpeg-output-parameters", "-profile:v high -pix_fmt yuv420p -level 4.2",
+    "--ffmpeg-output-parameters=-profile:v high -pix_fmt yuv420p -level 4.2",
     "--recording-system", "CS",
     "--close-game-after-recording",
     "--cfg", "assets/cs2_pov.cfg",
@@ -132,9 +132,13 @@ def render_round(
 
     elapsed = time.time() - t0
 
+    err = (result.stderr or "") + (result.stdout or "")
+    if "Steam is not running" in err:
+        print("FAILED - Steam is not running. Start Steam and CS2, then re-run.")
+        sys.exit(1)
+
     if result.returncode != 0:
-        err = result.stderr.strip()
-        print(f"FAILED ({elapsed:.0f}s): {err[:120]}")
+        print(f"FAILED ({elapsed:.0f}s, exit code {result.returncode})")
         return False
 
     rendered = sorted(output_dir.glob("sequence-*.mp4"), key=lambda p: p.stat().st_mtime)

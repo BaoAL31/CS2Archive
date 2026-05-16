@@ -7,6 +7,7 @@ CS2Archive — Trending Match Finder
 
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -111,27 +112,28 @@ def _teams_match(yt_t1: str, yt_t2: str, slug: str) -> bool:
 
 
 async def get_hltv_matches() -> list[dict]:
-    from scrapers.hltv import HLTVScraper
-    s = HLTVScraper()
-    try:
-        html = await s._get_page_content(f"{settings.hltv_base_url}/results")
-        soup = BeautifulSoup(html, "lxml")
-        matches = []
-        seen = set()
-        for link in soup.find_all("a", href=True):
-            href = link["href"]
-            m = re.match(r".*/matches/(\d+)/(.+)", href)
-            if not m or href in seen:
-                continue
-            seen.add(href)
-            matches.append({
-                "match_id": m.group(1),
-                "slug": m.group(2),
-                "url": f"{settings.hltv_base_url}/matches/{m.group(1)}/{m.group(2)}",
-            })
-        return matches
-    finally:
-        await s.close()
+    import cloudscraper
+    scraper = cloudscraper.create_scraper()
+    r = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: scraper.get(f"{settings.hltv_base_url}/results", timeout=30)
+    )
+    r.raise_for_status()
+    html = r.text
+    soup = BeautifulSoup(html, "lxml")
+    matches = []
+    seen = set()
+    for link in soup.find_all("a", href=True):
+        href = link["href"]
+        m = re.match(r".*/matches/(\d+)/(.+)", href)
+        if not m or href in seen:
+            continue
+        seen.add(href)
+        matches.append({
+            "match_id": m.group(1),
+            "slug": m.group(2),
+            "url": f"{settings.hltv_base_url}/matches/{m.group(1)}/{m.group(2)}",
+        })
+    return matches
 
 
 async def get_top_videos() -> list[dict]:

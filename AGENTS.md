@@ -24,6 +24,30 @@
     (`client_secret.json` in project root). First-time auth opens a browser for Google login. Your YouTube account
     must be verified (phone verify) to set custom thumbnails.
 
+### E2E Pipeline Script
+
+`python scripts/pipeline.py <rar_or_dem> <player> <map> <hltv_url> [--steam-id <id>] [--tournament "IEM Atlanta 2026"] [--step N] [--privacy unlisted]`
+
+Runs steps 1-10 in order. Resumable — state saved to `.pipeline_{run_id}.json`. Use `--step N` to start at a specific step:
+
+| Step | Name | What it does |
+|---|---|---|
+| 1 | extract_rar | Extract .rar to find the .dem |
+| 2 | ratings | Scrape HLTV Rating 3.0 |
+| 3 | steam_id | Extract Steam64 from demo, save to player list |
+| 4 | avatar | Download player cutout PNG from HLTV |
+| 5 | analyze | csdm analyze the demo |
+| 6 | render | Render all rounds as POV clips |
+| 7 | concat | Concatenate rounds, copy to youtube/ |
+| 8 | thumbnail | Generate 1280x720 thumbnail |
+| 9 | upload | Upload to YouTube (--privacy) |
+| 10 | cleanup | Remove renders folder + pipeline state |
+
+Example:
+```
+python scripts/pipeline.py "demos/hltv/iem-atlanta-2026-natus-vincere-vs-vitality-bo3-....rar" w0nderful Anubis "https://www.hltv.org/matches/2394174/natus-vincere-vs-vitality-iem-atlanta-2026" --tournament "IEM Atlanta 2026" --step 7
+```
+
 ## CLI Entry Point
 
 `python main.py <command>` — no other entry points.
@@ -48,14 +72,14 @@ Available commands:
 
 ## Demo Video Rendering
 
-Uses **CS2 Demo Manager (csdm)** CLI to render POV videos (csdm launches CS2 automatically, no need to start it manually). Installed at:
+Uses **CS2 Demo Manager (csdm)** CLI to render POV videos. Installed at:
 ```
 C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd
 ```
 
 Basic tick-range render:
 ```powershell
-& "C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd" video "<demo_path>" <start_tick> <end_tick> --output "demos\renders" --framerate 60 --width 1920 --height 1080 --recording-system CS --close-game-after-recording --ffmpeg-video-container mp4 --ffmpeg-video-codec libx264 --ffmpeg-crf 18 --ffmpeg-output-parameters "-profile:v high -pix_fmt yuv420p -level 4.2"
+& "C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd" video "<demo_path>" <start_tick> <end_tick> --output "demos\renders" --framerate 60 --width 1920 --height 1080 --recording-system CS --close-game-after-recording --ffmpeg-video-container mp4 --ffmpeg-video-codec h264_nvenc --ffmpeg-crf 0 --ffmpeg-output-parameters "-profile:v high -pix_fmt yuv420p -level 4.2 -b:v 50M -maxrate 50M -bufsize 100M"
 ```
 
 Tick ≈ 1/64 sec (most CS2 servers). For a 5-second clip use ~320 ticks.
@@ -65,7 +89,7 @@ Tick ≈ 1/64 sec (most CS2 servers). For a 5-second clip use ~320 ticks.
 For rendering a player's POV with full HUD (radar, health, ammo) and no x-ray, one round at a time to avoid disk I/O saturation:
 
 ```powershell
-& "C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd" video "<demo_path>" --mode player --steamids <steam64_id> --event rounds --rounds <N> --perspective player --no-show-x-ray --output "demos\renders\pov-folder" --framerate 60 --width 1920 --height 1080 --recording-system CS --close-game-after-recording --no-show-only-death-notices --show-assists --record-audio --concatenate-sequences --ffmpeg-video-codec libx264 --ffmpeg-crf 18 --cfg assets/cs2_pov.cfg
+& "C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd" video "<demo_path>" --mode player --steamids <steam64_id> --event rounds --rounds <N> --perspective player --no-show-x-ray --output "demos\renders\pov-folder" --framerate 60 --width 1920 --height 1080 --recording-system CS --close-game-after-recording --no-show-only-death-notices --show-assists --record-audio --concatenate-sequences --ffmpeg-video-codec h264_nvenc --ffmpeg-crf 0 --ffmpeg-output-parameters "-profile:v high -pix_fmt yuv420p -level 4.2 -b:v 50M -maxrate 50M -bufsize 100M" --cfg assets/cs2_pov.cfg
 ```
 
 Use `python scripts/render_pov.py <demo_path> <steam_id>` instead — it wraps the above command with auto round-detection, p1/p2 split handling, and per-round output naming.
@@ -97,10 +121,11 @@ Output is `combined.mp4` in the same folder. Uses ffmpeg stream copy (no re-enco
 - **HLTV CDN blocks image downloads** — Player body shots must be scraped via Playwright browser context (not httpx). Use `scrapers/player_images.py`.
 - **Background removal at download time** — `rembg` runs during avatar download (step 4), not during thumbnail generation. Cutout PNGs are saved as `{nickname}.png` in `demos/avatars/`.
 - **Thumbnail background auto-extraction** — When using `--demo` + `--steam-id`, the thumbnail generator renders a 1-second clip of a random kill, extracts the first frame, blurs it (radius 6), and uses it as background.
-- **Quality settings** — All renders use `libx264` with `--ffmpeg-crf 18` (high quality) at 1080p60. NVENC was tried but produced worse quality.
+- **Quality settings** — All renders use `h264_nvenc` with `-b:v 50M -maxrate 50M -cq 0` (max bitrate, best quality) at 1080p60. libx264 was used before but used more CPU.
 - **YouTube encoding** — Use `--ffmpeg-output-parameters "-profile:v high -pix_fmt yuv420p -level 4.2"` for YouTube compatibility. YouTube may still take 30-60 min to process 1080p60 after upload.
 - **Windows PowerShell** — does not support `&&`, `||`, `tail`. Use `; if ($?) { }` for chaining. Use `Select-String -Last 3` instead of `tail -3`. `@'...'@` heredocs broken with f-strings — write Python scripts to files instead.
 - **RAR extraction** — `rarfile` library doesn't work on Windows. Use `patoolib` (via `patool` pip package) which wraps WinRAR.
+- **CS2 launch for rendering** — csdm may fail to auto-launch CS2 if Steam is on a secondary drive. Just open CS2 manually to any menu before running `render_pov.py`.
 - **All async** — every scraper/command is `asyncio.run()`. Any new command must follow `async def` + `register_subparser` + `handle` pattern in `commands/`.
 - **YouTube verification** — To set custom thumbnails, your YouTube account must be verified (phone verify) at https://www.youtube.com/verify.
 
