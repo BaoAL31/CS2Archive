@@ -29,10 +29,11 @@ def extract_steamids(demo_path: str) -> dict[str, str]:
     csdm = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
 
     with tempfile.TemporaryDirectory(dir=TMP_DIR) as tmpdir:
-        result = subprocess.run(
-            [csdm, "json", str(demo), "--output-folder", tmpdir],
-            capture_output=True, text=True, timeout=300,
-        )
+        cmd = [csdm, "json", str(demo), "--output-folder", tmpdir]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0 and "unknown demo source" in (result.stderr or "").lower():
+            cmd += ["--source", "challengermode"]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
             print(f"[red]csdm json failed: {result.stderr}[/red]")
             return {}

@@ -70,5 +70,23 @@
     "steam_id": "",
     "created_at": "2026-05-17 00:19:52.302295",
     "updated_at": "2026-05-17 00:19:52.302295"
+  },
+  {
+    "nickname": "m0NESY",
+    "faceit_url": "",
+    "faceit_nickname": "",
+    "steam_url": "76561198074762801",
+    "steam_id": "",
+    "created_at": "2026-05-17 09:03:10.074883",
+    "updated_at": "2026-05-17 19:07:42.917016"
+  },
+  {
+    "nickname": "makazze",
+    "faceit_url": "",
+    "faceit_nickname": "",
+    "steam_url": "76561199076189612",
+    "steam_id": "",
+    "created_at": "2026-05-17 19:48:26.696503",
+    "updated_at": "2026-05-17 20:13:11.260483"
   }
 ]

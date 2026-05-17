@@ -62,6 +62,23 @@ class HLTVScraper:
         """)
         return self._context
 
+    @property
+    def browser(self) -> Browser | None:
+        return self._browser
+
+    async def fresh_context(self) -> BrowserContext:
+        return await self._browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            locale="en-US",
+            bypass_csp=True,
+            extra_http_headers={"Cache-Control": "no-cache, no-store"},
+        )
+
     async def close(self) -> None:
         if self._context:
             await self._context.close()

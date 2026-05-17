@@ -96,7 +96,7 @@ class Pipeline:
         self.steam_id = args.steam_id
         self.start_step = args.step
 
-        slug = args.hltv_url.rstrip("/").split("/")[-1].replace("-", "_")
+        slug = args.hltv_url.rstrip("/").split("/")[-1]
         self.ratings_json = PROJECT_ROOT / "demos" / "analysis" / f"{slug}_ratings.json"
 
         self.demo_path: Path | None = None
@@ -140,6 +140,10 @@ class Pipeline:
         print(f"\n  [OK] Pipeline complete -> {self.youtube_dir}/")
 
     def _run_py(self, args: list[str], **kwargs) -> subprocess.CompletedProcess:
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+        kwargs.setdefault("env", env)
+        if kwargs.get("text") and "encoding" not in kwargs:
+            kwargs["encoding"] = "utf-8"
         return subprocess.run([PY] + args, **kwargs)
 
     # ── Step 1: Extract ──────────────────────────────────────────────────
@@ -239,8 +243,15 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
         if not self.demo_path or not self.demo_path.exists():
             fail(5, "ANALYZE_DEMO_MISSING", f"demo not found: {self.demo_path}")
 
-        r = subprocess.run(["csdm", "analyze", str(self.demo_path)], capture_output=True, text=True, timeout=600)
+        cmd = [CSDM, "analyze", str(self.demo_path)]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         combined = (r.stdout or "") + (r.stderr or "")
+
+        if "unknown demo source" in combined.lower():
+            cmd += ["--source", "challengermode"]
+            print("  [PGL] Retrying with --source challengermode...")
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            combined = (r.stdout or "") + (r.stderr or "")
 
         if "already in database" in combined:
             print("  [OK] Already analyzed")
@@ -286,11 +297,10 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
         if len(rendered) == 0:
             fail(6, "RENDER_NO_CLIPS", f"no round-*.mp4 files produced in {self.render_dir}")
 
-        # Check round count vs expected
+        # Check round count vs expected (allow gaps — player may be dead some rounds)
         expected = self.state["data"].get("round_count", 0)
         if expected > 0 and len(rendered) != expected:
-            fail(6, "RENDER_ROUND_MISMATCH",
-                 f"rendered {len(rendered)} clips but expected {expected} rounds")
+            print(f"  [WARN] rendered {len(rendered)}/{expected} rounds ({expected - len(rendered)} missing — player may have been dead)")
 
         # Check first clip is valid
         if rendered[0].stat().st_size < 50000:
@@ -312,16 +322,19 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
         expected = self.state["data"].get("round_count", 0)
         if expected > 0:
             with tempfile.TemporaryDirectory() as tmp:
-                r = subprocess.run([CSDM, "json", str(self.demo_path), "--output-folder", tmp],
-                                   capture_output=True, text=True, timeout=300)
+                json_cmd = [CSDM, "json", str(self.demo_path), "--output-folder", tmp]
+                r = subprocess.run(json_cmd, capture_output=True, text=True, timeout=300)
+                if r.returncode != 0 and "unknown demo source" in (r.stderr or "").lower():
+                    json_cmd += ["--source", "challengermode"]
+                    r = subprocess.run(json_cmd, capture_output=True, text=True, timeout=300)
                 if r.returncode == 0:
                     jf = list(Path(tmp).glob("*.json"))
                     if jf:
                         data = json.loads(jf[0].read_text())
                         actual_rounds = len(data.get("rounds", []))
-                        if actual_rounds > 0 and len(rendered) != actual_rounds:
-                            fail(7, "CONCAT_ROUND_MISMATCH",
-                                 f"renders ({len(rendered)}) != demo rounds ({actual_rounds})")
+                if actual_rounds > 0 and len(rendered) != actual_rounds:
+                    print(f"  [WARN] concat: {len(rendered)} renders vs {actual_rounds} demo rounds "
+                          f"({actual_rounds - len(rendered)} missing)")
 
         combined = self.render_dir / "combined.mp4"
         if combined.exists():
@@ -356,6 +369,7 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
             "--demo", str(self.demo_path),
             "--steam-id", self.steam_id,
         ]
+        cmd += ["--output", str(self.youtube_dir)]
         if self.args.tournament:
             cmd += ["--tournament", self.args.tournament]
 

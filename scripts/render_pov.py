@@ -125,6 +125,7 @@ def render_round(
     print(f"  [RENDER] round {global_round} (part r{round_num})...", end=" ", flush=True)
     t0 = time.time()
 
+    print(f"  csdm cmd: {' '.join(cmd)}")
     result = subprocess.run(
         cmd,
         capture_output=True, text=True, timeout=900,
@@ -133,6 +134,8 @@ def render_round(
     elapsed = time.time() - t0
 
     err = (result.stderr or "") + (result.stdout or "")
+    print(f"  csdm stdout tail: {(result.stdout or '')[-500:]}")
+    print(f"  csdm stderr tail: {(result.stderr or '')[-500:]}")
     if "Steam is not running" in err:
         print("FAILED - Steam is not running. Start Steam and CS2, then re-run.")
         sys.exit(1)
@@ -152,8 +155,10 @@ def render_round(
             print(f"OK ({elapsed:.0f}s, {mb:.0f} MB)")
             return True
 
+    no_video_count = getattr(render_round, "no_video_count", 0) + 1
+    render_round.no_video_count = no_video_count
     print(f"OK ({elapsed:.0f}s, no video)")
-    return True
+    return False
 
 
 def main() -> None:
@@ -163,8 +168,8 @@ def main() -> None:
     parser.add_argument("--output", "-o", help="Output folder (default: auto from demo name)")
     parser.add_argument("--rounds", default="", help="Round range like 1-29 or 1,2,5-10 (default: all)")
     parser.add_argument("--framerate", type=int, default=60, help="Output framerate (default: 60)")
-    parser.add_argument("--width", type=int, default=1920)
-    parser.add_argument("--height", type=int, default=1080)
+    parser.add_argument("--width", type=int, default=2560)
+    parser.add_argument("--height", type=int, default=1440)
     args = parser.parse_args()
 
     parts = find_demo_parts(args.demo)
@@ -185,6 +190,9 @@ def main() -> None:
     if args.rounds:
         user_rounds = parse_round_range(args.rounds)
 
+    render_round.no_video_count = 0
+    total_rounds = 0
+    failed_rounds = 0
     global_offset = 0
     for pi, part in enumerate(parts):
         part_name = Path(part).name
@@ -206,14 +214,20 @@ def main() -> None:
             continue
 
         for r in part_rounds:
-            render_round(
+            ok = render_round(
                 part, args.steam_id, r, global_offset,
                 output_dir, args.framerate, args.width, args.height,
             )
+            if not ok:
+                failed_rounds += 1
+            total_rounds += 1
 
         global_offset += total
 
-    print(f"\nDone. Output: {output_dir}")
+    print(f"\nDone. {total_rounds} round(s), {failed_rounds} failed, {render_round.no_video_count} no-video")
+    if total_rounds > 0 and failed_rounds == total_rounds:
+        print("[ERROR] All rounds failed to produce video. This likely means the player was dead or not found.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

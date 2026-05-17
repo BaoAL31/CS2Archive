@@ -50,7 +50,7 @@ Use these when debugging a specific pipeline step failure or running steps manua
 
 1. **Demo Download** — `python main.py hltv match <url>` | If 403'd, manually download `.rar` from browser, cut from Downloads → `demos/hltv/` → extract with WinRAR (`patoolib` wraps WinRAR in `downloader.py`).
 2. **Ratings** — `python main.py ratings <url>` scrapes HLTV Rating 3.0 for the match (saves to `demos/analysis/`). Check top players: `python scripts/best_per_map.py demos/analysis/{slug}_ratings.json`
-3. **Avatars** — `scrapers/player_images.py`. Uses Playwright + `rembg` — **must run from browser context** (CDN requires page session). Body shots with `bg` URL param need rembg for background removal. Saved as `{nickname}.png` in `demos/avatars/`.
+3. **Avatars** — `scrapers/player_images.py`. Uses Playwright + `rembg`. Navigates **player page** (via `img.player-photo` → `closest('a')` → `href`) to capture 400×417 transparent PNG via response interception. Each player gets a **fresh BrowserContext** (`Cache-Control: no-cache`) to prevent stale cache from suppressing `response` events. Falls back to match page → rembg if player page fails. Saved as `{nickname}.png` in `demos/avatars/`.
 4. **Player Steam ID** — `python main.py player add <nickname> --steam <url>` or `python main.py player list`. Extract from demo: `python scripts/extract_steamids.py <demo_path>`.
 5. **CSDM Analysis** — `csdm analyze <demo>`. For PGL demos (PBDEMS2 format): `csdm analyze <demo> --source challengermode`.
 6. **Render POV Clip** — `python scripts/render_pov.py <demo_path> <steam_id>`. Renders each round as separate clip. Resume from specific round: `--rounds 10-18`. For kill compilations: `csdm video "<demo_path>" --mode player --steamids <id> --event kills ...`
@@ -89,24 +89,38 @@ Uses **CS2 Demo Manager (csdm)** CLI to render POV videos. Installed at:
 C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd
 ```
 
-Basic tick-range render:
-```powershell
-& "C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd" video "<demo_path>" <start_tick> <end_tick> --output "demos\renders" --framerate 60 --width 1920 --height 1080 --recording-system CS --close-game-after-recording --ffmpeg-video-container mp4 --ffmpeg-video-codec h264_nvenc --ffmpeg-crf 0 --ffmpeg-output-parameters "-profile:v high -pix_fmt yuv420p -level 4.2 -b:v 50M -maxrate 50M -bufsize 100M"
-```
+### Recording Mode
 
-Tick ≈ 1/64 sec (most CS2 servers). For a 5-second clip use ~320 ticks.
+Uses `--recording-system CS` — csdm captures frames directly to video via FFmpeg. **No intermediate TGA/PNG files are written to disk.** Previous HLAE approach broke after CS2 updates (produced "Raw files not found" errors).
+
+### HLAE Status Check (render step pre-check)
+
+**Before every render step (step 6), check if HLAE is fixed:**
+
+1. Fetch the latest HLAE release tag: `https://api.github.com/repos/advancedfx/advancedfx/releases/latest` → parse `tag_name`
+2. Compare with installed version `2.190.0` at `C:\Program Files (x86)\HLAE\HLAE.exe`
+3. If newer: test `--recording-system HLAE` on a 1-round render. If it works, update this doc, revert `render_pov.py` to `HLAE`, and remove this check.
+4. If same: stay on CS, no action needed.
+
+Purpose: CS2 updates (especially engine/tool string changes) silently break AfxHookSource2.dll. Without this check, render produces zero frames silently.
+
+### VP9 Trick (sharper YouTube uploads)
+
+Render at **2560×1440** even for 1080p-targeted uploads. YouTube allocates VP9 codec (higher bitrate) to 1440p+ uploads, while 1080p gets H.264. Video looks sharper even when watched at 1080p because YouTube uses better encoding.
+
+All scripts default to 2560×1440, 60 fps, libx264 CRF 18.
 
 ### Rounds-Only POV (full HUD, no x-ray, one round at a time)
 
 For rendering a player's POV with full HUD (radar, health, ammo) and no x-ray, one round at a time to avoid disk I/O saturation:
 
 ```powershell
-& "C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd" video "<demo_path>" --mode player --steamids <steam64_id> --event rounds --rounds <N> --perspective player --no-show-x-ray --output "demos\renders\pov-folder" --framerate 60 --width 1920 --height 1080 --recording-system CS --close-game-after-recording --no-show-only-death-notices --show-assists --record-audio --concatenate-sequences --ffmpeg-video-codec h264_nvenc --ffmpeg-crf 0 --ffmpeg-output-parameters "-profile:v high -pix_fmt yuv420p -level 4.2 -b:v 50M -maxrate 50M -bufsize 100M" --cfg assets/cs2_pov.cfg
+& "C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd" video "<demo_path>" --mode player --steamids <steam64_id> --event rounds --rounds <N> --perspective player --no-show-x-ray --output "demos\renders\pov-folder" --framerate 60 --width 2560 --height 1440 --recording-system CS --close-game-after-recording --no-show-only-death-notices --show-assists --record-audio --concatenate-sequences --ffmpeg-video-codec libx264 --ffmpeg-crf 18 --ffmpeg-output-parameters "-profile:v high -pix_fmt yuv420p -level 4.2" --cfg assets/cs2_pov.cfg
 ```
 
 Use `python scripts/render_pov.py <demo_path> <steam_id>` instead — it wraps the above command with auto round-detection, p1/p2 split handling, and per-round output naming.
 
-All scripts pass `--cfg assets/cs2_pov.cfg` which disables in-game chat and configures the HUD.
+All scripts pass `--cfg assets/cs2_pov.cfg` which configures HUD and restores keybinds via `exec autoexec`.
 
 ### Split demos (p1, p2)
 
@@ -130,10 +144,10 @@ Output is `combined.mp4` in the same folder. Uses ffmpeg stream copy (no re-enco
 - **Demo downloads from HLTV fail with 403** — HLTV CDN issues one-time signed URLs consumed after first download. IP gets blocked after repeated requests. Download manually from browser, cut `.rar` from Downloads → `demos/hltv/` → extract with WinRAR (`patoolib` wraps WinRAR in `downloader.py`).
 - **Split demos (p1, p2)** — IEM tournaments sometimes split single-map demos into parts (`-p1`, `-p2`). `render_pov.py` handles this automatically. The `.rar` may contain multiple `.dem` files — `extract_demo()` in `downloader.py` now extracts all of them.
 - **PBDEMS2 format** — PGL tournaments use a custom demo format. csdm now supports it (requires `--source challengermode` for analyze). Use `csdm analyze <demo> --source challengermode`.
-- **HLTV CDN blocks image downloads** — Player body shots must be scraped via Playwright browser context (not httpx). Use `scrapers/player_images.py`.
-- **Background removal at download time** — `rembg` runs during avatar download (step 4), not during thumbnail generation. Cutout PNGs are saved as `{nickname}.png` in `demos/avatars/`.
+- **HLTV CDN blocks image downloads** — Player body shots must be scraped via Playwright browser context (not httpx). Each player gets a **fresh BrowserContext** (with `Cache-Control: no-cache`) to prevent browser cache from suppressing `response` events. Use `scrapers/player_images.py`.
+- **Background removal at download time** — `rembg` runs during avatar download (step 4), not during thumbnail generation. Player page images (400×417) are already transparent — rembg only needed for match page fallback (200×200 with bg). Cutout PNGs saved as `{nickname}.png` in `demos/avatars/`.
 - **Thumbnail background auto-extraction** — When using `--demo` + `--steam-id`, the thumbnail generator renders a 1-second clip of a random kill, extracts the first frame, blurs it (radius 6), and uses it as background.
-- **Quality settings** — All renders use `h264_nvenc` with `-b:v 50M -maxrate 50M -cq 0` (max bitrate, best quality) at 1080p60. libx264 was used before but used more CPU.
+- **VP9 Trick** — Render at 2560×1440 even for 1080p-targeted uploads. YouTube gives 1440p+ videos VP9 codec (higher bitrate), making them sharper even when watched at 1080p.
 - **YouTube encoding** — Use `--ffmpeg-output-parameters "-profile:v high -pix_fmt yuv420p -level 4.2"` for YouTube compatibility. YouTube may still take 30-60 min to process 1080p60 after upload.
 - **Windows PowerShell** — does not support `&&`, `||`, `tail`. Use `; if ($?) { }` for chaining. Use `Select-String -Last 3` instead of `tail -3`. `@'...'@` heredocs broken with f-strings — write Python scripts to files instead.
 - **RAR extraction** — `rarfile` library doesn't work on Windows. Use `patoolib` (via `patool` pip package) which wraps WinRAR.

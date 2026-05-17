@@ -1,12 +1,13 @@
 """
 CS2Archive — Player Profile Image Scraper
 
-Downloads real HLTV player body shots and removes their backgrounds.
+Downloads high-res HLTV player body shots (400x417) from player pages.
 """
 
 from __future__ import annotations
 
 import asyncio
+from io import BytesIO
 from pathlib import Path
 
 from PIL import Image
@@ -20,19 +21,11 @@ console = Console(force_terminal=True)
 AVATAR_DIR = settings.demo_storage_dir / "avatars"
 
 
-def _cutout_bg(jpg_path: Path, png_path: Path) -> bool:
-    try:
-        raw = Image.open(jpg_path).convert("RGBA")
-        cut = remove(raw)
-        cut.save(png_path, "PNG")
-        return True
-    except Exception as e:
-        console.print(f"[yellow]   [{jpg_path.stem}] cutout failed: {e}[/yellow]")
-        return False
+def _cutout_bg(img_bytes: bytes) -> Image.Image:
+    return remove(Image.open(BytesIO(img_bytes)).convert("RGBA"))
 
 
 async def get_player_avatars(match_url: str) -> dict[str, Path]:
-    """Download real HLTV player body shots and save cutout PNGs."""
     from scrapers.hltv import HLTVScraper
 
     AVATAR_DIR.mkdir(parents=True, exist_ok=True)
@@ -41,70 +34,93 @@ async def get_player_avatars(match_url: str) -> dict[str, Path]:
     scraper = HLTVScraper()
     try:
         context = await scraper._ensure_browser()
-        page = await context.new_page()
 
+        page = await context.new_page()
         await page.goto(match_url, wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(3000)
 
-        body_shots = await page.evaluate("""
+        players = await page.evaluate("""
             () => {
                 const imgs = document.querySelectorAll('img.player-photo');
                 return Array.from(imgs).map(img => {
                     const alt = img.alt || '';
                     const m = alt.match(/'([^']+)'/);
                     const nick = m ? m[1].toLowerCase() : alt.split(' ').pop().toLowerCase();
-                    return { nickname: nick, src: img.src };
+                    const a = img.closest('a');
+                    return { nickname: nick, playerUrl: a ? a.href : null };
                 });
             }
         """)
+        await page.close()
 
-        if not body_shots:
+        if not players:
             console.print("[yellow]   No player photos found[/yellow]")
-            await page.close()
             return result
 
-        console.print(f"[dim]   Downloading {len(body_shots)} player photos...[/dim]")
+        console.print(f"[dim]   Fetching {len(players)} player photos...[/dim]")
+        loop = asyncio.get_event_loop()
 
-        for entry in body_shots:
+        for entry in players:
             nickname = entry["nickname"]
-            src = entry["src"]
             png_path = AVATAR_DIR / f"{nickname}.png"
-            jpg_path = AVATAR_DIR / f"{nickname}.jpg"
 
-            if png_path.exists():
-                result[nickname] = png_path
+            if png_path.exists() and png_path.stat().st_size > 20000:
+                try:
+                    im = Image.open(png_path)
+                    if im.size[0] >= 200 and im.size[1] >= 200:
+                        result[nickname] = png_path
+                        continue
+                except Exception:
+                    pass
+
+            if not entry["playerUrl"]:
+                console.print(f"[yellow]   [{nickname}] no player URL[/yellow]")
                 continue
 
-            img_data = await page.evaluate(f"""
-                async () => {{
-                    try {{
-                        const resp = await fetch('{src}');
-                        if (!resp.ok) return null;
-                        const blob = await resp.blob();
-                        if (blob.size < 10000) return null;
-                        const buf = await blob.arrayBuffer();
-                        return Array.from(new Uint8Array(buf));
-                    }} catch(e) {{ return null; }}
-                }}
-            """)
+            # Fresh context per player to avoid stale cache
+            cap_ctx = await scraper.fresh_context()
+            cap_page = await cap_ctx.new_page()
+            captured: dict[str, bytes] = {}
 
-            if not img_data:
-                console.print(f"[yellow]   [{nickname}] CDN blocked[/yellow]")
+            async def on_resp(resp):
+                if "playerbodyshot" not in resp.url:
+                    return
+                try:
+                    body = await resp.body()
+                    if len(body) > 5000 and not body.startswith(b"<html"):
+                        captured[resp.url] = body
+                except Exception:
+                    pass
+
+            cap_page.on("response", on_resp)
+            try:
+                await cap_page.goto(entry["playerUrl"], wait_until="domcontentloaded", timeout=20000)
+                await asyncio.sleep(3)
+            except Exception:
+                await asyncio.sleep(3)
+            await cap_page.close()
+            await cap_ctx.close()
+
+            if not captured:
+                console.print(f"[yellow]   [{nickname}] no image captured[/yellow]")
                 continue
 
-            jpg_path.write_bytes(bytes(img_data))
-            kb = len(img_data) / 1024
-            console.print(f"[green]   [OK] {nickname}.jpg ({kb:.0f} KB)[/green]")
+            raw = max(captured.values(), key=lambda b: len(b))
+            im = Image.open(BytesIO(raw))
+            is_transparent = im.mode == "RGBA" and min(im.getchannel("A").getextrema()) < 255
 
-            loop = asyncio.get_event_loop()
-            ok = await loop.run_in_executor(None, _cutout_bg, jpg_path, png_path)
-            if ok:
-                console.print(f"[green]         {nickname}.png cutout ({png_path.stat().st_size / 1024:.0f} KB)[/green]")
+            if is_transparent:
+                im.save(png_path, "PNG")
+                s = png_path.stat().st_size / 1024
+                console.print(f"[green]   [OK] {nickname}.png ({im.size[0]}x{im.size[1]}, {s:.0f} KB)[/green]")
                 result[nickname] = png_path
             else:
-                result[nickname] = jpg_path
+                cut = await loop.run_in_executor(None, _cutout_bg, raw)
+                cut.save(png_path, "PNG")
+                s = png_path.stat().st_size / 1024
+                console.print(f"[green]   [OK] {nickname}.png ({im.size[0]}x{im.size[1]}, {s:.0f} KB)[/green]")
+                result[nickname] = png_path
 
-        await page.close()
         return result
     finally:
         await scraper.close()
