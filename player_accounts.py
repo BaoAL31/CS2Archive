@@ -17,7 +17,7 @@ import httpx
 
 from models import PlayerAccount
 
-ACCOUNTS_FILE = Path("player_accounts.json")
+ACCOUNTS_FILE = Path(".data") / "player_accounts.json"
 
 
 def _load_accounts() -> list[dict]:

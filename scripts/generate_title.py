@@ -135,7 +135,41 @@ def main() -> None:
 
     description = "\n".join(desc_lines)
 
-    print(json.dumps({"title": title, "description": description}))
+    # Match format from stage
+    stage_tag = None
+    if stage:
+        stage_lower = stage.lower()
+        if "final" in stage_lower:
+            stage_tag = "Grand Final"
+        elif "semi" in stage_lower:
+            stage_tag = "Playoffs Semi-Final"
+
+    tags = list(filter(None, [
+        args.player,
+        args.map,
+        team_a_short,
+        team_b_short,
+        tournament or None,
+        stage_tag,
+        f"{args.player} cs2",
+        f"{team_a_short} CS2",
+        f"{team_b_short} CS2",
+        "CS2",
+        "Counter-Strike 2",
+        "Counter Strike 2",
+        "CS2 POV",
+        "CS2 gameplay",
+        "CS2 full match",
+        "POV",
+        "Full Match",
+        "HLTV",
+        "Counter-Strike",
+        "eSports",
+        "Competitive",
+        "Gaming",
+    ]))
+
+    print(json.dumps({"title": title, "description": description, "tags": tags}))
 
 
 if __name__ == "__main__":

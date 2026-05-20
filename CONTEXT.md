@@ -17,3 +17,13 @@
 ## Output Directory
 
 - `youtube/`: Root folder for all YouTube-related content (thumbnails, video files).
+
+## Wikify
+
+- **Wiki Output Structure**: Multi-file Markdown wiki with `index.md` entry point, per-article `.md` files, and `category/` index pages (Obsidian-vault style, not monolithic single-file).
+- **PDF Handling**: Pre-extract `.pdf` → `.md` before dispatching subagents.
+- **LaTeX Handling**: Pre-extract `.tex` → `.md` (strip commands, keep structure + math) before dispatching subagents.
+- **Extraction Source**: Wikify has its own extraction pipeline (independent of graphify).
+- **Category Taxonomy**: 5 categories — `method` (techniques, algorithms, baselines), `concept` (domain terms, findings, math), `paper` (citations, references), `dataset`, `architecture` (system patterns, decisions, APIs).
+- **Article ID Strategy**: Path-scoped `id` (deterministic, collision-free) + `canonical` group key (exact string match). Dedup by `id`, then consolidate by `canonical` in post-merge. `related_to` uses `canonical` keys, not `id`s.
+- **Article Status**: Every article has `status: "confirmed" | "ambiguous"`. Ambiguous = concept mentioned but not sufficiently explained in source.

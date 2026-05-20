@@ -34,7 +34,7 @@ from models import DemoRecord, DemoSource, DownloadResult, DownloadStatus, Match
 
 # ── Download History ──────────────────────────────────────────────────────────
 
-HISTORY_FILE = Path("download_history.json")
+HISTORY_FILE = Path(".data") / "download_history.json"
 
 
 def _load_history() -> list[dict]:
@@ -206,7 +206,7 @@ def _extract_zst(archive_path: Path, dest_dir: Path) -> Path:
 
 def _extract_with_patool(archive_path: Path, dest_dir: Path) -> list[Path]:
     """Extract all .dem files from an archive and validate them."""
-    opencode_tmp = Path(os.environ.get("TMPDIR", "C:/Users/jembo/AppData/Local/Temp/opencode"))
+    opencode_tmp = Path(__file__).resolve().parent / "tmp"
     opencode_tmp.mkdir(parents=True, exist_ok=True)
     temp_dir = tempfile.mkdtemp(prefix="demo_extract_", dir=str(opencode_tmp))
     try:

@@ -1,20 +1,16 @@
 """
-Render each round of a player's POV individually, one at a time.
+Render POV rounds in batches. 0 = all at once, N > 0 = N rounds per batch.
 Handles split demos (p1, p2) automatically.
+Batch mode uses incremental concat (never >2 inputs at once).
 
 Usage:
-    python scripts/render_pov.py <demo_path> <steam_id> [--output <folder>] [--rounds 1-30] [--framerate 60]
-
-Examples:
-    python scripts/render_pov.py "demos/hltv/faze-vs-vitality/nuke.dem" 76561197991272318
-    python scripts/render_pov.py "demos/hltv/faze-vs-vitality/nuke-p2.dem" 76561197991272318 --rounds 2-29
+    python scripts/render_pov.py <demo_path> <steam_id> [--batches 0] [--minimize-cs2]
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
@@ -22,8 +18,12 @@ import tempfile
 import time
 from pathlib import Path
 
-TMP_DIR = Path(os.environ.get("TMPDIR", "C:/Users/jembo/AppData/Local/Temp/opencode"))
-TMP_DIR.mkdir(parents=True, exist_ok=True)
+# Ensure project root is on sys.path for imports like cs2_minimizer
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from cs2_minimizer import CS2Minimizer
 
 CSDM = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
 
@@ -36,8 +36,8 @@ BASE_FLAGS = [
     "--record-audio",
     "--concatenate-sequences",
     "--ffmpeg-video-codec", "libx264",
-    "--ffmpeg-crf", "18",
-    "--ffmpeg-output-parameters=-profile:v high -pix_fmt yuv420p -level 4.2",
+    "--ffmpeg-crf", "15",
+    "--ffmpeg-output-parameters=-profile:v high -pix_fmt yuv420p -level 5.1 -minrate 20M -maxrate 40M -bufsize 40M",
     "--recording-system", "CS",
     "--close-game-after-recording",
     "--cfg", "assets/cs2_pov.cfg",
@@ -45,12 +45,10 @@ BASE_FLAGS = [
 
 
 def find_demo_parts(demo_path: str) -> list[str]:
-    """Find all parts of a split demo (p1, p2, ...) in the same directory."""
     path = Path(demo_path)
     if not path.exists():
         print(f"[ERROR] Demo not found: {path}")
         sys.exit(1)
-
     parts: list[Path] = [path]
     m = re.search(r"(.*)-p(\d+)(\.dem)$", path.name, re.IGNORECASE)
     if m:
@@ -65,111 +63,130 @@ def find_demo_parts(demo_path: str) -> list[str]:
 
 
 def get_round_count(demo_path: str) -> int:
-    with tempfile.TemporaryDirectory(dir=TMP_DIR) as tmp:
-        result = subprocess.run(
-            [CSDM, "json", demo_path, "--output-folder", tmp],
-            capture_output=True, text=True, timeout=300,
-        )
-        if result.returncode != 0:
-            print(f"[ERROR] csdm json failed: {result.stderr}")
+    with tempfile.TemporaryDirectory() as tmp:
+        cmd = [CSDM, "json", demo_path, "--output-folder", tmp]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if "unknown demo source" in (r.stderr or "").lower():
+            cmd += ["--source", "challengermode"]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
             return 0
-        json_files = list(Path(tmp).glob("*.json"))
-        if not json_files:
+        jf = list(Path(tmp).glob("*.json"))
+        if not jf:
             return 0
-        data = json.loads(json_files[0].read_text())
+        data = json.loads(jf[0].read_text())
         return len(data.get("rounds", []))
 
 
-def parse_round_range(s: str) -> list[int]:
-    if not s:
-        return []
-    parts = s.split(",")
-    result = []
-    for p in parts:
-        p = p.strip()
-        if "-" in p:
-            a, b = p.split("-")
-            result.extend(range(int(a), int(b) + 1))
-        else:
-            result.append(int(p))
-    return sorted(set(result))
+def concat_two(a: Path, b: Path, out: Path) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        lst = Path(tmp) / "files.txt"
+        with open(lst, "w") as f:
+            f.write(f"file '{a.resolve()}'\n")
+            f.write(f"file '{b.resolve()}'\n")
+        r = subprocess.run(
+            ["ffmpeg", "-f", "concat", "-safe", "0", "-i", str(lst),
+             "-c", "copy", str(out)],
+            capture_output=True, text=True, timeout=3600,
+        )
+        if r.returncode != 0:
+            print(f"\n  [CONCAT FAILED] {r.stderr[-300:]}")
+            sys.exit(1)
 
 
-def render_round(
-    demo_path: str,
-    steam_id: str,
-    round_num: int,
-    part_round_offset: int,
-    output_dir: Path,
-    framerate: int,
-    width: int,
-    height: int,
-) -> bool:
-    global_round = part_round_offset + round_num
-    out = output_dir / f"round-{global_round:03d}.mp4"
-    if out.exists():
-        print(f"  [SKIP] round {global_round} already exists")
-        return True
-
-    cmd = [
-        CSDM, "video", demo_path,
-        "--steamids", steam_id,
-        "--event", "rounds",
-        "--rounds", str(round_num),
-        "--output", str(output_dir),
-        "--framerate", str(framerate),
-        "--width", str(width),
-        "--height", str(height),
-    ] + BASE_FLAGS
-
-    print(f"  [RENDER] round {global_round} (part r{round_num})...", end=" ", flush=True)
+def run_csdm(cmd: list[str], label: str) -> Path | None:
+    print(f"  [{label}]...", end=" ", flush=True)
     t0 = time.time()
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=14400)
+    err = (result.stderr or "") + (result.stdout or "")
 
-    print(f"  csdm cmd: {' '.join(cmd)}")
-    result = subprocess.run(
-        cmd,
-        capture_output=True, text=True, timeout=900,
-    )
+    if "unknown demo source" in err.lower() and "--source" not in cmd:
+        cmd += ["--source", "challengermode"]
+        return run_csdm(cmd, f"{label} (challengermode)")
 
     elapsed = time.time() - t0
 
-    err = (result.stderr or "") + (result.stdout or "")
-    print(f"  csdm stdout tail: {(result.stdout or '')[-500:]}")
-    print(f"  csdm stderr tail: {(result.stderr or '')[-500:]}")
     if "Steam is not running" in err:
-        print("FAILED - Steam is not running. Start Steam and CS2, then re-run.")
+        print("FAILED - Steam is not running.")
         sys.exit(1)
 
-    if result.returncode != 0:
-        print(f"FAILED ({elapsed:.0f}s, exit code {result.returncode})")
-        return False
+    # No sequences = player had no events in this round, non-fatal
+    no_seqs = "no sequences generated" in err.lower()
 
-    rendered = sorted(output_dir.glob("sequence-*.mp4"), key=lambda p: p.stat().st_mtime)
-    if rendered:
-        latest = rendered[-1]
-        if latest.exists():
-            if out.exists():
-                out.unlink()
-            latest.rename(out)
-            mb = out.stat().st_size / 1024 / 1024
-            print(f"OK ({elapsed:.0f}s, {mb:.0f} MB)")
-            return True
+    if result.returncode != 0 and not no_seqs:
+        print(f"FAILED ({elapsed:.0f}s, exit {result.returncode})")
+        print(err[-500:])
+        sys.exit(1)
 
-    no_video_count = getattr(render_round, "no_video_count", 0) + 1
-    render_round.no_video_count = no_video_count
-    print(f"OK ({elapsed:.0f}s, no video)")
-    return False
+    # Find the newest mp4 in the output directory
+    for i, a in enumerate(cmd):
+        if a == "--output" and i + 1 < len(cmd):
+            out_dir = Path(cmd[i + 1])
+            break
+    else:
+        print("FAILED (no output dir in cmd)")
+        sys.exit(1)
+
+    mp4s = list(out_dir.rglob("*.mp4"))
+    if mp4s:
+        vid = max(mp4s, key=lambda p: p.stat().st_mtime)
+        mb = vid.stat().st_size / 1024 / 1024
+        print(f"OK ({elapsed:.0f}s, {mb:.0f} MB)")
+        if mb < 1:
+            print("[ERROR] Video too small")
+            sys.exit(1)
+        return vid
+
+    if no_seqs:
+        print("OK (no sequences)")
+        return None
+
+    print(f"FAILED ({elapsed:.0f}s, no video)")
+    sys.exit(1)
+
+
+def _get_resolution(path: Path) -> tuple[int, int]:
+    r = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json",
+         "-show_streams", "-select_streams", "v:0", str(path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    if r.returncode != 0:
+        return 0, 0
+    data = json.loads(r.stdout)
+    s = data.get("streams", [])
+    return (s[0]["width"], s[0]["height"]) if s else (0, 0)
+
+
+def _upscale(src: Path, dst: Path, w: int, h: int) -> None:
+    cmd = [
+        "ffmpeg", "-y", "-i", str(src),
+        "-vf", f"scale={w}:{h}:flags=lanczos",
+        "-c:v", "libx264", "-crf", "15",
+        "-profile:v", "high", "-pix_fmt", "yuv420p", "-level", "5.1",
+        "-minrate", "20M", "-maxrate", "40M", "-bufsize", "40M",
+        "-preset", "slow", "-c:a", "copy", str(dst),
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+    if r.returncode != 0:
+        print(f"[ERROR] Upscale failed: {r.stderr[-300:]}")
+        sys.exit(1)
+    mb = dst.stat().st_size / 1024 / 1024
+    print(f"  [OK] {dst.name} ({mb:.0f} MB)")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Render POV rounds one at a time (handles p1/p2)")
-    parser.add_argument("demo", help="Path to .dem file or any part (p1, p2, ...)")
-    parser.add_argument("steam_id", help="Steam64 ID of the player")
-    parser.add_argument("--output", "-o", help="Output folder (default: auto from demo name)")
-    parser.add_argument("--rounds", default="", help="Round range like 1-29 or 1,2,5-10 (default: all)")
-    parser.add_argument("--framerate", type=int, default=60, help="Output framerate (default: 60)")
+    parser = argparse.ArgumentParser(description="Render POV rounds")
+    parser.add_argument("demo", help="Path to .dem file")
+    parser.add_argument("steam_id", help="Steam64 ID")
+    parser.add_argument("--output", "-o", help="Output folder")
+    parser.add_argument("--batches", type=int, default=0,
+                        help="Rounds per batch (0 = all at once)")
+    parser.add_argument("--framerate", type=int, default=60)
     parser.add_argument("--width", type=int, default=2560)
     parser.add_argument("--height", type=int, default=1440)
+    parser.add_argument("--minimize-cs2", action="store_true",
+                        help="Auto-minimize CS2 when it launches (prevents focus stealing)")
     args = parser.parse_args()
 
     parts = find_demo_parts(args.demo)
@@ -184,50 +201,111 @@ def main() -> None:
         output_dir = Path("demos/renders") / f"pov-{stem}"
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output:  {output_dir}")
-    print()
 
-    user_rounds: list[int] | None = None
-    if args.rounds:
-        user_rounds = parse_round_range(args.rounds)
+    combined = output_dir / "combined.mp4"
+    if combined.exists():
+        print(f"  [SKIP] {combined.name} ({combined.stat().st_size // 1024 // 1024} MB)")
+        return
 
-    render_round.no_video_count = 0
-    total_rounds = 0
-    failed_rounds = 0
+    minimizer = None
+    if args.minimize_cs2:
+        minimizer = CS2Minimizer()
+        minimizer.start()
+        print("CS2 auto-minimize enabled (won't steal focus)")
+
+    batch_idx = 0
     global_offset = 0
+
     for pi, part in enumerate(parts):
+        n_rounds = get_round_count(part)
         part_name = Path(part).name
-        total = get_round_count(part)
-        print(f"\n--- {part_name}: {total} round(s) ---")
-
-        if total == 0:
+        print(f"\n--- {part_name}: {n_rounds} round(s) ---")
+        if n_rounds == 0:
             continue
 
-        if user_rounds:
-            part_rounds = [r - global_offset for r in user_rounds
-                           if global_offset < r <= global_offset + total]
+        if args.batches > 0:
+            round_nums = list(range(1, n_rounds + 1))
+            for b_start in range(0, n_rounds, args.batches):
+                batch = round_nums[b_start:b_start + args.batches]
+                batch_str = ",".join(str(r) for r in batch)
+                global_rounds = [global_offset + r for r in batch]
+                label = f"r{global_rounds[0]}-{global_rounds[-1]}"
+                batch_out = output_dir / f"_batch{batch_idx}.mp4"
+
+                cmd = [
+                    CSDM, "video", part,
+                    "--steamids", args.steam_id,
+                    "--event", "rounds",
+                    "--rounds", batch_str,
+                    "--output-file-name", batch_out.name,
+                    "--output", str(output_dir),
+                    "--framerate", str(args.framerate),
+                    "--width", str(args.width),
+                    "--height", str(args.height),
+                ] + BASE_FLAGS
+
+                vid = run_csdm(cmd, label)
+
+                if vid is None:
+                    batch_idx += 1
+                    continue
+
+                # csdm may write elsewhere; ensure it's at batch_out
+                if vid != batch_out:
+                    vid.replace(batch_out)
+
+                # Incremental concat: merge batch into combined
+                if not combined.exists():
+                    batch_out.rename(combined)
+                    mb = combined.stat().st_size / 1024 / 1024
+                    print(f"    -> {combined.name} ({mb:.0f} MB)")
+                else:
+                    tmp = output_dir / "_tmp.mp4"
+                    print(f"    -> appending to {combined.name}...", end=" ", flush=True)
+                    t0 = time.time()
+                    concat_two(combined, batch_out, tmp)
+                    tmp.replace(combined)
+                    batch_out.unlink(missing_ok=True)
+                    elapsed = time.time() - t0
+                    mb = combined.stat().st_size / 1024 / 1024
+                    print(f"OK ({elapsed:.0f}s, {mb:.0f} MB)")
+
+                batch_idx += 1
         else:
-            part_rounds = list(range(1, total + 1))
+            cmd = [
+                CSDM, "video", part,
+                "--steamids", args.steam_id,
+                "--event", "rounds",
+                "--output-file-name", "combined.mp4",
+                "--output", str(output_dir),
+                "--framerate", str(args.framerate),
+                "--width", str(args.width),
+                "--height", str(args.height),
+            ] + BASE_FLAGS
 
-        if not part_rounds:
-            print("  (no rounds in this part)")
-            global_offset += total
-            continue
+            vid = run_csdm(cmd, "all rounds")
+            if vid != combined:
+                vid.replace(combined)
 
-        for r in part_rounds:
-            ok = render_round(
-                part, args.steam_id, r, global_offset,
-                output_dir, args.framerate, args.width, args.height,
-            )
-            if not ok:
-                failed_rounds += 1
-            total_rounds += 1
+        global_offset += n_rounds
 
-        global_offset += total
+    if minimizer:
+        minimizer.stop()
 
-    print(f"\nDone. {total_rounds} round(s), {failed_rounds} failed, {render_round.no_video_count} no-video")
-    if total_rounds > 0 and failed_rounds == total_rounds:
-        print("[ERROR] All rounds failed to produce video. This likely means the player was dead or not found.")
+    if not combined.exists():
+        print("[ERROR] No video produced")
         sys.exit(1)
+
+    # csdm --recording-system CS captures at game resolution, ignoring --width/--height.
+    # Upscale to 1440p so YouTube allocates VP9 codec (sharper even at 1080p playback).
+    vid_w, vid_h = _get_resolution(combined)
+    if vid_h < args.height:
+        upscaled = output_dir / "_upscaled.mp4"
+        print(f"\n  [Upscale] {vid_w}x{vid_h} -> {args.width}x{args.height} (VP9 trigger)...")
+        _upscale(combined, upscaled, args.width, args.height)
+        upscaled.replace(combined)
+
+    print(f"\nDone. Output: {combined} ({combined.stat().st_size // 1024 // 1024} MB)")
 
 
 if __name__ == "__main__":

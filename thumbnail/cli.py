@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import random
 import shutil
 import subprocess
@@ -10,11 +9,12 @@ import sys
 import tempfile
 from pathlib import Path
 
-TMP_DIR = Path(os.environ.get("TMPDIR", "C:/Users/jembo/AppData/Local/Temp/opencode"))
+TMP_DIR = Path(__file__).resolve().parent.parent / "tmp"
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 from rich.console import Console
 
+from cs2_minimizer import CS2Minimizer
 from thumbnail.layouts import generate
 from thumbnail.utils import (
     YOUTUBE_DIR,
@@ -59,6 +59,8 @@ def build_output_dir(match_slug: str, player: str, map_name: str) -> Path:
 
 def extract_background_frame(demo_path: str, steam_id: str) -> Path:
     tmp_dir = Path(tempfile.mkdtemp(prefix="thumb_bg_", dir=TMP_DIR))
+    minimizer = CS2Minimizer(verbose=True)
+    minimizer.start()
     try:
         console.print(f"  Finding kills for player...")
         subprocess.run(
@@ -133,6 +135,7 @@ def extract_background_frame(demo_path: str, steam_id: str) -> Path:
         return dest
 
     finally:
+        minimizer.stop()
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 

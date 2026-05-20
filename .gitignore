@@ -16,12 +16,9 @@ client_secret.json
 token_youtube.json
 
 # App data
-player_accounts.json
-download_history.json
+.data/
 
 # Python
-__pycache__/
-*.pyc
 *.pyo
 *.egg-info/
 dist/
@@ -29,8 +26,16 @@ build/
 .venv/
 venv/
 
-# Temp scripts
+# Temp files
+tmp/
+tmp_*/
 tmp_*.py
+
+# Vault
+vault/
+
+# Pipeline state
+.pipeline/
 
 # IDE
 .vscode/

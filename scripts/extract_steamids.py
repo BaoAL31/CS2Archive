@@ -16,7 +16,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-TMP_DIR = Path(os.environ.get("TMPDIR", "C:/Users/jembo/AppData/Local/Temp/opencode"))
+TMP_DIR = Path(__file__).resolve().parent.parent / "tmp"
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 

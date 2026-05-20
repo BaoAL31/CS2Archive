@@ -32,6 +32,8 @@ import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+STATE_DIR = PROJECT_ROOT / ".pipeline"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
 os.chdir(str(PROJECT_ROOT))
 
 CSDM = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
@@ -69,14 +71,14 @@ def fail(step: int, code: str, message: str) -> None:
 
 
 def load_state(run_id: str) -> dict:
-    path = PROJECT_ROOT / f".pipeline_{run_id}.json"
+    path = STATE_DIR / f"{run_id}.json"
     if path.exists():
         return json.loads(path.read_text())
     return {"step": 1, "data": {}}
 
 
 def save_state(run_id: str, state: dict) -> None:
-    (PROJECT_ROOT / f".pipeline_{run_id}.json").write_text(json.dumps(state, indent=2))
+    (STATE_DIR / f"{run_id}.json").write_text(json.dumps(state, indent=2))
 
 
 def run_id_from_name(name: str) -> str:
@@ -289,60 +291,33 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
         if "steam.exe" not in steam_check.stdout:
             fail(6, "RENDER_STEAM_NOT_RUNNING", "Steam must be running before rendering")
 
-        r = self._run_py(["scripts/render_pov.py", str(self.demo_path), self.steam_id], timeout=7200)
+        r = self._run_py(["scripts/render_pov.py", str(self.demo_path), self.steam_id,
+                          "--batches", str(self.args.batches), "--minimize-cs2"], timeout=43200)
         if r.returncode != 0:
             fail(6, "RENDER_FAILED", f"render_pov.py exited {r.returncode}")
 
-        rendered = sorted(self.render_dir.glob("round-*.mp4"))
-        if len(rendered) == 0:
-            fail(6, "RENDER_NO_CLIPS", f"no round-*.mp4 files produced in {self.render_dir}")
+        combined = self.render_dir / "combined.mp4"
+        if not combined.exists():
+            fail(6, "RENDER_NO_VIDEO", f"no combined.mp4 produced in {self.render_dir}")
 
-        # Check round count vs expected (allow gaps — player may be dead some rounds)
-        expected = self.state["data"].get("round_count", 0)
-        if expected > 0 and len(rendered) != expected:
-            print(f"  [WARN] rendered {len(rendered)}/{expected} rounds ({expected - len(rendered)} missing — player may have been dead)")
+        if combined.stat().st_size < 50000:
+            fail(6, "RENDER_VIDEO_TOO_SMALL", f"combined.mp4 too small: {combined.stat().st_size} bytes")
 
-        # Check first clip is valid
-        if rendered[0].stat().st_size < 50000:
-            fail(6, "RENDER_CLIP_TOO_SMALL", f"first round clip too small: {rendered[0].stat().st_size} bytes")
+        mb = combined.stat().st_size / 1024 / 1024
+        print(f"  [OK] Rendered combined.mp4 ({mb:.0f} MB)")
 
-        print(f"  [OK] Rendered {len(rendered)} round clip(s)")
-
-    # ── Step 7: Concat ───────────────────────────────────────────────────
+    # ── Step 7: Concat (no-op — render_pov.py produces combined.mp4 directly) ──
 
     def step_concat(self) -> None:
         if not self.render_dir.exists():
             fail(7, "CONCAT_RENDER_DIR_MISSING", f"render dir not found: {self.render_dir}")
 
-        rendered = sorted(self.render_dir.glob("round-*.mp4"))
-        if len(rendered) == 0:
-            fail(7, "CONCAT_NO_RENDERS", f"no round-*.mp4 files in {self.render_dir}")
-
-        # Verify round count matches demo if we have expected count
-        expected = self.state["data"].get("round_count", 0)
-        if expected > 0:
-            with tempfile.TemporaryDirectory() as tmp:
-                json_cmd = [CSDM, "json", str(self.demo_path), "--output-folder", tmp]
-                r = subprocess.run(json_cmd, capture_output=True, text=True, timeout=300)
-                if r.returncode != 0 and "unknown demo source" in (r.stderr or "").lower():
-                    json_cmd += ["--source", "challengermode"]
-                    r = subprocess.run(json_cmd, capture_output=True, text=True, timeout=300)
-                if r.returncode == 0:
-                    jf = list(Path(tmp).glob("*.json"))
-                    if jf:
-                        data = json.loads(jf[0].read_text())
-                        actual_rounds = len(data.get("rounds", []))
-                if actual_rounds > 0 and len(rendered) != actual_rounds:
-                    print(f"  [WARN] concat: {len(rendered)} renders vs {actual_rounds} demo rounds "
-                          f"({actual_rounds - len(rendered)} missing)")
-
         combined = self.render_dir / "combined.mp4"
-        if combined.exists():
-            print("  combined.mp4 exists, skipping concat")
-        else:
-            r = self._run_py(["scripts/concat_rounds.py", str(self.render_dir)], timeout=600)
-            if r.returncode != 0:
-                fail(7, "CONCAT_FAILED", f"concat_rounds.py exited {r.returncode}")
+        if not combined.exists():
+            fail(7, "CONCAT_NO_COMBINED", f"no combined.mp4 found in {self.render_dir}")
+
+        mb = combined.stat().st_size / 1024 / 1024
+        print(f"  [OK] combined.mp4 exists ({mb:.0f} MB) — single-pass render skipped concat")
 
         if not combined.exists():
             fail(7, "CONCAT_OUTPUT_MISSING", "combined.mp4 not created after concat")
@@ -420,6 +395,7 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
 
         title = meta.get("title") or f"{self.args.player} | {self.args.map}"
         description = meta.get("description", "")
+        tags = meta.get("tags", [])
 
         cmd = [
             "scripts/upload_youtube.py",
@@ -428,6 +404,8 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
             "--description", description,
             "--privacy", self.args.privacy,
         ]
+        if tags:
+            cmd += ["--tags", ",".join(tags)]
         if thumb.exists():
             cmd += ["--thumbnail", str(thumb)]
 
@@ -455,10 +433,10 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
             removed.append(str(self.render_dir))
             print(f"  Removed: {self.render_dir.name}")
 
-        state_path = PROJECT_ROOT / f".pipeline_{self.run_id}.json"
+        state_path = STATE_DIR / f"{self.run_id}.json"
         if state_path.exists():
             state_path.unlink()
-            removed.append(f".pipeline_{self.run_id}.json")
+            removed.append(f".pipeline/{self.run_id}.json")
 
         # Verify removal
         if self.render_dir.exists():
@@ -482,6 +460,8 @@ def main() -> None:
     parser.add_argument("--step", type=int, default=1, choices=range(1, 11),
                         help="Start from step N (1=extract..10=cleanup)")
     parser.add_argument("--privacy", choices=["private", "unlisted", "public"], default="public")
+    parser.add_argument("--batches", type=int, default=0,
+                        help="Rounds per batch (0 = all at once, default: 0)")
     args = parser.parse_args()
 
     print(f"{'='*60}")

@@ -191,3 +191,4 @@ Installed from mattpocock/skills (see `skills-lock.json`):
 - `/grill-with-docs` — same but also updates CONTEXT.md + ADRs
 - `/handoff` — compact session into handoff doc for next agent
 - `/caveman` — ultra-compressed mode
+- `/wikify` — generate a Karpathy-style wiki from a thesis, project, paper, or report. Extracts concepts, methods, papers, datasets, and architecture into interlinked Markdown wiki articles.

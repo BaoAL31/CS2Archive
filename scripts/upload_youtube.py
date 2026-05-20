@@ -52,8 +52,9 @@ def get_authenticated_service() -> googleapiclient.discovery.Resource:
 def upload_video(
     youtube, video_path: str, title: str, description: str,
     privacy: str, thumbnail_path: str | None = None,
+    tags: list[str] | None = None,
 ) -> str:
-    body = {
+    body: dict = {
         "snippet": {
             "title": title,
             "description": description,
@@ -64,6 +65,8 @@ def upload_video(
             "selfDeclaredMadeForKids": False,
         },
     }
+    if tags:
+        body["snippet"]["tags"] = tags
 
     media = MediaFileUpload(video_path, chunksize=256 * 1024 * 1024, resumable=True)
     request = youtube.videos().insert(
@@ -104,6 +107,7 @@ def main() -> None:
     parser.add_argument("--thumbnail", "-t", help="Path to thumbnail image (PNG)")
     parser.add_argument("--title", required=True, help="Video title")
     parser.add_argument("--description", "-d", default="", help="Video description")
+    parser.add_argument("--tags", help="Comma-separated tags (max 500 chars total)")
     parser.add_argument("--privacy", choices=["private", "unlisted", "public"], default="unlisted")
     args = parser.parse_args()
 
@@ -118,10 +122,17 @@ def main() -> None:
 
     print("Authenticating with Google...")
     youtube = get_authenticated_service()
+    tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else None
+    total = sum(len(t) for t in tags) if tags else 0
+    if tags and total > 500:
+        print(f"[WARN] Tags too long ({total} chars), truncating to 500")
+        while tags and sum(len(t) for t in tags) > 500:
+            tags.pop()
+
     print("Uploading...")
     upload_video(
         youtube, str(video), args.title, args.description,
-        args.privacy, args.thumbnail,
+        args.privacy, args.thumbnail, tags,
     )
     print("Done!")
 

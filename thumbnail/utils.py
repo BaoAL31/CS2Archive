@@ -60,17 +60,25 @@ def find_player_stats(
 
 
 def get_team_names(ratings: dict, map_name: str) -> tuple[str, str]:
-    teams: list[str] = []
+    ABBR = {
+        "Natus Vincere": "NaVi",
+        "GamerLegion": "GL",
+        "Team Falcons": "Falcons",
+        "Natus Vincere Junior": "NAVI Junior",
+    }
+    raw_teams: list[str] = []
     for table in ratings.get("tables", []):
         if table["map"].lower() == map_name.lower():
-            teams.append(table["team"].strip())
-    if len(teams) >= 2:
-        return (teams[0], teams[1])
+            raw_teams.append(table["team"].strip())
+    if len(raw_teams) >= 2:
+        t1, t2 = raw_teams[0], raw_teams[1]
+        return (ABBR.get(t1, t1), ABBR.get(t2, t2))
     for table in ratings.get("tables", []):
         if table["map"] == "Series Overall":
-            teams.append(table["team"].strip())
-    if len(teams) >= 2:
-        return (teams[0], teams[1])
+            raw_teams.append(table["team"].strip())
+    if len(raw_teams) >= 2:
+        t1, t2 = raw_teams[0], raw_teams[1]
+        return (ABBR.get(t1, t1), ABBR.get(t2, t2))
     return ("Team 1", "Team 2")
 
 
