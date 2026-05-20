@@ -47,6 +47,7 @@ Thumbs.db
 
 # Other
 graphify-out/
+wiki-out/
 .agents/
 SKILLS.md
 skills-lock.json

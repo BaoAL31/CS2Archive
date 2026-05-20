@@ -27,6 +27,8 @@ from cs2_minimizer import CS2Minimizer
 
 CSDM = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
 
+FFMPEG_PATH = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
+
 BASE_FLAGS = [
     "--mode", "player",
     "--perspective", "player",
@@ -35,9 +37,10 @@ BASE_FLAGS = [
     "--show-assists",
     "--record-audio",
     "--concatenate-sequences",
-    "--ffmpeg-video-codec", "libx264",
-    "--ffmpeg-crf", "15",
-    "--ffmpeg-output-parameters=-profile:v high -pix_fmt yuv420p -level 5.1 -minrate 20M -maxrate 40M -bufsize 40M",
+    "--ffmpeg-executable-path", FFMPEG_PATH,
+    "--ffmpeg-video-codec", "h264_nvenc",
+    "--ffmpeg-crf", "22",
+    "--ffmpeg-output-parameters=-cq 22 -preset p7 -profile:v high -pix_fmt yuv420p -level 5.1",
     "--recording-system", "CS",
     "--close-game-after-recording",
     "--cfg", "assets/cs2_pov.cfg",
@@ -74,11 +77,14 @@ def get_round_count(demo_path: str) -> int:
         jf = list(Path(tmp).glob("*.json"))
         if not jf:
             return 0
-        data = json.loads(jf[0].read_text())
+        data = json.loads(jf[0].read_text(encoding="utf-8"))
         return len(data.get("rounds", []))
 
 
 def concat_two(a: Path, b: Path, out: Path) -> None:
+    a_mb = a.stat().st_size / 1024 / 1024
+    b_mb = b.stat().st_size / 1024 / 1024
+    print(f"\n  [Concat] {a_mb:.0f} MB + {b_mb:.0f} MB (disk I/O, no re-encode)...", end=" ", flush=True)
     with tempfile.TemporaryDirectory() as tmp:
         lst = Path(tmp) / "files.txt"
         with open(lst, "w") as f:
@@ -92,6 +98,8 @@ def concat_two(a: Path, b: Path, out: Path) -> None:
         if r.returncode != 0:
             print(f"\n  [CONCAT FAILED] {r.stderr[-300:]}")
             sys.exit(1)
+    out_mb = out.stat().st_size / 1024 / 1024
+    print(f"OK ({out_mb:.0f} MB)")
 
 
 def run_csdm(cmd: list[str], label: str) -> Path | None:
@@ -159,20 +167,34 @@ def _get_resolution(path: Path) -> tuple[int, int]:
 
 
 def _upscale(src: Path, dst: Path, w: int, h: int) -> None:
+    src_mb = src.stat().st_size / 1024 / 1024
+    print(f"\n  [Upscale] {src_mb:.0f} MB -> {w}x{h} (GPU NVENC, Lanczos)...", end=" ", flush=True)
+    temp = dst.with_suffix(".temp.mp4")
+    t0 = time.time()
     cmd = [
         "ffmpeg", "-y", "-i", str(src),
         "-vf", f"scale={w}:{h}:flags=lanczos",
-        "-c:v", "libx264", "-crf", "15",
+        "-c:v", "h264_nvenc", "-preset", "p7", "-cq", "15", "-b:v", "25M",
         "-profile:v", "high", "-pix_fmt", "yuv420p", "-level", "5.1",
-        "-minrate", "20M", "-maxrate", "40M", "-bufsize", "40M",
-        "-preset", "slow", "-c:a", "copy", str(dst),
+        "-c:a", "copy", str(temp),
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+    elapsed = time.time() - t0
     if r.returncode != 0:
-        print(f"[ERROR] Upscale failed: {r.stderr[-300:]}")
+        temp.unlink(missing_ok=True)
+        print(f"\n[ERROR] Upscale failed: {r.stderr[-300:]}")
         sys.exit(1)
+    temp.replace(dst)
     mb = dst.stat().st_size / 1024 / 1024
-    print(f"  [OK] {dst.name} ({mb:.0f} MB)")
+    print(f"OK ({elapsed:.0f}s, {mb:.0f} MB)")
+
+
+def _is_valid_video(path: Path) -> bool:
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", str(path)],
+        capture_output=True, text=True, timeout=10,
+    )
+    return r.returncode == 0
 
 
 def main() -> None:
@@ -180,13 +202,13 @@ def main() -> None:
     parser.add_argument("demo", help="Path to .dem file")
     parser.add_argument("steam_id", help="Steam64 ID")
     parser.add_argument("--output", "-o", help="Output folder")
-    parser.add_argument("--batches", type=int, default=0,
-                        help="Rounds per batch (0 = all at once)")
+    parser.add_argument("--batches", type=int, default=1,
+                        help="Rounds per batch (1 = one round at a time)")
     parser.add_argument("--framerate", type=int, default=60)
     parser.add_argument("--width", type=int, default=2560)
     parser.add_argument("--height", type=int, default=1440)
-    parser.add_argument("--minimize-cs2", action="store_true",
-                        help="Auto-minimize CS2 when it launches (prevents focus stealing)")
+    parser.add_argument("--no-minimize-cs2", action="store_true",
+                        help="Disable auto-minimize CS2 when it launches (default: enabled)")
     args = parser.parse_args()
 
     parts = find_demo_parts(args.demo)
@@ -203,12 +225,12 @@ def main() -> None:
     print(f"Output:  {output_dir}")
 
     combined = output_dir / "combined.mp4"
-    if combined.exists():
+    if combined.exists() and args.resume_from_round <= 1:
         print(f"  [SKIP] {combined.name} ({combined.stat().st_size // 1024 // 1024} MB)")
         return
 
     minimizer = None
-    if args.minimize_cs2:
+    if not args.no_minimize_cs2:
         minimizer = CS2Minimizer()
         minimizer.start()
         print("CS2 auto-minimize enabled (won't steal focus)")
@@ -227,6 +249,9 @@ def main() -> None:
             round_nums = list(range(1, n_rounds + 1))
             for b_start in range(0, n_rounds, args.batches):
                 batch = round_nums[b_start:b_start + args.batches]
+                if batch[-1] < args.resume_from_round:
+                    batch_idx += 1
+                    continue
                 batch_str = ",".join(str(r) for r in batch)
                 global_rounds = [global_offset + r for r in batch]
                 label = f"r{global_rounds[0]}-{global_rounds[-1]}"
@@ -296,14 +321,26 @@ def main() -> None:
         print("[ERROR] No video produced")
         sys.exit(1)
 
+    mb = combined.stat().st_size / 1024 / 1024
+    print(f"\n  [Render complete] combined.mp4 ({mb:.0f} MB)")
+
     # csdm --recording-system CS captures at game resolution, ignoring --width/--height.
     # Upscale to 1440p so YouTube allocates VP9 codec (sharper even at 1080p playback).
     vid_w, vid_h = _get_resolution(combined)
     if vid_h < args.height:
         upscaled = output_dir / "_upscaled.mp4"
-        print(f"\n  [Upscale] {vid_w}x{vid_h} -> {args.width}x{args.height} (VP9 trigger)...")
-        _upscale(combined, upscaled, args.width, args.height)
+
+        # Failsafe: remove corrupt/partial upscaled file from previous run
+        if upscaled.exists() and not _is_valid_video(upscaled):
+            print(f"\n  [Cleanup] Removing corrupt {upscaled.name}")
+            upscaled.unlink()
+
+        if not upscaled.exists():
+            _upscale(combined, upscaled, args.width, args.height)
+
         upscaled.replace(combined)
+    else:
+        print(f"\n  [Skip upscale] Already {vid_w}x{vid_h}")
 
     print(f"\nDone. Output: {combined} ({combined.stat().st_size // 1024 // 1024} MB)")
 

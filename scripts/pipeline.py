@@ -271,7 +271,7 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
             jf = list(Path(tmp).glob("*.json"))
             if not jf:
                 fail(5, "ANALYZE_NO_JSON", "csdm json produced no output files")
-            data = json.loads(jf[0].read_text())
+            data = json.loads(jf[0].read_text(encoding="utf-8"))
             rounds = data.get("rounds", [])
             kills = data.get("kills", [])
             print(f"  [OK] Rounds: {len(rounds)}, Kills: {len(kills)}")
@@ -292,7 +292,7 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
             fail(6, "RENDER_STEAM_NOT_RUNNING", "Steam must be running before rendering")
 
         r = self._run_py(["scripts/render_pov.py", str(self.demo_path), self.steam_id,
-                          "--batches", str(self.args.batches), "--minimize-cs2"], timeout=43200)
+                          "--batches", str(self.args.batches)], timeout=43200)
         if r.returncode != 0:
             fail(6, "RENDER_FAILED", f"render_pov.py exited {r.returncode}")
 
@@ -460,8 +460,8 @@ def main() -> None:
     parser.add_argument("--step", type=int, default=1, choices=range(1, 11),
                         help="Start from step N (1=extract..10=cleanup)")
     parser.add_argument("--privacy", choices=["private", "unlisted", "public"], default="public")
-    parser.add_argument("--batches", type=int, default=0,
-                        help="Rounds per batch (0 = all at once, default: 0)")
+    parser.add_argument("--batches", type=int, default=1,
+                        help="Rounds per batch (1 = one round at a time, default: 1)")
     args = parser.parse_args()
 
     print(f"{'='*60}")

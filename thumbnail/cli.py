@@ -28,6 +28,7 @@ from thumbnail.utils import (
 
 console = Console(force_terminal=True)
 CSDM = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
+FFMPEG_PATH = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
 
 
 def resolve_ratings(input_arg: str) -> tuple[Path, str]:
@@ -103,6 +104,8 @@ def extract_background_frame(demo_path: str, steam_id: str) -> Path:
             "--width", "1920",
             "--height", "1080",
             "--framerate", "30",
+            "--ffmpeg-executable-path", FFMPEG_PATH,
+            "--ffmpeg-video-codec", "h264_nvenc",
             "--recording-system", "CS",
             "--close-game-after-recording",
             "--cfg", "assets/cs2_pov.cfg",
