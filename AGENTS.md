@@ -58,7 +58,8 @@ Use these when debugging a specific pipeline step failure or running steps manua
 8. **Generate Thumbnail** — `python -m thumbnail <match_url> --player <nick> --map <map> --demo <dem> --steam-id <id> [--tournament "IEM Atlanta 2026"]`. Auto-extracts random kill frame as blurred background. Or `--background <frame.jpg>`.
    Example: `python -m thumbnail "https://www.hltv.org/matches/2394166/faze-vs-vitality-iem-atlanta-2026" --player ropz --map Nuke --demo demos/hltv/.../faze-vs-vitality-m1-nuke-p2.dem --steam-id 76561197991272318 --tournament "IEM Atlanta 2026"`
 9. **Generate Title & Description** — `python scripts/generate_title.py <ratings_json> --player <nick> --map <map> [--tournament "..."]`. Outputs JSON with `title` and `description` from ratings data.
-10. **Upload to YouTube** — `python scripts/upload_youtube.py <video_path> --thumbnail <thumb.png> --title <title> --description <desc> --privacy public`. Requires Google Cloud OAuth (`client_secret.json`). First-time auth opens browser. Account must be phone-verified for custom thumbnails.
+9. **Upload to YouTube** — `python scripts/upload_youtube.py <video_path> --thumbnail <thumb.png> --title <title> --description <desc> --privacy public`. Requires Google Cloud OAuth (`client_secret.json`). First-time auth opens browser. Account must be phone-verified for custom thumbnails.
+   Or use `--meta <upload_meta.json>` to read title/description/tags from a metadata file. The pipeline writes `upload_meta.json` at step 8 (thumbnail), so step 9 can resume with only the youtube folder. The file also stores `resumable_uri`/`resumable_progress` during upload for crash recovery, and `youtube_id` after completion.
 
 ## CLI Entry Point
 
@@ -141,6 +142,8 @@ Output is `combined.mp4` in the same folder. Uses ffmpeg stream copy (no re-enco
 
 ## Known Gotchas
 
+- **NEVER clean up avatars** — `demos/avatars/` is a persistent cache. Avatars are reused across all matches. Never delete avatar files during cleanup.
+
 - **Demo downloads from HLTV fail with 403** — HLTV CDN issues one-time signed URLs consumed after first download. IP gets blocked after repeated requests. Download manually from browser, cut `.rar` from Downloads → `demos/hltv/` → extract with WinRAR (`patoolib` wraps WinRAR in `downloader.py`).
 - **Split demos (p1, p2)** — IEM tournaments sometimes split single-map demos into parts (`-p1`, `-p2`). `render_pov.py` handles this automatically. The `.rar` may contain multiple `.dem` files — `extract_demo()` in `downloader.py` now extracts all of them.
 - **PBDEMS2 format** — PGL tournaments use a custom demo format. csdm now supports it (requires `--source challengermode` for analyze). Use `csdm analyze <demo> --source challengermode`.
@@ -163,8 +166,9 @@ After completing the pipeline for a POV:
 ```
 youtube/
 └── {match-slug}_{player}_{map}/
-    ├── thumbnail.png    (1280×720 PNG, auto-generated)
-    └── video.mp4        (1080p60, full match POV, concatenated rounds)
+    ├── thumbnail.png       (1280×720 PNG, auto-generated)
+    ├── video.mp4           (1080p60, full match POV, concatenated rounds)
+    └── upload_meta.json    (title, description, tags, upload status, youtube_id)
 ```
 
 ## Architecture

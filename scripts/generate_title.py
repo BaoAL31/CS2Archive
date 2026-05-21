@@ -62,6 +62,23 @@ def shorten_team(name: str) -> str:
     return name
 
 
+def shorten_tournament(name: str) -> str:
+    """Shorten verbose tournament names for titles."""
+    name = name.strip()
+    result = name.title()
+    for short, full in {
+        "Iem": "IEM",
+        "Blast": "BLAST",
+        "Pgl": "PGL",
+        "Esl": "ESL",
+        "Cac": "CAC",
+        "Cs Asia Championships": "CAC",
+    }.items():
+        result = result.replace(short, full)
+    result = result.replace("Season ", "S")
+    return result
+
+
 def normalize_stage(stage: str) -> str:
     """Extract core stage name from verbose HLTV stage strings."""
     if not stage:
@@ -120,6 +137,8 @@ def main() -> None:
         if m:
             tournament = m.group(1)
 
+    tournament_short = shorten_tournament(tournament)
+
     stage_raw = data.get("match_stage", "") if isinstance(data, dict) else ""
     stage = normalize_stage(stage_raw)
 
@@ -130,7 +149,7 @@ def main() -> None:
         f"{team_a_short} vs {team_b_short}",
         args.map,
         stage or None,
-        tournament or None,
+        tournament_short or None,
     ]))
 
     desc_lines = [

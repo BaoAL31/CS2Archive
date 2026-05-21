@@ -368,16 +368,13 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
 
         print(f"  [OK] Thumbnail: {thumb.name}")
 
-    # ── Step 9: Upload ──────────────────────────────────────────────────
+        # Generate upload metadata for resume capability
+        self._write_upload_meta()
 
-    def step_upload(self) -> None:
+    def _write_upload_meta(self) -> None:
+        """Generate upload_meta.json with all metadata needed for upload resume."""
         video = self.youtube_dir / "video.mp4"
         thumb = self.youtube_dir / "thumbnail.png"
-
-        if not video.exists():
-            fail(9, "UPLOAD_VIDEO_MISSING", f"video not found: {video}")
-        if video.stat().st_size < 100000:
-            fail(9, "UPLOAD_VIDEO_TOO_SMALL", f"video too small: {video.stat().st_size} bytes")
 
         r = self._run_py([
             "scripts/generate_title.py", str(self.ratings_json),
@@ -393,19 +390,43 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
             except json.JSONDecodeError:
                 pass
 
-        title = meta.get("title") or f"{self.args.player} | {self.args.map}"
-        description = meta.get("description", "")
-        tags = meta.get("tags", [])
+        upload_meta = {
+            "title": meta.get("title") or f"{self.args.player} | {self.args.map}",
+            "description": meta.get("description", ""),
+            "tags": meta.get("tags", []),
+            "video_path": str(video),
+            "thumbnail_path": str(thumb) if thumb.exists() else None,
+            "privacy": self.args.privacy,
+            "youtube_id": None,
+            "upload_status": "pending",
+        }
+
+        meta_path = self.youtube_dir / "upload_meta.json"
+        meta_path.write_text(json.dumps(upload_meta, indent=2))
+        print(f"  [OK] upload_meta.json written")
+
+    # ── Step 9: Upload ──────────────────────────────────────────────────
+
+    def step_upload(self) -> None:
+        video = self.youtube_dir / "video.mp4"
+        thumb = self.youtube_dir / "thumbnail.png"
+
+        if not video.exists():
+            fail(9, "UPLOAD_VIDEO_MISSING", f"video not found: {video}")
+        if video.stat().st_size < 100000:
+            fail(9, "UPLOAD_VIDEO_TOO_SMALL", f"video too small: {video.stat().st_size} bytes")
+
+        meta_path = self.youtube_dir / "upload_meta.json"
+        if not meta_path.exists():
+            # Fallback: generate meta on the fly (legacy resume path)
+            self._write_upload_meta()
 
         cmd = [
             "scripts/upload_youtube.py",
             str(video),
-            "--title", title,
-            "--description", description,
+            "--meta", str(meta_path),
             "--privacy", self.args.privacy,
         ]
-        if tags:
-            cmd += ["--tags", ",".join(tags)]
         if thumb.exists():
             cmd += ["--thumbnail", str(thumb)]
 
