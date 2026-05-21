@@ -68,7 +68,7 @@ def upload_video(
     if tags:
         body["snippet"]["tags"] = tags
 
-    media = MediaFileUpload(video_path, chunksize=256 * 1024 * 1024, resumable=True)
+    media = MediaFileUpload(video_path, chunksize=32 * 1024 * 1024, resumable=True)
     request = youtube.videos().insert(
         part="snippet,status",
         body=body,
@@ -82,11 +82,11 @@ def upload_video(
         if status:
             pct = int(status.progress() * 100)
             if pct != last_progress:
-                print(f"  Upload: {pct}%")
+                print(f"  Upload: {pct}%", flush=True)
                 last_progress = pct
 
     video_id = response.get("id")
-    print(f"  Uploaded: https://youtu.be/{video_id}")
+    print(f"  Uploaded: https://youtu.be/{video_id}", flush=True)
 
     if thumbnail_path and video_id:
         try:
@@ -94,9 +94,9 @@ def upload_video(
                 videoId=video_id,
                 media_body=MediaFileUpload(thumbnail_path),
             ).execute()
-            print(f"  Thumbnail set")
+            print(f"  Thumbnail set", flush=True)
         except Exception as e:
-            print(f"  Thumbnail failed: {e}")
+            print(f"  Thumbnail failed: {e}", flush=True)
 
     return video_id
 
@@ -120,21 +120,21 @@ def main() -> None:
         print(f"[ERROR] Thumbnail not found: {args.thumbnail}")
         sys.exit(1)
 
-    print("Authenticating with Google...")
+    print("Authenticating with Google...", flush=True)
     youtube = get_authenticated_service()
     tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else None
     total = sum(len(t) for t in tags) if tags else 0
     if tags and total > 500:
-        print(f"[WARN] Tags too long ({total} chars), truncating to 500")
+        print(f"[WARN] Tags too long ({total} chars), truncating to 500", flush=True)
         while tags and sum(len(t) for t in tags) > 500:
             tags.pop()
 
-    print("Uploading...")
+    print("Uploading...", flush=True)
     upload_video(
         youtube, str(video), args.title, args.description,
         args.privacy, args.thumbnail, tags,
     )
-    print("Done!")
+    print("Done!", flush=True)
 
 
 if __name__ == "__main__":

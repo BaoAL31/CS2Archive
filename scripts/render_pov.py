@@ -168,13 +168,13 @@ def _get_resolution(path: Path) -> tuple[int, int]:
 
 def _upscale(src: Path, dst: Path, w: int, h: int) -> None:
     src_mb = src.stat().st_size / 1024 / 1024
-    print(f"\n  [Upscale] {src_mb:.0f} MB -> {w}x{h} (GPU NVENC, Lanczos)...", end=" ", flush=True)
+    print(f"\n  [Upscale] {src_mb:.0f} MB -> {w}x{h} (GPU CUDA Lanczos + NVENC)...", end=" ", flush=True)
     temp = dst.with_suffix(".temp.mp4")
     t0 = time.time()
     cmd = [
         "ffmpeg", "-y", "-i", str(src),
-        "-vf", f"scale={w}:{h}:flags=lanczos",
-        "-c:v", "h264_nvenc", "-preset", "p7", "-cq", "15", "-b:v", "25M",
+        "-vf", f"scale_cuda={w}:{h}:interp_algo=lanczos",
+        "-c:v", "h264_nvenc", "-preset", "p7", "-rc", "vbr_hq", "-cq", "18", "-b:v", "0", "-maxrate", "50M",
         "-profile:v", "high", "-pix_fmt", "yuv420p", "-level", "5.1",
         "-c:a", "copy", str(temp),
     ]
@@ -183,7 +183,13 @@ def _upscale(src: Path, dst: Path, w: int, h: int) -> None:
     if r.returncode != 0:
         temp.unlink(missing_ok=True)
         print(f"\n[ERROR] Upscale failed: {r.stderr[-300:]}")
-        sys.exit(1)
+        print("  [Fallback] Retrying with CPU Lanczos...")
+        cmd[4] = f"scale={w}:{h}:flags=lanczos"
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        if r.returncode != 0:
+            temp.unlink(missing_ok=True)
+            print(f"\n[ERROR] Upscale fallback also failed: {r.stderr[-300:]}")
+            sys.exit(1)
     temp.replace(dst)
     mb = dst.stat().st_size / 1024 / 1024
     print(f"OK ({elapsed:.0f}s, {mb:.0f} MB)")
@@ -204,11 +210,13 @@ def main() -> None:
     parser.add_argument("--output", "-o", help="Output folder")
     parser.add_argument("--batches", type=int, default=1,
                         help="Rounds per batch (1 = one round at a time)")
-    parser.add_argument("--framerate", type=int, default=60)
+    parser.add_argument("--framerate", type=int, default=48)
     parser.add_argument("--width", type=int, default=2560)
     parser.add_argument("--height", type=int, default=1440)
     parser.add_argument("--no-minimize-cs2", action="store_true",
                         help="Disable auto-minimize CS2 when it launches (default: enabled)")
+    parser.add_argument("--resume-from-round", type=int, default=1,
+                        help="Skip rounds before this number (for resuming partial renders)")
     args = parser.parse_args()
 
     parts = find_demo_parts(args.demo)

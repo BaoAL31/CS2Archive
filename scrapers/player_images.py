@@ -116,7 +116,7 @@ async def get_player_avatars(match_url: str) -> dict[str, Path]:
 
         players = await page.evaluate("""
             () => {
-                const imgs = document.querySelectorAll('img.player-photo');
+                const imgs = document.querySelectorAll('div.players img.player-photo');
                 return Array.from(imgs).map(img => {
                     const alt = img.alt || '';
                     const m = alt.match(/'([^']+)'/);

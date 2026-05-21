@@ -409,13 +409,22 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
         if thumb.exists():
             cmd += ["--thumbnail", str(thumb)]
 
-        r2 = self._run_py(cmd, capture_output=True, text=True, timeout=7200)
-        out = (r2.stdout or "") + (r2.stderr or "")
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+        proc = subprocess.Popen(
+            [PY] + cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env=env, text=True, encoding="utf-8",
+        )
+        out_lines: list[str] = []
+        if proc.stdout:
+            for line in proc.stdout:
+                print(line, end="")
+                out_lines.append(line)
+        proc.wait()
+        out = "".join(out_lines)
 
-        if r2.returncode != 0:
-            fail(9, "UPLOAD_FAILED", f"upload exited {r2.returncode}: {out[:300]}")
+        if proc.returncode != 0:
+            fail(9, "UPLOAD_FAILED", f"upload exited {proc.returncode}: {out[:300]}")
 
-        # Extract video ID
         m = re.search(r"https://youtu\.be/([a-zA-Z0-9_-]+)", out)
         if m:
             vid_id = m.group(1)

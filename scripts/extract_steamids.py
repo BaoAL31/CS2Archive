@@ -43,7 +43,7 @@ def extract_steamids(demo_path: str) -> dict[str, str]:
             print("[red]No JSON output from csdm[/red]")
             return {}
 
-        data = json.loads(json_files[0].read_text())
+        data = json.loads(json_files[0].read_text(encoding="utf-8"))
         players: dict[str, str] = {}
         for p in data.get("players", []):
             name = p.get("name", "?")

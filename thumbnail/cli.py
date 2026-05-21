@@ -74,7 +74,7 @@ def extract_background_frame(demo_path: str, steam_id: str) -> Path:
             console.print("[red]  Failed to export demo data[/red]")
             sys.exit(1)
 
-        data = json.loads(json_files[0].read_text())
+        data = json.loads(json_files[0].read_text(encoding="utf-8"))
         kills = [
             k for k in data.get("kills", [])
             if k.get("killerSteamId") == steam_id

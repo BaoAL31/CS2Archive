@@ -62,6 +62,26 @@ def shorten_team(name: str) -> str:
     return name
 
 
+def normalize_stage(stage: str) -> str:
+    """Extract core stage name from verbose HLTV stage strings."""
+    if not stage:
+        return ""
+    stage_lower = stage.lower()
+    if "grand final" in stage_lower:
+        return "Grand Final"
+    if "semi" in stage_lower:
+        return "Semi-final"
+    if "quarter" in stage_lower:
+        return "Quarter-final"
+    if "final" in stage_lower:
+        return "Final"
+    if "playoff" in stage_lower:
+        return "Playoff"
+    if "group" in stage_lower:
+        return "Group Stage"
+    return stage.strip()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate YouTube video title and description")
     parser.add_argument("ratings_json", help="Path to ratings JSON file")
@@ -77,7 +97,7 @@ def main() -> None:
         print(json.dumps({"error": f"Ratings file not found: {path}"}))
         sys.exit(1)
 
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
 
     team_a, team_b = extract_team_names(data)
     if args.team_a:
@@ -100,8 +120,10 @@ def main() -> None:
         if m:
             tournament = m.group(1)
 
-    stage = data.get("match_stage", "") if isinstance(data, dict) else ""
+    stage_raw = data.get("match_stage", "") if isinstance(data, dict) else ""
+    stage = normalize_stage(stage_raw)
 
+    # Concrete title format: Player | Rating | TeamA vs TeamB | Map | Stage | Tournament
     title = " | ".join(filter(None, [
         args.player,
         f"{rating} Rating" if rating != "?.??" else "",
@@ -114,8 +136,8 @@ def main() -> None:
     desc_lines = [
         f"{args.player}'s POV on {args.map}",
     ]
-    if stage:
-        desc_lines.append(f"{tournament} — {stage}" if tournament else stage)
+    if stage_raw:
+        desc_lines.append(f"{tournament} — {stage_raw}" if tournament else stage_raw)
     elif tournament:
         desc_lines.append(tournament)
     if team_a and team_b:
@@ -135,14 +157,8 @@ def main() -> None:
 
     description = "\n".join(desc_lines)
 
-    # Match format from stage
-    stage_tag = None
-    if stage:
-        stage_lower = stage.lower()
-        if "final" in stage_lower:
-            stage_tag = "Grand Final"
-        elif "semi" in stage_lower:
-            stage_tag = "Playoffs Semi-Final"
+    # Tags from normalized stage
+    stage_tag = stage if stage else None
 
     tags = list(filter(None, [
         args.player,
