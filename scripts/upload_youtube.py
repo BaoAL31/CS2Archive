@@ -38,7 +38,7 @@ RETRIABLE_EXCEPTIONS = (
 RETRIABLE_STATUS_CODES = [500, 502, 503, 504]
 MAX_RETRIES = 10
 
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+SCOPES = ["https://www.googleapis.com/auth/youtube.upload", "https://www.googleapis.com/auth/youtube"]
 CLIENT_SECRET = "client_secret.json"
 TOKEN_FILE = "token_youtube.json"
 
@@ -204,16 +204,45 @@ def upload_video(
     return video_id
 
 
+def _update_thumbnail(youtube, video_id: str, thumb_path: str) -> None:
+    youtube.thumbnails().set(
+        videoId=video_id,
+        media_body=MediaFileUpload(thumb_path),
+    ).execute()
+    print(f"  Thumbnail updated for https://youtu.be/{video_id}", flush=True)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Upload video to YouTube")
-    parser.add_argument("video", help="Path to video file")
+    parser = argparse.ArgumentParser(description="Upload video to YouTube or update a thumbnail")
+    parser.add_argument("video", nargs="?", help="Path to video file")
     parser.add_argument("--thumbnail", "-t", help="Path to thumbnail image (PNG)")
     parser.add_argument("--title", help="Video title")
     parser.add_argument("--description", "-d", default="", help="Video description")
     parser.add_argument("--tags", help="Comma-separated tags (max 500 chars total)")
     parser.add_argument("--privacy", choices=["private", "unlisted", "public"], default="unlisted")
     parser.add_argument("--meta", help="Path to upload_meta.json (overrides --title, --description, --tags)")
+    parser.add_argument("--update-thumbnail", help="Update thumbnail for an existing video ID")
     args = parser.parse_args()
+
+    print("Authenticating with Google...", flush=True)
+    youtube = get_authenticated_service()
+
+    # Standalone thumbnail update mode
+    if args.update_thumbnail:
+        if not args.thumbnail:
+            print("[ERROR] --thumbnail required with --update-thumbnail", flush=True)
+            sys.exit(1)
+        if not Path(args.thumbnail).exists():
+            print(f"[ERROR] Thumbnail not found: {args.thumbnail}", flush=True)
+            sys.exit(1)
+        _update_thumbnail(youtube, args.update_thumbnail, args.thumbnail)
+        print("Done!", flush=True)
+        return
+
+    # Upload mode
+    if not args.video:
+        print("[ERROR] <video> path required (use --update-thumbnail to only set a thumbnail)", flush=True)
+        sys.exit(1)
 
     video = Path(args.video)
     if not video.exists():
@@ -257,9 +286,6 @@ def main() -> None:
         sys.exit(1)
 
     meta_file_path = str(video.parent / "upload_meta.json")
-
-    print("Authenticating with Google...", flush=True)
-    youtube = get_authenticated_service()
 
     print("Uploading...", flush=True)
     upload_video(
