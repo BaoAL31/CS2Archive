@@ -14,6 +14,7 @@ youtube/
 # Secrets & credentials
 client_secret.json
 token_youtube.json
+token_youtube_thumb.json
 
 # App data
 .data/
