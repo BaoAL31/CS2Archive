@@ -41,7 +41,6 @@ BASE_FLAGS = [
     "--ffmpeg-video-codec", "h264_nvenc",
     "--ffmpeg-crf", "22",
     "--ffmpeg-output-parameters=-cq 22 -preset p7 -profile:v high -pix_fmt yuv420p -level 5.1",
-    "--no-close-game-after-recording",
     "--recording-system", "CS",
     "--cfg", "assets/cs2_pov.cfg",
 ]

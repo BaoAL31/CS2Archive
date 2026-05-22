@@ -14,6 +14,24 @@
 - **Layout**: Player cutout on the left (90% height), 5-6 line text block middle-aligned on the right (player name, K-D, rating, map, match, tournament).
 - **Output Structure**: `youtube/{match-slug}_{player}_{map}/thumbnail.png`
 
+## Pipeline Steps
+
+Steps run in order. State is persisted in `.pipeline/{run_id}.json` for resume.
+
+| # | Name | Description |
+|---|------|-------------|
+| 1 | extract | Extract .rar, find correct .dem for the map |
+| 2 | ratings | Scrape HLTV Rating 3.0 |
+| 3 | steam_id | Save player Steam64 to player list |
+| 4 | avatar | Download player cutout PNG from HLTV |
+| 5 | analyze | csdm analyze the demo |
+| 6 | render | Render all rounds as POV clips |
+| 7 | concat | Copy combined.mp4 → youtube/video.mp4 |
+| 8 | outro | Generate 5s silent outro (Pillow + Montserrat, top-half text), concat onto video.mp4 |
+| 9 | thumbnail | Generate 1280×720 thumbnail.png |
+| 10 | upload | Upload video.mp4 + thumbnail.png to YouTube |
+| 11 | cleanup | Remove renders folder + pipeline state |
+
 ## Output Directory
 
 - `youtube/`: Root folder for all YouTube-related content (thumbnails, video files).

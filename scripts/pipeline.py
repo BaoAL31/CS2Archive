@@ -13,9 +13,10 @@ Steps (use --step N to start at a specific step):
   5 = analyze     csdm analyze the demo
   6 = render      Render all rounds as POV clips
   7 = concat      Concatenate rounds, copy to youtube/
-  8 = thumbnail   Generate 1280x720 thumbnail
-  9 = upload      Upload to YouTube (--privacy, auto-generates title + description)
-  10 = cleanup    Remove renders folder + pipeline state
+  8 = outro       Generate 5s silent outro, concat onto video.mp4
+  9 = thumbnail   Generate 1280x720 thumbnail
+  10 = upload     Upload to YouTube (--privacy, auto-generates title + description)
+  11 = cleanup    Remove renders folder + pipeline state
 """
 
 from __future__ import annotations
@@ -47,9 +48,10 @@ STEPS = {
     5: "analyze",
     6: "render",
     7: "concat",
-    8: "thumbnail",
-    9: "upload",
-    10: "cleanup",
+    8: "outro",
+    9: "thumbnail",
+    10: "upload",
+    11: "cleanup",
 }
 
 
@@ -330,7 +332,46 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
         vid_size = (self.youtube_dir / "video.mp4").stat().st_size
         print(f"  [OK] Copied video.mp4 ({vid_size / 1e9:.1f} GB)")
 
-    # ── Step 8: Thumbnail ────────────────────────────────────────────────
+    # ── Step 8: Outro ────────────────────────────────────────────────────
+
+    def step_outro(self) -> None:
+        video = self.youtube_dir / "video.mp4"
+        if not video.exists():
+            fail(8, "OUTRO_VIDEO_MISSING", f"video.mp4 not found in {self.youtube_dir}")
+
+        self._run_py(["scripts/generate_outro.py", str(video)], timeout=120)
+
+        outro = self.youtube_dir / "outro.mp4"
+        if not outro.exists():
+            fail(8, "OUTRO_CLIP_MISSING", f"outro.mp4 not generated in {self.youtube_dir}")
+        if outro.stat().st_size < 1000:
+            fail(8, "OUTRO_TOO_SMALL", f"outro.mp4 too small: {outro.stat().st_size} bytes")
+
+        # Concat video + outro (stream copy, crash-safe via temp file)
+        temp = self.youtube_dir / "video.temp.mp4"
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write(f"file '{video.resolve()}'\n")
+            f.write(f"file '{outro.resolve()}'\n")
+            list_path = f.name
+
+        r = subprocess.run(
+            ["ffmpeg", "-f", "concat", "-safe", "0", "-i", list_path,
+             "-c", "copy", str(temp)],
+            capture_output=True, text=True, timeout=3600,
+        )
+        Path(list_path).unlink(missing_ok=True)
+
+        if r.returncode != 0:
+            temp.unlink(missing_ok=True)
+            fail(8, "OUTRO_CONCAT_FAILED", f"ffmpeg concat failed: {r.stderr[-300:]}")
+
+        temp.replace(video)
+        outro.unlink()
+
+        vid_mb = video.stat().st_size / 1024 / 1024
+        print(f"  [OK] Outro appended, video.mp4 ({vid_mb:.0f} MB)")
+
+    # ── Step 9: Thumbnail ────────────────────────────────────────────────
 
     def step_thumbnail(self) -> None:
         self.youtube_dir.mkdir(parents=True, exist_ok=True)
@@ -350,19 +391,19 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
 
         r = self._run_py(cmd, timeout=300)
         if r.returncode != 0:
-            fail(8, "THUMBNAIL_FAILED", f"thumbnail generator exited {r.returncode}")
+            fail(9, "THUMBNAIL_FAILED", f"thumbnail generator exited {r.returncode}")
 
         if not thumb.exists():
-            fail(8, "THUMBNAIL_MISSING", f"thumbnail.png not created at {thumb}")
+            fail(9, "THUMBNAIL_MISSING", f"thumbnail.png not created at {thumb}")
         if thumb.stat().st_size < 1000:
-            fail(8, "THUMBNAIL_TOO_SMALL", f"thumbnail.png too small: {thumb.stat().st_size} bytes")
+            fail(9, "THUMBNAIL_TOO_SMALL", f"thumbnail.png too small: {thumb.stat().st_size} bytes")
 
         # Verify dimensions via Pillow
         try:
             from PIL import Image
             im = Image.open(thumb)
             if im.size != (1280, 720):
-                fail(8, "THUMBNAIL_BAD_SIZE", f"thumbnail dimensions {im.size} != expected 1280x720")
+                fail(9, "THUMBNAIL_BAD_SIZE", f"thumbnail dimensions {im.size} != expected 1280x720")
         except ImportError:
             pass
 
@@ -405,16 +446,16 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
         meta_path.write_text(json.dumps(upload_meta, indent=2))
         print(f"  [OK] upload_meta.json written")
 
-    # ── Step 9: Upload ──────────────────────────────────────────────────
+    # ── Step 10: Upload ─────────────────────────────────────────────────
 
     def step_upload(self) -> None:
         video = self.youtube_dir / "video.mp4"
         thumb = self.youtube_dir / "thumbnail.png"
 
         if not video.exists():
-            fail(9, "UPLOAD_VIDEO_MISSING", f"video not found: {video}")
+            fail(10, "UPLOAD_VIDEO_MISSING", f"video not found: {video}")
         if video.stat().st_size < 100000:
-            fail(9, "UPLOAD_VIDEO_TOO_SMALL", f"video too small: {video.stat().st_size} bytes")
+            fail(10, "UPLOAD_VIDEO_TOO_SMALL", f"video too small: {video.stat().st_size} bytes")
 
         meta_path = self.youtube_dir / "upload_meta.json"
         if not meta_path.exists():
@@ -444,7 +485,7 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
         out = "".join(out_lines)
 
         if proc.returncode != 0:
-            fail(9, "UPLOAD_FAILED", f"upload exited {proc.returncode}: {out[:300]}")
+            fail(10, "UPLOAD_FAILED", f"upload exited {proc.returncode}: {out[:300]}")
 
         m = re.search(r"https://youtu\.be/([a-zA-Z0-9_-]+)", out)
         if m:
@@ -452,9 +493,9 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
             self.state["data"]["youtube_id"] = vid_id
             print(f"  [OK] Uploaded: https://youtu.be/{vid_id}")
         else:
-            fail(9, "UPLOAD_NO_VIDEO_ID", f"could not extract video ID from output: {out[:200]}")
+            fail(10, "UPLOAD_NO_VIDEO_ID", f"could not extract video ID from output: {out[:200]}")
 
-    # ── Step 10: Cleanup ─────────────────────────────────────────────────
+    # ── Step 11: Cleanup ────────────────────────────────────────────────
 
     def step_cleanup(self) -> None:
         removed = []
@@ -470,9 +511,9 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
 
         # Verify removal
         if self.render_dir.exists():
-            fail(10, "CLEANUP_RENDER_DIR_FAILED", f"render dir still exists after rmtree: {self.render_dir}")
+            fail(11, "CLEANUP_RENDER_DIR_FAILED", f"render dir still exists after rmtree: {self.render_dir}")
         if state_path.exists():
-            fail(10, "CLEANUP_STATE_FAILED", f"pipeline state file still exists: {state_path}")
+            fail(11, "CLEANUP_STATE_FAILED", f"pipeline state file still exists: {state_path}")
         if not removed:
             print("  Nothing to clean up")
         else:
@@ -487,8 +528,8 @@ def main() -> None:
     parser.add_argument("--steam-id", required=True, help="Steam64 ID")
     parser.add_argument("--demo", required=True, help="Path to .dem file")
     parser.add_argument("--tournament", default="", help="Tournament name (e.g. IEM Atlanta 2026)")
-    parser.add_argument("--step", type=int, default=1, choices=range(1, 11),
-                        help="Start from step N (1=extract..10=cleanup)")
+    parser.add_argument("--step", type=int, default=1, choices=range(1, 12),
+                        help="Start from step N (1=extract..11=cleanup)")
     parser.add_argument("--privacy", choices=["private", "unlisted", "public"], default="public")
     parser.add_argument("--batches", type=int, default=1,
                         help="Rounds per batch (1 = one round at a time, default: 1)")

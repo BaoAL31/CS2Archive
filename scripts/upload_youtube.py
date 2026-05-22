@@ -38,15 +38,19 @@ RETRIABLE_EXCEPTIONS = (
 RETRIABLE_STATUS_CODES = [500, 502, 503, 504]
 MAX_RETRIES = 10
 
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload", "https://www.googleapis.com/auth/youtube"]
+SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+THUMB_SCOPES = ["https://www.googleapis.com/auth/youtube"]
 CLIENT_SECRET = "client_secret.json"
 TOKEN_FILE = "token_youtube.json"
+THUMB_TOKEN_FILE = "token_youtube_thumb.json"
 
 
-def get_authenticated_service() -> googleapiclient.discovery.Resource:
+def get_authenticated_service(scopes: list[str] | None = None, token_file: str | None = None) -> googleapiclient.discovery.Resource:
+    scopes = scopes or SCOPES
+    token_file = token_file or TOKEN_FILE
     creds = None
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    if os.path.exists(token_file):
+        creds = Credentials.from_authorized_user_file(token_file, scopes)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
@@ -54,9 +58,9 @@ def get_authenticated_service() -> googleapiclient.discovery.Resource:
             if not os.path.exists(CLIENT_SECRET):
                 print(f"[ERROR] {CLIENT_SECRET} not found. Download it from Google Cloud Console.")
                 sys.exit(1)
-            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET, SCOPES)
+            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET, scopes)
             creds = flow.run_local_server(port=random.randint(5000, 9999), open_browser=True)
-        with open(TOKEN_FILE, "w") as f:
+        with open(token_file, "w") as f:
             f.write(creds.to_json())
     return build("youtube", "v3", credentials=creds)
 
@@ -235,6 +239,7 @@ def main() -> None:
         if not Path(args.thumbnail).exists():
             print(f"[ERROR] Thumbnail not found: {args.thumbnail}", flush=True)
             sys.exit(1)
+        youtube = get_authenticated_service(scopes=THUMB_SCOPES, token_file=THUMB_TOKEN_FILE)
         _update_thumbnail(youtube, args.update_thumbnail, args.thumbnail)
         print("Done!", flush=True)
         return

@@ -6,7 +6,7 @@
 
 `python scripts/pipeline.py <player> <map> <hltv_url> --steam-id <id> --demo <dem_path> [--tournament "IEM Atlanta 2026"] [--step N] [--privacy public]`
 
-Runs steps 1-10 in order. Resumable — state saved to `.pipeline_{run_id}.json`. Use `--step N` to start at a specific step.
+Runs steps 1-11 in order. Resumable — state saved to `.pipeline/{run_id}.json`. Use `--step N` to start at a specific step.
 
 | Step | Name | Script for manual use / debugging |
 |---|---|---|
@@ -17,9 +17,10 @@ Runs steps 1-10 in order. Resumable — state saved to `.pipeline_{run_id}.json`
 | 5 | analyze | `csdm analyze <demo>` |
 | 6 | render | `python scripts/render_pov.py <demo> <steam_id>` |
 | 7 | concat | `python scripts/concat_rounds.py <renders_folder>` |
-| 8 | thumbnail | `python -m thumbnail <url> --player <nick> --map <map> --demo <dem> --steam-id <id>` |
-| 9 | upload | `python scripts/upload_youtube.py <video> --title <t> --thumbnail <thumb.png>` |
-| 10 | cleanup | `python scripts/cleanup_renders.py <renders_folder>` |
+| 8 | outro | `python scripts/generate_outro.py <video.mp4>` |
+| 9 | thumbnail | `python -m thumbnail <url> --player <nick> --map <map> --demo <dem> --steam-id <id>` |
+| 10 | upload | `python scripts/upload_youtube.py <video> --title <t> --thumbnail <thumb.png>` |
+| 11 | cleanup | `python scripts/cleanup_renders.py <renders_folder>` |
 
 ### Structured Errors (agent-parseable)
 
@@ -29,7 +30,7 @@ Every pipeline step validates its output and exits with a single JSON error line
 [PIPELINE_ERROR] {"error":true,"step":5,"step_name":"analyze","code":"ANALYZE_NO_ROUNDS","message":"csdm analysis has zero rounds"}
 ```
 
-Grep for `[PIPELINE_ERROR]` and parse the JSON. Each error has a unique `code` for programmatic handling (e.g. `RENDER_STEAM_NOT_RUNNING`, `THUMBNAIL_MISSING`, `UPLOAD_NO_VIDEO_ID`).
+Grep for `[PIPELINE_ERROR]` and parse the JSON. Each error has a unique `code` for programmatic handling (e.g. `RENDER_STEAM_NOT_RUNNING`, `OUTRO_CONCAT_FAILED`, `THUMBNAIL_MISSING`, `UPLOAD_NO_VIDEO_ID`).
 
 ### Example
 
@@ -43,6 +44,7 @@ python scripts/pipeline.py w0nderful Anubis "https://www.hltv.org/matches/239417
 - `--demo` accepts `.dem` or `.rar` (auto-extracts matching map).
 - Render step verifies Steam is running before starting.
 - Each step validates its output before proceeding — failures halt the pipeline.
+- **Resume rule: ALWAYS check `.pipeline/{run_id}.json` before deleting any saved progress (combined.mp4, rendered clips, etc.). The pipeline state tells you which step was last completed. Run `python scripts/pipeline.py <args> --step <N>` (with the SAME args as the original) to resume from that step. render_pov.py supports `--resume-from-round` for mid-render resumption, but this is NOT exposed through pipeline.py — if a render was mid-way, pass `--step 6` and render_pov.py will re-render from scratch (or use render_pov.py directly with `--resume-from-round`).
 
 ## Individual Step Scripts (Debugging / Manual Use)
 
