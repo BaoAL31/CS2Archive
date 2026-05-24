@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import argparse
+from pathlib import Path
 
 from rich.console import Console
 
@@ -24,6 +25,13 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
 
     hltv_match = sub.add_parser("match", help="Download demo from a match URL")
     hltv_match.add_argument("url", help="HLTV match page URL")
+    hltv_match.add_argument("--force", action="store_true", help="Re-download even if archive exists")
+    hltv_match.add_argument("--headless", action="store_true", help="Run CloakBrowser headless (default: visible)")
+    hltv_match.add_argument(
+        "--profile-dir",
+        default=None,
+        help="CloakBrowser profile directory (default: .cloak-hltv-profile)",
+    )
 
     hltv_player = sub.add_parser("player", help="Find & download demos for a player")
     hltv_player.add_argument("name", help="Player name")
@@ -35,19 +43,28 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
 
 def handle(args: argparse.Namespace) -> None:
     if args.action == "match":
-        asyncio.run(_cmd_match(args.url))
+        profile = Path(args.profile_dir) if args.profile_dir else None
+        asyncio.run(_cmd_match(args.url, force=args.force, headless=args.headless, profile_dir=profile))
     elif args.action == "player":
         asyncio.run(_cmd_player(args.name, args.count))
     elif args.action == "event":
         asyncio.run(_cmd_event(args.url))
 
 
-async def _cmd_match(url: str) -> None:
+async def _cmd_match(
+    url: str,
+    *,
+    force: bool = False,
+    headless: bool = False,
+    profile_dir: Path | None = None,
+) -> None:
     from scrapers.hltv import HLTVScraper
 
     scraper = HLTVScraper()
     try:
-        result = await scraper.get_match_demo(url)
+        result = await scraper.get_match_demo(
+            url, force=force, headless=headless, profile_dir=profile_dir,
+        )
         print_result_summary([result])
     finally:
         await scraper.close()

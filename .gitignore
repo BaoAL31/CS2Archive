@@ -38,6 +38,9 @@ vault/
 # Pipeline state
 .pipeline/
 
+# CloakBrowser HLTV session
+.cloak-hltv-profile/
+
 # IDE
 .vscode/
 .idea/

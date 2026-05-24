@@ -14,13 +14,27 @@
 - **Layout**: Player cutout on the left (90% height), 5-6 line text block middle-aligned on the right (player name, K-D, rating, map, match, tournament).
 - **Output Structure**: `youtube/{match-slug}_{player}_{map}/thumbnail.png`
 
+## Backlog & Resume
+
+- **Backlog Entry**: A handoff markdown file in `backlog/{priority}/{slug}.md` describing one POV to produce.
+- **Backlog Priority**: Entries are organized into `high/` (rating >=1.5), `medium/` (rating 1.0-1.49), or `low/` (rating <1.0).
+- **Progress File**: A thin JSON index at `backlog/{slug}.progress.json` pointing at a POV's `run_id`, next pipeline step, render resume round, and human-readable status. Agents read this to resume without retyping CLI flags.
+- **Pipeline State File**: Authoritative machine state at `.pipeline/{run_id}.json` (paths, round count, youtube dir). The pipeline reads/writes this; the Progress File does not duplicate it.
+- **Acquisition** (pipeline step 1): Browser-based download of the match GOTV archive from the HLTV match URL, then unpack and map selection. Replaces manual "download RAR in browser, drop into `demos/`".
+- **Demo path override**: Optional `--demo` on the pipeline CLI. When omitted, step 1 acquires from the HLTV URL and selects the `.dem` for `--map`. When set to an existing `.dem` or `.rar`, step 1 skips download and uses that file (extract + map pick only for `.rar`).
+- **HLTV profile**: Persistent browser session directory reused across acquisition runs so HLTV cookies and session stay warm between downloads.
+- **Match demo folder**: Directory for one HLTV match's acquired archive and extracted `.dem` files: `demos/hltv/<match-slug>/`. Multiple POVs on different maps from the same match share this folder; acquisition skips re-download when the archive or target map `.dem` is already present.
+- **Acquisition browser mode**: Default is a visible browser with human-like input (best chance on HLTV). Optional headless mode for unattended runs once downloads are trusted.
+- **HLTV acquisition entry points**: Pipeline step 1 and `hltv match` both use the same acquisition behavior (download, extract, map pick vs download-only).
+- **Acquisition force**: `--force` on pipeline or `hltv match` re-downloads the archive even when one already exists. Undersized archives are treated as failed downloads, not as cache hits.
+
 ## Pipeline Steps
 
-Steps run in order. State is persisted in `.pipeline/{run_id}.json` for resume.
+Steps run in order. Resume uses the Pipeline State File; the Progress File links a Backlog Entry to that state.
 
 | # | Name | Description |
 |---|------|-------------|
-| 1 | extract | Extract .rar, find correct .dem for the map |
+| 1 | acquire | Download match demo archive from HLTV (if not already local), extract it, select the `.dem` for the target map |
 | 2 | ratings | Scrape HLTV Rating 3.0 |
 | 3 | steam_id | Save player Steam64 to player list |
 | 4 | avatar | Download player cutout PNG from HLTV |

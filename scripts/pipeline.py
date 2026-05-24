@@ -6,7 +6,7 @@ Usage:
     python scripts/pipeline.py <player> <map> <hltv_url> --steam-id <id> --demo <dem_path> [options]
 
 Steps (use --step N to start at a specific step):
-  1 = extract     Extract .rar, find the right .dem for the map
+  1 = acquire     Download from HLTV (CloakBrowser), extract, pick .dem for map
   2 = ratings     Scrape HLTV Rating 3.0
   3 = steam_id    Save player Steam64 to player list
   4 = avatar      Download player cutout PNG from HLTV
@@ -33,6 +33,8 @@ import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 STATE_DIR = PROJECT_ROOT / ".pipeline"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 os.chdir(str(PROJECT_ROOT))
@@ -41,7 +43,7 @@ CSDM = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
 PY = sys.executable
 
 STEPS = {
-    1: "extract",
+    1: "acquire",
     2: "ratings",
     3: "steam_id",
     4: "avatar",
@@ -99,21 +101,28 @@ class Pipeline:
         self.args = args
         self.steam_id = args.steam_id
         self.start_step = args.step
+        self.end_step = args.until if args.until is not None else max(STEPS.keys())
 
         slug = args.hltv_url.rstrip("/").split("/")[-1]
         self.ratings_json = PROJECT_ROOT / "demos" / "analysis" / f"{slug}_ratings.json"
 
         self.demo_path: Path | None = None
-        self.rar_path: Path | None = None
-        src = Path(args.demo)
-        if src.suffix.lower() == ".dem":
-            self.demo_path = src
-        elif src.suffix.lower() == ".rar":
-            self.rar_path = src
-        else:
-            fail(0, "INVALID_DEMO_PATH", f"Unsupported file: {src.suffix} (use .rar or .dem)")
+        self.demo_override: Path | None = None
+        if args.demo:
+            src = Path(args.demo)
+            if src.suffix.lower() not in (".dem", ".rar"):
+                fail(0, "INVALID_DEMO_PATH", f"Unsupported file: {src.suffix} (use .rar or .dem)")
+            self.demo_override = src
+            if src.suffix.lower() == ".dem":
+                self.demo_path = src
 
-        stem = (self.demo_path or self.rar_path).stem
+        from scrapers.hltv_acquire import match_slug_from_url
+
+        stem = (
+            self.demo_path.stem
+            if self.demo_path
+            else (self.demo_override.stem if self.demo_override else match_slug_from_url(args.hltv_url))
+        )
         self.run_id = run_id_from_name(f"{stem}_{args.player}_{args.map}")
         self.state = load_state(self.run_id)
         self.state.setdefault("data", {})
@@ -129,7 +138,9 @@ class Pipeline:
         self.state["data"]["youtube_dir"] = str(self.youtube_dir)
 
     def run(self) -> None:
-        for step_num in range(self.start_step, max(STEPS.keys()) + 1):
+        if self.end_step < self.start_step:
+            fail(0, "INVALID_STEP_RANGE", f"--until {self.end_step} is before --step {self.start_step}")
+        for step_num in range(self.start_step, self.end_step + 1):
             step_name = STEPS[step_num]
             print(f"\n{'='*60}")
             print(f"  Step {step_num}/{max(STEPS.keys())}: {step_name}")
@@ -150,40 +161,41 @@ class Pipeline:
             kwargs["encoding"] = "utf-8"
         return subprocess.run([PY] + args, **kwargs)
 
-    # ── Step 1: Extract ──────────────────────────────────────────────────
+    # ── Step 1: Acquire ────────────────────────────────────────────────────
 
-    def step_extract(self) -> None:
-        if self.demo_path:
-            print("  Already a .dem, skipping")
-            return
+    def step_acquire(self) -> None:
+        from scrapers.hltv_acquire import DEFAULT_PROFILE_DIR, resolve_demo_for_pov
 
-        if self.rar_path is None:
-            fail(1, "EXTRACT_NO_RAR", "no .rar path set")
-
-        import patoolib
-        out = PROJECT_ROOT / "demos" / "hltv"
-        out.mkdir(parents=True, exist_ok=True)
+        profile_dir = Path(self.args.profile_dir) if self.args.profile_dir else DEFAULT_PROFILE_DIR
 
         try:
-            patoolib.extract_archive(str(self.rar_path), outdir=str(out))
+            self.demo_path = resolve_demo_for_pov(
+                self.args.hltv_url,
+                self.args.map,
+                demo_override=self.demo_override,
+                force=self.args.force,
+                headless=self.args.headless,
+                profile_dir=profile_dir,
+            )
+        except FileNotFoundError as e:
+            fail(1, "ACQUIRE_DEMO_NOT_FOUND", str(e))
+        except ValueError as e:
+            msg = str(e)
+            if "map" in msg.lower() and ".dem" in msg.lower():
+                fail(1, "ACQUIRE_MAP_NOT_FOUND", msg)
+            fail(1, "ACQUIRE_FAILED", msg)
         except Exception as e:
-            fail(1, "EXTRACT_RAR_FAILED", f"patool extract failed: {e}")
+            fail(1, "ACQUIRE_DOWNLOAD_FAILED", str(e))
 
-        files = sorted(out.glob(f"*{self.args.map.lower()}*.dem"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if len(files) == 0:
-            fail(1, "EXTRACT_MAP_NOT_FOUND", f"no .dem for map '{self.args.map}' in {self.rar_path.name}")
-
-        self.demo_path = files[0]
         self.state["data"]["demo_path"] = str(self.demo_path)
         self.render_dir = PROJECT_ROOT / "demos" / "renders" / f"pov-{self.demo_path.stem}"
         self.state["data"]["render_dir"] = str(self.render_dir)
-        print(f"  [OK] Extracted: {self.demo_path.name}")
+        print(f"  [OK] Demo: {self.demo_path}")
 
-        # Post-step validation
         if not self.demo_path.exists():
-            fail(1, "EXTRACT_DEM_MISSING", f"dem file vanished after extract: {self.demo_path}")
+            fail(1, "ACQUIRE_DEM_MISSING", f"dem file vanished after acquire: {self.demo_path}")
         if self.demo_path.stat().st_size < 1024:
-            fail(1, "EXTRACT_DEM_TOO_SMALL", f"dem file suspiciously small: {self.demo_path.stat().st_size} bytes")
+            fail(1, "ACQUIRE_DEM_TOO_SMALL", f"dem suspiciously small: {self.demo_path.stat().st_size} bytes")
 
     # ── Step 2: Ratings ──────────────────────────────────────────────────
 
@@ -293,8 +305,13 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
         if "steam.exe" not in steam_check.stdout:
             fail(6, "RENDER_STEAM_NOT_RUNNING", "Steam must be running before rendering")
 
-        r = self._run_py(["scripts/render_pov.py", str(self.demo_path), self.steam_id,
-                          "--batches", str(self.args.batches)], timeout=43200)
+        render_args = [
+            "scripts/render_pov.py", str(self.demo_path), self.steam_id,
+            "--batches", str(self.args.batches),
+        ]
+        if self.args.resume_from_round > 1:
+            render_args.extend(["--resume-from-round", str(self.args.resume_from_round)])
+        r = self._run_py(render_args, timeout=43200)
         if r.returncode != 0:
             fail(6, "RENDER_FAILED", f"render_pov.py exited {r.returncode}")
 
@@ -526,10 +543,25 @@ def main() -> None:
     parser.add_argument("map", help="Map name (e.g. Anubis)")
     parser.add_argument("hltv_url", help="HLTV match URL")
     parser.add_argument("--steam-id", required=True, help="Steam64 ID")
-    parser.add_argument("--demo", required=True, help="Path to .dem file")
+    parser.add_argument(
+        "--demo",
+        default=None,
+        help="Optional local .dem or .rar override (omit to download from HLTV URL)",
+    )
     parser.add_argument("--tournament", default="", help="Tournament name (e.g. IEM Atlanta 2026)")
     parser.add_argument("--step", type=int, default=1, choices=range(1, 12),
-                        help="Start from step N (1=extract..11=cleanup)")
+                        help="Start from step N (1=acquire..11=cleanup)")
+    parser.add_argument("--until", type=int, default=None, choices=range(1, 11),
+                        help="Stop after step N (default: 11). E.g. --until 9 stops before upload.")
+    parser.add_argument("--resume-from-round", type=int, default=1,
+                        help="Resume render from round N (step 6 only)")
+    parser.add_argument("--force", action="store_true", help="Re-download HLTV archive even if present")
+    parser.add_argument("--headless", action="store_true", help="CloakBrowser headless (default: visible)")
+    parser.add_argument(
+        "--profile-dir",
+        default=None,
+        help="CloakBrowser profile dir (default: .cloak-hltv-profile)",
+    )
     parser.add_argument("--privacy", choices=["private", "unlisted", "public"], default="public")
     parser.add_argument("--batches", type=int, default=1,
                         help="Rounds per batch (1 = one round at a time, default: 1)")
@@ -538,8 +570,8 @@ def main() -> None:
     print(f"{'='*60}")
     print(f"  CS2Archive Pipeline")
     print(f"  Player: {args.player} | Map: {args.map}")
-    print(f"  Demo:   {args.demo}")
-    print(f"  Step:   {args.step}")
+    print(f"  Demo:   {args.demo or '(acquire from HLTV)'}")
+    print(f"  Step:   {args.step}" + (f" -> {args.until}" if args.until else " -> 11"))
     print(f"{'='*60}")
 
     Pipeline(args).run()
