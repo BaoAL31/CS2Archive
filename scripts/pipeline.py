@@ -89,6 +89,12 @@ def run_id_from_name(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "_", name)[:80].strip("_")
 
 
+def pov_render_dir(dem_stem: str, player: str) -> Path:
+    """Per-POV render folder — one demo can produce multiple player POVs."""
+    player_slug = run_id_from_name(player)
+    return PROJECT_ROOT / "demos" / "renders" / f"pov-{dem_stem}_{player_slug}"
+
+
 def _find_steam_cmd() -> str | None:
     for p in [r"C:\Program Files (x86)\Steam\steam.exe", r"C:\Program Files\Steam\steam.exe"]:
         if Path(p).exists():
@@ -132,7 +138,7 @@ class Pipeline:
 
         dp = self.state["data"].get("demo_path") or (str(self.demo_path) if self.demo_path else "")
         dem_stem = Path(dp).stem if dp else stem
-        self.render_dir = PROJECT_ROOT / "demos" / "renders" / f"pov-{dem_stem}"
+        self.render_dir = pov_render_dir(dem_stem, args.player)
         self.youtube_dir = PROJECT_ROOT / "youtube" / self.run_id
         self.state["data"]["render_dir"] = str(self.render_dir)
         self.state["data"]["youtube_dir"] = str(self.youtube_dir)
@@ -188,7 +194,7 @@ class Pipeline:
             fail(1, "ACQUIRE_DOWNLOAD_FAILED", str(e))
 
         self.state["data"]["demo_path"] = str(self.demo_path)
-        self.render_dir = PROJECT_ROOT / "demos" / "renders" / f"pov-{self.demo_path.stem}"
+        self.render_dir = pov_render_dir(self.demo_path.stem, self.args.player)
         self.state["data"]["render_dir"] = str(self.render_dir)
         print(f"  [OK] Demo: {self.demo_path}")
 
@@ -307,6 +313,7 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
 
         render_args = [
             "scripts/render_pov.py", str(self.demo_path), self.steam_id,
+            "--output", str(self.render_dir),
             "--batches", str(self.args.batches),
         ]
         if self.args.resume_from_round > 1:

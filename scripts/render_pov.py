@@ -227,7 +227,7 @@ def main() -> None:
         output_dir = Path(args.output)
     else:
         stem = Path(parts[0]).stem.replace("-p1", "").replace(".dem", "")
-        output_dir = Path("demos/renders") / f"pov-{stem}"
+        output_dir = Path("demos/renders") / f"pov-{stem}_{args.steam_id}"
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output:  {output_dir}")
 

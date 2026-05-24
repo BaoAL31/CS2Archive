@@ -4,6 +4,7 @@
 
 - **Match**: A CS2 pro match between two teams on HLTV or FACEIT. Has a URL, team names, maps, and a unique slug.
 - **POV** (Point of View): A specific (match, player, map) tuple. The unit a thumbnail/video is generated for.
+- **Render Folder**: Working directory for POV video renders: `demos/renders/pov-{demo-stem}_{player}/`. Scoped per POV (not per demo) so multiple players on the same `.dem` never share `combined.mp4`.
 - **Ratings File**: JSON file in `demos/analysis/{match-slug}_ratings.json` containing per-map player stats from HLTV Rating 3.0.
 - **Avatar**: HLTV full-body player photo stored in `demos/avatars/{nickname}.png`. Background is removed with `rembg` during download (step 4), not at thumbnail time.
 - **Background Frame**: A single frame extracted from a csdm-rendered kill clip, blurred (radius 6) and used as the thumbnail background.

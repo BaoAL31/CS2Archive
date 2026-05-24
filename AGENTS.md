@@ -45,6 +45,7 @@ python scripts/pipeline.py w0nderful Anubis "https://www.hltv.org/matches/239417
 - Render step verifies Steam is running before starting.
 - Each step validates its output before proceeding — failures halt the pipeline.
 - **Resume rule: ALWAYS check `.pipeline/{run_id}.json` before deleting any saved progress (combined.mp4, rendered clips, etc.). The pipeline state tells you which step was last completed. Run `python scripts/pipeline.py <args> --step <N>` (with the SAME args as the original) to resume from that step.
+- **Render folder per POV** — `demos/renders/pov-{demo-stem}_{player}/` (not demo-only). Multiple POVs on the same map share the match demo folder but never share a render folder. Legacy `pov-{demo-stem}/` (no player suffix) may still exist from older runs; safe to delete after confirming youtube output.
 - **`--resume-from-round N`** (step 6 only) — passed through to `render_pov.py` to continue a partial render without re-recording earlier rounds.
 - **`--until N`** — stop after step N (e.g. `--until 9` runs through thumbnail, skips upload/cleanup). Default: run through step 11.
 
