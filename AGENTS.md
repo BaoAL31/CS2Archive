@@ -46,7 +46,8 @@ python scripts/pipeline.py w0nderful Anubis "https://www.hltv.org/matches/239417
 - Each step validates its output before proceeding — failures halt the pipeline.
 - **Resume rule: ALWAYS check `.pipeline/{run_id}.json` before deleting any saved progress (combined.mp4, rendered clips, etc.). The pipeline state tells you which step was last completed. Run `python scripts/pipeline.py <args> --step <N>` (with the SAME args as the original) to resume from that step.
 - **Render folder per POV** — `demos/renders/pov-{demo-stem}_{player}/` (not demo-only). Multiple POVs on the same map share the match demo folder but never share a render folder. Legacy `pov-{demo-stem}/` (no player suffix) may still exist from older runs; safe to delete after confirming youtube output.
-- **`--resume-from-round N`** (step 6 only) — passed through to `render_pov.py` to continue a partial render without re-recording earlier rounds.
+- **`--resume-from-round N`** — deprecated. Render now uses filesystem-based resume: existing `batch-*.mp4` files ≥1MB are automatically skipped on re-run. To re-render a specific batch, manually delete its file.
+- **`--batches N`** — rounds per render batch (default: 3). Each batch produces one MP4 named `batch-{start:03d}-{end:03d}.mp4`. `--batches 1` is equivalent to the old per-round model.
 - **`--until N`** — stop after step N (e.g. `--until 9` runs through thumbnail, skips upload/cleanup). Default: run through step 11.
 
 ### Chaining pipelines (upload overlap)
@@ -86,8 +87,8 @@ Use these when debugging a specific pipeline step failure or running steps manua
 3. **Avatars** — `scrapers/player_images.py`. Uses Playwright + `rembg`. Navigates **player page** (via `img.player-photo` → `closest('a')` → `href`) to capture 400×417 transparent PNG via response interception. Each player gets a **fresh BrowserContext** (`Cache-Control: no-cache`) to prevent stale cache from suppressing `response` events. Falls back to match page → rembg if player page fails. Saved as `{nickname}.png` in `demos/avatars/`.
 4. **Player Steam ID** — `python main.py player add <nickname> --steam <url>` or `python main.py player list`. Extract from demo: `python scripts/extract_steamids.py <demo_path>`.
 5. **CSDM Analysis** — `csdm analyze <demo>`. For PGL demos (PBDEMS2 format): `csdm analyze <demo> --source challengermode`.
-6. **Render POV Clip** — `python scripts/render_pov.py <demo_path> <steam_id>`. Renders each round as separate clip. Resume from specific round: `--rounds 10-18`. For kill compilations: `csdm video "<demo_path>" --mode player --steamids <id> --event kills ...`
-7. **Concatenate Rounds** — `python scripts/concat_rounds.py <renders_folder>` → `combined.mp4` (ffmpeg stream copy, lossless).
+6. **Render POV Clip** — `python scripts/render_pov.py <demo_path> <steam_id> [--batches 3]`. Renders rounds in batches; each batch produces one `batch-{start}-{end}.mp4` file. Filesystem-based resume: existing `batch-*.mp4` files ≥1MB are automatically skipped.
+7. **Concatenate Rounds** — `python scripts/concat_rounds.py <renders_folder>` → `combined.mp4` (incremental batch-by-batch concat with gap/overlap validation, then upscale to 1440p). Each batch file is deleted after successful append.
 8. **Generate Thumbnail** — `python -m thumbnail <match_url> --player <nick> --map <map> --demo <dem> --steam-id <id> [--tournament "IEM Atlanta 2026"]`. Auto-extracts random kill frame as blurred background. Or `--background <frame.jpg>`.
    Example: `python -m thumbnail "https://www.hltv.org/matches/2394166/faze-vs-vitality-iem-atlanta-2026" --player ropz --map Nuke --demo demos/hltv/.../faze-vs-vitality-m1-nuke-p2.dem --steam-id 76561197991272318 --tournament "IEM Atlanta 2026"`
 9. **Generate Title & Description** — `python scripts/generate_title.py <ratings_json> --player <nick> --map <map> [--tournament "..."]`. Outputs JSON with `title` and `description` from ratings data.
@@ -125,34 +126,27 @@ C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd
 
 ### Recording Mode
 
-Uses `--recording-system CS` — csdm captures frames directly to video via FFmpeg. **No intermediate TGA/PNG files are written to disk.** Previous HLAE approach broke after CS2 updates (produced "Raw files not found" errors).
+Uses `--recording-system HLAE` — csdm drives HLAE `mirv_streams` to encode directly to video via FFmpeg (no TGA/PNG sequence on disk).
 
-### HLAE Status Check (render step pre-check)
+**Critical:** `--output` must be an **absolute** path. Relative paths (e.g. `demos/renders/...`) resolve from the CS2 install directory and cause `AFXERROR: Failed writing image for screen recording` → csdm **Raw files not found**. `render_pov.py` and the pipeline always pass `Path.resolve()` output dirs.
 
-**Before every render step (step 6), check if HLAE is fixed:**
-
-1. Fetch the latest HLAE release tag: `https://api.github.com/repos/advancedfx/advancedfx/releases/latest` → parse `tag_name`
-2. Compare with installed version `2.190.0` at `C:\Program Files (x86)\HLAE\HLAE.exe`
-3. If newer: test `--recording-system HLAE` on a 1-round render. If it works, update this doc, revert `render_pov.py` to `HLAE`, and remove this check.
-4. If same: stay on CS, no action needed.
-
-Purpose: CS2 updates (especially engine/tool string changes) silently break AfxHookSource2.dll. Without this check, render produces zero frames silently.
+HLAE **2.190.1+** required (`C:\Program Files (x86)\HLAE\HLAE.exe`). Disable RTSS/MSI OSD and Steam/Xbox overlays if capture fails. After CS2 updates, if HLAE breaks again, test one round with absolute output before full pipeline runs.
 
 ### VP9 Trick (sharper YouTube uploads)
 
 Render at **2560×1440** even for 1080p-targeted uploads. YouTube allocates VP9 codec (higher bitrate) to 1440p+ uploads, while 1080p gets H.264. Video looks sharper even when watched at 1080p because YouTube uses better encoding.
 
-All scripts default to 2560×1440, 60 fps, libx264 CRF 18.
+All scripts default to 2560×1440; per-round render and concat upscale use **h264_nvenc CQ 18** (match quality end-to-end).
 
-### Rounds-Only POV (full HUD, no x-ray, one round at a time)
+### Rounds-Only POV (full HUD, no x-ray, batch rendering)
 
-For rendering a player's POV with full HUD (radar, health, ammo) and no x-ray, one round at a time to avoid disk I/O saturation:
+For rendering a player's POV with full HUD (radar, health, ammo) and no x-ray, in configurable batch sizes (default 3 rounds per csdm call):
 
 ```powershell
-& "C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd" video "<demo_path>" --mode player --steamids <steam64_id> --event rounds --rounds <N> --perspective player --no-show-x-ray --output "demos\renders\pov-folder" --framerate 60 --width 2560 --height 1440 --recording-system CS --close-game-after-recording --no-show-only-death-notices --show-assists --record-audio --concatenate-sequences --ffmpeg-video-codec libx264 --ffmpeg-crf 18 --ffmpeg-output-parameters "-profile:v high -pix_fmt yuv420p -level 4.2" --cfg assets/cs2_pov.cfg
+& "C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd" video "<demo_path>" --mode player --steamids <steam64_id> --event rounds --rounds <N> --perspective player --no-show-x-ray --output "C:\full\path\to\demos\renders\pov-folder" --framerate 60 --width 2560 --height 1440 --recording-system HLAE --close-game-after-recording --no-show-only-death-notices --show-assists --record-audio --concatenate-sequences --ffmpeg-video-codec h264_nvenc --ffmpeg-crf 18 --ffmpeg-output-parameters "-cq 18 -preset p7 -profile:v high -pix_fmt yuv420p -level 5.1" --cfg "C:\full\path\to\assets\cs2_pov.cfg"
 ```
 
-Use `python scripts/render_pov.py <demo_path> <steam_id>` instead — it wraps the above command with auto round-detection, p1/p2 split handling, and per-round output naming.
+Use `python scripts/render_pov.py <demo_path> <steam_id>` instead — it wraps the above command with auto round-detection, p1/p2 split handling, and batch output naming.
 
 All scripts pass `--cfg assets/cs2_pov.cfg` which configures HUD and restores keybinds via `exec autoexec`.
 
@@ -171,7 +165,7 @@ After rendering all rounds with `python scripts/render_pov.py`, join them into o
 ```powershell
 python scripts/concat_rounds.py <renders_folder>
 ```
-Output is `combined.mp4` in the same folder. Uses ffmpeg stream copy (no re-encode, lossless).
+Output is `combined.mp4` in the same folder. Concat is incremental (one batch at a time with ffmpeg stream copy), then upscaled to 1440p via CUDA Lanczos. Each batch file is deleted after successful append — remaining `batch-*.mp4` files on disk indicate which batches still need to be concat'd on resume.
 
 ## Known Gotchas
 
@@ -191,7 +185,7 @@ Output is `combined.mp4` in the same folder. Uses ffmpeg stream copy (no re-enco
 - **All async** — every scraper/command is `asyncio.run()`. Any new command must follow `async def` + `register_subparser` + `handle` pattern in `commands/`.
 - **YouTube verification** — To set custom thumbnails, your YouTube account must be verified (phone verify) at https://www.youtube.com/verify.
 - **Wrong HLTV match URL ID** — If the ratings scraper returns "Unknown Match" or empty tables, the match URL's numeric ID is wrong. HLTV uses SPAs where the JS routing matches the ID to the match. Check the correct ID by visiting the match page in a browser (the sidebar "Related matches" links have correct IDs).
-- **Agent error parsing** — Grep for `[PIPELINE_ERROR]` and parse the JSON. Each error has a unique `code` for programmatic handling. Common codes: `EXTRACT_MAP_NOT_FOUND`, `RATINGS_NO_TABLES`, `ANALYZE_NO_ROUNDS`, `RENDER_STEAM_NOT_RUNNING`, `CONCAT_ROUND_MISMATCH`, `THUMBNAIL_MISSING`, `UPLOAD_NO_VIDEO_ID`.
+- **Agent error parsing** — Grep for `[PIPELINE_ERROR]` and parse the JSON. Each error has a unique `code` for programmatic handling. Common codes: `EXTRACT_MAP_NOT_FOUND`, `RATINGS_NO_TABLES`, `ANALYZE_NO_ROUNDS`, `RENDER_STEAM_NOT_RUNNING`, `CONCAT_FAILED`, `THUMBNAIL_MISSING`, `UPLOAD_NO_VIDEO_ID`.
 
 ## Output Directory Structure
 
