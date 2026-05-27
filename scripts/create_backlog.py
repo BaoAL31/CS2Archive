@@ -54,8 +54,35 @@ def get_priority(rating: float) -> str:
     return "low"
 
 
+def _resolve_demo_for_map(match_slug: str, map_name: str) -> Path | None:
+    """
+    Best-effort resolve the actual .dem filename for a map.
+
+    HLTV acquisitions typically produce files like:
+      demos/hltv/<match_slug>/<match_slug>-m2-ancient.dem
+    Older code assumed <Map>.dem which is often wrong.
+    """
+    demo_dir = PROJECT_ROOT / "demos" / "hltv" / match_slug
+    if not demo_dir.exists():
+        return None
+
+    map_slug = map_name.strip().lower()
+    cands = list(demo_dir.glob(f"*{map_slug}*.dem"))
+    if not cands:
+        return None
+
+    def score(p: Path) -> tuple[int, int, str]:
+        name = p.name.lower()
+        # Prefer explicit "-mN-<map>" patterns if present
+        has_m = 0 if f"-{map_slug}.dem" in name or f"-{map_slug}-" in name or f"-m" in name else 1
+        return (has_m, len(name), name)
+
+    return sorted(cands, key=score)[0]
+
+
 def create_backlog_entry(
     match_url: str,
+    match_slug: str,
     player: str,
     map_name: str,
     rating: float,
@@ -76,11 +103,18 @@ def create_backlog_entry(
             break
     steam_id = (found.steam_id or found.steam_url or "") if found else ""
 
-    slug = f"{player_clean.lower()}-{map_name.lower()}"
+    slug = f"{player_clean.lower()}-{map_name.lower()}-{match_slug}"
     backlog_file = BACKLOG_DIR / priority / f"{slug}.md"
     backlog_file.parent.mkdir(parents=True, exist_ok=True)
 
     steam_flag = f"--steam-id {steam_id}" if steam_id else "--steam-id <STEAM_ID>"
+
+    demo_for_map = _resolve_demo_for_map(match_slug, map_name)
+    demo_rel = (
+        str(demo_for_map.relative_to(PROJECT_ROOT)).replace("\\", "/")
+        if demo_for_map
+        else f"demos/hltv/{match_slug}/<DEMO_FOR_MAP>.dem"
+    )
 
     content = f"""# Handoff: {player_clean} — {map_name} ({rating})
 
@@ -103,13 +137,13 @@ Run the pipeline for this POV.
 | Field | Value |
 |---|---|
 | HLTV URL | {match_url} |
-| Demo path | `demos/hltv/<match-slug>/{map_name}.dem` |
+| Demo path | `{demo_rel}` |
 
 ## Pipeline Command
 
 ```powershell
 python scripts/pipeline.py {player_clean} {map_name} "{match_url}" `
-  {steam_flag} --demo "demos/hltv/<match-slug>/{map_name}.dem"
+  {steam_flag} --demo "{demo_rel}"
 ```
 
 """
@@ -172,6 +206,7 @@ async def main() -> None:
             rating = float(player["rating"])
             create_backlog_entry(
                 match_url=match_url,
+                match_slug=slug,
                 player=player["nickname"],
                 map_name=map_name,
                 rating=rating,

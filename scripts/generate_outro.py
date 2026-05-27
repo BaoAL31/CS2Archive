@@ -118,7 +118,7 @@ def main() -> None:
              "-level", "5.1",
              "-vf", f"scale={w}:{h}",
              "-preset", "medium",
-             "-crf", "18",
+             "-crf", "15",
              str(out_path)],
             capture_output=True, text=True, timeout=120,
         )

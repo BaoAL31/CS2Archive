@@ -29,8 +29,8 @@ BASE_FLAGS = [
     "--concatenate-sequences",
     "--ffmpeg-executable-path", FFMPEG_PATH,
     "--ffmpeg-video-codec", "h264_nvenc",
-    "--ffmpeg-crf", "18",
-    "--ffmpeg-output-parameters=-cq 18 -preset p7 -profile:v high -pix_fmt yuv420p -level 5.1",
+    "--ffmpeg-crf", "15",
+    "--ffmpeg-output-parameters=-cq 15 -preset p7 -profile:v high -pix_fmt yuv420p -level 5.1",
     "--recording-system", "HLAE",
     "--close-game-after-recording",
 ]
@@ -153,8 +153,8 @@ def main() -> None:
     parser.add_argument("--framerate", type=int, default=60)
     parser.add_argument("--width", type=int, default=2560)
     parser.add_argument("--height", type=int, default=1440)
-    parser.add_argument("--batches", type=int, default=3,
-                        help="Rounds per batch (default: 3). Each batch produces one MP4.")
+    parser.add_argument("--batches", type=int, default=10,
+                        help="Rounds per batch (default: 10). Each batch produces one MP4.")
     parser.add_argument("--no-minimize-cs2", action="store_true",
                         help="Disable auto-minimize CS2 when it launches (default: enabled)")
     args = parser.parse_args()

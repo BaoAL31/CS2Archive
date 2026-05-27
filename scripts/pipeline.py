@@ -122,14 +122,15 @@ class Pipeline:
             if src.suffix.lower() == ".dem":
                 self.demo_path = src
 
-        from scrapers.hltv_acquire import match_slug_from_url
+        from scrapers.hltv_acquire import match_id_from_url, match_slug_from_url
 
         stem = (
             self.demo_path.stem
             if self.demo_path
             else (self.demo_override.stem if self.demo_override else match_slug_from_url(args.hltv_url))
         )
-        self.run_id = run_id_from_name(f"{stem}_{args.player}_{args.map}")
+        match_id = match_id_from_url(args.hltv_url)
+        self.run_id = run_id_from_name(f"{match_id}_{stem}_{args.player}_{args.map}")
         self.state = load_state(self.run_id)
         self.state.setdefault("data", {})
 
@@ -409,7 +410,7 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
 
     def step_thumbnail(self) -> None:
         self.youtube_dir.mkdir(parents=True, exist_ok=True)
-        thumb = self.youtube_dir / "thumbnail.png"
+        thumb = self.youtube_dir / "thumbnail.jpg"
 
         cmd = [
             "-m", "thumbnail",
@@ -428,9 +429,9 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
             fail(9, "THUMBNAIL_FAILED", f"thumbnail generator exited {r.returncode}")
 
         if not thumb.exists():
-            fail(9, "THUMBNAIL_MISSING", f"thumbnail.png not created at {thumb}")
+            fail(9, "THUMBNAIL_MISSING", f"thumbnail not created at {thumb}")
         if thumb.stat().st_size < 1000:
-            fail(9, "THUMBNAIL_TOO_SMALL", f"thumbnail.png too small: {thumb.stat().st_size} bytes")
+            fail(9, "THUMBNAIL_TOO_SMALL", f"thumbnail too small: {thumb.stat().st_size} bytes")
 
         # Verify dimensions via Pillow
         try:
@@ -449,7 +450,7 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
     def _write_upload_meta(self) -> None:
         """Generate upload_meta.json with all metadata needed for upload resume."""
         video = self.youtube_dir / "video.mp4"
-        thumb = self.youtube_dir / "thumbnail.png"
+        thumb = self.youtube_dir / "thumbnail.jpg"
 
         r = self._run_py([
             "scripts/generate_title.py", str(self.ratings_json),
@@ -484,7 +485,7 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
 
     def step_upload(self) -> None:
         video = self.youtube_dir / "video.mp4"
-        thumb = self.youtube_dir / "thumbnail.png"
+        thumb = self.youtube_dir / "thumbnail.jpg"
 
         if not video.exists():
             fail(10, "UPLOAD_VIDEO_MISSING", f"video not found: {video}")
@@ -580,8 +581,8 @@ def main() -> None:
         help="CloakBrowser profile dir (default: .cloak-hltv-profile)",
     )
     parser.add_argument("--privacy", choices=["private", "unlisted", "public"], default="public")
-    parser.add_argument("--batches", type=int, default=3,
-                        help="Rounds per render batch (default: 3). Forwarded to render_pov.py.")
+    parser.add_argument("--batches", type=int, default=10,
+                        help="Rounds per render batch (default: 10). Forwarded to render_pov.py.")
     args = parser.parse_args()
 
     print(f"{'='*60}")

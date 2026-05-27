@@ -122,7 +122,7 @@ def _upscale(src: Path, dst: Path, w: int, h: int) -> None:
     cmd = [
         "ffmpeg", "-y", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-i", str(src),
         "-vf", f"scale_cuda={w}:{h}:interp_algo=lanczos,hwdownload,format=nv12",
-        "-c:v", "h264_nvenc", "-preset", "p7", "-rc", "vbr_hq", "-cq", "18", "-b:v", "0", "-maxrate", "50M",
+        "-c:v", "h264_nvenc", "-preset", "p7", "-rc", "vbr_hq", "-cq", "15", "-b:v", "0", "-maxrate", "50M",
         "-profile:v", "high", "-pix_fmt", "yuv420p", "-level", "5.1",
         "-c:a", "copy", str(temp),
     ]

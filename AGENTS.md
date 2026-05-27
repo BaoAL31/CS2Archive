@@ -41,6 +41,7 @@ python scripts/pipeline.py w0nderful Anubis "https://www.hltv.org/matches/239417
 ### Notes
 
 - Pipeline requires `--steam-id` (no auto-extraction).
+- **Steam ID source of truth** — player Steam64 IDs are stored in `.data/player_accounts.json` (via `python main.py player add/list`). When filling `--steam-id` for a pipeline/backlog entry, read from `.data/` first.
 - `--demo` optional: omit to download from `hltv_url` via CloakBrowser; pass `.rar` or `.dem` to skip download. `--force` re-downloads; default browser is headed + humanize (`--headless` to opt out).
 - Render step verifies Steam is running before starting.
 - Each step validates its output before proceeding — failures halt the pipeline.
@@ -56,7 +57,7 @@ Use `scripts/pipeline_chain.py` to start the **next** POV when the **previous** 
 
 **How it works:** polls `.pipeline/{run_id}.json` every 30s (`--poll`). When `"step" >= 10`, spawns `pipeline.py` with the args you pass after `--`. Does **not** read terminal output — only the state file.
 
-**`run_id`** = `{demo_stem}_{player}_{map}` (e.g. `falcons-vs-mouz-m3-nuke_NiKo_Nuke`). Same args as the watched pipeline must be used when resuming.
+**`run_id`** = `{match_id}_{demo_stem}_{player}_{map}` (e.g. `2394174_falcons-vs-mouz-m3-nuke_NiKo_Nuke`). Includes HLTV match ID to prevent collision when the same teams/map/player appear in different tournaments. Use `match_id_from_url()` from `scrapers/hltv_acquire.py` to extract the ID. Same args as the watched pipeline must be used when resuming.
 
 ```powershell
 # When NiKo hits upload, start kyousuke (chain exits after launch)
@@ -136,14 +137,14 @@ HLAE **2.190.1+** required (`C:\Program Files (x86)\HLAE\HLAE.exe`). Disable RTS
 
 Render at **2560×1440** even for 1080p-targeted uploads. YouTube allocates VP9 codec (higher bitrate) to 1440p+ uploads, while 1080p gets H.264. Video looks sharper even when watched at 1080p because YouTube uses better encoding.
 
-All scripts default to 2560×1440; per-round render and concat upscale use **h264_nvenc CQ 18** (match quality end-to-end).
+All scripts default to 2560×1440; per-round render and concat upscale use **h264_nvenc CQ 15** (match quality end-to-end).
 
 ### Rounds-Only POV (full HUD, no x-ray, batch rendering)
 
 For rendering a player's POV with full HUD (radar, health, ammo) and no x-ray, in configurable batch sizes (default 3 rounds per csdm call):
 
 ```powershell
-& "C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd" video "<demo_path>" --mode player --steamids <steam64_id> --event rounds --rounds <N> --perspective player --no-show-x-ray --output "C:\full\path\to\demos\renders\pov-folder" --framerate 60 --width 2560 --height 1440 --recording-system HLAE --close-game-after-recording --no-show-only-death-notices --show-assists --record-audio --concatenate-sequences --ffmpeg-video-codec h264_nvenc --ffmpeg-crf 18 --ffmpeg-output-parameters "-cq 18 -preset p7 -profile:v high -pix_fmt yuv420p -level 5.1" --cfg "C:\full\path\to\assets\cs2_pov.cfg"
+& "C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd" video "<demo_path>" --mode player --steamids <steam64_id> --event rounds --rounds <N> --perspective player --no-show-x-ray --output "C:\full\path\to\demos\renders\pov-folder" --framerate 60 --width 2560 --height 1440 --recording-system HLAE --close-game-after-recording --no-show-only-death-notices --show-assists --record-audio --concatenate-sequences --ffmpeg-video-codec h264_nvenc --ffmpeg-crf 15 --ffmpeg-output-parameters "-cq 15 -preset p7 -profile:v high -pix_fmt yuv420p -level 5.1" --cfg "C:\full\path\to\assets\cs2_pov.cfg"
 ```
 
 Use `python scripts/render_pov.py <demo_path> <steam_id>` instead — it wraps the above command with auto round-detection, p1/p2 split handling, and batch output naming.
