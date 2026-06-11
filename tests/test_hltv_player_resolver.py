@@ -163,6 +163,110 @@ def test_resolve_from_roster_by_player_key() -> None:
     assert resolver.resolve_from_roster(roster, "missing") is None
 
 
+def _fixture_search_html() -> str:
+    return (Path(__file__).parent / "fixtures" / "hltv_search_results.html").read_text(
+        encoding="utf-8"
+    )
+
+
+def _match_ratings() -> dict:
+    return {
+        "tables": [
+            {
+                "players": [
+                    {"nickname": "ropz", "rating": "1.42"},
+                    {"nickname": "broky", "rating": "1.10"},
+                    {"nickname": "karrigan", "rating": "0.95"},
+                ]
+            }
+        ]
+    }
+
+
+def test_parse_search_player_candidates() -> None:
+    candidates = resolver.parse_search_player_candidates(_fixture_search_html())
+    assert len(candidates) == 5
+    assert candidates[0]["player_id"] == "11111"
+    assert candidates[1]["nickname"] == "ropz"
+    assert candidates[1]["player_url"] == "https://www.hltv.org/player/25619/ropz"
+
+
+def test_disambiguate_search_single_roster_match() -> None:
+    candidates = resolver.parse_search_player_candidates(_fixture_search_html())
+    pick = resolver.disambiguate_search_candidates(candidates, ["ropz"], "ropz")
+    assert pick is not None
+    assert pick["player_id"] == "25619"
+    assert pick["nickname"] == "ropz"
+
+
+def test_disambiguate_search_exact_tiebreaker() -> None:
+    html = """
+    <html><body>
+      <a href="/player/25619/ropz">ropz</a>
+      <a href="/player/18987/broky">broky</a>
+    </body></html>
+    """
+    candidates = resolver.parse_search_player_candidates(html)
+    roster = resolver.roster_nicknames_from_ratings(_match_ratings())
+    pick = resolver.disambiguate_search_candidates(candidates, roster, "RoPz")
+    assert pick is not None
+    assert pick["player_id"] == "25619"
+
+
+def test_disambiguate_search_no_guess_when_zero_roster_matches() -> None:
+    candidates = resolver.parse_search_player_candidates(_fixture_search_html())
+    roster = ["only-on-roster"]
+    assert resolver.disambiguate_search_candidates(candidates, roster, "ropz") is None
+
+
+def test_disambiguate_search_no_guess_when_multiple_without_exact_match() -> None:
+    html = """
+    <html><body>
+      <a href="/player/18987/broky">broky</a>
+      <a href="/player/8183/karrigan">karrigan</a>
+    </body></html>
+    """
+    candidates = resolver.parse_search_player_candidates(html)
+    roster = resolver.roster_nicknames_from_ratings(_match_ratings())
+    assert resolver.disambiguate_search_candidates(candidates, roster, "ropz") is None
+
+
+def test_resolve_from_search_with_fixture() -> None:
+    result = resolver.resolve_from_search(_fixture_search_html(), _match_ratings(), "ropz")
+    assert result == {
+        "player_url": "https://www.hltv.org/player/25619/ropz",
+        "player_id": "25619",
+        "source": "search",
+    }
+
+
+def test_resolve_hltv_player_search_after_roster() -> None:
+    ratings = _match_ratings()
+    roster = [{"nickname": "broky", "playerUrl": "https://www.hltv.org/player/18987/broky"}]
+    search_html = _fixture_search_html()
+
+    roster_hit = resolver.resolve_hltv_player(
+        "broky",
+        [],
+        ratings,
+        roster=roster,
+        search_html=search_html,
+    )
+    assert roster_hit is not None
+    assert roster_hit["source"] == "roster"
+
+    search_hit = resolver.resolve_hltv_player(
+        "ropz",
+        [],
+        ratings,
+        roster=roster,
+        search_html=search_html,
+    )
+    assert search_hit is not None
+    assert search_hit["source"] == "search"
+    assert search_hit["player_id"] == "25619"
+
+
 def test_resolve_hltv_player_cascade_order() -> None:
     accounts = [
         PlayerAccount(
@@ -200,6 +304,16 @@ def test_resolve_hltv_player_cascade_order() -> None:
     assert roster_only is not None
     assert roster_only["source"] == "roster"
     assert roster_only["player_id"] == "99999"
+
+    search_only = resolver.resolve_hltv_player(
+        "ropz",
+        [],
+        _match_ratings(),
+        roster=[],
+        search_html=_fixture_search_html(),
+    )
+    assert search_only is not None
+    assert search_only["source"] == "search"
 
 
 def test_load_ratings_json_missing_file() -> None:
