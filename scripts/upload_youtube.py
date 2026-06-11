@@ -229,9 +229,6 @@ def main() -> None:
     parser.add_argument("--update-thumbnail", help="Update thumbnail for an existing video ID")
     args = parser.parse_args()
 
-    print("Authenticating with Google...", flush=True)
-    youtube = get_authenticated_service()
-
     # Standalone thumbnail update mode
     if args.update_thumbnail:
         if not args.thumbnail:
@@ -240,10 +237,14 @@ def main() -> None:
         if not Path(args.thumbnail).exists():
             print(f"[ERROR] Thumbnail not found: {args.thumbnail}", flush=True)
             sys.exit(1)
+        print("Authenticating with Google...", flush=True)
         youtube = get_authenticated_service(scopes=THUMB_SCOPES, token_file=THUMB_TOKEN_FILE)
         _update_thumbnail(youtube, args.update_thumbnail, args.thumbnail)
         print("Done!", flush=True)
         return
+
+    print("Authenticating with Google...", flush=True)
+    youtube = get_authenticated_service()
 
     # Upload mode
     if not args.video:
