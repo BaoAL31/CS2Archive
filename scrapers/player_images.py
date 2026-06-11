@@ -34,10 +34,24 @@ MIN_RES = 300  # Reject images smaller than 300×300
 
 _BODYSHOT_PLAYER_ID_RE = re.compile(r"playerbodyshot/(\d+)/", re.IGNORECASE)
 _BODYSHOT_QUERY_ID_RE = re.compile(r"[?&]playerid=(\d+)", re.IGNORECASE)
+_CDN_BODYSHOT_BASE = "https://img-cdn.hltv.org/playerbodyshot"
 
 
 def _player_id_from_url(url: str | None) -> str | None:
     return hltv_player_id_from_url(url)
+
+
+def _cdn_bodyshot_urls(player_id: str) -> list[str]:
+    """Build direct CDN bodyshot URLs for a known HLTV player ID."""
+    pid = (player_id or "").strip()
+    if not pid:
+        return []
+    return [
+        f"{_CDN_BODYSHOT_BASE}/{pid}/player.png?w=400",
+        f"{_CDN_BODYSHOT_BASE}/player.png?playerid={pid}&w=400",
+        f"{_CDN_BODYSHOT_BASE}/{pid}/player.png?w=300",
+        f"{_CDN_BODYSHOT_BASE}/player.png?playerid={pid}&w=300",
+    ]
 
 
 def _bodyshot_url_matches_player(bodyshot_url: str, player_id: str) -> bool:
@@ -60,33 +74,6 @@ def _cutout_bg(img_bytes: bytes) -> Image.Image:
 
 def _is_acceptable(im: Image.Image) -> bool:
     return im.size[0] >= MIN_RES and im.size[1] >= MIN_RES
-
-
-async def _capture_from_url(ctx, url: str) -> dict[str, bytes]:
-    """Navigate to a page and capture playerbodyshot responses."""
-    cap_page = await ctx.new_page()
-    captured: dict[str, bytes] = {}
-
-    async def on_resp(resp):
-        if "playerbodyshot" not in resp.url:
-            return
-        if captured:
-            return
-        try:
-            body = await resp.body()
-            if len(body) > 5000 and not body.startswith(b"<html"):
-                captured[resp.url] = body
-        except Exception:
-            pass
-
-    cap_page.on("response", on_resp)
-    try:
-        await cap_page.goto(url, wait_until="domcontentloaded", timeout=20000)
-        await asyncio.sleep(3)
-    except Exception:
-        await asyncio.sleep(3)
-    await cap_page.close()
-    return captured
 
 
 async def _try_sizes(scraper, player_url: str) -> bytes | None:
@@ -127,6 +114,58 @@ async def _try_sizes(scraper, player_url: str) -> bytes | None:
                     return raw
             except Exception:
                 pass
+
+    return None
+
+
+async def _fetch_cdn_bodyshot(scraper, player_id: str) -> bytes | None:
+    """Fetch bodyshot directly from HLTV CDN when profile DOM interception fails."""
+    await scraper._ensure_browser()
+    pid = (player_id or "").strip()
+    if not pid:
+        return None
+
+    for cdn_url in _cdn_bodyshot_urls(pid):
+        cap_ctx = await scraper.fresh_context()
+        cap_page = await cap_ctx.new_page()
+        try:
+            resp = await cap_page.goto(cdn_url, wait_until="domcontentloaded", timeout=20000)
+            if resp is None or not resp.ok:
+                continue
+            raw = await resp.body()
+            if len(raw) <= 5000 or raw.startswith(b"<html"):
+                continue
+            if not _bodyshot_url_matches_player(resp.url, pid):
+                continue
+            im = Image.open(BytesIO(raw))
+            if _is_acceptable(im):
+                return raw
+        except Exception:
+            continue
+        finally:
+            await cap_page.close()
+            await cap_ctx.close()
+
+    return None
+
+
+async def _try_profile_and_cdn(scraper, resolution: dict) -> bytes | None:
+    """Try profile-page DOM capture, then CDN retry when player ID is known."""
+    player_url = str(resolution.get("player_url", "") or "").strip()
+    player_id = str(resolution.get("player_id", "") or "").strip() or (
+        hltv_player_id_from_url(player_url) or ""
+    )
+
+    if player_url:
+        raw = await _try_sizes(scraper, player_url)
+        if raw:
+            return raw
+
+    if player_id:
+        console.print(
+            f"[yellow]   Profile bodyshot failed; trying CDN for player {player_id}[/yellow]"
+        )
+        return await _fetch_cdn_bodyshot(scraper, player_id)
 
     return None
 
@@ -276,12 +315,14 @@ async def fetch_avatar_for_player(
 
     scraper = HLTVScraper()
     try:
-        if resolution and resolution.get("player_url"):
+        if resolution and (
+            resolution.get("player_url") or resolution.get("player_id")
+        ):
+            label = resolution.get("player_url") or f"player/{resolution.get('player_id')}"
             console.print(
-                f"[dim]   Resolved HLTV profile via {resolution['source']}: "
-                f"{resolution['player_url']}[/dim]"
+                f"[dim]   Resolved HLTV profile via {resolution['source']}: {label}[/dim]"
             )
-            raw = await _try_sizes(scraper, resolution["player_url"])
+            raw = await _try_profile_and_cdn(scraper, resolution)
             if raw and await _save_avatar_bytes(raw, png_path):
                 _promote_hltv_identity(account, resolution)
                 console.print(
@@ -291,12 +332,15 @@ async def fetch_avatar_for_player(
 
         roster = await _scrape_match_roster(scraper, match_url)
         roster_resolution = resolve_from_roster(roster, key)
-        if roster_resolution and roster_resolution.get("player_url"):
-            console.print(
-                f"[dim]   Resolved HLTV profile via roster: "
-                f"{roster_resolution['player_url']}[/dim]"
+        if roster_resolution and (
+            roster_resolution.get("player_url") or roster_resolution.get("player_id")
+        ):
+            label = (
+                roster_resolution.get("player_url")
+                or f"player/{roster_resolution.get('player_id')}"
             )
-            raw = await _try_sizes(scraper, roster_resolution["player_url"])
+            console.print(f"[dim]   Resolved HLTV profile via roster: {label}[/dim]")
+            raw = await _try_profile_and_cdn(scraper, roster_resolution)
             if raw and await _save_avatar_bytes(raw, png_path):
                 _promote_hltv_identity(account, roster_resolution)
                 console.print("[green]   Avatar resolution source: roster[/green]")

@@ -16,6 +16,7 @@ from models import PlayerAccount
 from scrapers import hltv_player_resolver as resolver
 from scrapers.player_images import (
     _bodyshot_url_matches_player,
+    _cdn_bodyshot_urls,
     _player_id_from_url,
     _promote_hltv_identity,
 )
@@ -35,6 +36,33 @@ def test_bodyshot_url_matches_player_id() -> None:
         "https://img-cdn.hltv.org/playerbodyshot/99999/abc.png?w=400",
         pid,
     )
+    assert not _bodyshot_url_matches_player(
+        f"https://img-cdn.hltv.org/playerbodyshot/abc.png?playerid=99999&w=400",
+        pid,
+    )
+    assert not _bodyshot_url_matches_player(
+        "https://img-cdn.hltv.org/playerbodyshot/abc.png?w=400",
+        pid,
+    )
+    assert not _bodyshot_url_matches_player(
+        f"https://img-cdn.hltv.org/playerbodyshot/{pid}/abc.png?w=400",
+        "",
+    )
+
+
+def test_cdn_bodyshot_urls_include_player_id() -> None:
+    pid = "25619"
+    urls = _cdn_bodyshot_urls(pid)
+    assert len(urls) == 4
+    assert any(f"/playerbodyshot/{pid}/" in url for url in urls)
+    assert any(f"playerid={pid}" in url for url in urls)
+    assert all("img-cdn.hltv.org/playerbodyshot" in url for url in urls)
+    assert all("w=400" in url or "w=300" in url for url in urls)
+
+
+def test_cdn_bodyshot_urls_empty_for_blank_id() -> None:
+    assert _cdn_bodyshot_urls("") == []
+    assert _cdn_bodyshot_urls("   ") == []
 
 
 def test_player_id_from_url() -> None:
