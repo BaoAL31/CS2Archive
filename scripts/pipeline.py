@@ -33,8 +33,13 @@ import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+from assign_playlist import normalize_playlist_name
 STATE_DIR = PROJECT_ROOT / ".pipeline"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 os.chdir(str(PROJECT_ROOT))
@@ -222,6 +227,7 @@ class Pipeline:
 
         if not data.get("tables"):
             fail(2, "RATINGS_NO_TABLES", f"ratings JSON has no player stat tables: {self.ratings_json.name}")
+        self.state["data"]["ratings_path"] = str(self.ratings_json)
         print(f"  [OK] Ratings: {self.ratings_json.name} ({len(data.get('tables', []))} tables)")
 
     # ── Step 3: Steam ID ─────────────────────────────────────────────────
@@ -242,20 +248,38 @@ class Pipeline:
     # ── Step 4: Avatar ───────────────────────────────────────────────────
 
     def step_avatar(self) -> None:
+        from PIL import Image
+
+        from scrapers.player_images import MIN_RES
+
+        player_key = self.args.player.strip().lower()
+        avatar_path = PROJECT_ROOT / "demos" / "avatars" / f"{player_key}.png"
+        ratings_path = self.state["data"].get("ratings_path") or str(self.ratings_json)
+
         r = self._run_py(["-c", f"""
 import asyncio
-from scrapers.player_images import get_player_avatars
-asyncio.run(get_player_avatars("{self.args.hltv_url}"))
+from pathlib import Path
+from scrapers.player_images import fetch_avatar_for_player
+asyncio.run(fetch_avatar_for_player(
+    "{player_key}",
+    "{self.args.hltv_url}",
+    Path(r"{ratings_path}"),
+    force=False,
+))
 """], capture_output=True, text=True, timeout=120)
         out = (r.stdout or "") + (r.stderr or "")
         print(out[:500] if out else "  (no output)")
 
-        avatar_dir = PROJECT_ROOT / "demos" / "avatars"
-        avatar_path = avatar_dir / f"{self.args.player.lower()}.png"
+        if r.returncode != 0:
+            fail(4, "AVATAR_FETCH_FAILED", f"avatar fetch exited {r.returncode}: {out[:300]}")
+
         if not avatar_path.exists():
             fail(4, "AVATAR_MISSING", f"avatar PNG not found: {avatar_path}")
-        if avatar_path.stat().st_size < 500:
-            fail(4, "AVATAR_TOO_SMALL", f"avatar PNG too small: {avatar_path.stat().st_size} bytes")
+
+        with Image.open(avatar_path) as im:
+            w, h = im.size
+        if w < MIN_RES or h < MIN_RES:
+            fail(4, "AVATAR_TOO_SMALL", f"avatar PNG too small: {w}x{h} (min {MIN_RES}x{MIN_RES})")
 
         self.state["data"]["avatar_path"] = str(avatar_path)
         print(f"  [OK] Avatar: {avatar_path.name}")
@@ -305,6 +329,10 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
     def step_render(self) -> None:
         if not self.demo_path or not self.demo_path.exists():
             fail(6, "RENDER_DEMO_MISSING", f"demo not found: {self.demo_path}")
+
+        from cs2_minimizer import ensure_cs2_closed
+
+        ensure_cs2_closed()
 
         # Verify Steam is running
         steam_check = subprocess.run(["tasklist", "/FI", "IMAGENAME eq steam.exe"],
@@ -409,6 +437,10 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
     # ── Step 9: Thumbnail ────────────────────────────────────────────────
 
     def step_thumbnail(self) -> None:
+        from cs2_minimizer import ensure_cs2_closed
+
+        ensure_cs2_closed()
+
         self.youtube_dir.mkdir(parents=True, exist_ok=True)
         thumb = self.youtube_dir / "thumbnail.jpg"
 
@@ -473,9 +505,12 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
             "video_path": str(video),
             "thumbnail_path": str(thumb) if thumb.exists() else None,
             "privacy": self.args.privacy,
+            "playlist_name": normalize_playlist_name(self.args.tournament),
             "youtube_id": None,
             "upload_status": "pending",
         }
+        if getattr(self.args, "publish_at", None):
+            upload_meta["publish_at"] = self.args.publish_at
 
         meta_path = self.youtube_dir / "upload_meta.json"
         meta_path.write_text(json.dumps(upload_meta, indent=2))
@@ -505,6 +540,8 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
         ]
         if thumb.exists():
             cmd += ["--thumbnail", str(thumb)]
+        if getattr(self.args, "publish_at", None):
+            cmd += ["--publish-at", self.args.publish_at]
 
         env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
         proc = subprocess.Popen(
@@ -566,7 +603,7 @@ def main() -> None:
         default=None,
         help="Optional local .dem or .rar override (omit to download from HLTV URL)",
     )
-    parser.add_argument("--tournament", default="", help="Tournament name (e.g. IEM Atlanta 2026)")
+    parser.add_argument("--tournament", required=True, help="Tournament name (e.g. IEM Atlanta 2026)")
     parser.add_argument("--step", type=int, default=1, choices=range(1, 12),
                         help="Start from step N (1=acquire..11=cleanup)")
     parser.add_argument("--until", type=int, default=None, choices=range(1, 11),
@@ -580,9 +617,11 @@ def main() -> None:
         default=None,
         help="CloakBrowser profile dir (default: .cloak-hltv-profile)",
     )
-    parser.add_argument("--privacy", choices=["private", "unlisted", "public"], default="public")
+    parser.add_argument("--privacy", choices=["private", "unlisted", "public"], default="private")
     parser.add_argument("--batches", type=int, default=10,
-                        help="Rounds per render batch (default: 10). Forwarded to render_pov.py.")
+                        help="Rounds per render batch (default: 10). 0 = all rounds in one session.")
+    parser.add_argument("--publish-at", default=None,
+                        help="Schedule YouTube publish (local time, e.g. '2026-06-12 17:00')")
     args = parser.parse_args()
 
     print(f"{'='*60}")

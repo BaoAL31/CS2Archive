@@ -149,6 +149,63 @@ def test_update_hltv_player_persists_and_round_trips() -> None:
             player_accounts.ACCOUNTS_FILE = original_file
 
 
+def test_resolve_from_roster_by_player_key() -> None:
+    roster = [
+        {"nickname": "ropz", "playerUrl": "https://www.hltv.org/player/25619/ropz"},
+        {"nickname": "broky", "playerUrl": "https://www.hltv.org/player/18987/broky"},
+    ]
+    result = resolver.resolve_from_roster(roster, "RoPz")
+    assert result == {
+        "player_url": "https://www.hltv.org/player/25619/ropz",
+        "player_id": "25619",
+        "source": "roster",
+    }
+    assert resolver.resolve_from_roster(roster, "missing") is None
+
+
+def test_resolve_hltv_player_cascade_order() -> None:
+    accounts = [
+        PlayerAccount(
+            nickname="cached",
+            hltv_player_id="11111",
+            hltv_player_url="https://www.hltv.org/player/11111/cached",
+        )
+    ]
+    ratings = {
+        "tables": [
+            {
+                "players": [
+                    {
+                        "nickname": "ropz",
+                        "hltv_player_url": "https://www.hltv.org/player/25619/ropz",
+                    }
+                ]
+            }
+        ]
+    }
+    roster = [
+        {"nickname": "ropz", "playerUrl": "https://www.hltv.org/player/99999/wrong"},
+    ]
+
+    account_first = resolver.resolve_hltv_player("cached", accounts, ratings, roster=roster)
+    assert account_first is not None
+    assert account_first["source"] == "account"
+
+    ratings_first = resolver.resolve_hltv_player("ropz", [], ratings, roster=roster)
+    assert ratings_first is not None
+    assert ratings_first["source"] == "ratings"
+    assert ratings_first["player_id"] == "25619"
+
+    roster_only = resolver.resolve_hltv_player("ropz", [], {}, roster=roster)
+    assert roster_only is not None
+    assert roster_only["source"] == "roster"
+    assert roster_only["player_id"] == "99999"
+
+
+def test_load_ratings_json_missing_file() -> None:
+    assert resolver.load_ratings_json(Path("/nonexistent/ratings.json")) == {}
+
+
 def test_existing_player_accounts_json_loads_without_migration() -> None:
     legacy = [
         {
