@@ -6,6 +6,7 @@ Resolves HLTV profile URLs/IDs from saved accounts and ratings JSON.
 
 from __future__ import annotations
 
+import json
 import re
 from io import BytesIO
 from pathlib import Path
@@ -121,6 +122,59 @@ def resolve_from_ratings(
             if url:
                 return _make_resolution(url, "ratings")
     return None
+
+
+def resolve_from_roster(
+    roster: list[dict],
+    player_key: str,
+) -> HltvPlayerResolution | None:
+    """Lookup HLTV profile URL from match roster entries."""
+    key = normalize_pipeline_player_key(player_key)
+    for entry in roster:
+        nick = normalize_pipeline_player_key(
+            str(entry.get("nickname") or entry.get("nick") or "")
+        )
+        if nick != key:
+            continue
+        url = str(
+            entry.get("playerUrl")
+            or entry.get("player_url")
+            or entry.get("hltv_player_url")
+            or ""
+        ).strip()
+        if url:
+            return _make_resolution(url, "roster")
+    return None
+
+
+def resolve_hltv_player(
+    player_key: str,
+    accounts: list[Any],
+    ratings: dict,
+    *,
+    roster: list[dict] | None = None,
+) -> HltvPlayerResolution | None:
+    """Resolve HLTV profile in priority order: account → ratings → roster."""
+    result = resolve_from_accounts(accounts, player_key)
+    if result:
+        return result
+    result = resolve_from_ratings(ratings, player_key)
+    if result:
+        return result
+    if roster:
+        return resolve_from_roster(roster, player_key)
+    return None
+
+
+def load_ratings_json(ratings_path: Path | str) -> dict:
+    """Load ratings JSON from disk; returns empty dict when missing or invalid."""
+    path = Path(ratings_path)
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 def avatar_cache_eligible(png_path: Path, account: Any | None) -> bool:
