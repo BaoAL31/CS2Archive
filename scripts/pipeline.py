@@ -264,7 +264,7 @@ asyncio.run(fetch_avatar_for_player(
     "{player_key}",
     "{self.args.hltv_url}",
     Path(r"{ratings_path}"),
-    force=False,
+    force={self.args.force_avatar!r},
 ))
 """], capture_output=True, text=True, timeout=120)
         out = (r.stdout or "") + (r.stderr or "")
@@ -611,6 +611,11 @@ def main() -> None:
     parser.add_argument("--resume-from-round", type=int, default=1,
                         help="Deprecated — filesystem-based resume is automatic. Keep for backward compat.")
     parser.add_argument("--force", action="store_true", help="Re-download HLTV archive even if present")
+    parser.add_argument(
+        "--force-avatar",
+        action="store_true",
+        help="Re-fetch player avatar even when valid cache exists",
+    )
     parser.add_argument("--headless", action="store_true", help="CloakBrowser headless (default: visible)")
     parser.add_argument(
         "--profile-dir",
