@@ -262,6 +262,16 @@ async def _save_avatar_bytes(raw: bytes, png_path: Path) -> bool:
     return True
 
 
+def _has_hltv_identity(resolution: dict | None) -> bool:
+    """True when a resolution includes an HLTV profile URL or player ID."""
+    if not resolution:
+        return False
+    return bool(
+        str(resolution.get("player_url", "") or "").strip()
+        or str(resolution.get("player_id", "") or "").strip()
+    )
+
+
 def _promote_hltv_identity(account: object | None, resolution: dict) -> None:
     """Persist resolved HLTV profile fields on the player account after a successful fetch."""
     from player_accounts import update_hltv_player
@@ -318,9 +328,7 @@ async def fetch_avatar_for_player(
     roster_resolution = None
     search_resolution = None
     try:
-        if resolution and (
-            resolution.get("player_url") or resolution.get("player_id")
-        ):
+        if _has_hltv_identity(resolution):
             label = resolution.get("player_url") or f"player/{resolution.get('player_id')}"
             console.print(
                 f"[dim]   Resolved HLTV profile via {resolution['source']}: {label}[/dim]"
@@ -335,9 +343,7 @@ async def fetch_avatar_for_player(
 
         roster = await _scrape_match_roster(scraper, match_url)
         roster_resolution = resolve_from_roster(roster, key)
-        if roster_resolution and (
-            roster_resolution.get("player_url") or roster_resolution.get("player_id")
-        ):
+        if _has_hltv_identity(roster_resolution):
             label = (
                 roster_resolution.get("player_url")
                 or f"player/{roster_resolution.get('player_id')}"
@@ -349,19 +355,25 @@ async def fetch_avatar_for_player(
                 console.print("[green]   Avatar resolution source: roster[/green]")
                 return png_path
 
-        search_url = f"{settings.hltv_base_url}/search?query={key}"
-        search_html = await scraper._get_page_content(search_url)
-        search_resolution = resolve_from_search(search_html, ratings, key)
-        if search_resolution and search_resolution.get("player_url"):
-            console.print(
-                f"[dim]   Resolved HLTV profile via search: "
-                f"{search_resolution['player_url']}[/dim]"
-            )
-            raw = await _try_sizes(scraper, search_resolution["player_url"])
-            if raw and await _save_avatar_bytes(raw, png_path):
-                _promote_hltv_identity(account, search_resolution)
-                console.print("[green]   Avatar resolution source: search[/green]")
-                return png_path
+        if not _has_hltv_identity(resolution) and not _has_hltv_identity(
+            roster_resolution
+        ):
+            search_url = f"{settings.hltv_base_url}/search?query={key}"
+            search_html = await scraper._get_page_content(search_url)
+            search_resolution = resolve_from_search(search_html, ratings, key)
+            if _has_hltv_identity(search_resolution):
+                label = (
+                    search_resolution.get("player_url")
+                    or f"player/{search_resolution.get('player_id')}"
+                )
+                console.print(
+                    f"[dim]   Resolved HLTV profile via search: {label}[/dim]"
+                )
+                raw = await _try_profile_and_cdn(scraper, search_resolution)
+                if raw and await _save_avatar_bytes(raw, png_path):
+                    _promote_hltv_identity(account, search_resolution)
+                    console.print("[green]   Avatar resolution source: search[/green]")
+                    return png_path
 
         console.print("[yellow]   Profile bodyshot failed; trying match-page fallback[/yellow]")
         raw = await _fetch_match_page_headshot(scraper, match_url, key)
