@@ -113,3 +113,18 @@ def get_account(nickname: str) -> Optional[PlayerAccount]:
         if r["nickname"] == nickname:
             return PlayerAccount(**r)
     return None
+
+
+def update_hltv_player(nickname: str, player_id: str, player_url: str) -> PlayerAccount:
+    """Persist HLTV profile identity for a saved player account."""
+    records = _load_accounts()
+    now = datetime.now()
+    existing = next((r for r in records if r["nickname"] == nickname), None)
+    if not existing:
+        raise ValueError(f"Player account not found: {nickname}")
+
+    existing["hltv_player_id"] = player_id
+    existing["hltv_player_url"] = player_url
+    existing["updated_at"] = now
+    _save_accounts(records)
+    return PlayerAccount(**existing)

@@ -89,5 +89,7 @@ class PlayerAccount(BaseModel):
     faceit_nickname: str = Field(default="", description="Extracted Faceit nickname from URL")
     steam_url: str = Field(default="", description="Full Steam profile URL")
     steam_id: str = Field(default="", description="Steam64 ID (numeric) resolved from steam_url")
+    hltv_player_id: str = Field(default="", description="Numeric HLTV player ID from profile URL")
+    hltv_player_url: str = Field(default="", description="Canonical HLTV profile URL")
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
