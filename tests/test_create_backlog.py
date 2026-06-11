@@ -47,6 +47,7 @@ def test_create_backlog_entry_creates_high_priority_file():
 
         cb.create_backlog_entry(
             match_url="https://www.hltv.org/matches/123/team1-vs-team2",
+            match_slug="team1-vs-team2",
             player="TestPlayer",
             map_name="Nuke",
             rating=1.54,
@@ -55,7 +56,7 @@ def test_create_backlog_entry_creates_high_priority_file():
             demo_path=None,
         )
 
-        expected_file = tmpdir / "backlog" / "high" / "testplayer-nuke.md"
+        expected_file = tmpdir / "backlog" / "high" / "testplayer-nuke-team1-vs-team2.md"
         assert expected_file.exists(), f"File not created at {expected_file}"
 
         content = expected_file.read_text(encoding="utf-8")
@@ -75,6 +76,7 @@ def test_create_backlog_entry_creates_medium_priority_file():
 
         cb.create_backlog_entry(
             match_url="https://www.hltv.org/matches/123/team1-vs-team2",
+            match_slug="team1-vs-team2",
             player="MidPlayer",
             map_name="Dust2",
             rating=1.2,
@@ -83,7 +85,7 @@ def test_create_backlog_entry_creates_medium_priority_file():
             demo_path=None,
         )
 
-        expected_file = tmpdir / "backlog" / "medium" / "midplayer-dust2.md"
+        expected_file = tmpdir / "backlog" / "medium" / "midplayer-dust2-team1-vs-team2.md"
         assert expected_file.exists()
 
         content = expected_file.read_text(encoding="utf-8")

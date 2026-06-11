@@ -16,6 +16,7 @@ import json
 import os
 import pathlib
 import random
+import ssl
 import sys
 import time
 from pathlib import Path
@@ -30,13 +31,13 @@ from googleapiclient.http import MediaFileUpload
 import httplib2
 
 RETRIABLE_EXCEPTIONS = (
-    httplib2.HttpLib2Error, IOError, http.client.NotConnected,
+    httplib2.HttpLib2Error, IOError, ssl.SSLError, http.client.NotConnected,
     http.client.IncompleteRead, http.client.ImproperConnectionState,
     http.client.CannotSendRequest, http.client.CannotSendHeader,
     http.client.ResponseNotReady, http.client.BadStatusLine,
 )
 RETRIABLE_STATUS_CODES = [500, 502, 503, 504]
-MAX_RETRIES = 10
+MAX_RETRIES = 20
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 THUMB_SCOPES = ["https://www.googleapis.com/auth/youtube"]
@@ -93,7 +94,7 @@ def upload_video(
     if tags:
         body["snippet"]["tags"] = tags
 
-    media = MediaFileUpload(video_path, chunksize=128 * 1024 * 1024, resumable=True)
+    media = MediaFileUpload(video_path, chunksize=32 * 1024 * 1024, resumable=True)
     request = youtube.videos().insert(
         part="snippet,status",
         body=body,

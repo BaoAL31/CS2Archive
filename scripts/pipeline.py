@@ -122,14 +122,15 @@ class Pipeline:
             if src.suffix.lower() == ".dem":
                 self.demo_path = src
 
-        from scrapers.hltv_acquire import match_slug_from_url
+        from scrapers.hltv_acquire import match_id_from_url, match_slug_from_url
 
         stem = (
             self.demo_path.stem
             if self.demo_path
             else (self.demo_override.stem if self.demo_override else match_slug_from_url(args.hltv_url))
         )
-        self.run_id = run_id_from_name(f"{stem}_{args.player}_{args.map}")
+        match_id = match_id_from_url(args.hltv_url)
+        self.run_id = run_id_from_name(f"{match_id}_{stem}_{args.player}_{args.map}")
         self.state = load_state(self.run_id)
         self.state.setdefault("data", {})
 
@@ -316,37 +317,47 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
             "--output", str(self.render_dir),
             "--batches", str(self.args.batches),
         ]
-        if self.args.resume_from_round > 1:
-            render_args.extend(["--resume-from-round", str(self.args.resume_from_round)])
         r = self._run_py(render_args, timeout=43200)
         if r.returncode != 0:
             fail(6, "RENDER_FAILED", f"render_pov.py exited {r.returncode}")
 
-        combined = self.render_dir / "combined.mp4"
-        if not combined.exists():
-            fail(6, "RENDER_NO_VIDEO", f"no combined.mp4 produced in {self.render_dir}")
+        batch_files = sorted(
+            [f for f in self.render_dir.glob("batch-*.mp4") if re.match(r"batch-\d+-\d+\.mp4$", f.name)],
+            key=lambda f: int(re.match(r"batch-(\d+)-\d+\.mp4$", f.name).group(1)),
+        )
+        if not batch_files:
+            fail(6, "RENDER_NO_BATCHES", f"no batch-*.mp4 files in {self.render_dir}")
 
-        if combined.stat().st_size < 50000:
-            fail(6, "RENDER_VIDEO_TOO_SMALL", f"combined.mp4 too small: {combined.stat().st_size} bytes")
+        round_count = self.state["data"].get("round_count", 0)
+        if round_count > 0:
+            last_batch = batch_files[-1]
+            last_end = int(re.match(r"batch-\d+-(\d+)\.mp4$", last_batch.name).group(1))
+            if last_end < round_count:
+                fail(6, "RENDER_INCOMPLETE",
+                     f"last batch ends at round {last_end}, expected {round_count}")
 
-        mb = combined.stat().st_size / 1024 / 1024
-        print(f"  [OK] Rendered combined.mp4 ({mb:.0f} MB)")
+        total_mb = sum(f.stat().st_size for f in batch_files) / 1024 / 1024
+        total_rounds = sum(
+            int(re.match(r"batch-\d+-(\d+)\.mp4$", f.name).group(1))
+            - int(re.match(r"batch-(\d+)-\d+\.mp4$", f.name).group(1))
+            + 1
+            for f in batch_files
+        )
+        print(f"  [OK] {len(batch_files)} batch(es), {total_rounds} round(s) ({total_mb:.0f} MB)")
 
-    # ── Step 7: Concat (no-op — render_pov.py produces combined.mp4 directly) ──
+    # ── Step 7: Concat ───────────────────────────────────────────────────
 
     def step_concat(self) -> None:
         if not self.render_dir.exists():
             fail(7, "CONCAT_RENDER_DIR_MISSING", f"render dir not found: {self.render_dir}")
 
+        r = self._run_py(["scripts/concat_rounds.py", str(self.render_dir)], timeout=7200)
+        if r.returncode != 0:
+            fail(7, "CONCAT_FAILED", f"concat_rounds.py exited {r.returncode}")
+
         combined = self.render_dir / "combined.mp4"
         if not combined.exists():
             fail(7, "CONCAT_NO_COMBINED", f"no combined.mp4 found in {self.render_dir}")
-
-        mb = combined.stat().st_size / 1024 / 1024
-        print(f"  [OK] combined.mp4 exists ({mb:.0f} MB) — single-pass render skipped concat")
-
-        if not combined.exists():
-            fail(7, "CONCAT_OUTPUT_MISSING", "combined.mp4 not created after concat")
         if combined.stat().st_size < 100000:
             fail(7, "CONCAT_OUTPUT_TOO_SMALL", f"combined.mp4 suspiciously small: {combined.stat().st_size} bytes")
 
@@ -399,7 +410,7 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
 
     def step_thumbnail(self) -> None:
         self.youtube_dir.mkdir(parents=True, exist_ok=True)
-        thumb = self.youtube_dir / "thumbnail.png"
+        thumb = self.youtube_dir / "thumbnail.jpg"
 
         cmd = [
             "-m", "thumbnail",
@@ -418,9 +429,9 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
             fail(9, "THUMBNAIL_FAILED", f"thumbnail generator exited {r.returncode}")
 
         if not thumb.exists():
-            fail(9, "THUMBNAIL_MISSING", f"thumbnail.png not created at {thumb}")
+            fail(9, "THUMBNAIL_MISSING", f"thumbnail not created at {thumb}")
         if thumb.stat().st_size < 1000:
-            fail(9, "THUMBNAIL_TOO_SMALL", f"thumbnail.png too small: {thumb.stat().st_size} bytes")
+            fail(9, "THUMBNAIL_TOO_SMALL", f"thumbnail too small: {thumb.stat().st_size} bytes")
 
         # Verify dimensions via Pillow
         try:
@@ -439,7 +450,7 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
     def _write_upload_meta(self) -> None:
         """Generate upload_meta.json with all metadata needed for upload resume."""
         video = self.youtube_dir / "video.mp4"
-        thumb = self.youtube_dir / "thumbnail.png"
+        thumb = self.youtube_dir / "thumbnail.jpg"
 
         r = self._run_py([
             "scripts/generate_title.py", str(self.ratings_json),
@@ -474,7 +485,7 @@ asyncio.run(get_player_avatars("{self.args.hltv_url}"))
 
     def step_upload(self) -> None:
         video = self.youtube_dir / "video.mp4"
-        thumb = self.youtube_dir / "thumbnail.png"
+        thumb = self.youtube_dir / "thumbnail.jpg"
 
         if not video.exists():
             fail(10, "UPLOAD_VIDEO_MISSING", f"video not found: {video}")
@@ -561,7 +572,7 @@ def main() -> None:
     parser.add_argument("--until", type=int, default=None, choices=range(1, 11),
                         help="Stop after step N (default: 11). E.g. --until 9 stops before upload.")
     parser.add_argument("--resume-from-round", type=int, default=1,
-                        help="Resume render from round N (step 6 only)")
+                        help="Deprecated — filesystem-based resume is automatic. Keep for backward compat.")
     parser.add_argument("--force", action="store_true", help="Re-download HLTV archive even if present")
     parser.add_argument("--headless", action="store_true", help="CloakBrowser headless (default: visible)")
     parser.add_argument(
@@ -570,8 +581,8 @@ def main() -> None:
         help="CloakBrowser profile dir (default: .cloak-hltv-profile)",
     )
     parser.add_argument("--privacy", choices=["private", "unlisted", "public"], default="public")
-    parser.add_argument("--batches", type=int, default=1,
-                        help="Rounds per batch (1 = one round at a time, default: 1)")
+    parser.add_argument("--batches", type=int, default=10,
+                        help="Rounds per render batch (default: 10). Forwarded to render_pov.py.")
     args = parser.parse_args()
 
     print(f"{'='*60}")

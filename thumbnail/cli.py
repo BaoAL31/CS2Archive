@@ -9,7 +9,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-TMP_DIR = Path(__file__).resolve().parent.parent / "tmp"
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+TMP_DIR = _PROJECT_ROOT / "tmp"
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 from rich.console import Console
@@ -59,13 +60,15 @@ def build_output_dir(match_slug: str, player: str, map_name: str) -> Path:
 
 
 def extract_background_frame(demo_path: str, steam_id: str) -> Path:
-    tmp_dir = Path(tempfile.mkdtemp(prefix="thumb_bg_", dir=TMP_DIR))
+    tmp_dir = Path(tempfile.mkdtemp(prefix="thumb_bg_", dir=TMP_DIR)).resolve()
+    demo = Path(demo_path).resolve()
+    cfg = (_PROJECT_ROOT / "assets" / "cs2_pov.cfg").resolve()
     minimizer = CS2Minimizer(verbose=True)
     minimizer.start()
     try:
         console.print(f"  Finding kills for player...")
         subprocess.run(
-            [CSDM, "json", str(demo_path), "--output-folder", str(tmp_dir)],
+            [CSDM, "json", str(demo), "--output-folder", str(tmp_dir)],
             capture_output=True, text=True, timeout=300,
         )
 
@@ -94,7 +97,7 @@ def extract_background_frame(demo_path: str, steam_id: str) -> Path:
         console.print(f"  Rendering kill at tick {tick} ({kill.get('weaponName', '?')}, {kill.get('victimName', '?')})...")
 
         cmd = [
-            CSDM, "video", str(demo_path),
+            CSDM, "video", str(demo),
             str(start_tick), str(end_tick),
             "--focus-player", steam_id,
             "--perspective", "player",
@@ -106,14 +109,17 @@ def extract_background_frame(demo_path: str, steam_id: str) -> Path:
             "--framerate", "30",
             "--ffmpeg-executable-path", FFMPEG_PATH,
             "--ffmpeg-video-codec", "h264_nvenc",
-            "--recording-system", "CS",
+            "--ffmpeg-crf", "15",
+            "--ffmpeg-output-parameters=-cq 15 -preset p7 -profile:v high -pix_fmt yuv420p -level 5.1",
+            "--recording-system", "HLAE",
             "--close-game-after-recording",
-            "--cfg", "assets/cs2_pov.cfg",
+            "--cfg", str(cfg),
         ]
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0:
-            console.print(f"[red]  Clip render failed: {result.stderr[:200]}[/red]")
+        err = (result.stderr or "") + (result.stdout or "")
+        if result.returncode != 0 or "Raw files not found" in err:
+            console.print(f"[red]  Clip render failed: {err[-300:]}[/red]")
             sys.exit(1)
 
         clips = sorted(tmp_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
@@ -213,7 +219,9 @@ def main() -> None:
         tournament=args.tournament or "",
         stage=stage,
     )
-    img.save(output_path, "PNG")
+    img = img.convert("RGB")
+    img.save(output_path.with_suffix(".jpg"), "JPEG", quality=95, subsampling=0)
+    output_path = output_path.with_suffix(".jpg")
 
     # Clean up auto-extracted bg frame
     if not args.background and bg_path.parent == YOUTUBE_DIR:

@@ -5,6 +5,11 @@
 - **Match**: A CS2 pro match between two teams on HLTV or FACEIT. Has a URL, team names, maps, and a unique slug.
 - **POV** (Point of View): A specific (match, player, map) tuple. The unit a thumbnail/video is generated for.
 - **Render Folder**: Working directory for POV video renders: `demos/renders/pov-{demo-stem}_{player}/`. Scoped per POV (not per demo) so multiple players on the same `.dem` never share `combined.mp4`.
+- **Render Batch**: Consecutive demo rounds rendered in a single csdm invocation. Default size is **10** (`--batches N`). On failure mid-batch, the whole batch is re-rendered on resume.
+- **Batch Artifact**: The single MP4 csdm writes for one render batch, named `batch-{start:03d}-{end:03d}.mp4` using **global** round numbers (continuous across split demo parts p1/p2). Render skips a batch only when that **exact** filename exists and is **≥ 1 MB** (no minimum duration; some rounds are very short). Concat requires `batch-*.mp4` ranges to be contiguous, non-overlapping, and cover rounds 1..N; otherwise it fails with a clear error (no silent overlap concat).
+- **Concat input**: Step 7 merges **batch artifacts** only (`batch-*.mp4`), in global round order, deleting each after a successful append. No `round-*.mp4` path in pipeline code; `--batches 1` is equivalent to the former one-round-per-file model (`batch-007-007.mp4`).
+- **Legacy migration**: Existing `round-NNN.mp4` files are renamed once to `batch-NNN-NNN.mp4` (same global index) before using batch concat; no re-render.
+- **Batches flag**: `--batches N` on `render_pov.py` and `pipeline.py` (default 10). Pipeline forwards the flag to render step 6.
 - **Ratings File**: JSON file in `demos/analysis/{match-slug}_ratings.json` containing per-map player stats from HLTV Rating 3.0.
 - **Avatar**: HLTV full-body player photo stored in `demos/avatars/{nickname}.png`. Background is removed with `rembg` during download (step 4), not at thumbnail time.
 - **Background Frame**: A single frame extracted from a csdm-rendered kill clip, blurred (radius 6) and used as the thumbnail background.
@@ -40,8 +45,8 @@ Steps run in order. Resume uses the Pipeline State File; the Progress File links
 | 3 | steam_id | Save player Steam64 to player list |
 | 4 | avatar | Download player cutout PNG from HLTV |
 | 5 | analyze | csdm analyze the demo |
-| 6 | render | Render all rounds as POV clips |
-| 7 | concat | Copy combined.mp4 → youtube/video.mp4 |
+| 6 | render | Render POV in batches; checkpoint = `batch-*.mp4` covering rounds 1..N |
+| 7 | concat | Merge batch artifacts into `combined.mp4`, copy to youtube |
 | 8 | outro | Generate 5s silent outro (Pillow + Montserrat, top-half text), concat onto video.mp4 |
 | 9 | thumbnail | Generate 1280×720 thumbnail.png |
 | 10 | upload | Upload video.mp4 + thumbnail.png to YouTube |
