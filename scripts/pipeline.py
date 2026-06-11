@@ -248,6 +248,10 @@ class Pipeline:
     # ── Step 4: Avatar ───────────────────────────────────────────────────
 
     def step_avatar(self) -> None:
+        from PIL import Image
+
+        from scrapers.player_images import MIN_RES
+
         player_key = self.args.player.strip().lower()
         avatar_path = PROJECT_ROOT / "demos" / "avatars" / f"{player_key}.png"
         ratings_path = self.state["data"].get("ratings_path") or str(self.ratings_json)
@@ -266,10 +270,16 @@ asyncio.run(fetch_avatar_for_player(
         out = (r.stdout or "") + (r.stderr or "")
         print(out[:500] if out else "  (no output)")
 
+        if r.returncode != 0:
+            fail(4, "AVATAR_FETCH_FAILED", f"avatar fetch exited {r.returncode}: {out[:300]}")
+
         if not avatar_path.exists():
             fail(4, "AVATAR_MISSING", f"avatar PNG not found: {avatar_path}")
-        if avatar_path.stat().st_size < 500:
-            fail(4, "AVATAR_TOO_SMALL", f"avatar PNG too small: {avatar_path.stat().st_size} bytes")
+
+        with Image.open(avatar_path) as im:
+            w, h = im.size
+        if w < MIN_RES or h < MIN_RES:
+            fail(4, "AVATAR_TOO_SMALL", f"avatar PNG too small: {w}x{h} (min {MIN_RES}x{MIN_RES})")
 
         self.state["data"]["avatar_path"] = str(avatar_path)
         print(f"  [OK] Avatar: {avatar_path.name}")
