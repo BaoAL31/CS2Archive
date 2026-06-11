@@ -24,6 +24,7 @@ from scrapers.hltv_player_resolver import (
     load_ratings_json,
     normalize_pipeline_player_key,
     resolve_from_roster,
+    resolve_from_search,
     resolve_hltv_player,
 )
 
@@ -314,6 +315,8 @@ async def fetch_avatar_for_player(
     from scrapers.hltv import HLTVScraper
 
     scraper = HLTVScraper()
+    roster_resolution = None
+    search_resolution = None
     try:
         if resolution and (
             resolution.get("player_url") or resolution.get("player_id")
@@ -346,10 +349,24 @@ async def fetch_avatar_for_player(
                 console.print("[green]   Avatar resolution source: roster[/green]")
                 return png_path
 
+        search_url = f"{settings.hltv_base_url}/search?query={key}"
+        search_html = await scraper._get_page_content(search_url)
+        search_resolution = resolve_from_search(search_html, ratings, key)
+        if search_resolution and search_resolution.get("player_url"):
+            console.print(
+                f"[dim]   Resolved HLTV profile via search: "
+                f"{search_resolution['player_url']}[/dim]"
+            )
+            raw = await _try_sizes(scraper, search_resolution["player_url"])
+            if raw and await _save_avatar_bytes(raw, png_path):
+                _promote_hltv_identity(account, search_resolution)
+                console.print("[green]   Avatar resolution source: search[/green]")
+                return png_path
+
         console.print("[yellow]   Profile bodyshot failed; trying match-page fallback[/yellow]")
         raw = await _fetch_match_page_headshot(scraper, match_url, key)
         if raw and await _save_avatar_bytes(raw, png_path):
-            promote_resolution = roster_resolution or resolution
+            promote_resolution = search_resolution or roster_resolution or resolution
             if promote_resolution:
                 _promote_hltv_identity(account, promote_resolution)
             console.print("[green]   Avatar resolution source: match_fallback[/green]")

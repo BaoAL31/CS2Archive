@@ -11,7 +11,9 @@ import re
 from io import BytesIO
 from pathlib import Path
 from typing import Any, TypedDict
+from urllib.parse import urljoin
 
+from bs4 import BeautifulSoup
 from PIL import Image
 
 MIN_AVATAR_RES = 300
@@ -23,6 +25,12 @@ class HltvPlayerResolution(TypedDict):
     player_url: str
     player_id: str
     source: str
+
+
+class SearchPlayerCandidate(TypedDict):
+    player_url: str
+    player_id: str
+    nickname: str
 
 
 def normalize_pipeline_player_key(player_key: str) -> str:
@@ -124,6 +132,88 @@ def resolve_from_ratings(
     return None
 
 
+def parse_search_player_candidates(
+    search_html: str,
+    *,
+    base_url: str = "https://www.hltv.org",
+) -> list[SearchPlayerCandidate]:
+    """Extract /player/ links from HLTV search page HTML."""
+    soup = BeautifulSoup(search_html, "lxml")
+    seen_ids: set[str] = set()
+    candidates: list[SearchPlayerCandidate] = []
+
+    for link in soup.find_all("a", href=True):
+        href = str(link["href"])
+        m = _HLTV_PLAYER_ID_RE.search(href)
+        if not m:
+            continue
+        player_id = m.group(1)
+        if player_id in seen_ids:
+            continue
+        seen_ids.add(player_id)
+
+        slug_m = re.search(rf"/player/{player_id}/([^/?#]+)", href, re.IGNORECASE)
+        slug = slug_m.group(1) if slug_m else ""
+        text = link.get_text(strip=True)
+        nickname = text or slug
+        if not nickname:
+            continue
+
+        full_url = href if href.startswith("http") else urljoin(base_url, href)
+        candidates.append(
+            {
+                "player_url": full_url,
+                "player_id": player_id,
+                "nickname": nickname,
+            }
+        )
+    return candidates
+
+
+def disambiguate_search_candidates(
+    candidates: list[SearchPlayerCandidate],
+    roster_nicknames: list[str],
+    player_key: str,
+) -> SearchPlayerCandidate | None:
+    """Filter search hits to roster nicknames; tiebreak on exact player_key match."""
+    roster_set = set(roster_nicknames)
+    on_roster = [
+        candidate
+        for candidate in candidates
+        if normalize_pipeline_player_key(candidate["nickname"]) in roster_set
+    ]
+    if not on_roster:
+        return None
+    if len(on_roster) == 1:
+        return on_roster[0]
+
+    key = normalize_pipeline_player_key(player_key)
+    exact = [
+        candidate
+        for candidate in on_roster
+        if normalize_pipeline_player_key(candidate["nickname"]) == key
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    return None
+
+
+def resolve_from_search(
+    search_html: str,
+    ratings: dict,
+    player_key: str,
+    *,
+    base_url: str = "https://www.hltv.org",
+) -> HltvPlayerResolution | None:
+    """Disambiguate HLTV search results using ratings roster nicknames."""
+    candidates = parse_search_player_candidates(search_html, base_url=base_url)
+    roster = roster_nicknames_from_ratings(ratings)
+    pick = disambiguate_search_candidates(candidates, roster, player_key)
+    if pick is None:
+        return None
+    return _make_resolution(pick["player_url"], "search", pick["player_id"])
+
+
 def resolve_from_roster(
     roster: list[dict],
     player_key: str,
@@ -153,8 +243,9 @@ def resolve_hltv_player(
     ratings: dict,
     *,
     roster: list[dict] | None = None,
+    search_html: str | None = None,
 ) -> HltvPlayerResolution | None:
-    """Resolve HLTV profile in priority order: account → ratings → roster."""
+    """Resolve HLTV profile in priority order: account → ratings → roster → search."""
     result = resolve_from_accounts(accounts, player_key)
     if result:
         return result
@@ -162,7 +253,11 @@ def resolve_hltv_player(
     if result:
         return result
     if roster:
-        return resolve_from_roster(roster, player_key)
+        result = resolve_from_roster(roster, player_key)
+        if result:
+            return result
+    if search_html:
+        return resolve_from_search(search_html, ratings, player_key)
     return None
 
 
