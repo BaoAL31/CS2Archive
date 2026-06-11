@@ -37,6 +37,37 @@ _BODYSHOT_PLAYER_ID_RE = re.compile(r"playerbodyshot/(\d+)/", re.IGNORECASE)
 _BODYSHOT_QUERY_ID_RE = re.compile(r"[?&]playerid=(\d+)", re.IGNORECASE)
 _CDN_BODYSHOT_BASE = "https://img-cdn.hltv.org/playerbodyshot"
 
+_BODYSHOT_LOCATORS = (
+    '.playerBodyshot img[src*="playerbodyshot"]',
+    'img.bodyshot-img[src*="playerbodyshot"]',
+)
+
+_PICK_PROFILE_BODYSHOT_JS = """
+([sel, expectedId]) => {
+    const all = Array.from(document.querySelectorAll(sel));
+    let imgs = all.filter((img) => {
+        const src = (img.currentSrc || img.src || '').toLowerCase();
+        return src.includes('playerbodyshot') && !src.includes('w=100') && !src.includes('h=100');
+    });
+    if (!imgs.length) return null;
+    if (expectedId) {
+        const id = String(expectedId);
+        const matched = imgs.filter((img) => {
+            const src = (img.currentSrc || img.src || '').toLowerCase();
+            return src.includes('/playerbodyshot/' + id + '/') || src.includes('playerid=' + id);
+        });
+        if (matched.length) imgs = matched;
+    }
+    let best = imgs[0];
+    for (let i = 1; i < imgs.length; i++) {
+        const area = imgs[i].naturalWidth * imgs[i].naturalHeight;
+        const bestArea = best.naturalWidth * best.naturalHeight;
+        if (area > bestArea) best = imgs[i];
+    }
+    return best.currentSrc || best.src;
+}
+"""
+
 
 def _player_id_from_url(url: str | None) -> str | None:
     return hltv_player_id_from_url(url)
@@ -77,46 +108,61 @@ def _is_acceptable(im: Image.Image) -> bool:
     return im.size[0] >= MIN_RES and im.size[1] >= MIN_RES
 
 
-async def _try_sizes(scraper, player_url: str) -> bytes | None:
-    """Try w=400, then w=300, then any size — return first acceptable image."""
-    for size_param in ["w=400", "w=300", ""]:
-        cap_ctx = await scraper.fresh_context()
-        cap_page = await cap_ctx.new_page()
-        captured: dict[str, bytes] = {}
+def _upgrade_bodyshot_url(url: str, width: int = 400) -> str:
+    """Request full-size HLTV bodyshot (sidebar widgets use w=100)."""
+    if "w=400" in url:
+        return url
+    if re.search(r"[?&]w=\d+", url):
+        return re.sub(r"([?&])w=\d+", rf"\1w={width}", url)
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}w={width}"
 
-        async def on_resp(resp):
-            if "playerbodyshot" not in resp.url:
-                return
-            if size_param and size_param not in resp.url:
-                return
-            if captured:
-                return
+
+async def _fetch_profile_bodyshot(scraper, player_url: str) -> bytes | None:
+    """Profile-header bodyshot only — uses DOM-selected img src (hash CDN URLs)."""
+    expected_id = hltv_player_id_from_url(player_url) or ""
+    await scraper._ensure_browser()
+    cap_ctx = await scraper.fresh_context()
+    page = await cap_ctx.new_page()
+    try:
+        await page.goto(player_url, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(5000)
+
+        picked_src: str | None = None
+        for sel in _BODYSHOT_LOCATORS:
             try:
-                body = await resp.body()
-                if len(body) > 5000 and not body.startswith(b"<html"):
-                    captured[resp.url] = body
+                picked_src = await page.evaluate(_PICK_PROFILE_BODYSHOT_JS, [sel, expected_id])
             except Exception:
-                pass
+                continue
+            if picked_src:
+                break
 
-        cap_page.on("response", on_resp)
-        try:
-            await cap_page.goto(player_url, wait_until="domcontentloaded", timeout=20000)
-            await asyncio.sleep(3)
-        except Exception:
-            await asyncio.sleep(3)
-        await cap_page.close()
+        if not picked_src:
+            return None
+
+        full_url = _upgrade_bodyshot_url(picked_src)
+    finally:
+        await page.close()
         await cap_ctx.close()
 
-        if captured:
-            raw = max(captured.values(), key=lambda b: len(b))
-            try:
-                im = Image.open(BytesIO(raw))
-                if _is_acceptable(im):
-                    return raw
-            except Exception:
-                pass
+    # CDN fetch on a fresh page — same-tab navigation from profile page returns 403/HTML.
+    dl_ctx = await scraper.fresh_context()
+    dl_page = await dl_ctx.new_page()
+    try:
+        resp = await dl_page.goto(full_url, wait_until="domcontentloaded", timeout=30000)
+        if resp is None or not resp.ok:
+            return None
+        raw = await resp.body()
+        if len(raw) < 5000 or raw.startswith(b"<html"):
+            return None
 
-    return None
+        im = Image.open(BytesIO(raw))
+        if not _is_acceptable(im):
+            return None
+        return raw
+    finally:
+        await dl_page.close()
+        await dl_ctx.close()
 
 
 async def _fetch_cdn_bodyshot(scraper, player_id: str) -> bytes | None:
@@ -135,8 +181,6 @@ async def _fetch_cdn_bodyshot(scraper, player_id: str) -> bytes | None:
                 continue
             raw = await resp.body()
             if len(raw) <= 5000 or raw.startswith(b"<html"):
-                continue
-            if not _bodyshot_url_matches_player(resp.url, pid):
                 continue
             im = Image.open(BytesIO(raw))
             if _is_acceptable(im):
@@ -158,7 +202,7 @@ async def _try_profile_and_cdn(scraper, resolution: dict) -> bytes | None:
     )
 
     if player_url:
-        raw = await _try_sizes(scraper, player_url)
+        raw = await _fetch_profile_bodyshot(scraper, player_url)
         if raw:
             return raw
 
@@ -195,50 +239,45 @@ async def _scrape_match_roster(scraper, match_url: str) -> list[dict]:
 
 
 async def _fetch_match_page_headshot(scraper, match_url: str, player_key: str) -> bytes | None:
-    """Last resort: download match-page lineup photo for one player."""
+    """Last resort: screenshot match-page lineup photo for one player."""
     context = await scraper._ensure_browser()
     page = await context.new_page()
-    await page.goto(match_url, wait_until="domcontentloaded", timeout=30000)
-    await page.wait_for_timeout(3000)
-
-    img_url = await page.evaluate(
-        """
-        (nick) => {
-            const imgs = document.querySelectorAll('div.players img.player-photo');
-            for (const img of imgs) {
-                const alt = img.alt || '';
-                const m = alt.match(/'([^']+)'/);
-                const n = m ? m[1].toLowerCase() : alt.split(' ').pop().toLowerCase();
-                if (n === nick) return img.src || null;
-            }
-            return null;
-        }
-        """,
-        player_key,
-    )
-    await page.close()
-
-    if not img_url:
-        return None
-
-    cap_ctx = await scraper.fresh_context()
-    cap_page = await cap_ctx.new_page()
     try:
-        resp = await cap_page.goto(img_url, wait_until="domcontentloaded", timeout=20000)
-        if resp is None or not resp.ok:
+        await page.goto(match_url, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(3000)
+
+        entries = await page.evaluate(
+            """
+            () => {
+                const imgs = document.querySelectorAll('div.players img.player-photo');
+                return Array.from(imgs).map((img, index) => {
+                    const alt = img.alt || '';
+                    const m = alt.match(/'([^']+)'/);
+                    const nick = m ? m[1].toLowerCase() : alt.split(' ').pop().toLowerCase();
+                    return { nickname: nick, index };
+                });
+            }
+            """
+        )
+        match = next((e for e in entries if e["nickname"] == player_key), None)
+        if not match:
+            console.print(f"[yellow]   [{player_key}] not found on match page for fallback[/yellow]")
             return None
-        raw = await resp.body()
-        if len(raw) <= 5000 or raw.startswith(b"<html"):
+
+        locator = page.locator("div.players img.player-photo").nth(match["index"])
+        shot = await locator.screenshot(type="png")
+        if not shot or len(shot) < 1000:
             return None
-        im = Image.open(BytesIO(raw))
+
+        im = Image.open(BytesIO(shot))
         if _is_acceptable(im):
-            return raw
-    except Exception:
+            return shot
+        console.print(
+            f"[yellow]   [{player_key}] match-page photo too small ({im.size[0]}x{im.size[1]})[/yellow]"
+        )
         return None
     finally:
-        await cap_page.close()
-        await cap_ctx.close()
-    return None
+        await page.close()
 
 
 async def _save_avatar_bytes(raw: bytes, png_path: Path) -> bool:
@@ -328,6 +367,7 @@ async def fetch_avatar_for_player(
     roster_resolution = None
     search_resolution = None
     try:
+        await scraper._ensure_browser()
         if _has_hltv_identity(resolution):
             label = resolution.get("player_url") or f"player/{resolution.get('player_id')}"
             console.print(
@@ -426,7 +466,7 @@ async def get_player_avatars(match_url: str) -> dict[str, Path]:
                 console.print(f"[yellow]   [{nickname}] no player URL[/yellow]")
                 continue
 
-            raw = await _try_sizes(scraper, entry["playerUrl"])
+            raw = await _fetch_profile_bodyshot(scraper, entry["playerUrl"])
 
             if not raw:
                 console.print(f"[yellow]   [{nickname}] no acceptable image captured[/yellow]")
