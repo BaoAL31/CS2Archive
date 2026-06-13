@@ -511,10 +511,48 @@ asyncio.run(fetch_avatar_for_player(
         }
         if getattr(self.args, "publish_at", None):
             upload_meta["publish_at"] = self.args.publish_at
+            upload_meta["publish_timezone"] = getattr(
+                self.args, "publish_timezone", None
+            ) or "Australia/Sydney"
 
         meta_path = self.youtube_dir / "upload_meta.json"
         meta_path.write_text(json.dumps(upload_meta, indent=2))
         print(f"  [OK] upload_meta.json written")
+        self._write_upload_meta_shorts(upload_meta)
+
+    def _write_upload_meta_shorts(self, upload_meta: dict) -> None:
+        """Write upload_meta_shorts.json for optional Shorts upload."""
+        title = upload_meta["title"]
+        if "#shorts" not in title.lower():
+            title = f"{title} #Shorts"
+        desc = upload_meta.get("description", "")
+        if "#shorts" not in desc.lower():
+            desc = f"{desc.rstrip()}\n\n#Shorts" if desc.strip() else "#Shorts"
+        tags = list(upload_meta.get("tags") or [])
+        if "Shorts" not in tags:
+            tags.append("Shorts")
+
+        shorts_meta = {
+            "title": title,
+            "description": desc,
+            "tags": tags,
+            "video_path": str(self.youtube_dir / "short.mp4"),
+            "privacy": upload_meta.get("privacy", self.args.privacy),
+            "youtube_id": None,
+            "upload_status": "pending",
+        }
+        publish_at = getattr(self.args, "publish_shorts_at", None) or getattr(
+            self.args, "publish_at", None
+        )
+        if publish_at:
+            shorts_meta["publish_at"] = publish_at
+            shorts_meta["publish_timezone"] = getattr(
+                self.args, "publish_timezone", None
+            ) or "Australia/Sydney"
+
+        shorts_path = self.youtube_dir / "upload_meta_shorts.json"
+        shorts_path.write_text(json.dumps(shorts_meta, indent=2))
+        print(f"  [OK] upload_meta_shorts.json written")
 
     # ── Step 10: Upload ─────────────────────────────────────────────────
 
@@ -542,6 +580,10 @@ asyncio.run(fetch_avatar_for_player(
             cmd += ["--thumbnail", str(thumb)]
         if getattr(self.args, "publish_at", None):
             cmd += ["--publish-at", self.args.publish_at]
+            cmd += [
+                "--timezone",
+                getattr(self.args, "publish_timezone", None) or "Australia/Sydney",
+            ]
 
         env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
         proc = subprocess.Popen(
@@ -566,6 +608,65 @@ asyncio.run(fetch_avatar_for_player(
             print(f"  [OK] Uploaded: https://youtu.be/{vid_id}")
         else:
             fail(10, "UPLOAD_NO_VIDEO_ID", f"could not extract video ID from output: {out[:200]}")
+
+        self._upload_shorts_if_present()
+
+    def _upload_shorts_if_present(self) -> None:
+        short = self.youtube_dir / "short.mp4"
+        if not short.exists():
+            print("  [SKIP] No short.mp4 — Shorts upload skipped")
+            return
+        if short.stat().st_size < 10000:
+            fail(10, "UPLOAD_SHORT_TOO_SMALL", f"short.mp4 too small: {short.stat().st_size} bytes")
+
+        shorts_meta_path = self.youtube_dir / "upload_meta_shorts.json"
+        if not shorts_meta_path.exists():
+            if (self.youtube_dir / "upload_meta.json").exists():
+                upload_meta = json.loads(
+                    (self.youtube_dir / "upload_meta.json").read_text(encoding="utf-8")
+                )
+                self._write_upload_meta_shorts(upload_meta)
+            else:
+                fail(10, "UPLOAD_SHORTS_META_MISSING", "upload_meta_shorts.json not found")
+
+        cmd = [
+            "scripts/upload_youtube_shorts.py",
+            str(short),
+            "--meta", str(shorts_meta_path),
+            "--privacy", self.args.privacy,
+        ]
+        publish_at = getattr(self.args, "publish_shorts_at", None) or getattr(
+            self.args, "publish_at", None
+        )
+        if publish_at:
+            cmd += ["--publish-at", publish_at]
+            cmd += [
+                "--timezone",
+                getattr(self.args, "publish_timezone", None) or "Australia/Sydney",
+            ]
+
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+        proc = subprocess.Popen(
+            [PY] + cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env=env, text=True, encoding="utf-8",
+        )
+        out_lines: list[str] = []
+        if proc.stdout:
+            for line in proc.stdout:
+                print(line, end="")
+                out_lines.append(line)
+        proc.wait()
+        out = "".join(out_lines)
+
+        if proc.returncode != 0:
+            fail(10, "UPLOAD_SHORTS_FAILED", f"shorts upload exited {proc.returncode}: {out[:300]}")
+
+        m = re.search(r"https://youtu\.be/([a-zA-Z0-9_-]+)", out)
+        if m:
+            self.state["data"]["youtube_shorts_id"] = m.group(1)
+            print(f"  [OK] Short uploaded: https://youtu.be/{m.group(1)}")
+        else:
+            fail(10, "UPLOAD_SHORTS_NO_VIDEO_ID", f"could not extract Shorts ID: {out[:200]}")
 
     # ── Step 11: Cleanup ────────────────────────────────────────────────
 
@@ -626,7 +727,18 @@ def main() -> None:
     parser.add_argument("--batches", type=int, default=10,
                         help="Rounds per render batch (default: 10). 0 = all rounds in one session.")
     parser.add_argument("--publish-at", default=None,
-                        help="Schedule YouTube publish (local time, e.g. '2026-06-12 17:00')")
+                        help="Schedule YouTube publish (wall-clock time in --timezone, e.g. '2026-06-12 17:00')")
+    parser.add_argument(
+        "--publish-shorts-at",
+        default=None,
+        help="Schedule Shorts publish (defaults to --publish-at if omitted)",
+    )
+    parser.add_argument(
+        "--timezone",
+        default="Australia/Sydney",
+        dest="publish_timezone",
+        help="IANA timezone for --publish-at / --publish-shorts-at (default: Australia/Sydney)",
+    )
     args = parser.parse_args()
 
     print(f"{'='*60}")

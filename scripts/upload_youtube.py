@@ -30,6 +30,12 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 import httplib2
 
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from youtube_schedule import DEFAULT_PUBLISH_TZ, resolve_publish_schedule
+
 RETRIABLE_EXCEPTIONS = (
     httplib2.HttpLib2Error, IOError, ssl.SSLError, http.client.NotConnected,
     http.client.IncompleteRead, http.client.ImproperConnectionState,
@@ -79,17 +85,23 @@ def upload_video(
     youtube, video_path: str, title: str, description: str,
     privacy: str, thumbnail_path: str | None = None,
     tags: list[str] | None = None, meta_path: str | None = None,
+    publish_at_utc: str | None = None,
 ) -> str:
+    status: dict = {
+        "privacyStatus": privacy,
+        "selfDeclaredMadeForKids": False,
+    }
+    if publish_at_utc:
+        status["privacyStatus"] = "private"
+        status["publishAt"] = publish_at_utc
+
     body: dict = {
         "snippet": {
             "title": title,
             "description": description,
             "categoryId": "20",
         },
-        "status": {
-            "privacyStatus": privacy,
-            "selfDeclaredMadeForKids": False,
-        },
+        "status": status,
     }
     if tags:
         body["snippet"]["tags"] = tags
@@ -182,6 +194,8 @@ def upload_video(
         meta.pop("video_size", None)
         meta["youtube_id"] = response.get("id")
         meta["upload_status"] = "completed"
+        if publish_at_utc:
+            meta["publish_at_utc"] = publish_at_utc
         with open(mp, "w") as f:
             json.dump(meta, f, indent=2)
     except Exception:
@@ -226,6 +240,15 @@ def main() -> None:
     parser.add_argument("--tags", help="Comma-separated tags (max 500 chars total)")
     parser.add_argument("--privacy", choices=["private", "unlisted", "public"], default="unlisted")
     parser.add_argument("--meta", help="Path to upload_meta.json (overrides --title, --description, --tags)")
+    parser.add_argument(
+        "--publish-at",
+        help="Schedule publish (wall-clock time in --timezone, e.g. '2026-06-12 17:00')",
+    )
+    parser.add_argument(
+        "--timezone",
+        default=DEFAULT_PUBLISH_TZ,
+        help=f"IANA timezone for --publish-at (default: {DEFAULT_PUBLISH_TZ})",
+    )
     parser.add_argument("--update-thumbnail", help="Update thumbnail for an existing video ID")
     args = parser.parse_args()
 
@@ -294,10 +317,35 @@ def main() -> None:
 
     meta_file_path = str(video.parent / "upload_meta.json")
 
+    original_privacy = privacy
+    try:
+        privacy, publish_at_utc, publish_tz, publish_local = resolve_publish_schedule(
+            publish_at=args.publish_at,
+            timezone=args.timezone,
+            meta=meta,
+            privacy=privacy,
+        )
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", flush=True)
+        sys.exit(1)
+
+    if publish_at_utc:
+        if original_privacy != "private":
+            print(
+                f"  [WARN] Scheduled publish requires private upload; "
+                f"overriding privacy {original_privacy!r} -> 'private'",
+                flush=True,
+            )
+        print(
+            f"  Scheduled publish: {publish_local} ({publish_tz}) -> {publish_at_utc} UTC",
+            flush=True,
+        )
+
     print("Uploading...", flush=True)
     upload_video(
         youtube, str(video), title, description,
         privacy, thumbnail, tags, meta_path=meta_file_path,
+        publish_at_utc=publish_at_utc,
     )
     print("Done!", flush=True)
 
