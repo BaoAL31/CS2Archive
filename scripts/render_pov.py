@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -29,8 +30,7 @@ BASE_FLAGS = [
     "--concatenate-sequences",
     "--ffmpeg-executable-path", FFMPEG_PATH,
     "--ffmpeg-video-codec", "h264_nvenc",
-    "--ffmpeg-crf", "15",
-    "--ffmpeg-output-parameters=-cq 15 -preset p7 -profile:v high -pix_fmt yuv420p -level 5.1",
+    "--ffmpeg-output-parameters=-rc vbr_hq -b:v 0 -cq 18 -preset p7 -profile:v high -pix_fmt yuv420p -level 5.1",
     "--recording-system", "HLAE",
     "--close-game-after-recording",
 ]
@@ -130,8 +130,16 @@ def run_csdm(cmd: list[str], label: str, expected: Path | None = None) -> Path |
     if mp4s:
         vid = max(mp4s, key=lambda p: p.stat().st_mtime)
         if expected is not None and vid != expected:
-            vid.replace(expected)
-            vid = expected
+            for _ in range(10):
+                try:
+                    shutil.copy2(str(vid), str(expected))
+                    vid = expected
+                    break
+                except PermissionError:
+                    time.sleep(1)
+            else:
+                print("FAILED (could not copy video, file locked)")
+                sys.exit(1)
         mb = vid.stat().st_size / 1024 / 1024
         print(f"OK ({elapsed:.0f}s, {mb:.0f} MB)")
         if mb < 1:
@@ -143,6 +151,55 @@ def run_csdm(cmd: list[str], label: str, expected: Path | None = None) -> Path |
     if err.strip():
         print(err[-800:])
     sys.exit(1)
+
+
+def _get_player_crosshair(steam_id: str, demo_parts: list[str]) -> list[str]:
+    """Extract player crosshair from demo analysis JSON via csdm json export."""
+    for p in demo_parts:
+        with tempfile.TemporaryDirectory() as tmp:
+            cmd = [CSDM, "json", p, "--output-folder", tmp]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if r.returncode != 0:
+                continue
+            jf = list(Path(tmp).glob("*.json"))
+            if not jf:
+                continue
+            data = json.loads(jf[0].read_text(encoding="utf-8"))
+            for pl in data.get("players", []):
+                if pl.get("steamId") == steam_id:
+                    code = pl.get("crosshairShareCode")
+                    if code:
+                        from crosshair_code import decode_crosshair, crosshair_to_convars
+                        cvars = crosshair_to_convars(decode_crosshair(code))
+                        return ["crosshair 1"] + cvars
+    return []
+
+def _write_cfg_with_crosshair(base_cfg: Path, crosshair_cmds: list[str], output: Path) -> None:
+    """Write cs2_pov.cfg with crosshair commands appended."""
+    output.write_text(base_cfg.read_text(encoding="utf-8"), encoding="utf-8")
+    if crosshair_cmds:
+        with open(output, "a", encoding="utf-8") as f:
+            f.write("\n// Player crosshair from demo\n")
+            for cmd in crosshair_cmds:
+                f.write(cmd + "\n")
+
+def _check_nvenc() -> None:
+    """Verify h264_nvenc actually works before starting render."""
+    import subprocess, time
+    cmd = [FFMPEG_PATH, "-y", "-f", "lavfi", "-i", "color=c=red:s=2560x1440:d=1",
+           "-c:v", "h264_nvenc", "-rc", "vbr_hq", "-b:v", "0", "-cq", "15",
+           "-preset", "p7", "-f", "null", "-"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        err = r.stderr.lower()
+        if "unknown encoder" in err or "h264_nvenc" in err:
+            print("[FATAL] h264_nvenc not available in ffmpeg. Install NVIDIA GPU drivers + NVENC ffmpeg.")
+        elif "driver" in err or "cuda" in err:
+            print("[FATAL] NVIDIA driver issue. Update GPU drivers.")
+        else:
+            print(f"[FATAL] NVENC test failed: {r.stderr[-300:]}")
+        sys.exit(1)
+    print("  [OK] NVENC encoder verified")
 
 
 def main() -> None:
@@ -159,6 +216,8 @@ def main() -> None:
                         help="Disable auto-minimize CS2 when it launches (default: enabled)")
     args = parser.parse_args()
 
+    _check_nvenc()
+
     parts = find_demo_parts(args.demo)
     print(f"Found {len(parts)} demo part(s):")
     for p in parts:
@@ -167,6 +226,13 @@ def main() -> None:
     output_dir = resolve_output_dir(args.output, parts[0], args.steam_id)
     output_dir.mkdir(parents=True, exist_ok=True)
     cfg = abs_cfg_path()
+
+    crosshair_cmds = _get_player_crosshair(args.steam_id, parts)
+    if crosshair_cmds:
+        print(f"  Player crosshair extracted ({len(crosshair_cmds)} cvars)")
+    else:
+        print("  [WARN] No crosshair found in demo — rendering with default CS2 crosshair")
+
     print(f"Output:  {output_dir}")
     print(f"Batch size: {args.batches} round(s) per batch")
 
@@ -197,17 +263,25 @@ def main() -> None:
             global_start = global_round + local_start
             global_end = global_round + local_end
 
-            out_name = f"batch-{global_start:03d}-{global_end:03d}.mp4"
-            expected_batches.append(out_name)
-            out_path = output_dir / out_name
+            out_name = f"batch-{global_start:03d}-{global_end:03d}"
+            expected_batches.append(out_name + ".mp4")
+            out_path = output_dir / (out_name + ".mp4")
 
             if out_path.exists() and out_path.stat().st_size >= 1_048_576:
                 mb = out_path.stat().st_size / 1024 / 1024
-                print(f"  [SKIP] {out_name} exists ({mb:.0f} MB)")
+                print(f"  [SKIP] {out_name}.mp4 exists ({mb:.0f} MB)")
                 total_rendered += local_end - local_start + 1
                 continue
 
             local_rounds = list(range(local_start, local_end + 1))
+            # Write cfg with crosshair injected (csdm reads --cfg, not the .dem.json)
+            if crosshair_cmds:
+                render_cfg = output_dir / "render_crosshair.cfg"
+                _write_cfg_with_crosshair(cfg, crosshair_cmds, render_cfg)
+                cfg_to_use = render_cfg
+                print(f"  Crosshair cfg: {render_cfg}")
+            else:
+                cfg_to_use = cfg
             cmd = [
                 CSDM, "video", str(Path(part).resolve()),
                 "--steamids", args.steam_id,
@@ -218,7 +292,7 @@ def main() -> None:
                 "--framerate", str(args.framerate),
                 "--width", str(args.width),
                 "--height", str(args.height),
-                "--cfg", str(cfg),
+                "--cfg", str(cfg_to_use),
             ] + BASE_FLAGS
 
             vid = run_csdm(cmd, out_name, expected=out_path)
