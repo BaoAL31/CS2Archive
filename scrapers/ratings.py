@@ -163,11 +163,16 @@ async def get_match_ratings(match_url: str) -> Optional[dict]:
 
     Returns dict with match info and per-map player stats.
     """
-    from scrapers.hltv import HLTVScraper
+    import asyncio
 
-    scraper = HLTVScraper()
-    try:
-        html = await scraper._get_page_content(match_url)
-        return parse_match_ratings_html(html, match_url)
-    finally:
-        await scraper.close()
+    from scrapers.hltv_acquire import fetch_hltv_page_html
+
+    html = await asyncio.to_thread(
+        fetch_hltv_page_html,
+        match_url,
+        wait_selector="table.totalstats, .match-header-title",
+    )
+    result = parse_match_ratings_html(html, match_url)
+    if not result or not result.get("tables"):
+        return None
+    return result

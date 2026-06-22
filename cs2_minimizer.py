@@ -56,6 +56,13 @@ def _find_cs2_windows() -> list[tuple[int, str]]:
     return results
 
 
+def ensure_cs2_closed() -> None:
+    """Minimize all CS2 windows (used before render to free GPU)."""
+    for hwnd, _ in _find_cs2_windows():
+        if user32.IsWindow(hwnd) and not user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, SW_MINIMIZE)
+
+
 class CS2Minimizer(threading.Thread):
     def __init__(self, verbose: bool = False):
         super().__init__(daemon=True)

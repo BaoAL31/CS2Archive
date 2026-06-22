@@ -43,6 +43,9 @@ def extract_faceit_nickname(url: str) -> Optional[str]:
 
 
 def extract_steam_id(steam_url: str) -> str:
+    steam_url = (steam_url or "").strip()
+    if re.fullmatch(r"\d{17}", steam_url):
+        return steam_url
     m = re.search(r"steamcommunity\.com/profiles/(\d{17})", steam_url)
     if m:
         return m.group(1)

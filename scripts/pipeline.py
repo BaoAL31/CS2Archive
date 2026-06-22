@@ -40,6 +40,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from assign_playlist import normalize_playlist_name
+from youtube_schedule import AUTO_PUBLISH_MODE
 STATE_DIR = PROJECT_ROOT / ".pipeline"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 os.chdir(str(PROJECT_ROOT))
@@ -333,6 +334,20 @@ asyncio.run(fetch_avatar_for_player(
         from cs2_minimizer import ensure_cs2_closed
 
         ensure_cs2_closed()
+
+        # Verify NVENC available before render
+        nvcheck = subprocess.run(
+            [
+                r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe",
+                "-y", "-f", "lavfi", "-i", "color=c=red:s=2560x1440:d=1",
+                "-c:v", "h264_nvenc", "-rc", "vbr_hq", "-b:v", "0", "-cq", "15",
+                "-preset", "p7", "-f", "null", "-",
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        if nvcheck.returncode != 0:
+            fail(6, "RENDER_NO_NVENC",
+                 f"h264_nvenc not available in ffmpeg. Install NVIDIA GPU drivers + NVENC-enabled ffmpeg.")
 
         # Verify Steam is running
         steam_check = subprocess.run(["tasklist", "/FI", "IMAGENAME eq steam.exe"],
@@ -726,8 +741,8 @@ def main() -> None:
     parser.add_argument("--privacy", choices=["private", "unlisted", "public"], default="private")
     parser.add_argument("--batches", type=int, default=10,
                         help="Rounds per render batch (default: 10). 0 = all rounds in one session.")
-    parser.add_argument("--publish-at", default=None,
-                        help="Schedule YouTube publish (wall-clock time in --timezone, e.g. '2026-06-12 17:00')")
+    parser.add_argument("--publish-at", default=AUTO_PUBLISH_MODE,
+                        help="Schedule YouTube publish: 'auto' = next future 16:30 Australia/Sydney, or explicit 'YYYY-MM-DD HH:MM'")
     parser.add_argument(
         "--publish-shorts-at",
         default=None,

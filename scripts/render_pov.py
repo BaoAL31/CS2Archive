@@ -17,8 +17,13 @@ if str(_PROJECT_ROOT) not in sys.path:
 from cs2_minimizer import CS2Minimizer
 
 CSDM = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
-
 FFMPEG_PATH = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
+GAME_CFG = Path(r"D:\Steam\steamapps\common\Counter-Strike Global Offensive\game\csgo\cfg")
+
+AUTOEXEC_RENDER = GAME_CFG / "autoexec_render.cfg"
+AUTOEXEC_PERSONAL = GAME_CFG / "autoexec_personal.cfg"
+AUTOEXEC_PERSONAL_BACKUP = GAME_CFG / "autoexec_personal_backup.cfg"
+AUTOEXEC_MAIN = GAME_CFG / "autoexec.cfg"
 
 BASE_FLAGS = [
     "--mode", "player",
@@ -30,14 +35,14 @@ BASE_FLAGS = [
     "--concatenate-sequences",
     "--ffmpeg-executable-path", FFMPEG_PATH,
     "--ffmpeg-video-codec", "h264_nvenc",
-    "--ffmpeg-output-parameters=-rc vbr_hq -b:v 0 -cq 18 -preset p7 -profile:v high -pix_fmt yuv420p -level 5.1",
+    "--ffmpeg-crf", "18",
+    "--ffmpeg-output-parameters=-cq 18 -preset p7 -profile:v high -pix_fmt yuv420p -level 5.1",
     "--recording-system", "HLAE",
     "--close-game-after-recording",
 ]
 
 
 def resolve_output_dir(output: str | None, first_demo_path: str, steam_id: str) -> Path:
-    """HLAE mirv_streams must receive an absolute --output (relative paths fail under the game cwd)."""
     if output:
         path = Path(output)
     else:
@@ -117,7 +122,6 @@ def run_csdm(cmd: list[str], label: str, expected: Path | None = None) -> Path |
         print(f"OK ({elapsed:.0f}s, {mb:.0f} MB)")
         return expected
 
-    # Fallback: find most recent mp4 in output dir
     for i, a in enumerate(cmd):
         if a == "--output" and i + 1 < len(cmd):
             out_dir = Path(cmd[i + 1])
@@ -154,7 +158,6 @@ def run_csdm(cmd: list[str], label: str, expected: Path | None = None) -> Path |
 
 
 def _get_player_crosshair(steam_id: str, demo_parts: list[str]) -> list[str]:
-    """Extract player crosshair from demo analysis JSON via csdm json export."""
     for p in demo_parts:
         with tempfile.TemporaryDirectory() as tmp:
             cmd = [CSDM, "json", p, "--output-folder", tmp]
@@ -174,17 +177,30 @@ def _get_player_crosshair(steam_id: str, demo_parts: list[str]) -> list[str]:
                         return cvars
     return []
 
-def _write_cfg_with_crosshair(base_cfg: Path, crosshair_cmds: list[str], output: Path) -> None:
-    """Write cs2_pov.cfg with crosshair commands appended."""
-    output.write_text(base_cfg.read_text(encoding="utf-8"), encoding="utf-8")
-    if crosshair_cmds:
-        with open(output, "a", encoding="utf-8") as f:
-            f.write("\n// Player crosshair from demo\n")
-            for cmd in crosshair_cmds:
-                f.write(cmd + "\n")
+
+def _write_render_autoexec(cvars: list[str]) -> None:
+    lines = ["crosshair 1"] + cvars
+    AUTOEXEC_RENDER.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _swap_autoexec(src: Path) -> None:
+    if src == AUTOEXEC_PERSONAL and not AUTOEXEC_PERSONAL.exists():
+        src = AUTOEXEC_PERSONAL_BACKUP
+    if src.exists():
+        shutil.copy2(str(src), str(AUTOEXEC_MAIN))
+
+
+def _kill_stale_processes() -> None:
+    names = ["cs2.exe", "csdm.cmd", "csdm.exe", "HLAE.exe"]
+    for n in names:
+        try:
+            subprocess.run(["taskkill", "/f", "/im", n], capture_output=True, timeout=10)
+        except Exception:
+            pass
+    time.sleep(2)
+
 
 def _check_nvenc() -> None:
-    """Verify h264_nvenc actually works before starting render."""
     import subprocess, time
     cmd = [FFMPEG_PATH, "-y", "-f", "lavfi", "-i", "color=c=red:s=2560x1440:d=1",
            "-c:v", "h264_nvenc", "-rc", "vbr_hq", "-b:v", "0", "-cq", "15",
@@ -216,6 +232,7 @@ def main() -> None:
                         help="Disable auto-minimize CS2 when it launches (default: enabled)")
     args = parser.parse_args()
 
+    _kill_stale_processes()
     _check_nvenc()
 
     parts = find_demo_parts(args.demo)
@@ -225,13 +242,15 @@ def main() -> None:
 
     output_dir = resolve_output_dir(args.output, parts[0], args.steam_id)
     output_dir.mkdir(parents=True, exist_ok=True)
-    cfg = abs_cfg_path()
 
-    crosshair_cmds = _get_player_crosshair(args.steam_id, parts)
-    if crosshair_cmds:
-        print(f"  Player crosshair extracted ({len(crosshair_cmds)} cvars)")
+    cvars = _get_player_crosshair(args.steam_id, parts)
+    if cvars:
+        print(f"  Player crosshair extracted ({len(cvars)} cvars)")
+        _write_render_autoexec(cvars)
+        _swap_autoexec(AUTOEXEC_RENDER)
+        print(f"  Swapped {AUTOEXEC_RENDER.name} -> {AUTOEXEC_MAIN.name}")
     else:
-        print("  [WARN] No crosshair found in demo — rendering with default CS2 crosshair")
+        print("  [WARN] No crosshair found in demo — keeping current autoexec.cfg")
 
     print(f"Output:  {output_dir}")
     print(f"Batch size: {args.batches} round(s) per batch")
@@ -240,91 +259,79 @@ def main() -> None:
         print("[ERROR] --batches must be >= 1")
         sys.exit(1)
 
-    minimizer = None
-    if not args.no_minimize_cs2:
-        minimizer = CS2Minimizer()
-        minimizer.start()
-        print("CS2 auto-minimize enabled (won't steal focus)")
+    try:
+        minimizer = None
+        if not args.no_minimize_cs2:
+            minimizer = CS2Minimizer()
+            minimizer.start()
+            print("CS2 auto-minimize enabled (won't steal focus)")
 
-    global_round = 0
-    total_rendered = 0
-    expected_batches: list[str] = []
+        global_round = 0
+        total_rendered = 0
+        expected_batches: list[str] = []
 
-    for part in parts:
-        n_rounds = get_round_count(part)
-        part_name = Path(part).name
-        print(f"\n--- {part_name}: {n_rounds} round(s) ---")
-        if n_rounds == 0:
-            continue
+        for part in parts:
+            n_rounds = get_round_count(part)
+            part_name = Path(part).name
+            print(f"\n--- {part_name}: {n_rounds} round(s) ---")
+            if n_rounds == 0:
+                continue
 
-        batch_size = args.batches
-        for local_start in range(1, n_rounds + 1, batch_size):
-            local_end = min(local_start + batch_size - 1, n_rounds)
-            global_start = global_round + local_start
-            global_end = global_round + local_end
+            batch_size = args.batches
+            for local_start in range(1, n_rounds + 1, batch_size):
+                local_end = min(local_start + batch_size - 1, n_rounds)
+                global_start = global_round + local_start
+                global_end = global_round + local_end
 
-            out_name = f"batch-{global_start:03d}-{global_end:03d}"
-            expected_batches.append(out_name + ".mp4")
-            out_path = output_dir / (out_name + ".mp4")
+                out_name = f"batch-{global_start:03d}-{global_end:03d}"
+                expected_batches.append(out_name + ".mp4")
+                out_path = output_dir / (out_name + ".mp4")
 
-            if out_path.exists() and out_path.stat().st_size >= 1_048_576:
-                mb = out_path.stat().st_size / 1024 / 1024
-                print(f"  [SKIP] {out_name}.mp4 exists ({mb:.0f} MB)")
+                if out_path.exists() and out_path.stat().st_size >= 1_048_576:
+                    mb = out_path.stat().st_size / 1024 / 1024
+                    print(f"  [SKIP] {out_name}.mp4 exists ({mb:.0f} MB)")
+                    total_rendered += local_end - local_start + 1
+                    continue
+
+                local_rounds = list(range(local_start, local_end + 1))
+                cmd = [
+                    CSDM, "video", str(Path(part).resolve()),
+                    "--steamids", args.steam_id,
+                    "--event", "rounds",
+                    "--rounds", ",".join(str(r) for r in local_rounds),
+                    "--output-file-name", out_name,
+                    "--output", str(output_dir),
+                    "--framerate", str(args.framerate),
+                    "--width", str(args.width),
+                    "--height", str(args.height),
+                    "--cfg", str(abs_cfg_path()),
+                ] + BASE_FLAGS
+
+                vid = run_csdm(cmd, out_name, expected=out_path)
+
+                if vid is None:
+                    continue
+
                 total_rendered += local_end - local_start + 1
-                continue
 
-            local_rounds = list(range(local_start, local_end + 1))
-            # Write cfg with crosshair injected (csdm reads --cfg, not the .dem.json)
-            if crosshair_cmds:
-                render_cfg = output_dir / "render_crosshair.cfg"
-                _write_cfg_with_crosshair(cfg, crosshair_cmds, render_cfg)
-                cfg_to_use = render_cfg
-                print(f"  Crosshair cfg: {render_cfg}")
-            else:
-                cfg_to_use = cfg
+            global_round += n_rounds
 
-            # Rename Steam Cloud VCFG so it doesn't reload and override our crosshair cvars
-            vcfg = Path(r"D:\Steam\userdata\322187440\730\remote\cs2_user_convars.vcfg")
-            if vcfg.exists():
-                bak = vcfg.with_suffix(".vcfg.bak")
-                vcfg.rename(bak)
+        if minimizer:
+            minimizer.stop()
 
-            cmd = [
-                CSDM, "video", str(Path(part).resolve()),
-                "--steamids", args.steam_id,
-                "--event", "rounds",
-                "--rounds", ",".join(str(r) for r in local_rounds),
-                "--output-file-name", out_name,
-                "--output", str(output_dir),
-                "--framerate", str(args.framerate),
-                "--width", str(args.width),
-                "--height", str(args.height),
-                "--cfg", str(cfg_to_use),
-            ] + BASE_FLAGS
+        if total_rendered == 0:
+            print("[ERROR] No rounds rendered")
+            sys.exit(1)
 
-            vid = run_csdm(cmd, out_name, expected=out_path)
+        missing = [n for n in expected_batches if not (output_dir / n).exists()]
+        if missing:
+            print(f"[ERROR] Missing expected batch files: {missing}")
+            sys.exit(1)
 
-            if vid is None:
-                continue
-
-            total_rendered += local_end - local_start + 1
-
-        global_round += n_rounds
-
-    if minimizer:
-        minimizer.stop()
-
-    if total_rendered == 0:
-        print("[ERROR] No rounds rendered")
-        sys.exit(1)
-
-    # Validate all expected batch files exist
-    missing = [n for n in expected_batches if not (output_dir / n).exists()]
-    if missing:
-        print(f"[ERROR] Missing expected batch files: {missing}")
-        sys.exit(1)
-
-    print(f"\nDone. {total_rendered} round(s) in {len(expected_batches)} batch(es) at {output_dir}")
+        print(f"\nDone. {total_rendered} round(s) in {len(expected_batches)} batch(es) at {output_dir}")
+    finally:
+        _swap_autoexec(AUTOEXEC_PERSONAL)
+        print(f"  Swapped {AUTOEXEC_PERSONAL.name} -> {AUTOEXEC_MAIN.name} (restored)")
 
 
 if __name__ == "__main__":

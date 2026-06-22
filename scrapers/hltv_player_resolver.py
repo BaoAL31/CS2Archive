@@ -283,6 +283,15 @@ def avatar_cache_eligible(png_path: Path, account: Any | None) -> bool:
         return False
     try:
         with Image.open(png_path) as im:
-            return im.size[0] >= MIN_AVATAR_RES and im.size[1] >= MIN_AVATAR_RES
+            # Size check
+            if im.size[0] < MIN_AVATAR_RES or im.size[1] < MIN_AVATAR_RES:
+                return False
+            # Reject fully transparent images (e.g., HLTV CDN placeholder)
+            if im.mode == "RGBA":
+                alpha = im.getchannel("A")
+                extrema = alpha.getextrema()
+                if extrema[0] == 0 and extrema[1] == 0:
+                    return False
+            return True
     except OSError:
         return False

@@ -19,6 +19,7 @@ import random
 import ssl
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import google.auth
@@ -34,7 +35,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from youtube_schedule import DEFAULT_PUBLISH_TZ, resolve_publish_schedule
+from youtube_schedule import AUTO_PUBLISH_MODE, DEFAULT_PUBLISH_TZ, resolve_publish_schedule
 
 RETRIABLE_EXCEPTIONS = (
     httplib2.HttpLib2Error, IOError, ssl.SSLError, http.client.NotConnected,
@@ -45,11 +46,14 @@ RETRIABLE_EXCEPTIONS = (
 RETRIABLE_STATUS_CODES = [500, 502, 503, 504]
 MAX_RETRIES = 20
 
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+SCOPES = ["https://www.googleapis.com/auth/youtube"]
 THUMB_SCOPES = ["https://www.googleapis.com/auth/youtube"]
 CLIENT_SECRET = "client_secret.json"
 TOKEN_FILE = "token_youtube.json"
 THUMB_TOKEN_FILE = "token_youtube_thumb.json"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+SCHEDULE_PATH = PROJECT_ROOT / "youtube" / ".publish_schedule.json"
+SCHEDULE_LOCK_PATH = PROJECT_ROOT / "youtube" / ".publish_schedule.lock"
 
 
 def get_authenticated_service(scopes: list[str] | None = None, token_file: str | None = None) -> googleapiclient.discovery.Resource:
@@ -79,6 +83,115 @@ def _session_path(video_path: str) -> str:
 def _meta_path(video_path: str) -> str:
     """Path to upload_meta.json alongside the video file."""
     return str(Path(video_path).parent / "upload_meta.json")
+
+
+def _load_publish_schedule(path: Path = SCHEDULE_PATH) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_publish_schedule(data: dict, path: Path = SCHEDULE_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+@contextmanager
+def _publish_schedule_lock(path: Path = SCHEDULE_LOCK_PATH, timeout: float = 30.0):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(str(os.getpid()))
+            break
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Timed out waiting for publish schedule lock: {path}")
+            time.sleep(0.1)
+    try:
+        yield
+    finally:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def load_occupied_publish_dates(path: Path = SCHEDULE_PATH) -> set[str]:
+    with _publish_schedule_lock(path.with_name(".publish_schedule.lock")):
+        return set(_load_publish_schedule(path).keys())
+
+
+def _reserve_publish_slot_locked(
+    publish_local: str,
+    publish_at_utc: str,
+    timezone: str,
+    video_path: str,
+    path: Path = SCHEDULE_PATH,
+) -> str:
+    publish_date = publish_local.strip().split()[0]
+    schedule = _load_publish_schedule(path)
+    if publish_date in schedule:
+        raise ValueError(f"Publish slot already reserved for {publish_date}")
+    schedule[publish_date] = {
+        "publish_at": publish_local,
+        "publish_at_utc": publish_at_utc,
+        "publish_timezone": timezone,
+        "video_path": video_path,
+    }
+    _save_publish_schedule(schedule, path)
+    return publish_date
+
+
+def reserve_publish_slot(
+    publish_local: str,
+    publish_at_utc: str,
+    timezone: str,
+    video_path: str,
+    path: Path = SCHEDULE_PATH,
+) -> str:
+    with _publish_schedule_lock(path.with_name(".publish_schedule.lock")):
+        return _reserve_publish_slot_locked(
+            publish_local,
+            publish_at_utc,
+            timezone,
+            video_path,
+            path,
+        )
+
+
+def release_publish_slot(publish_date: str, path: Path = SCHEDULE_PATH) -> None:
+    with _publish_schedule_lock(path.with_name(".publish_schedule.lock")):
+        schedule = _load_publish_schedule(path)
+        schedule.pop(publish_date, None)
+        _save_publish_schedule(schedule, path)
+
+
+def _record_publish_meta(
+    meta_file_path: str,
+    publish_local: str,
+    publish_tz: str,
+    publish_at_utc: str,
+) -> None:
+    path = Path(meta_file_path)
+    if not path.exists():
+        return
+    try:
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        meta["publish_at"] = publish_local
+        meta["publish_timezone"] = publish_tz
+        meta["publish_at_utc"] = publish_at_utc
+        path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def upload_video(
@@ -242,7 +355,8 @@ def main() -> None:
     parser.add_argument("--meta", help="Path to upload_meta.json (overrides --title, --description, --tags)")
     parser.add_argument(
         "--publish-at",
-        help="Schedule publish (wall-clock time in --timezone, e.g. '2026-06-12 17:00')",
+        default=None,
+        help="Schedule publish: 'auto' = next future 16:30 in --timezone (default), or wall-clock like '2026-06-12 17:00'",
     )
     parser.add_argument(
         "--timezone",
@@ -315,39 +429,62 @@ def main() -> None:
         print(f"[ERROR] Thumbnail not found: {thumbnail}")
         sys.exit(1)
 
+    if args.publish_at is None and "publish_at" not in meta:
+        args.publish_at = AUTO_PUBLISH_MODE
+
     meta_file_path = str(video.parent / "upload_meta.json")
 
     original_privacy = privacy
+    reserved_publish_date: str | None = None
     try:
-        privacy, publish_at_utc, publish_tz, publish_local = resolve_publish_schedule(
-            publish_at=args.publish_at,
-            timezone=args.timezone,
-            meta=meta,
-            privacy=privacy,
-        )
+        with _publish_schedule_lock():
+            privacy, publish_at_utc, publish_tz, publish_local = resolve_publish_schedule(
+                publish_at=args.publish_at,
+                timezone=args.timezone,
+                meta=meta,
+                privacy=privacy,
+                occupied_dates=set(_load_publish_schedule().keys()),
+            )
+            if publish_at_utc:
+                reserved_publish_date = _reserve_publish_slot_locked(
+                    publish_local,
+                    publish_at_utc,
+                    publish_tz,
+                    str(video),
+                )
     except ValueError as exc:
         print(f"[ERROR] {exc}", flush=True)
         sys.exit(1)
 
-    if publish_at_utc:
-        if original_privacy != "private":
+    try:
+        if publish_at_utc:
+            if original_privacy != "private":
+                print(
+                    f"  [WARN] Scheduled publish requires private upload; "
+                    f"overriding privacy {original_privacy!r} -> 'private'",
+                    flush=True,
+                )
             print(
-                f"  [WARN] Scheduled publish requires private upload; "
-                f"overriding privacy {original_privacy!r} -> 'private'",
+                f"  Scheduled publish: {publish_local} ({publish_tz}) -> {publish_at_utc} UTC",
                 flush=True,
             )
-        print(
-            f"  Scheduled publish: {publish_local} ({publish_tz}) -> {publish_at_utc} UTC",
-            flush=True,
-        )
 
-    print("Uploading...", flush=True)
-    upload_video(
-        youtube, str(video), title, description,
-        privacy, thumbnail, tags, meta_path=meta_file_path,
-        publish_at_utc=publish_at_utc,
-    )
-    print("Done!", flush=True)
+        print("Uploading...", flush=True)
+        upload_video(
+            youtube, str(video), title, description,
+            privacy, thumbnail, tags, meta_path=meta_file_path,
+            publish_at_utc=publish_at_utc,
+        )
+        if publish_at_utc:
+            _record_publish_meta(meta_file_path, publish_local, publish_tz, publish_at_utc)
+        print("Done!", flush=True)
+    except BaseException:
+        if reserved_publish_date:
+            try:
+                release_publish_slot(reserved_publish_date)
+            except Exception as release_error:
+                print(f"  [WARN] Could not release reserved publish slot: {release_error}", flush=True)
+        raise
 
 
 if __name__ == "__main__":

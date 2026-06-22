@@ -1,7 +1,7 @@
 """
 CS2Archive — Trending Match Finder
 
-1. Gets top highlight videos from all CS2 highlight channels (last 24h)
+1. Gets top highlight videos from all CS2 highlight channels (configurable window)
 2. Matches them to HLTV matches by scanning HLTV results page
 """
 
@@ -11,6 +11,7 @@ import asyncio
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 from rich.console import Console
@@ -31,6 +32,7 @@ HIGHLIGHT_CHANNELS = {
 }
 
 TEAM_ALIASES = {
+    "navi": "natus vincere",
     "bb": "betboom",
     "bbteam": "betboom",
     "bb team": "betboom",
@@ -111,14 +113,7 @@ def _teams_match(yt_t1: str, yt_t2: str, slug: str) -> bool:
     return (y1_norm == s1_clean and y2_norm == s2_clean) or (y1_norm == s2_clean and y2_norm == s1_clean)
 
 
-async def get_hltv_matches() -> list[dict]:
-    import cloudscraper
-    scraper = cloudscraper.create_scraper()
-    r = await asyncio.get_event_loop().run_in_executor(
-        None, lambda: scraper.get(f"{settings.hltv_base_url}/results", timeout=30)
-    )
-    r.raise_for_status()
-    html = r.text
+def _parse_hltv_match_links(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "lxml")
     matches = []
     seen = set()
@@ -136,21 +131,48 @@ async def get_hltv_matches() -> list[dict]:
     return matches
 
 
-async def get_top_videos() -> list[dict]:
+async def get_hltv_matches() -> list[dict]:
+    from scrapers.hltv_acquire import fetch_hltv_page_html
+
+    url = f"{settings.hltv_base_url}/results"
+    console.print("[cyan]Loading HLTV results via CloakBrowser...[/cyan]")
+    html = await asyncio.to_thread(fetch_hltv_page_html, url)
+    return _parse_hltv_match_links(html)
+
+
+def _pick_hltv_match(yt_t1: str, yt_t2: str, candidates: list[dict]) -> dict | None:
+    for h in candidates:
+        if _teams_match(yt_t1, yt_t2, h["slug"]):
+            return h
+    return None
+
+
+async def _search_hltv_match(yt_t1: str, yt_t2: str) -> dict | None:
+    from scrapers.hltv_acquire import fetch_hltv_page_html
+
+    query = quote(f"{yt_t1} vs {yt_t2}")
+    url = f"{settings.hltv_base_url}/search?query={query}"
+    html = await asyncio.to_thread(fetch_hltv_page_html, url)
+    candidates = _parse_hltv_match_links(html)
+    return _pick_hltv_match(yt_t1, yt_t2, candidates)
+
+
+async def get_top_videos(hours: int = 24) -> list[dict]:
     if not settings.youtube_api_key:
         console.print("[red]YOUTUBE_API_KEY not configured[/red]")
         return []
 
-    console.print("[bold cyan]Fetching top CS2 highlight videos (last 24h)...[/bold cyan]")
+    console.print(f"[bold cyan]Fetching top CS2 highlight videos (last {hours}h)...[/bold cyan]")
 
-    since = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    max_results = 5 if hours <= 24 else 10
     all_videos = []
 
     async with httpx.AsyncClient(timeout=15) as client:
         for cid, cname in HIGHLIGHT_CHANNELS.items():
             r = await client.get(YOUTUBE_SEARCH_URL, params={
                 "part": "snippet", "channelId": cid, "type": "video",
-                "order": "viewCount", "publishedAfter": since, "maxResults": 5,
+                "order": "viewCount", "publishedAfter": since, "maxResults": max_results,
                 "key": settings.youtube_api_key,
             })
             r.raise_for_status()
@@ -185,8 +207,8 @@ async def get_top_videos() -> list[dict]:
     return all_videos
 
 
-async def find_trending(count: int = 3) -> Optional[list[dict]]:
-    videos = await get_top_videos()
+async def find_trending(count: int = 3, hours: int = 24) -> Optional[list[dict]]:
+    videos = await get_top_videos(hours=hours)
     if not videos:
         console.print("[red]No highlight videos found[/red]")
         return None
@@ -205,11 +227,10 @@ async def find_trending(count: int = 3) -> Optional[list[dict]]:
         if len(results) >= count:
             break
         yt_t1, yt_t2 = v["teams"]
-        best = None
-        for h in hltv_matches:
-            if _teams_match(yt_t1, yt_t2, h["slug"]):
-                best = h
-                break
+        best = _pick_hltv_match(yt_t1, yt_t2, hltv_matches)
+        if not best:
+            console.print(f"[yellow]Searching HLTV for {yt_t1} vs {yt_t2}...[/yellow]")
+            best = await _search_hltv_match(yt_t1, yt_t2)
         if best:
             results.append({**v, "hltv_url": best["url"], "hltv_slug": best["slug"]})
 

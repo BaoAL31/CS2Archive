@@ -160,25 +160,24 @@ def _is_valid_dem(path: Path) -> bool:
 
 
 def extract_demo(archive_path: Path, dest_dir: Path) -> list[Path]:
-    """
-    Extract .dem files from an archive (.rar, .zip, or .gz).
-    Returns a list of paths to extracted .dem files.
-    """
     dest_dir.mkdir(parents=True, exist_ok=True)
     suffix = archive_path.suffix.lower()
 
     if suffix == ".gz":
-        return [_extract_gz(archive_path, dest_dir)]
+        result = [_extract_gz(archive_path, dest_dir)]
     elif suffix == ".zst":
-        return [_extract_zst(archive_path, dest_dir)]
+        result = [_extract_zst(archive_path, dest_dir)]
     elif suffix in (".zip", ".rar", ".7z"):
-        return _extract_with_patool(archive_path, dest_dir)
+        result = _extract_with_patool(archive_path, dest_dir)
     elif suffix == ".dem":
         final_path = dest_dir / archive_path.name
         shutil.move(str(archive_path), str(final_path))
         return [final_path]
     else:
         raise ValueError(f"Unsupported archive format: {suffix}")
+
+    archive_path.unlink()
+    return result
 
 
 def _extract_gz(archive_path: Path, dest_dir: Path) -> Path:

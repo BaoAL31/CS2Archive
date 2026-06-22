@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import sys
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from youtube_schedule import DEFAULT_PUBLISH_TZ, parse_publish_at
+from youtube_schedule import DEFAULT_PUBLISH_TZ, parse_publish_at, resolve_publish_schedule
 
 
 def test_parse_publish_at_aest_winter() -> None:
@@ -39,6 +41,55 @@ def test_parse_publish_at_invalid_format_raises() -> None:
 def test_parse_publish_at_invalid_timezone_raises() -> None:
     with pytest.raises(ValueError, match="Unknown timezone"):
         parse_publish_at("2026-06-12 17:00", "Not/A/Timezone")
+
+
+def test_resolve_publish_schedule_auto_uses_next_future_sydney_afternoon() -> None:
+    privacy, utc, tz, local = resolve_publish_schedule(
+        publish_at="auto",
+        timezone=DEFAULT_PUBLISH_TZ,
+        meta={},
+        privacy="public",
+        start_date=date(2026, 6, 19),
+        occupied_dates={"2026-06-19"},
+    )
+
+    assert privacy == "private"
+    assert utc == "2026-06-20T06:30:00.000Z"
+    assert tz == DEFAULT_PUBLISH_TZ
+    assert local == "2026-06-20 16:30"
+
+
+def test_resolve_publish_schedule_auto_skips_today_after_slot_time() -> None:
+    privacy, utc, tz, local = resolve_publish_schedule(
+        publish_at="auto",
+        timezone=DEFAULT_PUBLISH_TZ,
+        meta={},
+        privacy="public",
+        start_date=date(2026, 6, 19),
+        occupied_dates=set(),
+        now=datetime(2026, 6, 19, 16, 31, tzinfo=ZoneInfo(DEFAULT_PUBLISH_TZ)),
+    )
+
+    assert privacy == "private"
+    assert utc == "2026-06-20T06:30:00.000Z"
+    assert tz == DEFAULT_PUBLISH_TZ
+    assert local == "2026-06-20 16:30"
+
+
+def test_resolve_publish_schedule_auto_skips_consecutive_occupied_dates() -> None:
+    privacy, utc, tz, local = resolve_publish_schedule(
+        publish_at="auto",
+        timezone=DEFAULT_PUBLISH_TZ,
+        meta={},
+        privacy="public",
+        start_date=date(2026, 6, 19),
+        occupied_dates={"2026-06-19", "2026-06-20"},
+    )
+
+    assert privacy == "private"
+    assert utc == "2026-06-21T06:30:00.000Z"
+    assert tz == DEFAULT_PUBLISH_TZ
+    assert local == "2026-06-21 16:30"
 
 
 def test_resolve_publish_schedule_forces_private() -> None:

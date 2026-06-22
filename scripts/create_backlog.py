@@ -54,22 +54,21 @@ def get_priority(rating: float) -> str:
     return "low"
 
 
-def _resolve_demo_for_map(match_slug: str, map_name: str) -> Path | None:
-    """
-    Best-effort resolve the actual .dem filename for a map.
-
-    HLTV acquisitions typically produce files like:
-      demos/hltv/<match_slug>/<match_slug>-m2-ancient.dem
-    Older code assumed <Map>.dem which is often wrong.
-    """
+def _resolve_demo_for_map(match_slug: str, map_name: str) -> Path:
     demo_dir = PROJECT_ROOT / "demos" / "hltv" / match_slug
     if not demo_dir.exists():
-        return None
+        raise FileNotFoundError(
+            f"Demo directory not found: {demo_dir}\n"
+            f"  Download the match first before creating backlog entries."
+        )
 
     map_slug = map_name.strip().lower()
     cands = list(demo_dir.glob(f"*{map_slug}*.dem"))
     if not cands:
-        return None
+        raise FileNotFoundError(
+            f"No .dem file found for map '{map_name}' in {demo_dir}\n"
+            f"  Expected a file matching '*{map_slug}*.dem'."
+        )
 
     def score(p: Path) -> tuple[int, int, str]:
         name = p.name.lower()
@@ -88,7 +87,7 @@ def create_backlog_entry(
     rating: float,
     kd: str,
     team: str,
-    demo_path: Path | None,
+    demo_path: Path,
 ) -> None:
     player_clean = player.strip()
     steam_status, avatar_status = get_player_status(player_clean, demo_path)
@@ -110,11 +109,7 @@ def create_backlog_entry(
     steam_flag = f"--steam-id {steam_id}" if steam_id else "--steam-id <STEAM_ID>"
 
     demo_for_map = _resolve_demo_for_map(match_slug, map_name)
-    demo_rel = (
-        str(demo_for_map.relative_to(PROJECT_ROOT)).replace("\\", "/")
-        if demo_for_map
-        else f"demos/hltv/{match_slug}/<DEMO_FOR_MAP>.dem"
-    )
+    demo_rel = str(demo_for_map.relative_to(PROJECT_ROOT)).replace("\\", "/")
 
     content = f"""# Handoff: {player_clean} — {map_name} ({rating})
 

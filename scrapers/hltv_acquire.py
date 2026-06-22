@@ -22,6 +22,37 @@ MIN_ARCHIVE_BYTES = 1_000_000
 DEFAULT_PROFILE_DIR = Path(".cloak-hltv-profile")
 
 
+def fetch_hltv_page_html(
+    url: str,
+    *,
+    wait_selector: str = 'a[href*="/matches/"]',
+    headless: bool = False,
+    profile_dir: Path | None = None,
+    timeout_ms: int = 60_000,
+) -> str:
+    """Fetch an HLTV page HTML via system Chrome (bypass Cloudflare fingerprinting)."""
+    from playwright.sync_api import sync_playwright
+
+    profile = profile_dir or DEFAULT_PROFILE_DIR
+    profile.mkdir(parents=True, exist_ok=True)
+    with sync_playwright() as pw:
+        ctx = pw.chromium.launch_persistent_context(
+            user_data_dir=str(profile.resolve()),
+            channel="chrome",
+            headless=headless,
+            ignore_default_args=["--enable-automation"],
+        )
+        page = ctx.new_page()
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_timeout(3000)
+            if wait_selector:
+                page.wait_for_selector(wait_selector, timeout=timeout_ms)
+            return page.content()
+        finally:
+            ctx.close()
+
+
 def match_slug_from_url(url: str) -> str:
     """Match folder slug from HLTV URL (strips tournament suffix and trailing year)."""
     m = re.search(r"/matches/\d+/([^/?#]+)", url)

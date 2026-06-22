@@ -4,7 +4,7 @@
 
 ## Pipeline (Primary Entry Point)
 
-`python scripts/pipeline.py <player> <map> <hltv_url> --steam-id <id> [--demo <dem_path>] [--tournament "IEM Atlanta 2026"] [--step N] [--until N] [--resume-from-round N] [--privacy public]`
+`python scripts/pipeline.py <player> <map> <hltv_url> --steam-id <id> [--demo <dem_path>] [--tournament "IEM Atlanta 2026"] [--step N] [--until N] [--resume-from-round N] [--privacy public] [--publish-at auto|"YYYY-MM-DD HH:MM"]`
 
 Runs steps 1-11 in order. Resumable — state saved to `.pipeline/{run_id}.json`. Use `--step N` to start at a specific step.
 
@@ -19,7 +19,7 @@ Runs steps 1-11 in order. Resumable — state saved to `.pipeline/{run_id}.json`
 | 7 | concat | `python scripts/concat_rounds.py <renders_folder>` |
 | 8 | outro | `python scripts/generate_outro.py <video.mp4>` |
 | 9 | thumbnail | `python -m thumbnail <url> --player <nick> --map <map> --demo <dem> --steam-id <id>` |
-| 10 | upload | `python scripts/upload_youtube.py <video> --title <t> --thumbnail <thumb.png>` |
+| 10 | upload | `python scripts/upload_youtube.py <video> --title <t> --thumbnail <thumb.png>` | Default schedules at next future 16:30 Australia/Sydney; `--publish-at` overrides. |
 | 11 | cleanup | `python scripts/cleanup_renders.py <renders_folder>` |
 
 ### Structured Errors (agent-parseable)
@@ -88,13 +88,31 @@ Use these when debugging a specific pipeline step failure or running steps manua
 3. **Avatars** — `scrapers/player_images.py`. Uses Playwright + `rembg`. Navigates **player page** (via `img.player-photo` → `closest('a')` → `href`) to capture 400×417 transparent PNG via response interception. Each player gets a **fresh BrowserContext** (`Cache-Control: no-cache`) to prevent stale cache from suppressing `response` events. Falls back to match page → rembg if player page fails. Saved as `{nickname}.png` in `demos/avatars/`.
 4. **Player Steam ID** — `python main.py player add <nickname> --steam <url>` or `python main.py player list`. Extract from demo: `python scripts/extract_steamids.py <demo_path>`.
 5. **CSDM Analysis** — `csdm analyze <demo>`. For PGL demos (PBDEMS2 format): `csdm analyze <demo> --source challengermode`.
-6. **Render POV Clip** — `python scripts/render_pov.py <demo_path> <steam_id> [--batches 3]`. Renders rounds in batches; each batch produces one `batch-{start}-{end}.mp4` file. Filesystem-based resume: existing `batch-*.mp4` files ≥1MB are automatically skipped.
+6. **Render POV Clip** — `python scripts/render_pov.py <demo_path> <steam_id> [--batches 3]`. Extracts player's crosshair from demo, writes to `autoexec_render.cfg`, copies over `autoexec.cfg` in CS2's cfg dir (`game/csgo/cfg/`), renders rounds in batches. On exit (even crash), swaps `autoexec_personal.cfg` back. Each batch produces one `batch-{start}-{end}.mp4` file. Filesystem-based resume: existing `batch-*.mp4` files ≥1MB are automatically skipped.
 7. **Concatenate Rounds** — `python scripts/concat_rounds.py <renders_folder>` → `combined.mp4` (incremental batch-by-batch concat with gap/overlap validation, then upscale to 1440p). Each batch file is deleted after successful append.
 8. **Generate Thumbnail** — `python -m thumbnail <match_url> --player <nick> --map <map> --demo <dem> --steam-id <id> [--tournament "IEM Atlanta 2026"]`. Auto-extracts random kill frame as blurred background. Or `--background <frame.jpg>`.
    Example: `python -m thumbnail "https://www.hltv.org/matches/2394166/faze-vs-vitality-iem-atlanta-2026" --player ropz --map Nuke --demo demos/hltv/.../faze-vs-vitality-m1-nuke-p2.dem --steam-id 76561197991272318 --tournament "IEM Atlanta 2026"`
 9. **Generate Title & Description** — `python scripts/generate_title.py <ratings_json> --player <nick> --map <map> [--tournament "..."]`. Outputs JSON with `title` and `description` from ratings data.
 9. **Upload to YouTube** — `python scripts/upload_youtube.py <video_path> --thumbnail <thumb.png> --title <title> --description <desc> --privacy public`. Requires Google Cloud OAuth (`client_secret.json`). First-time auth opens browser. Account must be phone-verified for custom thumbnails.
+   Default publish mode is `auto`: schedule at the next future 16:30 Australia/Sydney on a free local calendar day. The script keeps `youtube/.publish_schedule.json` as the slot ledger and rolls back a reserved slot if upload fails.
+   Override with `--publish-at "YYYY-MM-DD HH:MM"` for an exact time, or keep `--publish-at auto` explicit.
    Or use `--meta <upload_meta.json>` to read title/description/tags from a metadata file. The pipeline writes `upload_meta.json` at step 8 (thumbnail), so step 9 can resume with only the youtube folder. The file also stores `resumable_uri`/`resumable_progress` during upload for crash recovery, and `youtube_id` after completion.
+
+## Backlog Creation
+
+`python scripts/create_backlog.py <hltv_url>` — downloads a match and generates prioritized backlog entries for every player/map combo.
+
+**Demos must be downloaded first.** The script calls into `acquire_match()` then scrapes HLTV Rating 3.0, creating a per-player backlog card ranked by rating. It validates that the `.dem` file for each map exists on disk — if not found, it raises `FileNotFoundError` with the expected path, rather than writing a placeholder.
+
+```powershell
+# 1. Download demo
+python main.py hltv match "https://www.hltv.org/matches/2394998/g2-vs-spirit-iem-cologne-major-2026"
+
+# 2. Create backlog entries (requires demos on disk)
+python scripts/create_backlog.py "https://www.hltv.org/matches/2394998/g2-vs-spirit-iem-cologne-major-2026"
+```
+
+Backlog entries land in `backlog/{priority}/{player}-{map}-{match_slug}.md` with the full pipeline command pre-built (steam-id, demo path, tournament). Use these as handoff cards for running pipelines.
 
 ## CLI Entry Point
 
@@ -117,6 +135,10 @@ Available commands:
 
 - `.env` required: `FACEIT_API_KEY`, `YOUTUBE_API_KEY`
 - All config in `config.py` (pydantic-settings, loads from `.env`)
+- **Python env:** uses same `cs2archive` conda env as sibling project. In non-interactive shells (OpenCode, CI), `conda activate` often fails — use direct-path bypass:
+  ```powershell
+  $env:PYTHONPATH="."; & "C:\Users\jembo\anaconda3\envs\cs2archive\python.exe" scripts/pipeline.py <args>
+  ```
 
 ## Demo Video Rendering
 
@@ -149,7 +171,7 @@ For rendering a player's POV with full HUD (radar, health, ammo) and no x-ray, i
 
 Use `python scripts/render_pov.py <demo_path> <steam_id>` instead — it wraps the above command with auto round-detection, p1/p2 split handling, and batch output naming.
 
-All scripts pass `--cfg assets/cs2_pov.cfg` which configures HUD and restores keybinds via `exec autoexec`.
+All scripts pass `--cfg assets/cs2_pov.cfg` which configures HUD and restores keybinds via `exec autoexec`. The crosshair comes from CS2's `autoexec.cfg` in the game's `csgo/cfg/` directory — `render_pov.py` swaps `autoexec_render.cfg` (pro's crosshair, extracted from demo) and `autoexec_personal.cfg` (your crosshair) before/after rendering.
 
 ### Split demos (p1, p2)
 
@@ -170,6 +192,8 @@ Output is `combined.mp4` in the same folder. Concat is incremental (one batch at
 
 ## Known Gotchas
 
+- **Autoexec crosshair swap** — CS2 reads crosshair from `game/csgo/cfg/autoexec.cfg` on startup. `assets/cs2_pov.cfg` executes `exec autoexec` after keybind restore, so autoexec.cfg's crosshair takes effect. Two files live alongside it: `autoexec_render.cfg` (pro's crosshair for renders) and `autoexec_personal.cfg` (your crosshair for playing). `render_pov.py` swaps them before/after rendering. If both are missing, just rename either one to `autoexec.cfg`. `autoexec_personal_backup.cfg` is a safety copy.
+
 - **NEVER clean up avatars** — `demos/avatars/` is a persistent cache. Avatars are reused across all matches. Never delete avatar files during cleanup.
 
 - **HLTV demo acquisition** — Pipeline step 1 and `hltv match` use CloakBrowser (`scrapers/hltv_acquire.py`), persistent profile `.cloak-hltv-profile/`. Undersized archives (&lt;1MB) are not treated as cache hits. Fallback: pass `--demo` with a local `.rar` or `.dem`.
@@ -184,9 +208,11 @@ Output is `combined.mp4` in the same folder. Concat is incremental (one batch at
 - **RAR extraction** — `rarfile` library doesn't work on Windows. Use `patoolib` (via `patool` pip package) which wraps WinRAR.
 - **CS2 launch for rendering** — csdm may fail to auto-launch CS2 if Steam is on a secondary drive. Just open CS2 manually to any menu before running `render_pov.py`.
 - **All async** — every scraper/command is `asyncio.run()`. Any new command must follow `async def` + `register_subparser` + `handle` pattern in `commands/`.
+- **YouTube scheduling** — Pipeline defaults to `--publish-at auto`: next future 16:30 Australia/Sydney slot on a free local calendar day, using local `youtube/.publish_schedule.json` to avoid same-day duplicates. Explicit `--publish-at "YYYY-MM-DD HH:MM"` still schedules exactly.
 - **YouTube verification** — To set custom thumbnails, your YouTube account must be verified (phone verify) at https://www.youtube.com/verify.
 - **Wrong HLTV match URL ID** — If the ratings scraper returns "Unknown Match" or empty tables, the match URL's numeric ID is wrong. HLTV uses SPAs where the JS routing matches the ID to the match. Check the correct ID by visiting the match page in a browser (the sidebar "Related matches" links have correct IDs).
 - **Agent error parsing** — Grep for `[PIPELINE_ERROR]` and parse the JSON. Each error has a unique `code` for programmatic handling. Common codes: `EXTRACT_MAP_NOT_FOUND`, `RATINGS_NO_TABLES`, `ANALYZE_NO_ROUNDS`, `RENDER_STEAM_NOT_RUNNING`, `CONCAT_FAILED`, `THUMBNAIL_MISSING`, `UPLOAD_NO_VIDEO_ID`.
+- **HLTV Cloudflare block** — If CloakBrowser or Playwright get `net::ERR_CONNECTION_RESET` on HLTV while regular Chrome works, Cloudflare is fingerprinting the automation browser. Fix: use Playwright with system Chrome + `ignore_default_args=["--enable-automation"]` to hide automation flags. Applied in `scrapers/hltv_acquire.py` (`fetch_hltv_page_html`) and `scrapers/hltv.py` (`HLTVScraper._ensure_browser()`). Forcing custom DNS (`--dns-server`) does NOT help — DNS resolves fine, block is TCP-level from Cloudflare.
 
 ## Output Directory Structure
 
