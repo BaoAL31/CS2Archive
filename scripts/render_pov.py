@@ -171,7 +171,7 @@ def _get_player_crosshair(steam_id: str, demo_parts: list[str]) -> list[str]:
                     if code:
                         from crosshair_code import decode_crosshair, crosshair_to_convars
                         cvars = crosshair_to_convars(decode_crosshair(code))
-                        return ["crosshair 1"] + cvars
+                        return cvars
     return []
 
 def _write_cfg_with_crosshair(base_cfg: Path, crosshair_cmds: list[str], output: Path) -> None:
@@ -282,6 +282,13 @@ def main() -> None:
                 print(f"  Crosshair cfg: {render_cfg}")
             else:
                 cfg_to_use = cfg
+
+            # Rename Steam Cloud VCFG so it doesn't reload and override our crosshair cvars
+            vcfg = Path(r"D:\Steam\userdata\322187440\730\remote\cs2_user_convars.vcfg")
+            if vcfg.exists():
+                bak = vcfg.with_suffix(".vcfg.bak")
+                vcfg.rename(bak)
+
             cmd = [
                 CSDM, "video", str(Path(part).resolve()),
                 "--steamids", args.steam_id,
