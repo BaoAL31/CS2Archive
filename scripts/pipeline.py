@@ -47,13 +47,13 @@ CSDM = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
 PY = sys.executable
 
 STEPS = {
-    5: "analyze",
-    6: "render",
-    7: "concat",
-    8: "outro",
-    9: "thumbnail",
-    10: "upload",
-    11: "cleanup",
+    1: "analyze",
+    2: "render",
+    3: "concat",
+    4: "outro",
+    5: "thumbnail",
+    6: "upload",
+    7: "cleanup",
 }
 
 REQUIRED_META_FIELDS = [
@@ -87,7 +87,7 @@ def load_state(run_id: str) -> dict:
     path = STATE_DIR / f"{run_id}.json"
     if path.exists():
         return json.loads(path.read_text())
-    return {"step": 5, "data": {}}
+    return {"step": 1, "data": {}}
 
 
 def save_state(run_id: str, state: dict) -> None:
@@ -228,7 +228,7 @@ class Pipeline:
 
     def step_analyze(self) -> None:
         if not self.demo_path or not self.demo_path.exists():
-            fail(5, "ANALYZE_DEMO_MISSING", f"demo not found: {self.demo_path}")
+            fail(1, "ANALYZE_DEMO_MISSING", f"demo not found: {self.demo_path}")
 
         cmd = [CSDM, "analyze", str(self.demo_path)]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -245,29 +245,29 @@ class Pipeline:
         elif r.returncode == 0:
             print("  [OK] Analysis done")
         else:
-            fail(5, "ANALYZE_FAILED", f"csdm analyze returned {r.returncode}: {combined[:300]}")
+            fail(1, "ANALYZE_FAILED", f"csdm analyze returned {r.returncode}: {combined[:300]}")
 
         with tempfile.TemporaryDirectory() as tmp:
             r2 = subprocess.run([CSDM, "json", str(self.demo_path), "--output-folder", tmp],
                                 capture_output=True, text=True, timeout=300)
             if r2.returncode != 0:
-                fail(5, "ANALYZE_JSON_FAILED", f"csdm json export failed: {r2.stderr[:200]}")
+                fail(1, "ANALYZE_JSON_FAILED", f"csdm json export failed: {r2.stderr[:200]}")
             jf = list(Path(tmp).glob("*.json"))
             if not jf:
-                fail(5, "ANALYZE_NO_JSON", "csdm json produced no output files")
+                fail(1, "ANALYZE_NO_JSON", "csdm json produced no output files")
             data = json.loads(jf[0].read_text(encoding="utf-8"))
             rounds = data.get("rounds", [])
             kills = data.get("kills", [])
             print(f"  [OK] Rounds: {len(rounds)}, Kills: {len(kills)}")
             if len(rounds) == 0:
-                fail(5, "ANALYZE_NO_ROUNDS", "csdm analysis has zero rounds")
+                fail(1, "ANALYZE_NO_ROUNDS", "csdm analysis has zero rounds")
             self.state["data"]["round_count"] = len(rounds)
 
     # ── Step 6: Render ───────────────────────────────────────────────────
 
     def step_render(self) -> None:
         if not self.demo_path or not self.demo_path.exists():
-            fail(6, "RENDER_DEMO_MISSING", f"demo not found: {self.demo_path}")
+            fail(2, "RENDER_DEMO_MISSING", f"demo not found: {self.demo_path}")
 
         from cs2_minimizer import ensure_cs2_closed
 
@@ -283,13 +283,13 @@ class Pipeline:
             capture_output=True, text=True, timeout=30,
         )
         if nvcheck.returncode != 0:
-            fail(6, "RENDER_NO_NVENC",
+            fail(2, "RENDER_NO_NVENC",
                  f"h264_nvenc not available in ffmpeg. Install NVIDIA GPU drivers + NVENC-enabled ffmpeg.")
 
         steam_check = subprocess.run(["tasklist", "/FI", "IMAGENAME eq steam.exe"],
                                      capture_output=True, text=True, timeout=10)
         if "steam.exe" not in steam_check.stdout:
-            fail(6, "RENDER_STEAM_NOT_RUNNING", "Steam must be running before rendering")
+            fail(2, "RENDER_STEAM_NOT_RUNNING", "Steam must be running before rendering")
 
         render_args = [
             "scripts/render_pov.py", str(self.demo_path), self.steam_id,
@@ -298,21 +298,21 @@ class Pipeline:
         ]
         r = self._run_py(render_args, timeout=43200)
         if r.returncode != 0:
-            fail(6, "RENDER_FAILED", f"render_pov.py exited {r.returncode}")
+            fail(2, "RENDER_FAILED", f"render_pov.py exited {r.returncode}")
 
         batch_files = sorted(
             [f for f in self.render_dir.glob("batch-*.mp4") if re.match(r"batch-\d+-\d+\.mp4$", f.name)],
             key=lambda f: int(re.match(r"batch-(\d+)-\d+\.mp4$", f.name).group(1)),
         )
         if not batch_files:
-            fail(6, "RENDER_NO_BATCHES", f"no batch-*.mp4 files in {self.render_dir}")
+            fail(2, "RENDER_NO_BATCHES", f"no batch-*.mp4 files in {self.render_dir}")
 
         round_count = self.state["data"].get("round_count", 0)
         if round_count > 0:
             last_batch = batch_files[-1]
             last_end = int(re.match(r"batch-\d+-(\d+)\.mp4$", last_batch.name).group(1))
             if last_end < round_count:
-                fail(6, "RENDER_INCOMPLETE",
+                fail(2, "RENDER_INCOMPLETE",
                      f"last batch ends at round {last_end}, expected {round_count}")
 
         total_rounds = sum(
@@ -328,17 +328,17 @@ class Pipeline:
 
     def step_concat(self) -> None:
         if not self.render_dir.exists():
-            fail(7, "CONCAT_RENDER_DIR_MISSING", f"render dir not found: {self.render_dir}")
+            fail(3, "CONCAT_RENDER_DIR_MISSING", f"render dir not found: {self.render_dir}")
 
         r = self._run_py(["scripts/concat_rounds.py", str(self.render_dir)], timeout=7200)
         if r.returncode != 0:
-            fail(7, "CONCAT_FAILED", f"concat_rounds.py exited {r.returncode}")
+            fail(3, "CONCAT_FAILED", f"concat_rounds.py exited {r.returncode}")
 
         combined = self.render_dir / "combined.mp4"
         if not combined.exists():
-            fail(7, "CONCAT_NO_COMBINED", f"no combined.mp4 found in {self.render_dir}")
+            fail(3, "CONCAT_NO_COMBINED", f"no combined.mp4 found in {self.render_dir}")
         if combined.stat().st_size < 100000:
-            fail(7, "CONCAT_OUTPUT_TOO_SMALL", f"combined.mp4 suspiciously small: {combined.stat().st_size} bytes")
+            fail(3, "CONCAT_OUTPUT_TOO_SMALL", f"combined.mp4 suspiciously small: {combined.stat().st_size} bytes")
 
         self.youtube_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(str(combined), str(self.youtube_dir / "video.mp4"))
@@ -350,15 +350,15 @@ class Pipeline:
     def step_outro(self) -> None:
         video = self.youtube_dir / "video.mp4"
         if not video.exists():
-            fail(8, "OUTRO_VIDEO_MISSING", f"video.mp4 not found in {self.youtube_dir}")
+            fail(4, "OUTRO_VIDEO_MISSING", f"video.mp4 not found in {self.youtube_dir}")
 
         self._run_py(["scripts/generate_outro.py", str(video)], timeout=120)
 
         outro = self.youtube_dir / "outro.mp4"
         if not outro.exists():
-            fail(8, "OUTRO_CLIP_MISSING", f"outro.mp4 not generated in {self.youtube_dir}")
+            fail(4, "OUTRO_CLIP_MISSING", f"outro.mp4 not generated in {self.youtube_dir}")
         if outro.stat().st_size < 1000:
-            fail(8, "OUTRO_TOO_SMALL", f"outro.mp4 too small: {outro.stat().st_size} bytes")
+            fail(4, "OUTRO_TOO_SMALL", f"outro.mp4 too small: {outro.stat().st_size} bytes")
 
         temp = self.youtube_dir / "video.temp.mp4"
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
@@ -375,7 +375,7 @@ class Pipeline:
 
         if r.returncode != 0:
             temp.unlink(missing_ok=True)
-            fail(8, "OUTRO_CONCAT_FAILED", f"ffmpeg concat failed: {r.stderr[-300:]}")
+            fail(4, "OUTRO_CONCAT_FAILED", f"ffmpeg concat failed: {r.stderr[-300:]}")
 
         temp.replace(video)
         outro.unlink()
@@ -408,18 +408,18 @@ class Pipeline:
 
         r = self._run_py(cmd, timeout=300)
         if r.returncode != 0:
-            fail(9, "THUMBNAIL_FAILED", f"thumbnail generator exited {r.returncode}")
+            fail(5, "THUMBNAIL_FAILED", f"thumbnail generator exited {r.returncode}")
 
         if not thumb.exists():
-            fail(9, "THUMBNAIL_MISSING", f"thumbnail not created at {thumb}")
+            fail(5, "THUMBNAIL_MISSING", f"thumbnail not created at {thumb}")
         if thumb.stat().st_size < 1000:
-            fail(9, "THUMBNAIL_TOO_SMALL", f"thumbnail too small: {thumb.stat().st_size} bytes")
+            fail(5, "THUMBNAIL_TOO_SMALL", f"thumbnail too small: {thumb.stat().st_size} bytes")
 
         try:
             from PIL import Image
             im = Image.open(thumb)
             if im.size != (1280, 720):
-                fail(9, "THUMBNAIL_BAD_SIZE", f"thumbnail dimensions {im.size} != expected 1280x720")
+                fail(5, "THUMBNAIL_BAD_SIZE", f"thumbnail dimensions {im.size} != expected 1280x720")
         except ImportError:
             pass
 
@@ -470,9 +470,9 @@ class Pipeline:
         thumb = self.youtube_dir / "thumbnail.jpg"
 
         if not video.exists():
-            fail(10, "UPLOAD_VIDEO_MISSING", f"video not found: {video}")
+            fail(6, "UPLOAD_VIDEO_MISSING", f"video not found: {video}")
         if video.stat().st_size < 100000:
-            fail(10, "UPLOAD_VIDEO_TOO_SMALL", f"video too small: {video.stat().st_size} bytes")
+            fail(6, "UPLOAD_VIDEO_TOO_SMALL", f"video too small: {video.stat().st_size} bytes")
 
         meta_path = self.youtube_dir / "upload_meta.json"
         if not meta_path.exists():
@@ -501,7 +501,7 @@ class Pipeline:
         out = "".join(out_lines)
 
         if proc.returncode != 0:
-            fail(10, "UPLOAD_FAILED", f"upload exited {proc.returncode}: {out[:300]}")
+            fail(6, "UPLOAD_FAILED", f"upload exited {proc.returncode}: {out[:300]}")
 
         m = re.search(r"https://youtu\.be/([a-zA-Z0-9_-]+)", out)
         if m:
@@ -509,7 +509,7 @@ class Pipeline:
             self.state["data"]["youtube_id"] = vid_id
             print(f"  [OK] Uploaded: https://youtu.be/{vid_id}")
         else:
-            fail(10, "UPLOAD_NO_VIDEO_ID", f"could not extract video ID from output: {out[:200]}")
+            fail(6, "UPLOAD_NO_VIDEO_ID", f"could not extract video ID from output: {out[:200]}")
 
     # ── Step 11: Cleanup ────────────────────────────────────────────────
 
@@ -526,9 +526,9 @@ class Pipeline:
             removed.append(f".pipeline/{self.run_id}.json")
 
         if self.render_dir.exists():
-            fail(11, "CLEANUP_RENDER_DIR_FAILED", f"render dir still exists after rmtree: {self.render_dir}")
+            fail(7, "CLEANUP_RENDER_DIR_FAILED", f"render dir still exists after rmtree: {self.render_dir}")
         if state_path.exists():
-            fail(11, "CLEANUP_STATE_FAILED", f"pipeline state file still exists: {state_path}")
+            fail(7, "CLEANUP_STATE_FAILED", f"pipeline state file still exists: {state_path}")
         if not removed:
             print("  Nothing to clean up")
         else:
@@ -538,10 +538,10 @@ class Pipeline:
 def main() -> None:
     parser = argparse.ArgumentParser(description="E2E Pipeline: backlog .md -> render -> thumbnail -> upload")
     parser.add_argument("--backlog", required=True, help="Path to backlog markdown file with BACKLOG_META")
-    parser.add_argument("--step", type=int, default=5, choices=range(5, 12),
-                        help="Start from step N (5=analyze..11=cleanup)")
-    parser.add_argument("--until", type=int, default=None, choices=range(5, 11),
-                        help="Stop after step N (default: 11)")
+    parser.add_argument("--step", type=int, default=1, choices=range(1, 8),
+                        help="Start from step N (1=analyze..7=cleanup)")
+    parser.add_argument("--until", type=int, default=None, choices=range(1, 7),
+                        help="Stop after step N (default: 7)")
     args = parser.parse_args()
 
     meta = _parse_backlog(args.backlog)
@@ -549,7 +549,7 @@ def main() -> None:
     print(f"  CS2Archive Pipeline")
     print(f"  Player: {meta.get('player', '?')} | Map: {meta.get('map', '?')}")
     print(f"  Demo:   {meta.get('demo_path', '(unknown)')}")
-    print(f"  Step:   {args.step}" + (f" -> {args.until}" if args.until else f" -> 11"))
+    print(f"  Step:   {args.step}" + (f" -> {args.until}" if args.until else f" -> 7"))
     print(f"{'='*60}")
 
     Pipeline(args).run()

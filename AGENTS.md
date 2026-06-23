@@ -6,24 +6,24 @@
 
 `python scripts/pipeline.py --backlog backlog/<match_slug>/<priority>/<slug>.json [--step N] [--until N]`
 
-Reads all POV metadata from the backlog file. Runs steps 5-11 in order. Resumable — state saved to `.pipeline/{run_id}.json`. Use `--step N` to start at a specific step.
+Reads all POV metadata from the backlog file. Runs steps 1-7 in order. Resumable — state saved to `.pipeline/{run_id}.json`. Use `--step N` to start at a specific step.
 
 | Step | Name | Script for manual use / debugging |
 |---|---|---|
-| 5 | analyze | `csdm analyze <demo>` |
-| 6 | render | `python scripts/render_pov.py <demo> <steam_id>` |
-| 7 | concat | `python scripts/concat_rounds.py <renders_folder>` |
-| 8 | outro | `python scripts/generate_outro.py <video.mp4>` |
-| 9 | thumbnail | `python -m thumbnail <url> --player <nick> --map <map> --demo <dem> --steam-id <id>` |
-| 10 | upload | `python scripts/upload_youtube.py <video> --title <t> --thumbnail <thumb.png>` |
-| 11 | cleanup | `python scripts/cleanup_renders.py <renders_folder>` |
+| 1 | analyze | `csdm analyze <demo>` |
+| 2 | render | `python scripts/render_pov.py <demo> <steam_id>` |
+| 3 | concat | `python scripts/concat_rounds.py <renders_folder>` |
+| 4 | outro | `python scripts/generate_outro.py <video.mp4>` |
+| 5 | thumbnail | `python -m thumbnail <url> --player <nick> --map <map> --demo <dem> --steam-id <id>` |
+| 6 | upload | `python scripts/upload_youtube.py <video> --title <t> --thumbnail <thumb.png>` |
+| 7 | cleanup | `python scripts/cleanup_renders.py <renders_folder>` |
 
 ### Structured Errors (agent-parseable)
 
 Every pipeline step validates its output and exits with a single JSON error line on failure:
 
 ```
-[PIPELINE_ERROR] {"error":true,"step":5,"step_name":"analyze","code":"ANALYZE_NO_ROUNDS","message":"csdm analysis has zero rounds"}
+[PIPELINE_ERROR] {"error":true,"step":1,"step_name":"analyze","code":"ANALYZE_NO_ROUNDS","message":"csdm analysis has zero rounds"}
 ```
 
 Grep for `[PIPELINE_ERROR]` and parse the JSON. Each error has a unique `code` for programmatic handling (e.g. `RENDER_STEAM_NOT_RUNNING`, `OUTRO_CONCAT_FAILED`, `THUMBNAIL_MISSING`, `UPLOAD_NO_VIDEO_ID`).
@@ -36,9 +36,8 @@ python scripts/pipeline.py --backlog backlog/spirit-vs-falcons-iem-cologne-major
 
 ### Notes
 
-- Pipeline requires `--steam-id` (no auto-extraction).
-- **Steam ID source of truth** — player Steam64 IDs are stored in `.data/player_accounts.json` (via `python main.py player add/list`). When filling `--steam-id` for a pipeline/backlog entry, read from `.data/` first.
-- `--demo` optional: omit to download from `hltv_url` via CloakBrowser; pass `.rar` or `.dem` to skip download. `--force` re-downloads; default browser is headed + humanize (`--headless` to opt out).
+- Pipeline reads `steam_id` from backlog entry (resolved by `create_backlog.py` from `.data/player_accounts.json`). No `--steam-id` CLI flag — source of truth is `.data/player_accounts.json` (via `python main.py player add/list`). Extract from demo: `python scripts/extract_steamids.py <demo_path>`.
+- `--demo` optional in pipeline: omit to download from `hltv_url` (CloakBrowser) or from HuggingFace if `hf_root` set; pass `.rar` or `.dem` to skip download.`--force` re-downloads.
 - **HF auto-download:** if `demo_path` not found locally and backlog has `hf_root` (e.g. `iem_cologne_major_2026`), pipeline pulls single `.dem` from `cs2povarchive/cs2-demos` dataset. Demo-level granularity — only the needed map is downloaded.
 - Render step verifies Steam is running before starting.
 - Each step validates its output before proceeding — failures halt the pipeline.
@@ -46,13 +45,13 @@ python scripts/pipeline.py --backlog backlog/spirit-vs-falcons-iem-cologne-major
 - **Render folder per POV** — `demos/renders/pov-{demo-stem}_{player}/` (not demo-only). Multiple POVs on the same map share the match demo folder but never share a render folder. Legacy `pov-{demo-stem}/` (no player suffix) may still exist from older runs; safe to delete after confirming youtube output.
 - **`--resume-from-round N`** — deprecated. Render now uses filesystem-based resume: existing `batch-*.mp4` files ≥1MB are automatically skipped on re-run. To re-render a specific batch, manually delete its file.
 - **`--batches N`** — rounds per render batch (default: 10). Each batch produces one MP4 named `batch-{start:03d}-{end:03d}.mp4`. `--batches 1` is equivalent to the old per-round model.
-- **`--until N`** — stop after step N (e.g. `--until 9` runs through thumbnail, skips upload/cleanup). Default: run through step 11.
+- **`--until N`** — stop after step N (e.g. `--until 5` runs through thumbnail, skips upload/cleanup). Default: run through step 7.
 
 ### Chaining pipelines (upload overlap)
 
-Use `scripts/pipeline_chain.py` to start the **next** POV when the **previous** reaches **upload** (state `step >= 10`). Only one render (step 6) should run at a time; upload (step 10) can overlap with the next POV’s acquire→render.
+Use `scripts/pipeline_chain.py` to start the **next** POV when the **previous** reaches **upload** (state `step >= 6`). Only one render (step 2) should run at a time; upload (step 6) can overlap with the next POV’s acquire→render.
 
-**How it works:** polls `.pipeline/{run_id}.json` every 30s (`--poll`). When `"step" >= 10`, spawns `pipeline.py` with the args you pass after `--`. Does **not** read terminal output — only the state file.
+**How it works:** polls `.pipeline/{run_id}.json` every 30s (`--poll`). When `"step" >= 6`, spawns `pipeline.py` with the args you pass after `--`. Does **not** read terminal output — only the state file.
 
 **`run_id`** = `{match_id}_{demo_stem}_{player}_{map}` (e.g. `2394174_falcons-vs-mouz-m3-nuke_NiKo_Nuke`). Includes HLTV match ID to prevent collision when the same teams/map/player appear in different tournaments. Use `match_id_from_url()` from `scrapers/hltv_acquire.py` to extract the ID. Same args as the watched pipeline must be used when resuming.
 
@@ -87,13 +86,13 @@ Use these when debugging a specific pipeline step failure or running steps manua
 9. **Upload to YouTube** — `python scripts/upload_youtube.py <video_path> --thumbnail <thumb.png> --title <title> --description <desc> --privacy public`. Requires Google Cloud OAuth (`client_secret.json`). First-time auth opens browser. Account must be phone-verified for custom thumbnails.
    Default publish mode is `auto`: schedule at the next future 16:30 Australia/Sydney on a free local calendar day. The script keeps `youtube/.publish_schedule.json` as the slot ledger and rolls back a reserved slot if upload fails.
    Override with `--publish-at "YYYY-MM-DD HH:MM"` for an exact time, or keep `--publish-at auto` explicit.
-   Or use `--meta <upload_meta.json>` to read title/description/tags from a metadata file. The pipeline writes `upload_meta.json` at step 8 (thumbnail), so step 9 can resume with only the youtube folder. The file also stores `resumable_uri`/`resumable_progress` during upload for crash recovery, and `youtube_id` after completion.
+   Or use `--meta <upload_meta.json>` to read title/description/tags from a metadata file. The pipeline writes `upload_meta.json` at step 5 (thumbnail), so step 6 can resume with only the youtube folder. The file also stores `resumable_uri`/`resumable_progress` during upload for crash recovery, and `youtube_id` after completion.
 
 ## Backlog Creation
 
 `python scripts/create_backlog.py <hltv_url>` — downloads a match and generates prioritized backlog entries for every player/map combo.
 
-**Demos must be downloaded first.** The script calls into `acquire_match()` then scrapes HLTV Rating 3.0, creating a per-player backlog card ranked by rating. It validates that the `.dem` file for each map exists on disk — if not found, it raises `FileNotFoundError` with the expected path, rather than writing a placeholder.
+**Demos are downloaded automatically.** The script calls into `acquire_match()` then scrapes HLTV Rating 3.0, creating a per-player backlog card ranked by rating. It validates that the `.dem` file for each map exists on disk — if not found, it raises `FileNotFoundError` with the expected path, rather than writing a placeholder.
 
 Each backlog entry contains full metadata as JSON: player, map, steam_id, demo_path, hltv_url, tournament, avatar_path, ratings_path, rating, kd, team, priority. The script also scrapes tournament name from HLTV, fetches player avatars, and adds `hf_root` for HuggingFace demo auto-download.
 
@@ -190,8 +189,8 @@ Output is `combined.mp4` in the same folder. Concat is incremental (one batch at
 - **HLTV page scraping** — `fetch_hltv_page_html()` uses Chrome DevTools Protocol (CDP) auto-launch with temp profile (port 9222). Kills stale temp-profile Chrome on startup. Rate-limited retry: up to 10 attempts, delay `min(2*attempt, 60)`. System DNS respects, no profile lock conflicts. `HLTVScraper` also uses CDP `connect_over_cdp` fallback with single reusable page + per-navigation rate limiting.
 - **Split demos (p1, p2)** — IEM tournaments sometimes split single-map demos into parts (`-p1`, `-p2`). `render_pov.py` handles this automatically. The `.rar` may contain multiple `.dem` files — `extract_demo()` in `downloader.py` now extracts all of them.
 - **PBDEMS2 format** — PGL tournaments use a custom demo format. csdm now supports it (requires `--source challengermode` for analyze). Use `csdm analyze <demo> --source challengermode`.
-- **HLTV CDN blocks image downloads** — Player body shots must be scraped via Playwright browser context (not httpx). Each player gets a **fresh BrowserContext** (with `Cache-Control: no-cache`) to prevent browser cache from suppressing `response` events. Use `scrapers/player_images.py`.
-- **Background removal at download time** — `rembg` runs during avatar download (step 4), not during thumbnail generation. Player page images (400×417) are already transparent — rembg only needed for match page fallback (200×200 with bg). Cutout PNGs saved as `{nickname}.png` in `demos/avatars/`.
+- **HLTV CDN blocks image downloads** — Player body shots must be scraped via shared `HLTVScraper` (single Chrome instance, response interception). Rate-limited with 2s delay between players. One reusable page per scraper, no fresh context per player.
+- **Background removal at download time** — `rembg` runs during avatar download (not during thumbnail generation). Player page images (400×417) are already transparent — rembg only needed for match page fallback (200×200 with bg). Cutout PNGs saved as `{nickname}.png` in `demos/avatars/`.
 - **Thumbnail background auto-extraction** — When using `--demo` + `--steam-id`, the thumbnail generator renders a 1-second clip of a random kill, extracts the first frame, blurs it (radius 6), and uses it as background.
 - **VP9 Trick** — Render at 2560×1440 even for 1080p-targeted uploads. YouTube gives 1440p+ videos VP9 codec (higher bitrate), making them sharper even when watched at 1080p.
 - **YouTube encoding** — Use `--ffmpeg-output-parameters "-profile:v high -pix_fmt yuv420p -level 4.2"` for YouTube compatibility. YouTube may still take 30-60 min to process 1080p60 after upload.

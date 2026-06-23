@@ -1,5 +1,5 @@
 """
-Start the next pipeline when the previous run reaches upload (state step >= 10).
+Start the next pipeline when the previous run reaches upload (state step >= 6).
 
 Usage:
     python scripts/pipeline_chain.py --watch <run_id> --then <pipeline args...>
@@ -21,14 +21,14 @@ PY = sys.executable
 
 def wait_for_upload_step(run_id: str, poll_seconds: int = 30) -> None:
     path = STATE_DIR / f"{run_id}.json"
-    print(f"[chain] Waiting for {run_id} to reach upload (step >= 10)...")
+    print(f"[chain] Waiting for {run_id} to reach upload (step >= 6)...")
     while True:
         if path.exists():
             try:
                 step = json.loads(path.read_text()).get("step", 1)
             except (json.JSONDecodeError, OSError):
                 step = 1
-            if step >= 10:
+            if step >= 6:
                 print(f"[chain] {run_id} at step {step} — starting next pipeline")
                 return
         time.sleep(poll_seconds)
