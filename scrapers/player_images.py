@@ -131,55 +131,45 @@ async def _fetch_profile_bodyshot(scraper, player_url: str) -> bytes | None:
     """Profile-header bodyshot only — uses DOM-selected img src (hash CDN URLs)."""
     expected_id = hltv_player_id_from_url(player_url) or ""
     await scraper._ensure_browser()
-    cap_ctx = await scraper.fresh_context()
-    page = await cap_ctx.new_page()
     try:
+        await scraper.navigate(player_url, timeout_ms=30000)
+    except Exception:
+        console.print(f"[yellow]   Profile page navigation failed: {player_url}[/yellow]")
+        return None
+
+    page = scraper._nav_page
+    await page.wait_for_timeout(5000)
+
+    picked_src: str | None = None
+    for sel in _BODYSHOT_LOCATORS:
         try:
-            await page.goto(player_url, wait_until="domcontentloaded", timeout=30000)
+            picked_src = await page.evaluate(_PICK_PROFILE_BODYSHOT_JS, [sel, expected_id])
         except Exception:
-            console.print(f"[yellow]   Profile page navigation failed: {player_url}[/yellow]")
-            return None
-        await page.wait_for_timeout(5000)
+            continue
+        if picked_src:
+            break
 
-        picked_src: str | None = None
-        for sel in _BODYSHOT_LOCATORS:
-            try:
-                picked_src = await page.evaluate(_PICK_PROFILE_BODYSHOT_JS, [sel, expected_id])
-            except Exception:
-                continue
-            if picked_src:
-                break
+    if not picked_src:
+        return None
 
-        if not picked_src:
-            return None
+    full_url = _upgrade_bodyshot_url(picked_src)
 
-        full_url = _upgrade_bodyshot_url(picked_src)
-    finally:
-        await page.close()
-        await cap_ctx.close()
-
-    # CDN fetch on a fresh page — same-tab navigation from profile page returns 403/HTML.
-    dl_ctx = await scraper.fresh_context()
-    dl_page = await dl_ctx.new_page()
+    # CDN fetch — navigate same page to CDN URL
     try:
-        try:
-            resp = await dl_page.goto(full_url, wait_until="domcontentloaded", timeout=30000)
-        except Exception:
-            console.print(f"[yellow]   CDN navigation failed: {full_url}[/yellow]")
-            return None
+        await scraper._rate_limit()
+        resp = await page.goto(full_url, wait_until="domcontentloaded", timeout=30000)
         if resp is None or not resp.ok:
             return None
         raw = await resp.body()
         if len(raw) < 5000 or raw.startswith(b"<html"):
             return None
-
         im = Image.open(BytesIO(raw))
         if not _is_acceptable(im):
             return None
         return raw
-    finally:
-        await dl_page.close()
-        await dl_ctx.close()
+    except Exception:
+        console.print(f"[yellow]   CDN navigation failed: {full_url}[/yellow]")
+        return None
 
 
 async def _fetch_cdn_bodyshot(scraper, player_id: str) -> bytes | None:
@@ -189,32 +179,25 @@ async def _fetch_cdn_bodyshot(scraper, player_id: str) -> bytes | None:
     if not pid:
         return None
 
+    page = scraper._nav_page
     for cdn_url in _cdn_bodyshot_urls(pid):
-        cap_ctx = await scraper.fresh_context()
-        cap_page = await cap_ctx.new_page()
         try:
-            try:
-                resp = await cap_page.goto(cdn_url, wait_until="domcontentloaded", timeout=20000)
-            except Exception as e:
-                console.print(f"[dim]   CDN {cdn_url}: navigation error {type(e).__name__}[/dim]")
-                continue
-            if resp is None or not resp.ok:
-                console.print(f"[dim]   CDN {cdn_url}: response not ok[/dim]")
-                continue
-            raw = await resp.body()
-            if len(raw) <= 5000 or raw.startswith(b"<html"):
-                console.print(f"[dim]   CDN {cdn_url}: response too small or HTML[/dim]")
-                continue
-            im = Image.open(BytesIO(raw))
-            if _is_acceptable(im):
-                return raw
-            console.print(f"[dim]   CDN {cdn_url}: image not acceptable ({im.size})[/dim]")
+            await scraper._rate_limit()
+            resp = await page.goto(cdn_url, wait_until="domcontentloaded", timeout=20000)
         except Exception as e:
-            console.print(f"[dim]   CDN {cdn_url}: exception {type(e).__name__}[/dim]")
+            console.print(f"[dim]   CDN {cdn_url}: navigation error {type(e).__name__}[/dim]")
             continue
-        finally:
-            await cap_page.close()
-            await cap_ctx.close()
+        if resp is None or not resp.ok:
+            console.print(f"[dim]   CDN {cdn_url}: response not ok[/dim]")
+            continue
+        raw = await resp.body()
+        if len(raw) <= 5000 or raw.startswith(b"<html"):
+            console.print(f"[dim]   CDN {cdn_url}: response too small or HTML[/dim]")
+            continue
+        im = Image.open(BytesIO(raw))
+        if _is_acceptable(im):
+            return raw
+        console.print(f"[dim]   CDN {cdn_url}: image not acceptable ({im.size})[/dim]")
 
     return None
 
@@ -242,17 +225,15 @@ async def _try_profile_and_cdn(scraper, resolution: dict) -> bytes | None:
 
 async def _scrape_match_roster(scraper, match_url: str) -> list[dict]:
     """Scrape match-page lineup for nickname → profile URL pairs."""
-    context = await scraper._ensure_context()
-    page = await context.new_page()
+    await scraper._ensure_browser()
     try:
-        await page.goto(match_url, wait_until="domcontentloaded", timeout=30000)
+        await scraper.navigate(match_url, timeout_ms=30000)
     except Exception as e:
         console.print(f"[yellow]   Roster scrape failed: {type(e).__name__}[/yellow]")
-        await page.close()
         return []
-    await page.wait_for_timeout(3000)
+    await scraper._nav_page.wait_for_timeout(3000)
 
-    players = await page.evaluate("""
+    players = await scraper._nav_page.evaluate("""
         () => {
             const imgs = document.querySelectorAll('div.players img.player-photo');
             return Array.from(imgs).map(img => {
@@ -264,54 +245,50 @@ async def _scrape_match_roster(scraper, match_url: str) -> list[dict]:
             });
         }
     """)
-    await page.close()
     return players or []
 
 
 async def _fetch_match_page_headshot(scraper, match_url: str, player_key: str) -> bytes | None:
     """Last resort: screenshot match-page lineup photo for one player."""
-    context = await scraper._ensure_context()
-    page = await context.new_page()
+    await scraper._ensure_browser()
     try:
-        try:
-            await page.goto(match_url, wait_until="domcontentloaded", timeout=30000)
-        except Exception as e:
-            console.print(f"[yellow]   [{player_key}] match page navigation failed: {type(e).__name__}[/yellow]")
-            return None
-        await page.wait_for_timeout(3000)
-
-        entries = await page.evaluate(
-            """
-            () => {
-                const imgs = document.querySelectorAll('div.players img.player-photo');
-                return Array.from(imgs).map((img, index) => {
-                    const alt = img.alt || '';
-                    const m = alt.match(/'([^']+)'/);
-                    const nick = m ? m[1].toLowerCase() : alt.split(' ').pop().toLowerCase();
-                    return { nickname: nick, index };
-                });
-            }
-            """
-        )
-        match = next((e for e in entries if e["nickname"] == player_key), None)
-        if not match:
-            console.print(f"[yellow]   [{player_key}] not found on match page for fallback[/yellow]")
-            return None
-
-        locator = page.locator("div.players img.player-photo").nth(match["index"])
-        shot = await locator.screenshot(type="png")
-        if not shot or len(shot) < 1000:
-            return None
-
-        im = Image.open(BytesIO(shot))
-        if _is_acceptable(im):
-            return shot
-        console.print(
-            f"[yellow]   [{player_key}] match-page photo too small ({im.size[0]}x{im.size[1]})[/yellow]"
-        )
+        await scraper.navigate(match_url, timeout_ms=30000)
+    except Exception as e:
+        console.print(f"[yellow]   [{player_key}] match page navigation failed: {type(e).__name__}[/yellow]")
         return None
-    finally:
-        await page.close()
+    await scraper._nav_page.wait_for_timeout(3000)
+
+    page = scraper._nav_page
+    entries = await page.evaluate(
+        """
+        () => {
+            const imgs = document.querySelectorAll('div.players img.player-photo');
+            return Array.from(imgs).map((img, index) => {
+                const alt = img.alt || '';
+                const m = alt.match(/'([^']+)'/);
+                const nick = m ? m[1].toLowerCase() : alt.split(' ').pop().toLowerCase();
+                return { nickname: nick, index };
+            });
+        }
+        """
+    )
+    match = next((e for e in entries if e["nickname"] == player_key), None)
+    if not match:
+        console.print(f"[yellow]   [{player_key}] not found on match page for fallback[/yellow]")
+        return None
+
+    locator = page.locator("div.players img.player-photo").nth(match["index"])
+    shot = await locator.screenshot(type="png")
+    if not shot or len(shot) < 1000:
+        return None
+
+    im = Image.open(BytesIO(shot))
+    if _is_acceptable(im):
+        return shot
+    console.print(
+        f"[yellow]   [{player_key}] match-page photo too small ({im.size[0]}x{im.size[1]})[/yellow]"
+    )
+    return None
 
 
 async def _save_avatar_bytes(raw: bytes, png_path: Path) -> bool:
@@ -372,12 +349,14 @@ async def fetch_avatar_for_player(
     ratings_path: Path | str,
     *,
     force: bool = False,
+    scraper=None,
 ) -> Path:
     """
     Fetch one player avatar using accounts → ratings → roster resolution.
 
     Skips network fetch when cached PNG is ≥300×300 and account has hltv_player_id,
     unless force=True.
+    Pass existing scraper to reuse browser across multiple calls.
     """
     from player_accounts import list_accounts
 
@@ -397,7 +376,10 @@ async def fetch_avatar_for_player(
 
     from scrapers.hltv import HLTVScraper
 
-    scraper = HLTVScraper()
+    own_scraper = False
+    if scraper is None:
+        scraper = HLTVScraper()
+        own_scraper = True
     roster_resolution = None
     search_resolution = None
     try:
@@ -458,7 +440,8 @@ async def fetch_avatar_for_player(
             console.print("[green]   Avatar resolution source: match_fallback[/green]")
             return png_path
     finally:
-        await scraper.close()
+        if own_scraper:
+            await scraper.close()
 
     raise RuntimeError(f"no acceptable avatar for {key}")
 

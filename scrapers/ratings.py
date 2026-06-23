@@ -161,9 +161,10 @@ def parse_match_ratings_html(html: str, match_url: str = "") -> Optional[dict]:
 async def get_match_ratings(match_url: str) -> Optional[dict]:
     """Scrape HLTV match page for all player ratings and stats.
 
-    Returns dict with match info and per-map player stats.
+    Returns dict with match info, per-map player stats, and tournament name.
     """
     import asyncio
+    from bs4 import BeautifulSoup
 
     from scrapers.hltv_acquire import fetch_hltv_page_html
 
@@ -175,4 +176,8 @@ async def get_match_ratings(match_url: str) -> Optional[dict]:
     result = parse_match_ratings_html(html, match_url)
     if not result or not result.get("tables"):
         return None
+
+    soup = BeautifulSoup(html, "lxml")
+    event_el = soup.select_one(".event a")
+    result["tournament"] = event_el.get_text(strip=True) if event_el else ""
     return result

@@ -37,28 +37,32 @@ class HLTVScraper:
         self._context: Optional[BrowserContext] = None
         self._headless = headless
 
-    async def _ensure_browser(self) -> BrowserContext:
-        if self._context:
-            return self._context
-        # Use sync playwright in thread to match working fetch_hltv_page_html pattern
-        from scrapers.hltv_acquire import fetch_hltv_page_html, DEFAULT_PROFILE_DIR
+    async def _ensure_browser(self) -> Browser:
+        if self._browser:
+            return self._browser
+        from scrapers.hltv_acquire import DEFAULT_PROFILE_DIR
 
         DEFAULT_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-        # For page creation, we need async context
         pw = await async_playwright().start()
-        self._browser = await pw.chromium.launch(
-            channel="chrome",
-            headless=self._headless,
-            ignore_default_args=["--enable-automation"],
-        )
+        # Try connecting to existing CDP Chrome first
+        try:
+            self._browser = await pw.chromium.connect_over_cdp("http://127.0.0.1:9222")
+            self._browser.contexts  # verify alive
+        except Exception:
+            self._browser = await pw.chromium.launch(
+                channel="chrome",
+                headless=self._headless,
+                ignore_default_args=["--enable-automation"],
+            )
         self._context = await self._browser.new_context(
             viewport={"width": 1920, "height": 1080},
             locale="en-US",
         )
-        return self._context
+        return self._browser
 
     async def _ensure_context(self) -> BrowserContext:
-        return await self._ensure_browser()
+        await self._ensure_browser()
+        return self._context
 
     @property
     def browser(self) -> Browser | None:
@@ -73,7 +77,31 @@ class HLTVScraper:
             extra_http_headers={"Cache-Control": "no-cache, no-store"},
         )
 
+    async def navigate(self, url: str, *, timeout_ms: int = 30000) -> str:
+        """Rate-limited navigation in a single reusable page. Returns page content."""
+        await self._ensure_browser()
+        if not hasattr(self, "_nav_page") or self._nav_page is None:
+            self._nav_page = await self._context.new_page()
+        await self._rate_limit()
+        try:
+            await self._nav_page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            await self._nav_page.wait_for_timeout(2000)
+            return await self._nav_page.content()
+        except Exception:
+            try:
+                await self._nav_page.close()
+            except Exception:
+                pass
+            self._nav_page = None
+            raise
+
     async def close(self) -> None:
+        if hasattr(self, "_nav_page") and self._nav_page:
+            try:
+                await self._nav_page.close()
+            except Exception:
+                pass
+            self._nav_page = None
         if self._context:
             await self._context.close()
         if self._browser:

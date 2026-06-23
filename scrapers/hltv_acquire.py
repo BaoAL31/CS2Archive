@@ -19,7 +19,111 @@ console = Console(force_terminal=True)
 
 ARCHIVE_EXTENSIONS = {".rar", ".zip", ".7z"}
 MIN_ARCHIVE_BYTES = 1_000_000
-DEFAULT_PROFILE_DIR = Path(".cloak-hltv-profile")
+CDP_PROFILE_DIR = Path(".cdp-hltv-profile")
+DEFAULT_PROFILE_DIR = CDP_PROFILE_DIR
+
+
+_CDP_BROWSER_CACHE: dict = {}
+_CDP_PORT = 9222
+
+
+def _kill_stale_cdp_chrome() -> None:
+    """Kill Chrome process on port 9222 if it's ours (temp profile). Doesn't touch user Chrome."""
+    import subprocess, time
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             'netstat -ano | Select-String ":9222" | Select-String "LISTENING"'],
+            capture_output=True, text=True, timeout=10,
+        )
+        for line in r.stdout.splitlines():
+            parts = line.strip().split()
+            pid = parts[-1] if parts else ""
+            if not pid.isdigit():
+                continue
+            cmd = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f'Get-CimInstance Win32_Process -Filter "ProcessId={pid}" | Select-Object -ExpandProperty CommandLine'],
+                capture_output=True, text=True, timeout=5,
+            )
+            if "hltv-cdp-" in cmd.stdout or "temp" in cmd.stdout.lower():
+                subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True, timeout=5)
+                time.sleep(1)
+    except Exception:
+        pass
+
+
+def _ensure_cdp_browser():
+    """Return browser handle (reused if already connected). Launches Chrome if needed."""
+    from playwright.sync_api import sync_playwright
+    import subprocess, socket, time, tempfile
+
+    cached = _CDP_BROWSER_CACHE.get("browser")
+    if cached is not None:
+        try:
+            cached.contexts  # verify alive
+            return cached
+        except Exception:
+            _CDP_BROWSER_CACHE.pop("browser", None)
+            _CDP_BROWSER_CACHE.pop("pw", None)
+
+    _kill_stale_cdp_chrome()
+
+    # Launch Chrome with CDP port + temp profile (no conflict with any running Chrome)
+    tmp_profile = Path(tempfile.mkdtemp(prefix="hltv-cdp-"))
+    subprocess.Popen(
+        [
+            "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+            f"--remote-debugging-port={_CDP_PORT}",
+            f"--user-data-dir={tmp_profile.resolve()}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-sync",
+            "--no-sandbox",
+            "about:blank",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(3)
+
+    pw = sync_playwright().start()
+    for _ in range(10):
+        try:
+            browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{_CDP_PORT}")
+            browser.contexts  # verify live
+            _CDP_BROWSER_CACHE["browser"] = browser
+            _CDP_BROWSER_CACHE["pw"] = pw
+            return browser
+        except Exception:
+            time.sleep(2)
+    raise RuntimeError("Could not start or connect to Chrome CDP")
+
+
+def _navigate_with_retry(
+    page,
+    url: str,
+    *,
+    wait_selector: str | None,
+    timeout_ms: int,
+    max_retries: int = 10,
+) -> str:
+    """Navigate to URL, retry on network errors (ERR_CONNECTION_RESET etc)."""
+    import time
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_timeout(3000)
+            if wait_selector:
+                page.wait_for_selector(wait_selector, timeout=timeout_ms)
+            return page.content()
+        except Exception as e:
+            if attempt < max_retries:
+                delay = min(2 * attempt, 60)
+                time.sleep(delay)
+            else:
+                raise
 
 
 def fetch_hltv_page_html(
@@ -30,27 +134,16 @@ def fetch_hltv_page_html(
     profile_dir: Path | None = None,
     timeout_ms: int = 60_000,
 ) -> str:
-    """Fetch an HLTV page HTML via system Chrome (bypass Cloudflare fingerprinting)."""
-    from playwright.sync_api import sync_playwright
-
-    profile = profile_dir or DEFAULT_PROFILE_DIR
-    profile.mkdir(parents=True, exist_ok=True)
-    with sync_playwright() as pw:
-        ctx = pw.chromium.launch_persistent_context(
-            user_data_dir=str(profile.resolve()),
-            channel="chrome",
-            headless=headless,
-            ignore_default_args=["--enable-automation"],
-        )
+    """Fetch an HLTV page HTML via CDP. Auto-launches Chrome if needed."""
+    browser = _ensure_cdp_browser()
+    ctx = browser.new_context()
+    try:
         page = ctx.new_page()
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            page.wait_for_timeout(3000)
-            if wait_selector:
-                page.wait_for_selector(wait_selector, timeout=timeout_ms)
-            return page.content()
-        finally:
-            ctx.close()
+        return _navigate_with_retry(
+            page, url, wait_selector=wait_selector, timeout_ms=timeout_ms
+        )
+    finally:
+        ctx.close()
 
 
 def match_slug_from_url(url: str) -> str:
@@ -129,14 +222,38 @@ def find_dem_for_map(folder: Path, map_name: str) -> Path | None:
     return matches[0] if matches else None
 
 
+def _kill_chrome_on_port_9222() -> None:
+    """Kill any Chrome process listening on CDP port 9222 (frees profile lock)."""
+    import subprocess, time
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "netstat -ano | findstr :9222"],
+            capture_output=True, text=True, timeout=10,
+        )
+        for line in r.stdout.splitlines():
+            if "LISTENING" in line:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    subprocess.run(["taskkill", "/F", "/PID", parts[-1]],
+                                   capture_output=True, timeout=5)
+        time.sleep(1)
+    except Exception:
+        pass
+
+
 def _download_with_browser(
     match_url: str,
     dest_path: Path,
     profile_dir: Path,
     *,
     headless: bool,
+    max_retries: int = 10,
 ) -> Path:
+    """Download demo via CloakBrowser. Retry with random delay if error page appears."""
     from cloakbrowser import launch_persistent_context
+    import random
+    import time
 
     profile_dir.mkdir(parents=True, exist_ok=True)
     dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -144,26 +261,52 @@ def _download_with_browser(
     ctx = launch_persistent_context(
         str(profile_dir.resolve()),
         headless=headless,
+        viewport={"width": 1920, "height": 1080},
         humanize=True,
+        channel="chrome",
     )
-    page = ctx.new_page()
+
+    for attempt in range(1, max_retries + 1):
+        page = ctx.new_page()
+        try:
+            page.goto(match_url)
+            page.wait_for_selector(
+                "[data-demo-link], [data-demo-link-button]",
+                state="visible",
+                timeout=30_000,
+            )
+            console.print(f"  [cyan]Clicking 'Demo download' (attempt {attempt}/{max_retries})...[/cyan]")
+            with page.expect_download(timeout=120_000) as dl_info:
+                page.locator("text=Demo download").first.click(force=True)
+            dl = dl_info.value
+            ext = Path(dl.suggested_filename).suffix or ".rar"
+            if dest_path.suffix.lower() not in ARCHIVE_EXTENSIONS:
+                dest_path = dest_path.with_suffix(ext)
+            dl.save_as(str(dest_path))
+            dl = None
+            try:
+                ctx.close()
+            except Exception:
+                pass
+            time.sleep(0.5)
+            console.print(f"  [green]Downloaded: {dest_path.name} ({dest_path.stat().st_size / 1024 / 1024:.0f} MB)[/green]")
+            return dest_path
+        except Exception as e:
+            console.print(f"  [yellow]Attempt {attempt} failed: {e}[/yellow]")
+            try:
+                page.close()
+            except Exception:
+                pass
+            if attempt < max_retries:
+                wait = random.uniform(4, 8)
+                console.print(f"  [yellow]Retrying in {wait:.0f}s...[/yellow]")
+                time.sleep(wait)
+
     try:
-        page.goto(match_url)
-        page.wait_for_selector(
-            "[data-demo-link], [data-demo-link-button]",
-            state="visible",
-            timeout=30_000,
-        )
-        with page.expect_download(timeout=120_000) as download_info:
-            page.click("[data-demo-link], [data-demo-link-button]")
-        download = download_info.value
-        ext = Path(download.suggested_filename).suffix or ".rar"
-        if dest_path.suffix.lower() not in ARCHIVE_EXTENSIONS:
-            dest_path = dest_path.with_suffix(ext)
-        download.save_as(str(dest_path))
-        return dest_path
-    finally:
         ctx.close()
+    except Exception:
+        pass
+    raise RuntimeError(f"Download failed after {max_retries} attempts")
 
 
 def _ensure_extracted(archive_path: Path, folder: Path) -> list[Path]:

@@ -1,25 +1,21 @@
 # AGENTS.md — CS2Archive
 
-> **ALWAYS use `scripts/pipeline.py` as the primary entry point.** Individual step scripts exist for debugging or resuming a failed step — see below.
+> **ALWAYS use `scripts/create_backlog.py` for data acquisition, then `scripts/pipeline.py` for rendering/upload.** Individual step scripts exist for debugging or resuming a failed step — see below.
 
 ## Pipeline (Primary Entry Point)
 
-`python scripts/pipeline.py <player> <map> <hltv_url> --steam-id <id> [--demo <dem_path>] [--tournament "IEM Atlanta 2026"] [--step N] [--until N] [--resume-from-round N] [--privacy public] [--publish-at auto|"YYYY-MM-DD HH:MM"]`
+`python scripts/pipeline.py --backlog backlog/<match_slug>/<priority>/<slug>.json [--step N] [--until N]`
 
-Runs steps 1-11 in order. Resumable — state saved to `.pipeline/{run_id}.json`. Use `--step N` to start at a specific step.
+Reads all POV metadata from the backlog file. Runs steps 5-11 in order. Resumable — state saved to `.pipeline/{run_id}.json`. Use `--step N` to start at a specific step.
 
 | Step | Name | Script for manual use / debugging |
 |---|---|---|
-| 1 | acquire | CloakBrowser download from HLTV URL → `extract_demo()` in `downloader.py` |
-| 2 | ratings | `python main.py ratings <url>` → `demos/analysis/` |
-| 3 | steam_id | `python main.py player add <nick> --steam <id>` |
-| 4 | avatar | `scrapers/player_images.py` → `demos/avatars/{nick}.png` |
 | 5 | analyze | `csdm analyze <demo>` |
 | 6 | render | `python scripts/render_pov.py <demo> <steam_id>` |
 | 7 | concat | `python scripts/concat_rounds.py <renders_folder>` |
 | 8 | outro | `python scripts/generate_outro.py <video.mp4>` |
 | 9 | thumbnail | `python -m thumbnail <url> --player <nick> --map <map> --demo <dem> --steam-id <id>` |
-| 10 | upload | `python scripts/upload_youtube.py <video> --title <t> --thumbnail <thumb.png>` | Default schedules at next future 16:30 Australia/Sydney; `--publish-at` overrides. |
+| 10 | upload | `python scripts/upload_youtube.py <video> --title <t> --thumbnail <thumb.png>` |
 | 11 | cleanup | `python scripts/cleanup_renders.py <renders_folder>` |
 
 ### Structured Errors (agent-parseable)
@@ -35,7 +31,7 @@ Grep for `[PIPELINE_ERROR]` and parse the JSON. Each error has a unique `code` f
 ### Example
 
 ```
-python scripts/pipeline.py w0nderful Anubis "https://www.hltv.org/matches/2394174/natus-vincere-vs-vitality-iem-atlanta-2026" --steam-id 76561199063068840 --demo demos/hltv/natus-vincere-vs-vitality-m2-anubis.dem --tournament "IEM Atlanta 2026" --step 7
+python scripts/pipeline.py --backlog backlog/spirit-vs-falcons-iem-cologne-major/high/tnir-mirage-spirit-vs-falcons-iem-cologne-major.json --step 7
 ```
 
 ### Notes
@@ -43,12 +39,13 @@ python scripts/pipeline.py w0nderful Anubis "https://www.hltv.org/matches/239417
 - Pipeline requires `--steam-id` (no auto-extraction).
 - **Steam ID source of truth** — player Steam64 IDs are stored in `.data/player_accounts.json` (via `python main.py player add/list`). When filling `--steam-id` for a pipeline/backlog entry, read from `.data/` first.
 - `--demo` optional: omit to download from `hltv_url` via CloakBrowser; pass `.rar` or `.dem` to skip download. `--force` re-downloads; default browser is headed + humanize (`--headless` to opt out).
+- **HF auto-download:** if `demo_path` not found locally and backlog has `hf_root` (e.g. `iem_cologne_major_2026`), pipeline pulls single `.dem` from `cs2povarchive/cs2-demos` dataset. Demo-level granularity — only the needed map is downloaded.
 - Render step verifies Steam is running before starting.
 - Each step validates its output before proceeding — failures halt the pipeline.
-- **Resume rule: ALWAYS check `.pipeline/{run_id}.json` before deleting any saved progress (combined.mp4, rendered clips, etc.). The pipeline state tells you which step was last completed. Run `python scripts/pipeline.py <args> --step <N>` (with the SAME args as the original) to resume from that step.
+- **Resume rule: ALWAYS check `.pipeline/{run_id}.json` before deleting any saved progress (combined.mp4, rendered clips, etc.). The pipeline state tells you which step was last completed. Run `python scripts/pipeline.py --backlog <path> --step <N>` (same backlog) to resume.
 - **Render folder per POV** — `demos/renders/pov-{demo-stem}_{player}/` (not demo-only). Multiple POVs on the same map share the match demo folder but never share a render folder. Legacy `pov-{demo-stem}/` (no player suffix) may still exist from older runs; safe to delete after confirming youtube output.
 - **`--resume-from-round N`** — deprecated. Render now uses filesystem-based resume: existing `batch-*.mp4` files ≥1MB are automatically skipped on re-run. To re-render a specific batch, manually delete its file.
-- **`--batches N`** — rounds per render batch (default: 3). Each batch produces one MP4 named `batch-{start:03d}-{end:03d}.mp4`. `--batches 1` is equivalent to the old per-round model.
+- **`--batches N`** — rounds per render batch (default: 10). Each batch produces one MP4 named `batch-{start:03d}-{end:03d}.mp4`. `--batches 1` is equivalent to the old per-round model.
 - **`--until N`** — stop after step N (e.g. `--until 9` runs through thumbnail, skips upload/cleanup). Default: run through step 11.
 
 ### Chaining pipelines (upload overlap)
@@ -62,17 +59,11 @@ Use `scripts/pipeline_chain.py` to start the **next** POV when the **previous** 
 ```powershell
 # When NiKo hits upload, start kyousuke (chain exits after launch)
 python scripts/pipeline_chain.py --watch falcons-vs-mouz-m3-nuke_NiKo_Nuke --no-wait -- `
-  kyousuke Dust2 "https://www.hltv.org/matches/2394225/falcons-vs-mouz-cs-asia-championships-2026" `
-  --steam-id 76561199032006224 `
-  --demo "demos/hltv/falcons-vs-mouz/falcons-vs-mouz-m2-dust2.dem" `
-  --tournament "CS Asia Championships 2026"
+  --backlog backlog/falcons-vs-mouz-cs-asia-championships-2026/high/kyousuke-dust2-falcons-vs-mouz-cs-asia-championships-2026.json
 
 # Chain xelex after kyousuke (run in a second terminal)
 python scripts/pipeline_chain.py --watch falcons-vs-mouz-m2-dust2_kyousuke_Dust2 --no-wait -- `
-  xelex Mirage "https://www.hltv.org/matches/2394225/falcons-vs-mouz-cs-asia-championships-2026" `
-  --steam-id 76561198998266210 `
-  --demo "demos/hltv/falcons-vs-mouz/falcons-vs-mouz-m1-mirage.dem" `
-  --tournament "CS Asia Championships 2026"
+  --backlog backlog/falcons-vs-mouz-cs-asia-championships-2026/high/xelex-mirage-falcons-vs-mouz-cs-asia-championships-2026.json
 ```
 
 - **`--no-wait`** — start the next pipeline and exit (recommended; each POV runs in its own process/terminal).
@@ -85,7 +76,7 @@ Use these when debugging a specific pipeline step failure or running steps manua
 
 1. **Demo Download** — `python main.py hltv match <url>` (CloakBrowser, same as pipeline step 1). Archives and `.dem` files land in `demos/hltv/<match-slug>/`. Use `--force` to re-download.
 2. **Ratings** — `python main.py ratings <url>` scrapes HLTV Rating 3.0 for the match (saves to `demos/analysis/`). Check top players: `python scripts/best_per_map.py demos/analysis/{slug}_ratings.json`
-3. **Avatars** — `scrapers/player_images.py`. Uses Playwright + `rembg`. Navigates **player page** (via `img.player-photo` → `closest('a')` → `href`) to capture 400×417 transparent PNG via response interception. Each player gets a **fresh BrowserContext** (`Cache-Control: no-cache`) to prevent stale cache from suppressing `response` events. Falls back to match page → rembg if player page fails. Saved as `{nickname}.png` in `demos/avatars/`.
+3. **Avatars** — `scrapers/player_images.py`. Uses shared `HLTVScraper` (single Chrome instance) across all players. Navigates **player page** to capture 400×417 transparent PNG via response interception. Falls back to match page → rembg if player page fails. Rate-limited: 2s delay between players. Saved as `{nickname}.png` in `demos/avatars/`.
 4. **Player Steam ID** — `python main.py player add <nickname> --steam <url>` or `python main.py player list`. Extract from demo: `python scripts/extract_steamids.py <demo_path>`.
 5. **CSDM Analysis** — `csdm analyze <demo>`. For PGL demos (PBDEMS2 format): `csdm analyze <demo> --source challengermode`.
 6. **Render POV Clip** — `python scripts/render_pov.py <demo_path> <steam_id> [--batches 3]`. Extracts player's crosshair from demo, writes to `autoexec_render.cfg`, copies over `autoexec.cfg` in CS2's cfg dir (`game/csgo/cfg/`), renders rounds in batches. On exit (even crash), swaps `autoexec_personal.cfg` back. Each batch produces one `batch-{start}-{end}.mp4` file. Filesystem-based resume: existing `batch-*.mp4` files ≥1MB are automatically skipped.
@@ -104,15 +95,14 @@ Use these when debugging a specific pipeline step failure or running steps manua
 
 **Demos must be downloaded first.** The script calls into `acquire_match()` then scrapes HLTV Rating 3.0, creating a per-player backlog card ranked by rating. It validates that the `.dem` file for each map exists on disk — if not found, it raises `FileNotFoundError` with the expected path, rather than writing a placeholder.
 
-```powershell
-# 1. Download demo
-python main.py hltv match "https://www.hltv.org/matches/2394998/g2-vs-spirit-iem-cologne-major-2026"
+Each backlog entry contains full metadata as JSON: player, map, steam_id, demo_path, hltv_url, tournament, avatar_path, ratings_path, rating, kd, team, priority. The script also scrapes tournament name from HLTV, fetches player avatars, and adds `hf_root` for HuggingFace demo auto-download.
 
-# 2. Create backlog entries (requires demos on disk)
+```powershell
+# 1. Download demo + create backlog entries (all-in-one)
 python scripts/create_backlog.py "https://www.hltv.org/matches/2394998/g2-vs-spirit-iem-cologne-major-2026"
 ```
 
-Backlog entries land in `backlog/{priority}/{player}-{map}-{match_slug}.md` with the full pipeline command pre-built (steam-id, demo path, tournament). Use these as handoff cards for running pipelines.
+Backlog entries land in `backlog/{match_slug}/{priority}/{player}-{map}-{match_slug}.json` with the simplified pipeline command. Use these as handoff cards for running pipelines.
 
 ## CLI Entry Point
 
@@ -197,6 +187,7 @@ Output is `combined.mp4` in the same folder. Concat is incremental (one batch at
 - **NEVER clean up avatars** — `demos/avatars/` is a persistent cache. Avatars are reused across all matches. Never delete avatar files during cleanup.
 
 - **HLTV demo acquisition** — Pipeline step 1 and `hltv match` use CloakBrowser (`scrapers/hltv_acquire.py`), persistent profile `.cloak-hltv-profile/`. Undersized archives (&lt;1MB) are not treated as cache hits. Fallback: pass `--demo` with a local `.rar` or `.dem`.
+- **HLTV page scraping** — `fetch_hltv_page_html()` uses Chrome DevTools Protocol (CDP) auto-launch with temp profile (port 9222). Kills stale temp-profile Chrome on startup. Rate-limited retry: up to 10 attempts, delay `min(2*attempt, 60)`. System DNS respects, no profile lock conflicts. `HLTVScraper` also uses CDP `connect_over_cdp` fallback with single reusable page + per-navigation rate limiting.
 - **Split demos (p1, p2)** — IEM tournaments sometimes split single-map demos into parts (`-p1`, `-p2`). `render_pov.py` handles this automatically. The `.rar` may contain multiple `.dem` files — `extract_demo()` in `downloader.py` now extracts all of them.
 - **PBDEMS2 format** — PGL tournaments use a custom demo format. csdm now supports it (requires `--source challengermode` for analyze). Use `csdm analyze <demo> --source challengermode`.
 - **HLTV CDN blocks image downloads** — Player body shots must be scraped via Playwright browser context (not httpx). Each player gets a **fresh BrowserContext** (with `Cache-Control: no-cache`) to prevent browser cache from suppressing `response` events. Use `scrapers/player_images.py`.
@@ -211,7 +202,8 @@ Output is `combined.mp4` in the same folder. Concat is incremental (one batch at
 - **YouTube scheduling** — Pipeline defaults to `--publish-at auto`: next future 16:30 Australia/Sydney slot on a free local calendar day, using local `youtube/.publish_schedule.json` to avoid same-day duplicates. Explicit `--publish-at "YYYY-MM-DD HH:MM"` still schedules exactly.
 - **YouTube verification** — To set custom thumbnails, your YouTube account must be verified (phone verify) at https://www.youtube.com/verify.
 - **Wrong HLTV match URL ID** — If the ratings scraper returns "Unknown Match" or empty tables, the match URL's numeric ID is wrong. HLTV uses SPAs where the JS routing matches the ID to the match. Check the correct ID by visiting the match page in a browser (the sidebar "Related matches" links have correct IDs).
-- **Agent error parsing** — Grep for `[PIPELINE_ERROR]` and parse the JSON. Each error has a unique `code` for programmatic handling. Common codes: `EXTRACT_MAP_NOT_FOUND`, `RATINGS_NO_TABLES`, `ANALYZE_NO_ROUNDS`, `RENDER_STEAM_NOT_RUNNING`, `CONCAT_FAILED`, `THUMBNAIL_MISSING`, `UPLOAD_NO_VIDEO_ID`.
+- **Agent error parsing** — Grep for `[PIPELINE_ERROR]` and parse the JSON. Each error has a unique `code` for programmatic handling. Common codes: `EXTRACT_MAP_NOT_FOUND`, `RATINGS_NO_TABLES`, `ANALYZE_NO_ROUNDS`, `RENDER_STEAM_NOT_RUNNING`, `CONCAT_FAILED`, `THUMBNAIL_MISSING`, `UPLOAD_NO_VIDEO_ID`, `HF_DOWNLOAD_FAILED`.
+- **HF download failure** — Pipeline pulls single `.dem` from `cs2povarchive/cs2-demos` dataset when local file missing. Requires `hf_root` in backlog. If HF download fails (wrong root, file not uploaded), error code `HF_DOWNLOAD_FAILED`. Demo-level granularity — only the needed `.dem` is downloaded, not the full match archive.
 - **HLTV Cloudflare block** — If CloakBrowser or Playwright get `net::ERR_CONNECTION_RESET` on HLTV while regular Chrome works, Cloudflare is fingerprinting the automation browser. Fix: use Playwright with system Chrome + `ignore_default_args=["--enable-automation"]` to hide automation flags. Applied in `scrapers/hltv_acquire.py` (`fetch_hltv_page_html`) and `scrapers/hltv.py` (`HLTVScraper._ensure_browser()`). Forcing custom DNS (`--dns-server`) does NOT help — DNS resolves fine, block is TCP-level from Cloudflare.
 
 ## Output Directory Structure
