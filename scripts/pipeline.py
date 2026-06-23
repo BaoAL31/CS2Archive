@@ -294,7 +294,7 @@ class Pipeline:
         render_args = [
             "scripts/render_pov.py", str(self.demo_path), self.steam_id,
             "--output", str(self.render_dir),
-            "--batches", str(getattr(self.args, "batches", 10)),
+            "--batches", str(getattr(self.args, "batches", 20)),
         ]
         r = self._run_py(render_args, timeout=43200)
         if r.returncode != 0:
