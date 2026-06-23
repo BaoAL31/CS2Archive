@@ -144,7 +144,7 @@ async def create_backlog_entry(
         "kd": kd,
         "team": team,
         "priority": priority,
-        "pipeline_cmd": f'$env:PYTHONPATH="."; & \'C:/Users/jembo/anaconda3/envs/cs2archive/python.exe\' scripts/pipeline.py --backlog backlog/{match_slug}/{priority}/{slug}.json',
+        "pipeline_cmd": f'$env:PYTHONPATH="."; & "C:/Users/jembo/anaconda3/envs/cs2archive/python.exe" scripts/pipeline.py --backlog backlog/{match_slug}/{priority}/{slug}.json',
     }
 
     backlog_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")

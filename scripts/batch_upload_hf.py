@@ -207,9 +207,9 @@ def main():
     completed_set = set(state["completed"])
     failed_set = set(state["failed"])
 
-    # Filter matches
+    # Filter matches — include failed (retry them)
     to_process = [(mid, slug) for mid, slug in MISSING_MATCHES
-                  if mid not in completed_set and mid not in failed_set]
+                  if mid not in completed_set]
 
     if args.start_id:
         try:
@@ -255,6 +255,7 @@ def main():
                 save_state(state)
                 continue
             state["completed"].append(mid)
+            state["failed"].discard(mid)
             state["in_progress"] = None
             save_state(state)
             cleanup_local(folder)
@@ -271,6 +272,7 @@ def main():
 
         if args.download_only:
             state["completed"].append(mid)
+            state["failed"].discard(mid)
             state["in_progress"] = None
             save_state(state)
             console.print(f"  [green]Downloaded: {slug}[/green]")
@@ -286,6 +288,7 @@ def main():
 
         # 3) Record success
         state["completed"].append(mid)
+        state["failed"].discard(mid)
         state["in_progress"] = None
         save_state(state)
 
