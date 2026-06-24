@@ -147,14 +147,15 @@ def fetch_hltv_page_html(
 
 
 def match_slug_from_url(url: str) -> str:
-    """Match folder slug from HLTV URL (strips tournament suffix and trailing year)."""
-    m = re.search(r"/matches/\d+/([^/?#]+)", url)
+    """Match folder slug from HLTV URL, prefixed with match ID for uniqueness."""
+    m = re.search(r"/matches/(\d+)/([^/?#]+)", url)
     if not m:
         raise ValueError(f"Could not extract match slug from URL: {url}")
-    path = m.group(1)
+    mid = m.group(1)
+    path = m.group(2)
     path = re.sub(r"-cs-.*", "", path, flags=re.IGNORECASE)
     path = re.sub(r"-\d{4}$", "", path)
-    return path
+    return f"{mid}-{path}"
 
 
 def match_id_from_url(url: str) -> str:
@@ -269,11 +270,11 @@ def _download_with_browser(
     for attempt in range(1, max_retries + 1):
         page = ctx.new_page()
         try:
-            page.goto(match_url)
+            page.goto(match_url, timeout=120_000)
             page.wait_for_selector(
                 "[data-demo-link], [data-demo-link-button]",
                 state="visible",
-                timeout=30_000,
+                timeout=60_000,
             )
             console.print(f"  [cyan]Clicking 'Demo download' (attempt {attempt}/{max_retries})...[/cyan]")
             with page.expect_download(timeout=120_000) as dl_info:

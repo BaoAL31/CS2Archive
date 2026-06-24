@@ -133,7 +133,7 @@ def resolve_auto_publish_schedule(
     Returns (privacy, publish_at_utc, timezone_used, publish_at_local).
     Scheduled uploads force privacy to private (YouTube requirement).
     """
-    tz = timezone or DEFAULT_PUBLISH_TZ
+    tz = timezone or _detect_local_tz()
     tzinfo = ZoneInfo(tz)
     hour, minute = _parse_publish_time(publish_time)
     if now is None:
@@ -181,12 +181,13 @@ def resolve_publish_schedule(
         return privacy, None, tz, None
 
     if local == AUTO_PUBLISH_MODE:
+        # Auto mode: always use local timezone detection
         return resolve_auto_publish_schedule(
-            timezone=tz,
             start_date=start_date,
             occupied_dates=occupied_dates,
             publish_time=publish_time,
             now=now,
+            timezone=tz,
         )
 
     publish_at_utc = parse_publish_at(local, tz)

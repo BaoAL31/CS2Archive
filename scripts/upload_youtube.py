@@ -76,6 +76,36 @@ def get_authenticated_service(scopes: list[str] | None = None, token_file: str |
     return build("youtube", "v3", credentials=creds)
 
 
+def last_long_form_upload_date(youtube) -> date | None:
+    """Return date+1 of latest long-form upload (not Shorts). None on error."""
+    from datetime import datetime, timedelta, timezone as dt_timezone
+    try:
+        channels = youtube.channels().list(part="contentDetails", mine=True).execute()
+        if not channels.get("items"):
+            return None
+        uploads_id = channels["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
+        items = youtube.playlistItems().list(
+            part="snippet",
+            playlistId=uploads_id,
+            maxResults=50,
+        ).execute()
+        latest = None
+        for item in items.get("items", []):
+            title = item["snippet"].get("title", "")
+            if "#Shorts" in title or "#shorts" in title:
+                continue
+            published = item["snippet"]["publishedAt"]
+            dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
+            d = dt.date()
+            if latest is None or d > latest:
+                latest = d
+        if latest is None:
+            return None
+        return latest + timedelta(days=1)
+    except Exception:
+        return None
+
+
 def _session_path(video_path: str) -> str:
     return video_path + ".upload_session.json"
 
@@ -435,6 +465,15 @@ def main() -> None:
     meta_file_path = str(video.parent / "upload_meta.json")
 
     original_privacy = privacy
+    from datetime import date as _date
+    start_date: _date | None = None
+    if args.publish_at == AUTO_PUBLISH_MODE:
+        free = last_long_form_upload_date(youtube)
+        if free:
+            start_date = free
+            print(f"  [Schedule] Next free date from YouTube: {free.isoformat()}", flush=True)
+        else:
+            print("  [Schedule] YouTube API query failed, using today as fallback", flush=True)
     reserved_publish_date: str | None = None
     try:
         with _publish_schedule_lock():
@@ -443,7 +482,8 @@ def main() -> None:
                 timezone=args.timezone,
                 meta=meta,
                 privacy=privacy,
-                occupied_dates=set(_load_publish_schedule().keys()),
+                start_date=start_date,
+                occupied_dates=set(),
             )
             if publish_at_utc:
                 reserved_publish_date = _reserve_publish_slot_locked(

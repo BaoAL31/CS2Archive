@@ -132,11 +132,11 @@ def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def hf_folder_name(slug: str) -> str:
-    """Normalize HLTV slug to HF folder name (strip trailing year)."""
+def hf_folder_name(match_id: str, slug: str) -> str:
+    """Normalize HLTV slug to HF folder name, prefixed with match ID."""
     name = slug.lower()
     name = re.sub(r"-\d{4}$", "", name)
-    return name
+    return f"{match_id}-{name}"
 
 
 def download_match(match_id: str, slug: str) -> Path | None:
@@ -234,7 +234,7 @@ def main():
         state["in_progress"] = mid
         save_state(state)
 
-        hf_name = hf_folder_name(slug)
+        hf_name = hf_folder_name(mid, slug)
         hf_path = f"{HF_ROOT}/{hf_name}"
 
         if args.upload_only:
@@ -255,7 +255,8 @@ def main():
                 save_state(state)
                 continue
             state["completed"].append(mid)
-            state["failed"].discard(mid)
+            if mid in state["failed"]:
+                state["failed"].remove(mid)
             state["in_progress"] = None
             save_state(state)
             cleanup_local(folder)
@@ -272,7 +273,8 @@ def main():
 
         if args.download_only:
             state["completed"].append(mid)
-            state["failed"].discard(mid)
+            if mid in state["failed"]:
+                state["failed"].remove(mid)
             state["in_progress"] = None
             save_state(state)
             console.print(f"  [green]Downloaded: {slug}[/green]")
@@ -288,7 +290,8 @@ def main():
 
         # 3) Record success
         state["completed"].append(mid)
-        state["failed"].discard(mid)
+        if mid in state["failed"]:
+            state["failed"].remove(mid)
         state["in_progress"] = None
         save_state(state)
 
