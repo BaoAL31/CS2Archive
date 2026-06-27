@@ -10,6 +10,7 @@ demos/
 
 # Output
 youtube/
+renders/
 
 # Secrets & credentials
 client_secret.json

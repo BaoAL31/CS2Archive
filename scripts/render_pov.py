@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -24,6 +25,62 @@ AUTOEXEC_RENDER = GAME_CFG / "autoexec_render.cfg"
 AUTOEXEC_PERSONAL = GAME_CFG / "autoexec_personal.cfg"
 AUTOEXEC_PERSONAL_BACKUP = GAME_CFG / "autoexec_personal_backup.cfg"
 AUTOEXEC_MAIN = GAME_CFG / "autoexec.cfg"
+RENDER_CROSSHAIR_CFG = GAME_CFG / "render_crosshair.cfg"
+
+os.environ["HF_HOME"] = "D:/.cache/huggingface"
+os.environ["HF_HUB_CACHE"] = "D:/.cache/huggingface/hub"
+
+HF_REPO_DEFAULT = "cs2povarchive/cs2-demos"
+HF_CACHE_DIR = Path(os.environ["HF_HOME"])
+
+
+def _ensure_demo(demo_path_str: str, hf_root: str = "",
+                 hf_repo: str = HF_REPO_DEFAULT,
+                 match_slug: str | None = None,
+                 match_id: str = "") -> str:
+    """Return resolved demo path, downloading from HuggingFace if missing locally.
+
+    match_slug: remote folder name on HF. Derives from parent folder if omitted.
+    match_id:   HLTV match ID, prefixed to slug for HF remote path (e.g. "2395002").
+    """
+    path = Path(demo_path_str)
+    if path.exists():
+        return str(path.resolve())
+
+    if not hf_root:
+        print(f"[ERROR] Demo not found: {path}")
+        print(f"[HINT]  Use --hf-root <root> (e.g. iem_cologne_major_2026) to auto-download from HF.")
+        sys.exit(1)
+
+    slug = match_slug if match_slug else path.parent.name
+    folder = f"{match_id}-{slug}" if match_id else slug
+    dem_filename = path.name
+    hf_remote = f"{hf_root}/{folder}/{dem_filename}"
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"  [HF] Demo not found locally. Downloading from {hf_repo}...")
+    print(f"       hf://{hf_repo}/{hf_remote}")
+    print(f"       cache: {HF_CACHE_DIR / 'hub'}")
+    try:
+        from huggingface_hub import hf_hub_download
+        cached = hf_hub_download(
+            repo_id=hf_repo,
+            filename=hf_remote,
+            repo_type="dataset",
+        )
+        shutil.copy2(cached, path)
+    except Exception as e:
+        print(f"[ERROR] HF download failed: {e}")
+        sys.exit(1)
+
+    if not path.exists():
+        print(f"[ERROR] Download said success but file not found: {path}")
+        sys.exit(1)
+
+    mb = path.stat().st_size / 1024 / 1024
+    print(f"  [OK] Demo downloaded ({mb:.0f} MB): {path}")
+    return str(path.resolve())
+
 
 BASE_FLAGS = [
     "--mode", "player",
@@ -47,7 +104,7 @@ def resolve_output_dir(output: str | None, first_demo_path: str, steam_id: str) 
         path = Path(output)
     else:
         stem = Path(first_demo_path).stem.replace("-p1", "").replace(".dem", "")
-        path = _PROJECT_ROOT / "demos" / "renders" / f"pov-{stem}_{steam_id}"
+        path = _PROJECT_ROOT / "renders" / f"pov-{stem}_{steam_id}"
     return path.resolve()
 
 
@@ -179,8 +236,10 @@ def _get_player_crosshair(steam_id: str, demo_parts: list[str]) -> list[str]:
 
 
 def _write_render_autoexec(cvars: list[str]) -> None:
-    lines = ["crosshair 1"] + cvars
-    AUTOEXEC_RENDER.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    lines = ["crosshair 1", "cl_chatfilters 63", "snd_mvp_volume 0"] + cvars
+    content = "\n".join(lines) + "\n"
+    AUTOEXEC_RENDER.write_text(content, encoding="utf-8")
+    RENDER_CROSSHAIR_CFG.write_text(content, encoding="utf-8")
 
 
 def _swap_autoexec(src: Path) -> None:
@@ -228,14 +287,28 @@ def main() -> None:
     parser.add_argument("--height", type=int, default=1440)
     parser.add_argument("--batches", type=int, default=10,
                         help="Rounds per batch (default: 10). Each batch produces one MP4.")
+    parser.add_argument("--rounds", type=str, default="",
+                    help="Comma-separated list of specific rounds to render, e.g. '1,3,5' or '2-4,7'. If omitted, all rounds are rendered.")
+
     parser.add_argument("--no-minimize-cs2", action="store_true",
                         help="Disable auto-minimize CS2 when it launches (default: enabled)")
+    parser.add_argument("--hf-root", default="",
+                        help="HuggingFace dataset folder root (e.g. iem_cologne_major_2026). Auto-downloads demo if missing.")
+    parser.add_argument("--hf-repo", default=HF_REPO_DEFAULT,
+                        help=f"HuggingFace dataset repo (default: {HF_REPO_DEFAULT})")
+    parser.add_argument("--match-slug", default=None,
+                        help="Remote folder name on HF (derived from demo path parent if omitted).")
+    parser.add_argument("--match-id", default="",
+                        help="HLTV match ID for HF path prefix (e.g. 2395002). Required when hf_root set and local demo missing.")
+    parser.add_argument("--overlay", action="store_true",
+                        help="Apply input overlay + util cam trajectory after render.")
     args = parser.parse_args()
 
     _kill_stale_processes()
     _check_nvenc()
 
-    parts = find_demo_parts(args.demo)
+    demo_path = _ensure_demo(args.demo, args.hf_root, args.hf_repo, args.match_slug, args.match_id)
+    parts = find_demo_parts(demo_path)
     print(f"Found {len(parts)} demo part(s):")
     for p in parts:
         print(f"  {Path(p).name}")
@@ -270,6 +343,31 @@ def main() -> None:
         total_rendered = 0
         expected_batches: list[str] = []
 
+        # Parse optional round selection
+        if args.rounds:
+            try:
+                wanted = set()
+                for part in args.rounds.split(','):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    if '-' in part:
+                        a, b = part.split('-')
+                        start, end = int(a), int(b)
+                        if start > end:
+                            start, end = end, start
+                        for v in range(start, end + 1):
+                            if v >= 1:
+                                wanted.add(v)
+                    else:
+                        v = int(part)
+                        if v >= 1:
+                            wanted.add(v)
+            except Exception:
+                sys.exit("[ERROR] Invalid --rounds format. Use comma-separated numbers or ranges like '1,3-5,7'.")
+        else:
+            wanted = None  # None means all rounds
+
         for part in parts:
             n_rounds = get_round_count(part)
             part_name = Path(part).name
@@ -277,9 +375,23 @@ def main() -> None:
             if n_rounds == 0:
                 continue
 
+            # Determine which local rounds (1-indexed within this part) are wanted
+            all_local = list(range(1, n_rounds + 1))
+            if wanted is not None:
+                desired_local = [lr for lr in all_local if (global_round + lr) in wanted]
+            else:
+                desired_local = all_local
+
+            if not desired_local:
+                print(f"  [INFO] No requested rounds in this part.")
+                global_round += n_rounds
+                continue
+
             batch_size = args.batches
-            for local_start in range(1, n_rounds + 1, batch_size):
-                local_end = min(local_start + batch_size - 1, n_rounds)
+            for i in range(0, len(desired_local), batch_size):
+                batch = desired_local[i:i + batch_size]
+                local_start = batch[0]
+                local_end = batch[-1]
                 global_start = global_round + local_start
                 global_end = global_round + local_end
 
@@ -287,18 +399,17 @@ def main() -> None:
                 expected_batches.append(out_name + ".mp4")
                 out_path = output_dir / (out_name + ".mp4")
 
-                if out_path.exists() and out_path.stat().st_size >= 1_048_576:
-                    mb = out_path.stat().st_size / 1024 / 1024
+                if out_path.exists() and os.path.getsize(out_path) >= 1_048_576:
+                    mb = os.path.getsize(out_path) / 1024 / 1024
                     print(f"  [SKIP] {out_name}.mp4 exists ({mb:.0f} MB)")
-                    total_rendered += local_end - local_start + 1
+                    total_rendered += len(batch)
                     continue
 
-                local_rounds = list(range(local_start, local_end + 1))
                 cmd = [
                     CSDM, "video", str(Path(part).resolve()),
                     "--steamids", args.steam_id,
                     "--event", "rounds",
-                    "--rounds", ",".join(str(r) for r in local_rounds),
+                    "--rounds", ",".join(str(r) for r in batch),
                     "--output-file-name", out_name,
                     "--output", str(output_dir),
                     "--framerate", str(args.framerate),
@@ -312,7 +423,7 @@ def main() -> None:
                 if vid is None:
                     continue
 
-                total_rendered += local_end - local_start + 1
+                total_rendered += len(batch)
 
             global_round += n_rounds
 
@@ -329,6 +440,24 @@ def main() -> None:
             sys.exit(1)
 
         print(f"\nDone. {total_rendered} round(s) in {len(expected_batches)} batch(es) at {output_dir}")
+
+        if args.overlay:
+            # Run overlay on the rendered output
+            vid = output_dir / expected_batches[0]
+            if not vid.exists():
+                print(f"[WARN] --overlay set but no video found: {vid}")
+            else:
+                round_arg = []
+                if args.rounds:
+                    # Use first round number for tick offset
+                    r = args.rounds.split(",")[0].split("-")[0]
+                    round_arg = ["--round", r]
+                subprocess.run([
+                    sys.executable, "scripts/overlay_pov.py",
+                    "--video", str(vid),
+                    "--demo", demo_path,
+                    "--steam-id", args.steam_id,
+                ] + round_arg, timeout=7200)
     finally:
         _swap_autoexec(AUTOEXEC_PERSONAL)
         print(f"  Swapped {AUTOEXEC_PERSONAL.name} -> {AUTOEXEC_MAIN.name} (restored)")

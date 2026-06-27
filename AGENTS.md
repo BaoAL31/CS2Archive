@@ -13,10 +13,20 @@ Reads all POV metadata from the backlog file. Runs steps 1-7 in order. Resumable
 | 1 | analyze | `csdm analyze <demo>` |
 | 2 | render | `python scripts/render_pov.py <demo> <steam_id>` |
 | 3 | concat | `python scripts/concat_rounds.py <renders_folder>` |
-| 4 | outro | `python scripts/generate_outro.py <video.mp4>` |
-| 5 | thumbnail | `python -m thumbnail <url> --player <nick> --map <map> --demo <dem> --steam-id <id>` |
-| 6 | upload | `python scripts/upload_youtube.py <video> --title <t> --thumbnail <thumb.png>` |
-| 7 | cleanup | `python scripts/cleanup_renders.py <renders_folder>` |
+| **4** | **overlay (optional)** | `python scripts/overlay_pov.py --video <video.mp4> --demo <demo> --steam-id <id> [--round N]` |
+| 5 | outro | `python scripts/generate_outro.py <video.mp4>` |
+| 6 | thumbnail | `python -m thumbnail <url> --player <nick> --map <map> --demo <dem> --steam-id <id>` |
+| 7 | upload | `python scripts/upload_youtube.py <video> --title <t> --thumbnail <thumb.png>` |
+| 8 | cleanup | `python scripts/cleanup_renders.py <renders_folder>` |
+
+Omit step 4 to skip overlay entirely. Use `--step 4` to include it, or run pipeline up to step 3 and then manually invoke overlay.
+
+**Overlay step (step 4) does two things:**
+1. Extracts keyboard states via demoparser2 (full round, not sparse parquet)
+2. Renders utility throw flight clips via CSDM `build_flight_command()` (chase camera) then composites as PiP overlays at bottom-left
+
+Throw clips are rendered in sequence via CSDM/HLAE — this takes ~1-2 minutes per throw. For a full match with 20+ throws, budget 30-60 minutes.
+
 
 ### Structured Errors (agent-parseable)
 
@@ -42,7 +52,7 @@ python scripts/pipeline.py --backlog backlog/spirit-vs-falcons-iem-cologne-major
 - Render step verifies Steam is running before starting.
 - Each step validates its output before proceeding — failures halt the pipeline.
 - **Resume rule: ALWAYS check `.pipeline/{run_id}.json` before deleting any saved progress (combined.mp4, rendered clips, etc.). The pipeline state tells you which step was last completed. Run `python scripts/pipeline.py --backlog <path> --step <N>` (same backlog) to resume.
-- **Render folder per POV** — `demos/renders/pov-{demo-stem}_{player}/` (not demo-only). Multiple POVs on the same map share the match demo folder but never share a render folder. Legacy `pov-{demo-stem}/` (no player suffix) may still exist from older runs; safe to delete after confirming youtube output.
+- **Render folder per POV** — `renders/pov-{demo-stem}_{player}/` (not demo-only). Multiple POVs on the same map share the match demo folder but never share a render folder. Legacy `pov-{demo-stem}/` (no player suffix) may still exist from older runs; safe to delete after confirming youtube output.
 - **`--resume-from-round N`** — deprecated. Render now uses filesystem-based resume: existing `batch-*.mp4` files ≥1MB are automatically skipped on re-run. To re-render a specific batch, manually delete its file.
 - **`--batches N`** — rounds per render batch (default: 10). Each batch produces one MP4 named `batch-{start:03d}-{end:03d}.mp4`. `--batches 1` is equivalent to the old per-round model.
 - **`--until N`** — stop after step N (e.g. `--until 5` runs through thumbnail, skips upload/cleanup). Default: run through step 7.
@@ -80,7 +90,8 @@ Use these when debugging a specific pipeline step failure or running steps manua
 5. **CSDM Analysis** — `csdm analyze <demo>`. For PGL demos (PBDEMS2 format): `csdm analyze <demo> --source challengermode`.
 6. **Render POV Clip** — `python scripts/render_pov.py <demo_path> <steam_id> [--batches 3]`. Extracts player's crosshair from demo, writes to `autoexec_render.cfg`, copies over `autoexec.cfg` in CS2's cfg dir (`game/csgo/cfg/`), renders rounds in batches. On exit (even crash), swaps `autoexec_personal.cfg` back. Each batch produces one `batch-{start}-{end}.mp4` file. Filesystem-based resume: existing `batch-*.mp4` files ≥1MB are automatically skipped.
 7. **Concatenate Rounds** — `python scripts/concat_rounds.py <renders_folder>` → `combined.mp4` (incremental batch-by-batch concat with gap/overlap validation, then upscale to 1440p). Each batch file is deleted after successful append.
-8. **Generate Thumbnail** — `python -m thumbnail <match_url> --player <nick> --map <map> --demo <dem> --steam-id <id> [--tournament "IEM Atlanta 2026"]`. Auto-extracts random kill frame as blurred background. Or `--background <frame.jpg>`.
+8. **Overlay** — `python scripts/overlay_pov.py --video <video.mp4> --demo <demo> --steam-id <id> [--round N]`. Applies keyboard overlay (demoparser2 full extraction) + utility throw flight PiP (CSDM flight renders at bottom-left). Requires CS2UtilArchive with throws.parquet. Renders flight clips via `build_flight_command()` — ~1-2 min per throw.
+9. **Generate Thumbnail** — `python -m thumbnail <match_url> --player <nick> --map <map> --demo <dem> --steam-id <id> [--tournament "IEM Atlanta 2026"]`. Auto-extracts random kill frame as blurred background. Or `--background <frame.jpg>`.
    Example: `python -m thumbnail "https://www.hltv.org/matches/2394166/faze-vs-vitality-iem-atlanta-2026" --player ropz --map Nuke --demo demos/hltv/.../faze-vs-vitality-m1-nuke-p2.dem --steam-id 76561197991272318 --tournament "IEM Atlanta 2026"`
 9. **Generate Title & Description** — `python scripts/generate_title.py <ratings_json> --player <nick> --map <map> [--tournament "..."]`. Outputs JSON with `title` and `description` from ratings data.
 9. **Upload to YouTube** — `python scripts/upload_youtube.py <video_path> --thumbnail <thumb.png> --title <title> --description <desc> --privacy public`. Requires Google Cloud OAuth (`client_secret.json`). First-time auth opens browser. Account must be phone-verified for custom thumbnails.
@@ -140,7 +151,7 @@ C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd
 
 Uses `--recording-system HLAE` — csdm drives HLAE `mirv_streams` to encode directly to video via FFmpeg (no TGA/PNG sequence on disk).
 
-**Critical:** `--output` must be an **absolute** path. Relative paths (e.g. `demos/renders/...`) resolve from the CS2 install directory and cause `AFXERROR: Failed writing image for screen recording` → csdm **Raw files not found**. `render_pov.py` and the pipeline always pass `Path.resolve()` output dirs.
+**Critical:** `--output` must be an **absolute** path. Relative paths (e.g. `renders/...`) resolve from the CS2 install directory and cause `AFXERROR: Failed writing image for screen recording` → csdm **Raw files not found**. `render_pov.py` and the pipeline always pass `Path.resolve()` output dirs.
 
 HLAE **2.190.1+** required (`C:\Program Files (x86)\HLAE\HLAE.exe`). Disable RTSS/MSI OSD and Steam/Xbox overlays if capture fails. After CS2 updates, if HLAE breaks again, test one round with absolute output before full pipeline runs.
 
@@ -155,7 +166,7 @@ All scripts default to 2560×1440; per-round render and concat upscale use **h26
 For rendering a player's POV with full HUD (radar, health, ammo) and no x-ray, in configurable batch sizes (default 3 rounds per csdm call):
 
 ```powershell
-& "C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd" video "<demo_path>" --mode player --steamids <steam64_id> --event rounds --rounds <N> --perspective player --no-show-x-ray --output "C:\full\path\to\demos\renders\pov-folder" --framerate 60 --width 2560 --height 1440 --recording-system HLAE --close-game-after-recording --no-show-only-death-notices --show-assists --record-audio --concatenate-sequences --ffmpeg-video-codec h264_nvenc --ffmpeg-crf 15 --ffmpeg-output-parameters "-cq 15 -preset p7 -profile:v high -pix_fmt yuv420p -level 5.1" --cfg "C:\full\path\to\assets\cs2_pov.cfg"
+& "C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd" video "<demo_path>" --mode player --steamids <steam64_id> --event rounds --rounds <N> --perspective player --no-show-x-ray --output "C:\full\path\to\renders\pov-folder" --framerate 60 --width 2560 --height 1440 --recording-system HLAE --close-game-after-recording --no-show-only-death-notices --show-assists --record-audio --concatenate-sequences --ffmpeg-video-codec h264_nvenc --ffmpeg-crf 15 --ffmpeg-output-parameters "-cq 15 -preset p7 -profile:v high -pix_fmt yuv420p -level 5.1" --cfg "C:\full\path\to\assets\cs2_pov.cfg"
 ```
 
 Use `python scripts/render_pov.py <demo_path> <steam_id>` instead — it wraps the above command with auto round-detection, p1/p2 split handling, and batch output naming.
@@ -168,7 +179,7 @@ HLTV sometimes splits match demos into parts. The render script auto-detects com
 
 To manually concatenate split renders:
 ```powershell
-ffmpeg -f concat -safe 0 -i <filelist.txt> -c copy "demos\renders\combined.mp4"
+ffmpeg -f concat -safe 0 -i <filelist.txt> -c copy "renders\combined.mp4"
 ```
 
 ### Concatenating rendered rounds
@@ -201,6 +212,7 @@ Output is `combined.mp4` in the same folder. Concat is incremental (one batch at
 - **YouTube scheduling** — Pipeline defaults to `--publish-at auto`: next future 16:30 Australia/Sydney slot on a free local calendar day, using local `youtube/.publish_schedule.json` to avoid same-day duplicates. Explicit `--publish-at "YYYY-MM-DD HH:MM"` still schedules exactly.
 - **YouTube verification** — To set custom thumbnails, your YouTube account must be verified (phone verify) at https://www.youtube.com/verify.
 - **Wrong HLTV match URL ID** — If the ratings scraper returns "Unknown Match" or empty tables, the match URL's numeric ID is wrong. HLTV uses SPAs where the JS routing matches the ID to the match. Check the correct ID by visiting the match page in a browser (the sidebar "Related matches" links have correct IDs).
+- **Overlay pipeline** (`overlay_pov.py`) — sprite-based ffmpeg filter_complex. 18 sprite PNGs (9 keys × idle/pressed), not full-frame per-frame PNGs. Key caps at 76×76 with rounded rects, stepped release fade (12 frames, 4 steps), proper grid positioning. Reads `input_overlay.parquet` from CS2UtilArchive results when available; otherwise extracts via demoparser2 bitmask (`buttons` field → `decode_button_mask`). Generates assets via `overlay_assets.generate_key_assets()`, builds filter via `build_png_overlay_filter()`. Single ffmpeg call with `-loop 1 -i` sprite inputs.
 - **Agent error parsing** — Grep for `[PIPELINE_ERROR]` and parse the JSON. Each error has a unique `code` for programmatic handling. Common codes: `EXTRACT_MAP_NOT_FOUND`, `RATINGS_NO_TABLES`, `ANALYZE_NO_ROUNDS`, `RENDER_STEAM_NOT_RUNNING`, `CONCAT_FAILED`, `THUMBNAIL_MISSING`, `UPLOAD_NO_VIDEO_ID`, `HF_DOWNLOAD_FAILED`.
 - **HF download failure** — Pipeline pulls single `.dem` from `cs2povarchive/cs2-demos` dataset when local file missing. Requires `hf_root` in backlog. If HF download fails (wrong root, file not uploaded), error code `HF_DOWNLOAD_FAILED`. Demo-level granularity — only the needed `.dem` is downloaded, not the full match archive.
 - **HLTV Cloudflare block** — If CloakBrowser or Playwright get `net::ERR_CONNECTION_RESET` on HLTV while regular Chrome works, Cloudflare is fingerprinting the automation browser. Fix: use Playwright with system Chrome + `ignore_default_args=["--enable-automation"]` to hide automation flags. Applied in `scrapers/hltv_acquire.py` (`fetch_hltv_page_html`) and `scrapers/hltv.py` (`HLTVScraper._ensure_browser()`). Forcing custom DNS (`--dns-server`) does NOT help — DNS resolves fine, block is TCP-level from Cloudflare.

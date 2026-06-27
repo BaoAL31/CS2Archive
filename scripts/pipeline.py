@@ -37,8 +37,11 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from huggingface_hub import hf_hub_download
 from assign_playlist import normalize_playlist_name
+# Redirect HF cache to D: drive before importing huggingface_hub
+os.environ.setdefault("HF_HOME", "D:/.cache/huggingface")
+os.environ.setdefault("HF_HUB_CACHE", "D:/.cache/huggingface/hub")
+from huggingface_hub import hf_hub_download
 STATE_DIR = PROJECT_ROOT / ".pipeline"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 os.chdir(str(PROJECT_ROOT))
@@ -50,10 +53,11 @@ STEPS = {
     1: "analyze",
     2: "render",
     3: "concat",
-    4: "outro",
-    5: "thumbnail",
-    6: "upload",
-    7: "cleanup",
+    4: "overlay",
+    5: "outro",
+    6: "thumbnail",
+    7: "upload",
+    8: "cleanup",
 }
 
 REQUIRED_META_FIELDS = [
@@ -100,7 +104,7 @@ def run_id_from_name(name: str) -> str:
 
 def pov_render_dir(dem_stem: str, player: str) -> Path:
     player_slug = run_id_from_name(player)
-    return PROJECT_ROOT / "demos" / "renders" / f"pov-{dem_stem}_{player_slug}"
+    return PROJECT_ROOT / "renders" / f"pov-{dem_stem}_{player_slug}"
 
 
 def _parse_backlog(path: str) -> dict:
@@ -151,12 +155,12 @@ class Pipeline:
         from scrapers.hltv_acquire import match_id_from_url
 
         slug = self.hltv_url.rstrip("/").split("/")[-1]
-        match_id = match_id_from_url(self.hltv_url)
+        self.match_id = match_id_from_url(self.hltv_url)
         dem_stem = self.demo_path.stem if self.demo_path else slug
         self.render_dir = pov_render_dir(dem_stem, self.player)
-        self.youtube_dir = PROJECT_ROOT / "youtube" / run_id_from_name(f"{match_id}_{dem_stem}_{self.player}_{self.map_name}")
+        self.youtube_dir = PROJECT_ROOT / "youtube" / run_id_from_name(f"{self.match_id}_{dem_stem}_{self.player}_{self.map_name}")
 
-        self.run_id = run_id_from_name(f"{match_id}_{dem_stem}_{self.player}_{self.map_name}")
+        self.run_id = run_id_from_name(f"{self.match_id}_{dem_stem}_{self.player}_{self.map_name}")
         self.state = load_state(self.run_id)
         self.state.setdefault("data", {})
         self.state["data"]["steam_id"] = self.steam_id
@@ -178,7 +182,8 @@ class Pipeline:
             return
         match_slug = self.demo_path.parent.name
         dem_filename = self.demo_path.name
-        hf_remote = f"{hf_root}/{match_slug}/{dem_filename}"
+        hf_folder = f"{self.match_id}-{match_slug}" if self.match_id else match_slug
+        hf_remote = f"{hf_root}/{hf_folder}/{dem_filename}"
         self.demo_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"  [HF] Demo not found locally. Downloading from {hf_repo}...")
         print(f"       hf://{hf_repo}/{hf_remote}")
@@ -224,7 +229,7 @@ class Pipeline:
             kwargs["encoding"] = "utf-8"
         return subprocess.run([PY] + args, **kwargs)
 
-    # ── Step 5: Analyze ──────────────────────────────────────────────────
+    # ── Step 1: Analyze ──────────────────────────────────────────────────
 
     def step_analyze(self) -> None:
         if not self.demo_path or not self.demo_path.exists():
@@ -263,7 +268,7 @@ class Pipeline:
                 fail(1, "ANALYZE_NO_ROUNDS", "csdm analysis has zero rounds")
             self.state["data"]["round_count"] = len(rounds)
 
-    # ── Step 6: Render ───────────────────────────────────────────────────
+    # ── Step 2: Render ───────────────────────────────────────────────────
 
     def step_render(self) -> None:
         if not self.demo_path or not self.demo_path.exists():
@@ -296,6 +301,11 @@ class Pipeline:
             "--output", str(self.render_dir),
             "--batches", str(getattr(self.args, "batches", 20)),
         ]
+        hf_root = self.meta.get("hf_root", "").strip()
+        if hf_root:
+            render_args += ["--hf-root", hf_root]
+            if self.match_id:
+                render_args += ["--match-id", str(self.match_id)]
         r = self._run_py(render_args, timeout=43200)
         if r.returncode != 0:
             fail(2, "RENDER_FAILED", f"render_pov.py exited {r.returncode}")
@@ -324,7 +334,7 @@ class Pipeline:
         total_mb = sum(f.stat().st_size for f in batch_files) / 1024 / 1024
         print(f"  [OK] {len(batch_files)} batch(es), {total_rounds} round(s) ({total_mb:.0f} MB)")
 
-    # ── Step 7: Concat ───────────────────────────────────────────────────
+    # ── Step 3: Concat ───────────────────────────────────────────────────
 
     def step_concat(self) -> None:
         if not self.render_dir.exists():
@@ -345,20 +355,45 @@ class Pipeline:
         vid_size = (self.youtube_dir / "video.mp4").stat().st_size
         print(f"  [OK] Copied video.mp4 ({vid_size / 1e9:.1f} GB)")
 
-    # ── Step 8: Outro ────────────────────────────────────────────────────
+    # ── Step 5: Outro ────────────────────────────────────────────────────
+
+    def step_overlay(self) -> None:
+        """Overlay input and util flight on the video."""
+        video_path = self.youtube_dir / "video.mp4"
+        if not video_path.exists():
+            print("  [skip] video.mp4 not found")
+            return
+        if not self.demo_path or not self.demo_path.exists():
+            print("  [skip] demo not found")
+            return
+        steam_id = self.state["data"].get("steam_id", self.meta.get("steam_id", ""))
+        if not steam_id:
+            print("  [skip] no steam_id")
+            return
+        # Run overlay script
+        r = self._run_py([
+            "scripts/overlay_pov.py",
+            "--video", str(video_path),
+            "--demo", str(self.demo_path),
+            "--steam-id", steam_id,
+        ], timeout=7200)
+        if r.returncode != 0:
+            fail(4, "OVERLAY_FAILED", f"overlay_pov.py exited {r.returncode}")
+
+        print(f"  [OK] Overlay applied to video.mp4")
 
     def step_outro(self) -> None:
         video = self.youtube_dir / "video.mp4"
         if not video.exists():
-            fail(4, "OUTRO_VIDEO_MISSING", f"video.mp4 not found in {self.youtube_dir}")
+            fail(5, "OUTRO_VIDEO_MISSING", f"video.mp4 not found in {self.youtube_dir}")
 
         self._run_py(["scripts/generate_outro.py", str(video)], timeout=120)
 
         outro = self.youtube_dir / "outro.mp4"
         if not outro.exists():
-            fail(4, "OUTRO_CLIP_MISSING", f"outro.mp4 not generated in {self.youtube_dir}")
+            fail(5, "OUTRO_CLIP_MISSING", f"outro.mp4 not generated in {self.youtube_dir}")
         if outro.stat().st_size < 1000:
-            fail(4, "OUTRO_TOO_SMALL", f"outro.mp4 too small: {outro.stat().st_size} bytes")
+            fail(5, "OUTRO_TOO_SMALL", f"outro.mp4 too small: {outro.stat().st_size} bytes")
 
         temp = self.youtube_dir / "video.temp.mp4"
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
@@ -375,14 +410,14 @@ class Pipeline:
 
         if r.returncode != 0:
             temp.unlink(missing_ok=True)
-            fail(4, "OUTRO_CONCAT_FAILED", f"ffmpeg concat failed: {r.stderr[-300:]}")
+            fail(5, "OUTRO_CONCAT_FAILED", f"ffmpeg concat failed: {r.stderr[-300:]}")
 
         temp.replace(video)
         outro.unlink()
         vid_mb = video.stat().st_size / 1024 / 1024
         print(f"  [OK] Outro appended, video.mp4 ({vid_mb:.0f} MB)")
 
-    # ── Step 9: Thumbnail ────────────────────────────────────────────────
+    # ── Step 6: Thumbnail ────────────────────────────────────────────────
 
     def step_thumbnail(self) -> None:
         from cs2_minimizer import ensure_cs2_closed
@@ -408,7 +443,7 @@ class Pipeline:
 
         r = self._run_py(cmd, timeout=300)
         if r.returncode != 0:
-            fail(5, "THUMBNAIL_FAILED", f"thumbnail generator exited {r.returncode}")
+            fail(6, "THUMBNAIL_FAILED", f"thumbnail generator exited {r.returncode}")
 
         if not thumb.exists():
             fail(5, "THUMBNAIL_MISSING", f"thumbnail not created at {thumb}")
@@ -426,7 +461,7 @@ class Pipeline:
         print(f"  [OK] Thumbnail: {thumb.name}")
         self._write_upload_meta()
 
-    # ── Step 10: Upload ─────────────────────────────────────────────────
+    # ── Step 7: Upload ─────────────────────────────────────────────────
 
     def _write_upload_meta(self) -> None:
         video = self.youtube_dir / "video.mp4"
@@ -501,7 +536,7 @@ class Pipeline:
         out = "".join(out_lines)
 
         if proc.returncode != 0:
-            fail(6, "UPLOAD_FAILED", f"upload exited {proc.returncode}: {out[:300]}")
+            fail(7, "UPLOAD_FAILED", f"upload exited {proc.returncode}: {out[:300]}")
 
         m = re.search(r"https://youtu\.be/([a-zA-Z0-9_-]+)", out)
         if m:
@@ -511,7 +546,7 @@ class Pipeline:
         else:
             fail(6, "UPLOAD_NO_VIDEO_ID", f"could not extract video ID from output: {out[:200]}")
 
-    # ── Step 11: Cleanup ────────────────────────────────────────────────
+    # ── Step 8: Cleanup ────────────────────────────────────────────────
 
     def step_cleanup(self) -> None:
         removed = []
@@ -526,9 +561,9 @@ class Pipeline:
             removed.append(f".pipeline/{self.run_id}.json")
 
         if self.render_dir.exists():
-            fail(7, "CLEANUP_RENDER_DIR_FAILED", f"render dir still exists after rmtree: {self.render_dir}")
+            fail(8, "CLEANUP_RENDER_DIR_FAILED", f"render dir still exists after rmtree: {self.render_dir}")
         if state_path.exists():
-            fail(7, "CLEANUP_STATE_FAILED", f"pipeline state file still exists: {state_path}")
+            fail(8, "CLEANUP_STATE_FAILED", f"pipeline state file still exists: {state_path}")
         if not removed:
             print("  Nothing to clean up")
         else:

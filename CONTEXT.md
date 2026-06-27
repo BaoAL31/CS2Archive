@@ -4,7 +4,7 @@
 
 - **Match**: A CS2 pro match between two teams on HLTV or FACEIT. Has a URL, team names, maps, and a unique slug.
 - **POV** (Point of View): A specific (match, player, map) tuple. The unit a thumbnail/video is generated for.
-- **Render Folder**: Working directory for POV video renders: `demos/renders/pov-{demo-stem}_{player}/`. Scoped per POV (not per demo) so multiple players on the same `.dem` never share `combined.mp4`.
+- **Render Folder**: Working directory for POV video renders: `renders/pov-{demo-stem}_{player}/`. Scoped per POV (not per demo) so multiple players on the same `.dem` never share `combined.mp4`.
 - **Render Batch**: Consecutive demo rounds rendered in a single csdm invocation. Default size is **10** (`--batches N`). On failure mid-batch, the whole batch is re-rendered on resume.
 - **Batch Artifact**: The single MP4 csdm writes for one render batch, named `batch-{start:03d}-{end:03d}.mp4` using **global** round numbers (continuous across split demo parts p1/p2). Render skips a batch only when that **exact** filename exists and is **≥ 1 MB** (no minimum duration; some rounds are very short). Concat requires `batch-*.mp4` ranges to be contiguous, non-overlapping, and cover rounds 1..N; otherwise it fails with a clear error (no silent overlap concat).
 - **Concat input**: Step 3 merges **batch artifacts** only (`batch-*.mp4`), in global round order, deleting each after a successful append. No `round-*.mp4` path in pipeline code; `--batches 1` is equivalent to the former one-round-per-file model (`batch-007-007.mp4`).

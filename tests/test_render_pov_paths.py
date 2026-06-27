@@ -14,15 +14,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_resolve_output_dir_relative_becomes_absolute():
-    out = resolve_output_dir("demos/renders/test", "ignored.dem", "76561198000000000")
+    out = resolve_output_dir("renders/test", "ignored.dem", "76561198000000000")
     assert out.is_absolute()
-    assert out == (PROJECT_ROOT / "demos/renders/test").resolve()
+    assert out == (PROJECT_ROOT / "renders/test").resolve()
 
 
 def test_resolve_output_dir_default_under_project():
     out = resolve_output_dir(None, "match-m1-nuke.dem", "76561198000000000")
     assert out.is_absolute()
-    assert out == (render_pov._PROJECT_ROOT / "demos/renders/pov-match-m1-nuke_76561198000000000").resolve()
+    assert out == (render_pov._PROJECT_ROOT / "renders/pov-match-m1-nuke_76561198000000000").resolve()
 
 
 def test_resolve_output_dir_preserves_absolute_input():

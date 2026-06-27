@@ -5,7 +5,7 @@ Usage:
     python scripts/rename_legacy_rounds.py <render_folder>
 
 Or recursively scan all pov-* folders:
-    python scripts/rename_legacy_rounds.py demos/renders --recursive
+    python scripts/rename_legacy_rounds.py renders --recursive
 """
 
 from __future__ import annotations
