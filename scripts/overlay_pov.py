@@ -30,7 +30,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import traceback
 from bisect import bisect_right
 from pathlib import Path
 from dataclasses import dataclass
@@ -54,7 +53,6 @@ from scripts.input_overlay_decode import (
     overlay_tick_from_row,
     DEMOPARSER_TICK_FIELDS,
 )
-from scripts.render.csdm import build_flight_command, run_csdm
 from scripts.render.paths import flight_clip_name
 
 # -- Constants -----------------------------------------------------------
@@ -75,6 +73,13 @@ PIP_MAX_SIMULTANEOUS = 2
 # Caller-side logic clips to whichever the current height allows.
 
 FLIGHT_DIR_NAME = "throw_flights"
+
+OVERLAY_BATCH_PREFIX = "batch-overlay-"
+
+
+def _overlay_output_valid(path: Path) -> bool:
+    """Return True if a batch/final overlay file is present and non-empty."""
+    return path.is_file() and path.stat().st_size > 100_000
 
 
 def _pip_geometry(pip_index: int, video_width: int, video_height: int) -> dict[str, int]:
@@ -502,6 +507,58 @@ def _rm_empty_dir(d: Path) -> None:
             pass
 
 
+def _util_slug_for_throw(throw: dict, demo_path: Path) -> tuple[str, str, str]:
+    """Return (util_id, util_slug, demo_id) for a throw row.
+
+    util_id = ``<map>:<util_type>:<side>:<relx>_<rely>_<relz>``
+    util_slug = util_id with colons replaced by underscores (filesystem-safe)
+    """
+    map_name = str(throw.get("map", "") or demo_path.stem)
+    util_type = str(throw.get("util_type", "unknown")).lower()
+    side = str(throw.get("thrower_side", "T") or "T")[:1].upper()
+    rel_x = int(round(float(throw.get("release_x", 0) or 0)))
+    rel_y = int(round(float(throw.get("release_y", 0) or 0)))
+    rel_z = int(round(float(throw.get("release_z", 0) or 0)))
+    util_id = f"{map_name}:{util_type}:{side}:{rel_x}_{rel_y}_{rel_z}"
+    util_slug = util_id.replace(":", "_")
+    demo_id = str(throw.get("demo_id", demo_path.stem))
+    return util_id, util_slug, demo_id
+
+
+def _run_batch_util_cams_subprocess(
+    demo_path: Path,
+    steam_id: str,
+    data_dir: Path,
+    util_cams_root: Path,
+    chunk_size: int = 8,
+) -> int:
+    """Shell out to scripts/batch_util_cams.py for batched util_cam rendering.
+
+    Bypasses the inline run_csdm loop (Bug A: random POV instead of chase cam
+    when the inject thread races csdm's actions-file write). batch_util_cams.py
+    uses CS2UtilArchive's render_spot_batch — one CS2 launch per chunk of N
+    spots, spec_goto precomputed and merged before CS2 starts.
+    """
+    import subprocess
+    script_path = Path(__file__).resolve().parent / "batch_util_cams.py"
+    cmd = [
+        sys.executable, str(script_path),
+        "--util-cams-root", str(util_cams_root.resolve()),
+        "--data-dir", str(data_dir.resolve()),
+        "--chunk-size", str(chunk_size),
+    ]
+    _log(f"  [flight] CMD: {' '.join(cmd)}")
+    try:
+        result = subprocess.run(
+            cmd, cwd=str(util_cams_root.parent.parent.parent),
+            check=False,
+        )
+        return result.returncode
+    except Exception as exc:
+        _log(f"  [flight] batch_util_cams.py subprocess failed: {exc}")
+        return 1
+
+
 def _scan_utility_cams_clips(video_path: Path) -> dict[str, Path]:
     """Scan utility_cams for pre-rendered clips (orbit + victims + flight).
 
@@ -562,9 +619,11 @@ def _render_throw_flight_clips(
 ) -> list[PipClip]:
     """Render CSDM flight clips for each player throw.
 
-    Uses existing orbit clips from utility_cams when available.
-    Falls back to CS2UtilArchive's build_flight_command() -> csdm -> HLAE.
-    Outputs 1920x1080 clips to output_dir/throw_flights/.
+    Shells out to scripts/batch_util_cams.py (Batched CSDM — one CS2 launch
+    per chunk of N spots, spec_goto precomputed). Fix for Bug A: inline
+    run_csdm loop races csdm's actions-file write → random POV instead of
+    chase cam. See scripts/batch_util_cams.py for batching details.
+    Outputs 1920x1080 clips to <util_cams_root>/unnamed/<slug>/<demo_id>/.
     Returns PipClip metadata sorted by start_frame.
     """
     # Determine first round tick for filtering
@@ -627,6 +686,44 @@ def _render_throw_flight_clips(
     if pre_rendered:
         _log(f"  [flight] Found {len(pre_rendered)} pre-rendered clips in utility_cams")
 
+    # Determine if any throw still needs rendering (skip subprocess if all done).
+    # A throw is "covered" if either:
+    #   (a) its throw_id is in pre_rendered, OR
+    #   (b) its util_cam dir contains a shared throw_flight_*.mp4 ≥1MB
+    #       (a different throw at the same release position was batched)
+    needs_render = False
+    for throw in throws:
+        tid = str(throw.get("throw_id", ""))
+        _, util_slug, demo_id = _util_slug_for_throw(throw, demo_path)
+        render_dir_check = util_cams_root / "unnamed" / util_slug / demo_id
+        has_shared = (
+            render_dir_check.is_dir()
+            and any(p.stat().st_size > 1_000_000
+                    for p in render_dir_check.glob("throw_flight_*.mp4"))
+        )
+        if tid in pre_rendered or has_shared:
+            continue
+        needs_render = True
+        break
+
+    if needs_render and data_dir is not None:
+        _log(f"  [flight] Subprocess: batch_util_cams.py (batched, one CS2 launch per chunk)")
+        # data_dir is the per-demo dir (throws.parquet sits inside it).
+        # batch_util_cams.py expects the parent (containing demo=* subdirs).
+        data_dir_parent = data_dir.parent
+        _run_batch_util_cams_subprocess(
+            demo_path=demo_path,
+            steam_id=steam_id,
+            data_dir=data_dir_parent,
+            util_cams_root=util_cams_root,
+        )
+        # Re-scan after batch render to pick up newly written mp4s + _throw_poses.json
+        pre_rendered = _scan_utility_cams_clips(video_path) if video_path else {}
+        if pre_rendered:
+            _log(f"  [flight] After batch: {len(pre_rendered)} clips now available")
+    elif needs_render and data_dir is None:
+        _log(f"  [flight] WARN: no CS2UtilArchive data dir — cannot batch-render")
+
     clips: list[PipClip] = []
     for idx, throw in enumerate(throws):
         throw_tick = int(throw["throw_tick"])
@@ -681,95 +778,34 @@ def _render_throw_flight_clips(
         render_dir = util_cams_root / "unnamed" / util_slug / demo_id
         clip_path = render_dir / f"{clip_name}.mp4"
 
-        # Use pre-rendered clip if available
+        # Use pre-rendered clip if available (set by initial scan or batch re-scan)
         if throw_id in pre_rendered:
             src = pre_rendered[throw_id]
             if src.is_file() and src.stat().st_size > 100_000:
                 _log(f"  [flight] Using pre-rendered {src.parent.parent.name}/{src.name}")
                 clip_path = src
-            else:
-                _log(f"  [flight] Pre-rendered clip {src} too small, will re-render")
 
-        if clip_path.is_file() and clip_path.stat().st_size > 100_000:
-            _log(f"  [flight] {util_type} throw {idx} already rendered, skipping")
-        else:
-            _log(f"  [flight] Rendering {util_type} throw {idx} "
-                 f"(t{throw_tick}, {flight_ticks} ticks, frames {start_frame}-{end_frame})...")
-
-            # Only create render dir when we actually need to write to it
-            render_dir.mkdir(parents=True, exist_ok=True)
-
-            # Build thrower eye pose at throw_tick (chase-cam origin).
-            traj_df = traj_by_throw.get(throw_id)
-            if traj_df is None or traj_df.empty:
-                _log(f"  [flight] SKIP {util_type} throw {idx}: no trajectory data for chase cam")
-                continue
-            throw_pose = {
-                "x": float(throw.get("throw_x", 0) or 0),
-                "y": float(throw.get("throw_y", 0) or 0),
-                "z": float(throw.get("throw_z", 0) or 0),
-                "pitch": float(throw.get("throw_pitch", 0) or 0),
-                "yaw": float(throw.get("throw_yaw", 0) or 0),
-                "rx": float(throw.get("throw_x", 0) or 0),
-                "ry": float(throw.get("throw_y", 0) or 0),
-                "rz": float(throw.get("throw_z", 0) or 0),
-            }
-            # NaN pose -> inject would write garbage spec_goto -> skip
-            if any(throw_pose[k] != throw_pose[k] for k in ("x", "y", "z", "pitch", "yaw")):
-                _log(f"  [flight] SKIP {util_type} throw {idx}: NaN throw pose")
-                continue
-
-            job: dict[str, Any] = {
-                "demo_path": str(demo_path.resolve()),
-                "throw_tick": throw_tick,
-                "detonate_tick": detonate_tick,
-                "throw_id": throw_id,
-                "output_name": clip_name,
-            }
-            try:
-                cmd = build_flight_command(job, str(render_dir))
-                _log(f"  [flight] CSDM: {' '.join(cmd[:4])} ... (inject flight cam)")
-                # run_csdm spawns inject poll thread that writes spec_goto
-                # chase-cam commands into csdm actions JSON while CS2 runs.
-                # Watch for "[inject] flight (N ticks)" on stdout = success.
-                out_path = run_csdm(
-                    cmd,
-                    f"flight {idx}",
-                    demo_path=str(demo_path.resolve()),
-                    flight_throw_tick=throw_tick,
-                    flight_detonate_tick=detonate_tick,
-                    flight_trajectories_df=traj_df,
-                    flight_throw_pose=throw_pose,
-                    flight_smooth=0.75,
-                    orbit_handoff_delay_ticks=0,
-                )
-                if out_path is None or not out_path.is_file() or out_path.stat().st_size < 100_000:
-                    _log(f"  [flight] FAILED: run_csdm produced no usable output")
-                    _rm_empty_dir(render_dir)
-                    continue
-                # Normalize sequence-*.mp4 (csdm default) to stable clip name
-                if out_path.resolve() != clip_path.resolve():
-                    clip_path.unlink(missing_ok=True)
-                    out_path.rename(clip_path)
-                    _log(f"  [flight] Renamed {out_path.name} -> {clip_path.name}")
-
-                # Write _throw_poses.json so scan finds it next time
-                poses_file = render_dir / "_throw_poses.json"
-                poses_data: dict[str, Any] = {
-                    "1": {"pos": [rel_x, rel_y, rel_z]},
-                    "_throws": {throw_id: {"pos": [rel_x, rel_y, rel_z]}},
-                }
-                poses_file.write_text(json.dumps(poses_data, indent=2), encoding="utf-8")
-            except Exception as exc:
-                _log(f"  [flight] Error rendering {util_type} throw {idx}: {exc}")
-                traceback.print_exc()
-                _rm_empty_dir(render_dir)
-                continue
+        # Fallback: util_cam dir may contain a batched render for a DIFFERENT
+        # throw_id at the same release position (e.g. e239 and e896 share
+        # pos [299, 1581, 202]). Use any throw_flight_*.mp4 ≥1MB in the dir.
+        if (not clip_path.is_file() or clip_path.stat().st_size < 100_000) \
+                and render_dir.is_dir():
+            shared = [
+                p for p in render_dir.glob("throw_flight_*.mp4")
+                if p.stat().st_size > 1_000_000
+            ]
+            if shared:
+                # Prefer orbit (flight cam) over victims (flash variants)
+                shared.sort(key=lambda p: ("victims" in p.name, p.name))
+                clip_path = shared[0]
+                _log(f"  [flight] Using shared clip at {render_dir.parent.name}/"
+                     f"{clip_path.name} (different throw at same pos)")
 
         if not clip_path.is_file() or clip_path.stat().st_size < 100_000:
-            _log(f"  [flight] WARN: {clip_path.name} too small or missing, skipping")
-            clip_path.unlink(missing_ok=True)
-            _rm_empty_dir(render_dir)
+            # Batch render should have produced this clip. If missing, either
+            # trajectory was empty (skip) or batch render failed for this throw.
+            _log(f"  [flight] SKIP {util_type} throw {idx}: "
+                 f"no clip at {clip_path.name} (t{throw_tick})")
             continue
 
         clips.append(PipClip(
@@ -791,8 +827,19 @@ def _build_pip_chain(
     width: int,
     height: int,
     fps: float,
+    start_label: str = "[0:v]",
+    pip_input_offset: int = 1,
 ) -> tuple[list[str], str, list[PipClip]]:
-    """Sort clips, assign stack rows, build PiP filter parts."""
+    """Sort clips, assign stack rows, build PiP filter parts.
+
+    ``start_label`` is the filter graph label the PiP chain starts from
+    (default ``[0:v]`` = raw input video; pass the keyboard output label
+    when batching to chain keyboard + PiP in a single ffmpeg pass).
+
+    ``pip_input_offset`` is the ffmpeg input index for the FIRST flight
+    clip. When sprite PNGs occupy inputs 1-18, pass ``1 + len(png_inputs)``
+    so clips are referenced as ``[19:v]``, ``[20:v]``, etc.
+    """
     sorted_clips = sorted(flight_clips, key=lambda c: c.start_frame)
     active: list[PipClip] = []
     for clip in sorted_clips:
@@ -802,9 +849,9 @@ def _build_pip_chain(
         _log(f"  PiP: {clip.util_type} @ frames {clip.start_frame}-{clip.end_frame}, row {clip.pip_index}")
 
     pip_parts: list[str] = []
-    pip_current = "[0:v]"
-    for idx, clip in enumerate(sorted_clips):
-        fc_part, tag = _build_pip_overlay(clip, pip_current, idx + 1, width, height, fps)
+    pip_current = start_label
+    for idx, clip in enumerate(sorted_clips, start=pip_input_offset):
+        fc_part, tag = _build_pip_overlay(clip, pip_current, idx, width, height, fps)
         pip_parts.append(fc_part)
         pip_current = f"[{tag}]"
     return pip_parts, pip_current, sorted_clips
@@ -848,7 +895,12 @@ def _build_pip_overlay(
     #   2. pad back up to body with white border = the outline
     #   3. format=rgba + optional geq for rounded corners
     #   4. setpts to align first frame with clip.start_frame on main timeline
-    pre_filters = [f"scale=w={pip_inner}:h={pip_inner}:flags=lanczos"]
+    # Aspect-preserving scale (force increase) + center-crop to square.
+    # Avoids horizontal squeeze on wide flight clips (1920x1080 -> 568x568).
+    pre_filters = [
+        f"scale=w={pip_inner}:h={pip_inner}:force_original_aspect_ratio=increase:flags=lanczos",
+        f"crop={pip_inner}:{pip_inner}",
+    ]
     if ol > 0:
         pre_filters.append(
             f"pad=w={pip_body}:h={pip_body}:x={ol}:y={ol}:color=white"
@@ -888,11 +940,42 @@ def _build_pip_overlay(
     return ";".join(parts), tag
 
 
+def _compute_batch_boundaries(
+    round_offsets: dict[int, float],
+    fps: float,
+    frame_count: int,
+    batch_size: int,
+) -> list[tuple[int, int, int, float, float]]:
+    """Group sorted rounds into chunks of ``batch_size`` and return
+    ``[(round_start, round_end, batch_start_frame, batch_start_sec, batch_end_sec), ...]``.
+
+    The last batch's end_sec clamps to ``frame_count / fps``. ``batch_end_sec``
+    for intermediate batches is the start_sec of the next batch's first round.
+    """
+    if batch_size < 1 or not round_offsets:
+        return []
+    sorted_rounds = sorted(round_offsets.keys())
+    total_seconds = frame_count / fps
+    boundaries: list[tuple[int, int, int, float, float]] = []
+    for i in range(0, len(sorted_rounds), batch_size):
+        chunk = sorted_rounds[i:i + batch_size]
+        rn_start, rn_end = chunk[0], chunk[-1]
+        start_sec = float(round_offsets[rn_start])
+        if i + batch_size < len(sorted_rounds):
+            end_sec = float(round_offsets[sorted_rounds[i + batch_size]])
+        else:
+            end_sec = total_seconds
+        start_frame = int(start_sec * fps)
+        boundaries.append((rn_start, rn_end, start_frame, start_sec, end_sec))
+    return boundaries
+
+
 def run_overlay(
     video_path: Path,
     demo_path: Path,
     steam_id: str,
     round_num: int | None = None,
+    batches: int = 0,
 ) -> None:
     """Apply keyboard overlay + utility throw flight PiP onto video_path (in place)."""
     if not video_path.exists():
@@ -922,10 +1005,10 @@ def run_overlay(
             # Each batch divides its duration equally among its rounds
             for b in off_data.get("batches", []):
                 rs = int(b["round_start"])
-                re = int(b["round_end"])
+                re_end = int(b["round_end"])  # avoid shadowing re module
                 dur = float(b["duration_seconds"])
-                per_round = dur / (re - rs + 1)
-                for rn in range(rs, re + 1):
+                per_round = dur / (re_end - rs + 1)
+                for rn in range(rs, re_end + 1):
                     round_video_duration[rn] = per_round
             _log(f"Round offsets: {len(round_offsets)} rounds from {offset_path.name}")
             _log(f"  Batch durations: {len(off_data.get('batches', []))} batches")
@@ -1092,6 +1175,130 @@ def run_overlay(
         output_path = video_path.with_suffix(".overlay.mp4")
         t4 = time.time()
 
+        # Batched path: per-round-group segments + checkpoint resume.
+        # Each batch has a smaller filter graph (fewer key-press segments
+        # per signal) -> 1.5-2x faster per-frame; single-pass merge of
+        # keyboard + PiP -> ~1.5x more; filesystem resume on crash.
+        if batches > 0 and round_offsets:
+            _log(f"Batched overlay: {batches} round(s) per batch")
+            if _overlay_output_valid(output_path):
+                _log(f"  [skip] Overlay output already exists: {output_path.name}")
+                return
+
+            boundaries = _compute_batch_boundaries(round_offsets, fps, frame_count, batches)
+            if not boundaries:
+                _log("  [warn] No batch boundaries computed; falling through to single-pass")
+            else:
+                batch_dir = video_path.parent
+                pip_input_offset = 1 + len(png_inputs)
+                t5 = time.time()
+                for batch_start_rn, batch_end_rn, batch_start_frame, batch_start_sec, batch_end_sec in boundaries:
+                    batch_name = f"{OVERLAY_BATCH_PREFIX}{batch_start_rn:03d}-{batch_end_rn:03d}.mp4"
+                    batch_path = batch_dir / batch_name
+                    batch_end_frame = min(int(batch_end_sec * fps), frame_count)
+                    if batch_end_frame <= batch_start_frame:
+                        _log(f"  [batch] {batch_name} empty range, skipping")
+                        continue
+
+                    if _overlay_output_valid(batch_path):
+                        _log(f"  [batch] {batch_name} exists, skipping")
+                        continue
+
+                    _log(f"  [batch] {batch_name} frames {batch_start_frame}-{batch_end_frame}")
+
+                    # Slice per_sig to this batch's frame range.
+                    batch_per_sig = {
+                        sig: per_sig[sig][batch_start_frame:batch_end_frame]
+                        for sig in per_sig
+                    }
+
+                    # Rebuild keyboard filter (smaller graph per batch).
+                    batch_kb_fc, batch_kb_label = build_png_overlay_filter(
+                        batch_per_sig,
+                        assets=assets,
+                        placement="bottom-center",
+                        video_width=width,
+                        video_height=height,
+                        pressed_release_fade_frames=0,
+                        pressed_release_fade_steps=0,
+                        video_label="[0:v]",
+                        png_input_offset=1,
+                    )
+                    if not batch_kb_fc:
+                        batch_kb_fc = ""
+                        batch_kb_label = "[0:v]"
+
+                    # Filter + rebase PiP clips to this batch's local frame range.
+                    batch_pips: list[PipClip] = []
+                    batch_frame_count = batch_end_frame - batch_start_frame
+                    for clip in flight_clips:
+                        if clip.end_frame <= batch_start_frame or clip.start_frame >= batch_end_frame:
+                            continue
+                        local = PipClip(
+                            clip_path=clip.clip_path,
+                            start_frame=max(0, clip.start_frame - batch_start_frame),
+                            end_frame=min(batch_frame_count, clip.end_frame - batch_start_frame),
+                            util_type=clip.util_type,
+                        )
+                        if local.start_frame < local.end_frame:
+                            batch_pips.append(local)
+
+                    pip_fc = ""
+                    pip_label = batch_kb_label
+                    sorted_batch_pips: list[PipClip] = []
+                    if batch_pips:
+                        pip_parts, pip_label, sorted_batch_pips = _build_pip_chain(
+                            batch_pips, width, height, fps,
+                            start_label=batch_kb_label,
+                            pip_input_offset=pip_input_offset,
+                        )
+                        pip_fc = ";".join(pip_parts)
+
+                    # Merge filter chains into a single ffmpeg pass.
+                    if batch_kb_fc and pip_fc:
+                        combined_fc = f"{batch_kb_fc};{pip_fc}"
+                        out_label = pip_label
+                    elif batch_kb_fc:
+                        combined_fc = batch_kb_fc
+                        out_label = batch_kb_label
+                    elif pip_fc:
+                        combined_fc = pip_fc
+                        out_label = pip_label
+                    else:
+                        _log(f"  [batch] {batch_name} no overlay, stream-copying segment")
+                        _ffmpeg_segment_copy(
+                            video_path, batch_start_sec, batch_end_sec, batch_path,
+                        )
+                        continue
+
+                    fc_script = work_dir / f"batch_{batch_start_rn:03d}_{batch_end_rn:03d}.txt"
+                    fc_script.write_text(combined_fc, encoding="utf-8")
+                    extra = list(png_inputs) + [c.clip_path for c in sorted_batch_pips]
+                    _ffmpeg_encode(
+                        str(video_path), extra,
+                        ["-filter_complex_script", str(fc_script.resolve())],
+                        out_label, str(batch_path),
+                        segment=(batch_start_sec, batch_end_sec),
+                    )
+
+                _log(f"  [batch] All batches encoded in {time.time()-t5:.1f}s")
+                batch_files = sorted(
+                    [bf for bf in batch_dir.glob(f"{OVERLAY_BATCH_PREFIX}*.mp4")],
+                    key=lambda f: int(re.match(rf"{OVERLAY_BATCH_PREFIX}(\d+)-\d+\.mp4$", f.name).group(1)),
+                )
+                if not batch_files:
+                    _log("[ERROR] no batch files produced; cannot concat")
+                    sys.exit(1)
+                _log(f"  [concat] {len(batch_files)} batch files -> {output_path.name}")
+                t6 = time.time()
+                _concat_overlay_batches(batch_files, output_path)
+                _log(f"  [concat] OK in {time.time()-t6:.1f}s")
+                for bf in batch_files:
+                    bf.unlink(missing_ok=True)
+                mb = output_path.stat().st_size / 1024 / 1024
+                _log(f"Overlay: {output_path.name} ({mb:.0f} MB) in {time.time()-t4:.1f}s")
+                return
+
         if keyboard_fc and flight_clips:
             # 2-pass: keyboard then PiP
             kb_temp = work_dir / "kb_temp.mp4"
@@ -1156,43 +1363,91 @@ def _ffmpeg_encode(
     fc_args: list[str],
     out_label: str,
     output_path: str,
+    segment: tuple[float, float] | None = None,
 ) -> None:
-    """Run ffmpeg with h264_nvenc, fall back to libx264 on failure."""
-    def _build_cmd(encoder: str, crf_or_cq: str, preset: str) -> list[str]:
-        cmd = ["ffmpeg", "-y", "-i", main_input]
-        for inp in extra_inputs:
-            cmd.extend(["-i", str(inp)])
-        if encoder == "h264_nvenc":
-            cmd.extend([
-                *fc_args, "-map", out_label, "-map", "0:a?", "-shortest",
-                "-c:v", "h264_nvenc", "-cq", crf_or_cq, "-preset", preset,
-                "-profile:v", "high", "-pix_fmt", "yuv420p",
-                "-c:a", "copy", "-movflags", "+faststart", output_path,
-            ])
-        else:
-            cmd.extend([
-                *fc_args, "-map", out_label, "-map", "0:a?", "-shortest",
-                "-c:v", "libx264", "-crf", crf_or_cq, "-preset", preset,
-                "-pix_fmt", "yuv420p",
-                "-c:a", "copy", output_path,
-            ])
-        return cmd
+    """Run ffmpeg with h264_nvenc. No CPU fallback (libx forbidden by user).
 
-    try:
-        cmd = _build_cmd("h264_nvenc", "18", "p7")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
-        if result.returncode == 0 and Path(output_path).is_file():
-            return
-        _log(f"  nvenc failed (rc={result.returncode}), retrying libx264...")
-        _log(f"  stderr: {(result.stderr or '')[-300:]}")
-    except subprocess.TimeoutExpired:
-        _log("  nvenc timed out, retrying libx264...")
+    When ``segment`` is set, ``-ss {start} -to {end}`` is applied as INPUT
+    options on the main video so both video and audio streams are trimmed
+    frame-accurately by ffmpeg's demuxer. Keyframe-aligned (input-side
+    seeking is fast; visible round-boundary jumps are avoided by the
+    round_offsets sidecar using actual per-round frames).
+    """
+    cmd = ["ffmpeg", "-y"]
+    if segment is not None:
+        start_sec, end_sec = segment
+        if start_sec > 0:
+            cmd.extend(["-ss", f"{start_sec:.6f}"])
+        cmd.extend(["-to", f"{end_sec:.6f}"])
+    cmd.extend(["-i", main_input])
+    for inp in extra_inputs:
+        cmd.extend(["-i", str(inp)])
+    cmd.extend([
+        *fc_args, "-map", out_label, "-map", "0:a?", "-shortest",
+        "-c:v", "h264_nvenc", "-cq", "18", "-preset", "p4",
+        "-profile:v", "high", "-pix_fmt", "yuv420p",
+        "-c:a", "copy", "-movflags", "+faststart",
+        "-g", "60", "-bf", "0", "-keyint_min", "60",
+        output_path,
+    ])
+    _log(f"  [ffmpeg] nvenc preset p4 cq 18 (no libx fallback)")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=21600)  # 6h
+    if result.returncode != 0 or not Path(output_path).is_file():
+        _log(f"[ERROR] nvenc ffmpeg failed: rc={result.returncode}")
+        _log(f"  stderr: {(result.stderr or '')[-400:]}")
+        sys.exit(1)
 
-    Path(output_path).unlink(missing_ok=True)
-    cmd_sw = _build_cmd("libx264", "18", "fast")
-    r2 = subprocess.run(cmd_sw, capture_output=True, text=True, timeout=7200)
-    if r2.returncode != 0 or not Path(output_path).is_file():
-        _log(f"[ERROR] ffmpeg failed: {(r2.stderr or '')[-300:]}")
+
+def _ffmpeg_segment_copy(
+    video_path: Path,
+    start_sec: float,
+    end_sec: float,
+    output_path: Path,
+) -> None:
+    """Stream-copy a video segment when no overlay applies to this batch.
+
+    Fast path (no encode) used when a batch has zero key presses AND zero
+    flight PiP clips — output is byte-identical (codec params) to the
+    other batch-overlay-*.mp4 files so the final concat stream-copy works.
+    """
+    cmd = ["ffmpeg", "-y"]
+    if start_sec > 0:
+        cmd.extend(["-ss", f"{start_sec:.6f}"])
+    cmd.extend(["-to", f"{end_sec:.6f}", "-i", str(video_path), "-c", "copy",
+                "-movflags", "+faststart", str(output_path)])
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    if result.returncode != 0 or not output_path.is_file():
+        _log(f"[ERROR] ffmpeg segment copy failed: rc={result.returncode}")
+        _log(f"  stderr: {(result.stderr or '')[-400:]}")
+        sys.exit(1)
+
+
+def _concat_overlay_batches(batch_files: list[Path], output_path: Path) -> None:
+    """Concat batch-overlay-*.mp4 files via ffmpeg stream copy (no re-encode).
+
+    Validates the merged file is non-empty. Raises ``SystemExit`` on ffmpeg
+    failure. Stream copy requires all inputs to share codec params (same
+    _ffmpeg_encode call produces all batches, so this holds).
+    """
+    if not batch_files:
+        _log("[ERROR] no batch files to concat")
+        sys.exit(1)
+    with tempfile.TemporaryDirectory() as tmp:
+        lst = Path(tmp) / "files.txt"
+        with open(lst, "w", encoding="utf-8") as f:
+            for bf in batch_files:
+                f.write(f"file '{bf.resolve()}'\n")
+        cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
+            "-c", "copy", "-movflags", "+faststart", str(output_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        if result.returncode != 0 or not output_path.is_file():
+            _log(f"[ERROR] ffmpeg batch concat failed: rc={result.returncode}")
+            _log(f"  stderr: {(result.stderr or '')[-400:]}")
+            sys.exit(1)
+    if not _overlay_output_valid(output_path):
+        _log(f"[ERROR] concat output too small: {output_path}")
         sys.exit(1)
 
 
@@ -1208,8 +1463,12 @@ def main() -> None:
     parser.add_argument("--steam-id", required=True, help="Steam64 ID")
     parser.add_argument("--round", type=int, default=None,
                         help="Round number (1-indexed, optional)")
+    parser.add_argument("--batches", type=int, default=0,
+                        help="Rounds per overlay batch (0=single-pass, default 0). "
+                             "Smaller filter graph per batch -> 2-3x speedup; "
+                             "crash resumes from last completed batch.")
     args = parser.parse_args()
-    run_overlay(Path(args.video), Path(args.demo), args.steam_id, args.round)
+    run_overlay(Path(args.video), Path(args.demo), args.steam_id, args.round, args.batches)
 
 
 if __name__ == "__main__":
