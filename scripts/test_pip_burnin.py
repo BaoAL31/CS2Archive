@@ -57,13 +57,15 @@ sys.modules["overlay_pov"] = _overlay_pov
 _spec.loader.exec_module(_overlay_pov)
 
 PipClip = _overlay_pov.PipClip
-PIP_WIDTH = _overlay_pov.PIP_WIDTH
-PIP_HEIGHT = _overlay_pov.PIP_HEIGHT
+PIP_BODY = _overlay_pov.PIP_BODY
+PIP_OUTLINE_THICKNESS = _overlay_pov.PIP_OUTLINE_THICKNESS
+PIP_CORNER_RADIUS = _overlay_pov.PIP_CORNER_RADIUS
 PIP_MARGIN = _overlay_pov.PIP_MARGIN
 PIP_GAP = _overlay_pov.PIP_GAP
 PIP_MAX_SIMULTANEOUS = _overlay_pov.PIP_MAX_SIMULTANEOUS
 _build_pip_chain = _overlay_pov._build_pip_chain
 _build_pip_overlay = _overlay_pov._build_pip_overlay
+_pip_geometry = _overlay_pov._pip_geometry
 
 
 # ---- ffmpeg helpers ----------------------------------------------------
@@ -163,8 +165,12 @@ def check_pip_region(video: Path, width: int, height: int,
     The bottom-left of a POV video naturally contains the player model, so
     raw luma is misleading. Diff-vs-source is the reliable signal.
     """
-    crop_pip = f"crop={PIP_WIDTH}:{PIP_HEIGHT}:{PIP_MARGIN}:{height - PIP_MARGIN - PIP_HEIGHT}"
-    crop_ctrl = f"crop={PIP_WIDTH}:{PIP_HEIGHT}:{(width - PIP_WIDTH)//2}:50"
+    # PiP slot is square (PIP_BODY x PIP_BODY) with PIP_OUTLINE_THICKNESS px
+    # white border. Crop the full slot including the outline so the luma /
+    # diff check covers the new geometry. The slot's y position uses
+    # PIP_MARGIN gap to the video bottom edge (outline-to-outline distance).
+    crop_pip = f"crop={PIP_BODY}:{PIP_BODY}:{PIP_MARGIN}:{height - PIP_MARGIN - PIP_BODY}"
+    crop_ctrl = f"crop={PIP_BODY}:{PIP_BODY}:{(width - PIP_BODY)//2}:50"
 
     try:
         from PIL import Image
@@ -321,8 +327,9 @@ def main() -> None:
                     help="Comma-sep timestamps (sec) to sample when checking --check-overlay")
     args = ap.parse_args()
 
-    print(f"PIP constants: width={PIP_WIDTH} height={PIP_HEIGHT} "
-          f"margin={PIP_MARGIN} gap={PIP_GAP} max={PIP_MAX_SIMULTANEOUS}")
+    print(f"PIP constants: body={PIP_BODY} outline={PIP_OUTLINE_THICKNESS} "
+          f"radius={PIP_CORNER_RADIUS} margin={PIP_MARGIN} "
+          f"gap={PIP_GAP} max={PIP_MAX_SIMULTANEOUS}")
 
     # Resolve clips
     if args.clip:

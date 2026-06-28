@@ -54,18 +54,44 @@ from scripts.input_overlay_decode import (
     overlay_tick_from_row,
     DEMOPARSER_TICK_FIELDS,
 )
-from scripts.render.csdm import build_flight_command
+from scripts.render.csdm import build_flight_command, run_csdm
+from scripts.render.paths import flight_clip_name
 
 # -- Constants -----------------------------------------------------------
 TICKRATE = 64.0
 
-PIP_WIDTH = 480
-PIP_HEIGHT = 270
-PIP_MARGIN = 8
-PIP_MAX_SIMULTANEOUS = 4
-PIP_GAP = 4
+# --- Util PiP burn-in geometry -----------------------------------------
+# Render path computes pip size dynamically from video height
+# (pip_body = video_height * 2 // 5 = video_height / 2.5). The constants
+# below are reference values for 1440p source (576px) and the static test
+# helpers in scripts/test_pip_burnin.py that crop the expected PiP region.
+PIP_BODY = 576                  # Reference size for 1440p (height * 2 // 5). Test-only; render uses video_height * 2 // 5.
+PIP_OUTLINE_THICKNESS = 2       # Pixels. White border around each PiP (0 disables outline).
+PIP_CORNER_RADIUS = 0           # Pixels. Rounded corner radius. 0 = disabled (see note below).
+PIP_MARGIN = 12                 # Pixels. Outline-to-outline gap from video edge.
+PIP_GAP = 12                    # Pixels. Outline-to-outline gap between stacked PiPs.
+# Max physically-fit stacked pips at 1440p (body=576, 2*576+12=1164 <= 1416).
+PIP_MAX_SIMULTANEOUS = 2
+# Caller-side logic clips to whichever the current height allows.
 
 FLIGHT_DIR_NAME = "throw_flights"
+
+
+def _pip_geometry(pip_index: int, video_width: int, video_height: int) -> dict[str, int]:
+    """Compute PiP slot, content, and position for given stack row.
+
+    Returns dict with:
+      body   - total slot size on screen (square, = video_height * 2 // 5)
+      inner  - content area inside the outline (body - 2*outline)
+      x, y   - top-left of the slot in main video coords
+      outline- outline thickness in pixels
+    """
+    ol = PIP_OUTLINE_THICKNESS
+    body = video_height * 2 // 5
+    inner = body - 2 * ol
+    x = PIP_MARGIN
+    y = video_height - PIP_MARGIN - body - pip_index * (body + PIP_GAP)
+    return {"body": body, "inner": inner, "x": x, "y": y, "outline": ol}
 
 # Column subset we actually need (avoid fetching huge unnecessary fields)
 REQUIRED_TICK_FIELDS = (
@@ -467,6 +493,15 @@ def _build_round_frame_ranges(
     return result
 
 
+def _rm_empty_dir(d: Path) -> None:
+    """Remove *d* if it exists and contains no files (skips subdirs)."""
+    if d.is_dir() and not any(d.iterdir()):
+        try:
+            d.rmdir()
+        except OSError:
+            pass
+
+
 def _scan_utility_cams_clips(video_path: Path) -> dict[str, Path]:
     """Scan utility_cams for pre-rendered clips (orbit + victims + flight).
 
@@ -547,6 +582,24 @@ def _render_throw_flight_clips(
     if not throws:
         return []
 
+    # Load trajectories once (per-throw chase-cam injection needs them).
+    # Bug A fix: without trajectories + throw_pose + run_csdm inject thread,
+    # csdm free-cams a random POV instead of chasing the grenade.
+    data_dir = _find_demo_data_dir(demo_path)
+    traj_by_throw: dict[str, Any] = {}
+    if data_dir is not None:
+        traj_path = data_dir / "trajectories.parquet"
+        if traj_path.is_file():
+            import pandas as _pd
+            _traj_df = _pd.read_parquet(traj_path)
+            for tid, sub in _traj_df.groupby("throw_id"):
+                traj_by_throw[str(tid)] = sub.sort_values("tick").copy()
+            _log(f"  [flight] Loaded {len(traj_by_throw)} trajectories")
+        else:
+            _log(f"  [flight] WARN: {traj_path.name} missing — flight cams will be skipped")
+    else:
+        _log(f"  [flight] WARN: no CS2UtilArchive data dir — flight cams will be skipped")
+
     # Resolve utility_cams directory near the video (persistent render cache)
     video_dir = video_path.parent if video_path else output_dir
     util_cams_root: Path | None = None
@@ -613,8 +666,7 @@ def _render_throw_flight_clips(
             continue
 
         throw_id = str(throw.get("throw_id", ""))
-        throw_id_slug = throw_id.replace(":", "_")
-        clip_name = f"throw_flight_{throw_id_slug}"
+        clip_name = flight_clip_name(throw_id)  # flight_<slug> — no "throw_" prefix
 
         # Determine per-throw util render directory from manifest-style slug:
         #   utility_cams/unnamed/<map>_<util>_<side>_<relx>_<rely>_<relz>/<demo_id>/
@@ -627,7 +679,6 @@ def _render_throw_flight_clips(
         util_slug = util_id.replace(":", "_")
         demo_id = str(throw.get("demo_id", demo_path.stem))
         render_dir = util_cams_root / "unnamed" / util_slug / demo_id
-        render_dir.mkdir(parents=True, exist_ok=True)
         clip_path = render_dir / f"{clip_name}.mp4"
 
         # Use pre-rendered clip if available
@@ -645,6 +696,29 @@ def _render_throw_flight_clips(
             _log(f"  [flight] Rendering {util_type} throw {idx} "
                  f"(t{throw_tick}, {flight_ticks} ticks, frames {start_frame}-{end_frame})...")
 
+            # Only create render dir when we actually need to write to it
+            render_dir.mkdir(parents=True, exist_ok=True)
+
+            # Build thrower eye pose at throw_tick (chase-cam origin).
+            traj_df = traj_by_throw.get(throw_id)
+            if traj_df is None or traj_df.empty:
+                _log(f"  [flight] SKIP {util_type} throw {idx}: no trajectory data for chase cam")
+                continue
+            throw_pose = {
+                "x": float(throw.get("throw_x", 0) or 0),
+                "y": float(throw.get("throw_y", 0) or 0),
+                "z": float(throw.get("throw_z", 0) or 0),
+                "pitch": float(throw.get("throw_pitch", 0) or 0),
+                "yaw": float(throw.get("throw_yaw", 0) or 0),
+                "rx": float(throw.get("throw_x", 0) or 0),
+                "ry": float(throw.get("throw_y", 0) or 0),
+                "rz": float(throw.get("throw_z", 0) or 0),
+            }
+            # NaN pose -> inject would write garbage spec_goto -> skip
+            if any(throw_pose[k] != throw_pose[k] for k in ("x", "y", "z", "pitch", "yaw")):
+                _log(f"  [flight] SKIP {util_type} throw {idx}: NaN throw pose")
+                continue
+
             job: dict[str, Any] = {
                 "demo_path": str(demo_path.resolve()),
                 "throw_tick": throw_tick,
@@ -654,28 +728,30 @@ def _render_throw_flight_clips(
             }
             try:
                 cmd = build_flight_command(job, str(render_dir))
-                _log(f"  [flight] CSDM: {' '.join(cmd[:4])} ...")
-                result = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=600,
+                _log(f"  [flight] CSDM: {' '.join(cmd[:4])} ... (inject flight cam)")
+                # run_csdm spawns inject poll thread that writes spec_goto
+                # chase-cam commands into csdm actions JSON while CS2 runs.
+                # Watch for "[inject] flight (N ticks)" on stdout = success.
+                out_path = run_csdm(
+                    cmd,
+                    f"flight {idx}",
+                    demo_path=str(demo_path.resolve()),
+                    flight_throw_tick=throw_tick,
+                    flight_detonate_tick=detonate_tick,
+                    flight_trajectories_df=traj_df,
+                    flight_throw_pose=throw_pose,
+                    flight_smooth=0.75,
+                    orbit_handoff_delay_ticks=0,
                 )
-                stderr = (result.stderr or "") + (result.stdout or "")
-                if "Steam is not running" in stderr:
-                    _log(f"  [flight] FAILED: Steam is not running")
+                if out_path is None or not out_path.is_file() or out_path.stat().st_size < 100_000:
+                    _log(f"  [flight] FAILED: run_csdm produced no usable output")
+                    _rm_empty_dir(render_dir)
                     continue
-                if "Raw files not found" in stderr:
-                    _log(f"  [flight] FAILED: HLAE produced no video (check absolute --output)")
-                    continue
-                if result.returncode != 0 or not clip_path.is_file():
-                    if not clip_path.is_file():
-                        # CSDM may output sequence-*.mp4; find and rename
-                        seqs = sorted(render_dir.glob("sequence-*.mp4"))
-                        if seqs:
-                            seq_path = seqs[0]
-                            seq_path.rename(clip_path)
-                            _log(f"  [flight] Renamed {seq_path.name} -> {clip_path.name}")
-                        else:
-                            _log(f"  [flight] No output file found")
-                            continue
+                # Normalize sequence-*.mp4 (csdm default) to stable clip name
+                if out_path.resolve() != clip_path.resolve():
+                    clip_path.unlink(missing_ok=True)
+                    out_path.rename(clip_path)
+                    _log(f"  [flight] Renamed {out_path.name} -> {clip_path.name}")
 
                 # Write _throw_poses.json so scan finds it next time
                 poses_file = render_dir / "_throw_poses.json"
@@ -684,17 +760,16 @@ def _render_throw_flight_clips(
                     "_throws": {throw_id: {"pos": [rel_x, rel_y, rel_z]}},
                 }
                 poses_file.write_text(json.dumps(poses_data, indent=2), encoding="utf-8")
-            except subprocess.TimeoutExpired:
-                _log(f"  [flight] TIMEOUT rendering {util_type} throw {idx}")
-                continue
             except Exception as exc:
                 _log(f"  [flight] Error rendering {util_type} throw {idx}: {exc}")
                 traceback.print_exc()
+                _rm_empty_dir(render_dir)
                 continue
 
         if not clip_path.is_file() or clip_path.stat().st_size < 100_000:
             _log(f"  [flight] WARN: {clip_path.name} too small or missing, skipping")
             clip_path.unlink(missing_ok=True)
+            _rm_empty_dir(render_dir)
             continue
 
         clips.append(PipClip(
@@ -758,17 +833,54 @@ def _build_pip_overlay(
     show through once the clip finishes (no frozen last-frame held over the
     rest of the video).
     """
-    x = PIP_MARGIN
-    pip_y = height - PIP_MARGIN - PIP_HEIGHT - clip.pip_index * (PIP_HEIGHT + PIP_GAP)
+    geom = _pip_geometry(clip.pip_index, width, height)
+    pip_body = geom["body"]
+    pip_inner = geom["inner"]
+    x = geom["x"]
+    pip_y = geom["y"]
+    ol = geom["outline"]
     tag = f"pip{clip.pip_index}_{input_idx}"
     scaled_tag = f"pip_scaled_{input_idx}"
     start_seconds = clip.start_frame / fps
 
+    # Build pre-overlay filter chain for the flight clip:
+    #   1. scale to inner content size (body - 2*outline)
+    #   2. pad back up to body with white border = the outline
+    #   3. format=rgba + optional geq for rounded corners
+    #   4. setpts to align first frame with clip.start_frame on main timeline
+    pre_filters = [f"scale=w={pip_inner}:h={pip_inner}:flags=lanczos"]
+    if ol > 0:
+        pre_filters.append(
+            f"pad=w={pip_body}:h={pip_body}:x={ol}:y={ol}:color=white"
+        )
+    # NOTE: Rounded corners (PIP_CORNER_RADIUS > 0) deliberately disabled.
+    # Benchmark on this machine (scripts/_bench_geq.py, 576x576 RGBA, 300 frames):
+    #   baseline (format=rgba only): 0.50s
+    #   with corner geq:            2.89s  (+7.96 ms/frame/pip, +476% CPU)
+    # At 60 fps the per-frame budget is 16.67 ms; one pip consumes ~48% of it,
+    # two pips blow the budget and the pipeline would need to drop to ~30 fps.
+    # Re-enable only if (a) the project moves overlay compositing to a GPU
+    # path (e.g. vspipe + glsl, or a hardware overlay layer) or (b) the target
+    # framerate is lowered. Filter expression preserved below for that case:
+    #
+    #   R = PIP_CORNER_RADIUS
+    #   half = pip_body // 2
+    #   inner_half = half - R
+    #   pre_filters.append("format=rgba")
+    #   pre_filters.append(
+    #       "geq="
+    #       f"r='p(X,Y)':g='p(X,Y)':b='p(X,Y)':"
+    #       f"a='if(gt(abs(X-{half})-{inner_half},0)*"
+    #       f"gt(abs(Y-{half})-{inner_half},0),"
+    #       f"if(lte(hypot(abs(X-{half})-{inner_half},"
+    #       f"abs(Y-{half})-{inner_half}),{R}),"
+    #       f"255,0),255)'"
+    #   )
+    pre_filters.append(f"setpts=PTS-STARTPTS+{start_seconds:.6f}/TB")
+    pre_chain = f"[{input_idx}:v]" + ",".join(pre_filters) + f"[{scaled_tag}]"
+
     parts = [
-        f"[{input_idx}:v]"
-        f"scale=w={PIP_WIDTH}:h={PIP_HEIGHT}:flags=lanczos,"
-        f"setpts=PTS-STARTPTS+{start_seconds:.6f}/TB"
-        f"[{scaled_tag}]",
+        pre_chain,
         f"{current_label}[{scaled_tag}]"
         f"overlay=x={x}:y={pip_y}:eof_action=pass"
         f"[{tag}]",
