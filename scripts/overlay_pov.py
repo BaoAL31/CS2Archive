@@ -54,6 +54,7 @@ from scripts.input_overlay_decode import (
     DEMOPARSER_TICK_FIELDS,
 )
 from scripts.render.paths import flight_clip_name
+from scripts.render.paths import clip_name_for_cameras
 
 # -- Constants -----------------------------------------------------------
 TICKRATE = 64.0
@@ -473,6 +474,13 @@ def _load_player_throws(
         return []
 
     _log(f"  [throws] {len(player_df)} renderable throws")
+    side_counts = player_df["thrower_side"].value_counts().to_dict()
+    t_count = int(side_counts.get("T", 0))
+    ct_count = int(side_counts.get("CT", 0))
+    _log(f"  [throws] side breakdown: T={t_count} CT={ct_count}")
+    if (t_count == 0 or ct_count == 0) and (t_count + ct_count) > 0:
+        missing = "CT" if ct_count == 0 else "T"
+        _log(f"  [throws] NOTE: zero throws on {missing} side — data observation, not pipeline bug")
     return [dict(row) for _, row in player_df.iterrows()]
 
 
@@ -515,13 +523,13 @@ def _util_slug_for_throw(throw: dict, demo_path: Path) -> tuple[str, str, str]:
     """
     map_name = str(throw.get("map", "") or demo_path.stem)
     util_type = str(throw.get("util_type", "unknown")).lower()
-    side = str(throw.get("thrower_side", "T") or "T")[:1].upper()
+    side = str(throw.get("thrower_side", "T") or "T").upper()
     rel_x = int(round(float(throw.get("release_x", 0) or 0)))
     rel_y = int(round(float(throw.get("release_y", 0) or 0)))
     rel_z = int(round(float(throw.get("release_z", 0) or 0)))
     util_id = f"{map_name}:{util_type}:{side}:{rel_x}_{rel_y}_{rel_z}"
     util_slug = util_id.replace(":", "_")
-    demo_id = str(throw.get("demo_id", demo_path.stem))
+    demo_id = re.sub(r"^\d{6,}-", "", str(throw.get("demo_id", demo_path.stem)))
     return util_id, util_slug, demo_id
 
 
@@ -530,21 +538,24 @@ def _run_batch_util_cams_subprocess(
     steam_id: str,
     data_dir: Path,
     util_cams_root: Path,
-    chunk_size: int = 8,
+    chunk_size: int = 0,
 ) -> int:
-    """Shell out to scripts/batch_util_cams.py for batched util_cam rendering.
+    """Shell out to scripts/render_util_cams.py for util_cam prep + render.
 
     Bypasses the inline run_csdm loop (Bug A: random POV instead of chase cam
-    when the inject thread races csdm's actions-file write). batch_util_cams.py
-    uses CS2UtilArchive's render_spot_batch — one CS2 launch per chunk of N
-    spots, spec_goto precomputed and merged before CS2 starts.
+    when the inject thread races csdm's actions-file write). render_util_cams.py
+    handles BOTH prep (filter throws.parquet by steamid, create util_cam dirs
+    + _throw_poses.json) and render (call CS2UtilArchive's render_spot_batch
+    in one CS2 launch per chunk of N spots). Idempotent — re-runs are no-ops
+    for already-rendered clips.
     """
     import subprocess
-    script_path = Path(__file__).resolve().parent / "batch_util_cams.py"
+    script_path = Path(__file__).resolve().parent / "render_util_cams.py"
     cmd = [
         sys.executable, str(script_path),
         "--util-cams-root", str(util_cams_root.resolve()),
         "--data-dir", str(data_dir.resolve()),
+        "--steamid", str(steam_id),
         "--chunk-size", str(chunk_size),
     ]
     _log(f"  [flight] CMD: {' '.join(cmd)}")
@@ -555,7 +566,7 @@ def _run_batch_util_cams_subprocess(
         )
         return result.returncode
     except Exception as exc:
-        _log(f"  [flight] batch_util_cams.py subprocess failed: {exc}")
+        _log(f"  [flight] render_util_cams.py subprocess failed: {exc}")
         return 1
 
 
@@ -591,14 +602,11 @@ def _scan_utility_cams_clips(video_path: Path) -> dict[str, Path]:
         if not mp4s:
             continue
         for tid in throw_map:
-            # Match by entity ID substring in filename (orbit clips)
-            # Format: throw_flight_orbit_<slug>_e{N}_s{M}.mp4 → matching e{N}:s{M}
+            # Match by entity ID substring in filename.
+            # New naming: flight_<short-slug>.mp4 or flight_orbit_<short-slug>.mp4
+            # Each throw_id has its own dir + 1 mp4 (1:1 mapping).
             ent_part = tid.split(":")[1] if ":" in tid else ""
             matching = [m for m in mp4s if ent_part and ent_part in m.name]
-            if not matching:
-                # Fallback: victims clips share one .mp4 across one throw_id
-                # (single throw_id directories).
-                matching = mp4s if len(throw_map) == 1 else []
             if len(matching) == 1:
                 pre_rendered[tid] = matching[0]
             elif matching:
@@ -694,12 +702,13 @@ def _render_throw_flight_clips(
     needs_render = False
     for throw in throws:
         tid = str(throw.get("throw_id", ""))
-        _, util_slug, demo_id = _util_slug_for_throw(throw, demo_path)
-        render_dir_check = util_cams_root / "unnamed" / util_slug / demo_id
+        # Throw_id-keyed dir: unnamed/<throw_id_slug>/
+        util_slug = tid.replace(":", "_")
+        render_dir_check = util_cams_root / "unnamed" / util_slug
         has_shared = (
             render_dir_check.is_dir()
             and any(p.stat().st_size > 1_000_000
-                    for p in render_dir_check.glob("throw_flight_*.mp4"))
+                    for p in render_dir_check.glob("*.mp4"))
         )
         if tid in pre_rendered or has_shared:
             continue
@@ -763,19 +772,15 @@ def _render_throw_flight_clips(
             continue
 
         throw_id = str(throw.get("throw_id", ""))
-        clip_name = flight_clip_name(throw_id)  # flight_<slug> — no "throw_" prefix
+        # Util-type-aware cameras: smoke gets flight+orbit, others get flight only.
+        # clip_name_for_cameras also strips the HLTV match ID from the slug.
+        _cameras = "flight,orbit" if util_type == "smoke" else "flight"
+        clip_name = clip_name_for_cameras(_cameras, throw_id)
 
-        # Determine per-throw util render directory from manifest-style slug:
-        #   utility_cams/unnamed/<map>_<util>_<side>_<relx>_<rely>_<relz>/<demo_id>/
-        map_name = str(throw.get("map", "")) or demo_path.stem
-        side = str(throw.get("thrower_side", "T"))[:1].upper()
-        rel_x = int(round(float(throw.get("release_x", 0) or 0)))
-        rel_y = int(round(float(throw.get("release_y", 0) or 0)))
-        rel_z = int(round(float(throw.get("release_z", 0) or 0)))
-        util_id = f"{map_name}:{util_type}:{side}:{rel_x}_{rel_y}_{rel_z}"
-        util_slug = util_id.replace(":", "_")
-        demo_id = str(throw.get("demo_id", demo_path.stem))
-        render_dir = util_cams_root / "unnamed" / util_slug / demo_id
+        # Throw_id-keyed util_cam dir: utility_cams/unnamed/<throw_id_slug>/
+        # One dir per throw_id (no aggregation, no demo_id leaf).
+        util_slug = throw_id.replace(":", "_")
+        render_dir = util_cams_root / "unnamed" / util_slug
         clip_path = render_dir / f"{clip_name}.mp4"
 
         # Use pre-rendered clip if available (set by initial scan or batch re-scan)
@@ -791,7 +796,7 @@ def _render_throw_flight_clips(
         if (not clip_path.is_file() or clip_path.stat().st_size < 100_000) \
                 and render_dir.is_dir():
             shared = [
-                p for p in render_dir.glob("throw_flight_*.mp4")
+                p for p in render_dir.glob("*.mp4")
                 if p.stat().st_size > 1_000_000
             ]
             if shared:
@@ -975,7 +980,7 @@ def run_overlay(
     demo_path: Path,
     steam_id: str,
     round_num: int | None = None,
-    batches: int = 0,
+    batches: int = 5,
 ) -> None:
     """Apply keyboard overlay + utility throw flight PiP onto video_path (in place)."""
     if not video_path.exists():
@@ -1265,9 +1270,12 @@ def run_overlay(
                         combined_fc = pip_fc
                         out_label = pip_label
                     else:
-                        _log(f"  [batch] {batch_name} no overlay, stream-copying segment")
-                        _ffmpeg_segment_copy(
-                            video_path, batch_start_sec, batch_end_sec, batch_path,
+                        _log(f"  [batch] {batch_name} no overlay, re-encoding segment for codec consistency")
+                        _ffmpeg_encode(
+                            str(video_path), [],
+                            ["-filter_complex", "[0:v]null[outv]"],
+                            "[outv]", str(batch_path),
+                            segment=(batch_start_sec, batch_end_sec),
                         )
                         continue
 
@@ -1386,7 +1394,9 @@ def _ffmpeg_encode(
         *fc_args, "-map", out_label, "-map", "0:a?", "-shortest",
         "-c:v", "h264_nvenc", "-cq", "18", "-preset", "p4",
         "-profile:v", "high", "-pix_fmt", "yuv420p",
-        "-c:a", "copy", "-movflags", "+faststart",
+        "-c:a", "aac", "-b:a", "192k",
+        "-af", "asetpts=PTS-STARTPTS",
+        "-movflags", "+faststart",
         "-g", "60", "-bf", "0", "-keyint_min", "60",
         output_path,
     ])
@@ -1463,8 +1473,9 @@ def main() -> None:
     parser.add_argument("--steam-id", required=True, help="Steam64 ID")
     parser.add_argument("--round", type=int, default=None,
                         help="Round number (1-indexed, optional)")
-    parser.add_argument("--batches", type=int, default=0,
-                        help="Rounds per overlay batch (0=single-pass, default 0). "
+    parser.add_argument("--batches", type=int, default=5,
+                        help="Rounds per overlay batch (default 5). "
+                             "0=single-pass (slow on large videos). "
                              "Smaller filter graph per batch -> 2-3x speedup; "
                              "crash resumes from last completed batch.")
     args = parser.parse_args()

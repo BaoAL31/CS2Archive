@@ -107,6 +107,12 @@ def main() -> None:
     parser.add_argument("--tournament", default="", help="Tournament name")
     parser.add_argument("--team-a", help="Override team A name")
     parser.add_argument("--team-b", help="Override team B name")
+    parser.add_argument(
+        "--variant",
+        choices=["raw", "overlay"],
+        default="raw",
+        help="Variant: 'raw' (default) or 'overlay' (suffix title/desc/tags)",
+    )
     args = parser.parse_args()
 
     path = Path(args.ratings_json)
@@ -203,6 +209,25 @@ def main() -> None:
         "Competitive",
         "Gaming",
     ]))
+
+    if args.variant == "overlay":
+        title = f"{title} | Input Overlay + Utility Cam"
+        description = (
+            f"{description}\n\n"
+            "This version includes a real-time keyboard & mouse input overlay "
+            "plus utility throw flight camera (chase-cam) PiP clips for smokes, "
+            "flashes, molotovs, and other grenades."
+        )
+        extra_overlay_tags = [
+            "input overlay",
+            "utility cam",
+            "CS2 overlay",
+            "keyboard overlay",
+            "mouse input",
+            "CS2 utility cam",
+            "smoke lineup",
+        ]
+        tags = tags + extra_overlay_tags
 
     print(json.dumps({"title": title, "description": description, "tags": tags}))
 

@@ -8,6 +8,7 @@ from thumbnail.generator import (
     WIDTH,
     HEIGHT,
     FONT_SIZES,
+    FONT_PATH,
     AVATAR_HEIGHT_RATIO,
     _load_font,
     cutout_player,
@@ -23,6 +24,55 @@ def _line_height(size: int) -> int:
     return int(size * LINE_GAP)
 
 
+def _draw_overlay_badge(img: Image.Image) -> None:
+    """Draw a semi-transparent pill badge in top-right corner for the overlay variant."""
+    from PIL import ImageDraw, ImageFont
+
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    badge_text = "W/ INPUT OVERLAY"
+    padding_x, padding_y = 18, 10
+    corner_radius = 12
+    margin = 20
+
+    try:
+        font = ImageFont.truetype(str(FONT_PATH), 30)
+    except Exception:
+        font = ImageFont.load_default()
+
+    bbox = draw.textbbox((0, 0), badge_text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    badge_w = text_w + padding_x * 2
+    badge_h = text_h + padding_y * 2
+
+    x0 = WIDTH - badge_w - margin
+    y0 = margin
+    x1 = WIDTH - margin
+    y1 = y0 + badge_h
+
+    # Semi-transparent dark background pill
+    draw.rounded_rectangle(
+        [x0, y0, x1, y1],
+        radius=corner_radius,
+        fill=(0, 0, 0, 200),
+    )
+
+    # White text, centered in pill
+    text_x = x0 + badge_w // 2
+    text_y = y0 + badge_h // 2
+    draw.text(
+        (text_x, text_y),
+        badge_text,
+        font=font,
+        fill=(255, 255, 255, 255),
+        anchor="mm",
+    )
+
+    img.paste(overlay, (0, 0), overlay)
+
+
 def generate(
     bg_path: Path,
     avatar_path: Path,
@@ -33,6 +83,7 @@ def generate(
     match_detail: str,
     tournament: str = "",
     stage: str = "",
+    variant: str = "raw",
 ) -> Image.Image:
     bg = load_background(bg_path)
 
@@ -68,5 +119,8 @@ def generate(
     for text, size in lines:
         draw_text(draw, text, text_x, current_y, size, anchor="mm")
         current_y += _line_height(size)
+
+    if variant == "overlay":
+        _draw_overlay_badge(bg)
 
     return bg

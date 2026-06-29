@@ -157,6 +157,12 @@ def main() -> None:
     parser.add_argument("--demo", help="Path to .dem file (for auto background extraction)")
     parser.add_argument("--steam-id", help="Player Steam64 ID (required with --demo)")
     parser.add_argument("--tournament", "-t", help="Tournament name (e.g. IEM Atlanta 2026)")
+    parser.add_argument(
+        "--variant",
+        choices=["raw", "overlay"],
+        default="raw",
+        help="Variant: 'raw' (default) or 'overlay' (adds W/ INPUT OVERLAY badge)",
+    )
     parser.add_argument("--output", "-o", help="Output path (defaults to youtube/...)")
     args = parser.parse_args()
 
@@ -218,6 +224,7 @@ def main() -> None:
         f"{team1} vs {team2}",
         tournament=args.tournament or "",
         stage=stage,
+        variant=args.variant,
     )
     img = img.convert("RGB")
     img.save(output_path.with_suffix(".jpg"), "JPEG", quality=95, subsampling=0)

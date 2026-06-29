@@ -1,4 +1,4 @@
-"""Verify overlay_pov.py integration with batch_util_cams.py.
+"""Verify overlay_pov.py integration with render_util_cams.py.
 
 Tests:
   1. Module imports cleanly (no missing refs after refactor).
@@ -7,7 +7,7 @@ Tests:
      pre-rendered batched util_cams).
   3. `_run_batch_util_cams_subprocess` correctly invokes the batch script
      with the data_dir PARENT (not the per-demo dir).
-  4. `_write_throw_poses` (in batch_util_cams) MERGES instead of
+  4. `_write_throw_poses` (in render_util_cams) MERGES instead of
      overwriting — multiple throws sharing one util_cam dir all appear
      in the `_throws` dict.
   5. Idempotence: re-running `_render_throw_flight_clips` does NOT
@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import overlay_pov as op  # noqa: E402
-import batch_util_cams as buc  # noqa: E402
+import render_util_cams as ruc  # noqa: E402
 
 
 DEMO = Path(r"D:\Projects\CS2Archive\demos\hltv\furia-vs-falcons-iem-cologne-major\furia-vs-falcons-m3-inferno.dem")
@@ -112,7 +112,7 @@ def test_4_write_throw_poses_merges():
             },
             util_dir=util_dir,
         )
-        buc._write_throw_poses(new_entry, util_dir / "out.mp4")
+        ruc._write_throw_poses(new_entry, util_dir / "out.mp4")
         result = json.loads((util_dir / "_throw_poses.json").read_text())
         throws = result["_throws"]
         assert "demo1:e100:s0" in throws, "old throw was overwritten"
@@ -141,7 +141,7 @@ def test_5_idempotence():
         )
     output = buf.getvalue()
     assert len(clips) == 28
-    assert "Subprocess: batch_util_cams.py" not in output, \
+    assert "Subprocess: render_util_cams.py" not in output, \
         "subprocess was invoked even though all clips were pre-rendered"
     print("  [ok] no subprocess call when all clips pre-rendered")
 

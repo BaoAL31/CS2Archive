@@ -56,6 +56,32 @@ python scripts/pipeline.py --backlog backlog/spirit-vs-falcons-iem-cologne-major
 - **`--resume-from-round N`** — deprecated. Render now uses filesystem-based resume: existing `batch-*.mp4` files ≥1MB are automatically skipped on re-run. To re-render a specific batch, manually delete its file.
 - **`--batches N`** — rounds per render batch (default: 10). Each batch produces one MP4 named `batch-{start:03d}-{end:03d}.mp4`. `--batches 1` is equivalent to the old per-round model.
 - **`--until N`** — stop after step N (e.g. `--until 5` runs through thumbnail, skips upload/cleanup). Default: run through step 7.
+- **`--dual-upload`** — produce and upload a **second independent variant** with the keyboard + util-cam overlay applied. Default behavior (no flag) is 100% unchanged.
+
+### Dual-Upload (`--dual-upload`)
+
+When passed, the pipeline produces **two** separate YouTube uploads from one backlog entry:
+
+| Variant | YouTube dir | Title suffix | Thumbnail | Description |
+|---|---|---|---|---|
+| Raw | `youtube/{run_id}/` | _(none)_ | standard | standard |
+| Overlay | `youtube/{run_id}_overlay/` | `\| Input Overlay + Utility Cam` | + `W/ INPUT OVERLAY` badge top-right | + overlay note paragraph |
+
+Both variants get independent `upload_meta.json`, independent YouTube video IDs (`youtube_id` + `overlay_youtube_id` in state), and independent publish-schedule slots.
+
+**Data flow:**
+1. Step 3 (concat): `combined.mp4` copied to both `youtube/{run_id}/` and `youtube/{run_id}_overlay/`
+2. Step 4 (overlay): runs `overlay_pov.py` on the overlay dir's `video.mp4`; output replaces `video.mp4` in the overlay dir. Skipped in raw-only mode (no `--dual-upload`) so cost is zero.
+3. Step 5 (outro): appended to both `video.mp4` files
+4. Step 6 (thumbnail): two thumbnails generated, each with its own `upload_meta.json`
+5. Step 7 (upload): both uploaded sequentially, each with its own resume-safe state key
+6. Step 8 (cleanup): unchanged
+
+**Resume:** if raw uploads but overlay fails, re-running with the same `--dual-upload` flag re-uploads only the overlay variant. Each variant's `upload_meta.json` is checked for an existing `youtube_id` before re-uploading.
+
+**Cost:** adds one full overlay rendering (~30–60 min for 20+ throws) and one extra YouTube upload. Use only for matches where the overlay version adds value (high-profile matches, educational content).
+
+**Backwards compat:** without `--dual-upload`, behavior is **identical** to before — step 4 still runs the overlay script but its sidecar output is left orphaned exactly as before. No new directories created. No new state keys. Existing `youtube/{run_id}/` and `.pipeline/{run_id}.json` files unaffected.
 
 ### Chaining pipelines (upload overlap)
 
@@ -90,11 +116,12 @@ Use these when debugging a specific pipeline step failure or running steps manua
 5. **CSDM Analysis** — `csdm analyze <demo>`. For PGL demos (PBDEMS2 format): `csdm analyze <demo> --source challengermode`.
 6. **Render POV Clip** — `python scripts/render_pov.py <demo_path> <steam_id> [--batches 3]`. Extracts player's crosshair from demo, writes to `autoexec_render.cfg`, copies over `autoexec.cfg` in CS2's cfg dir (`game/csgo/cfg/`), renders rounds in batches. On exit (even crash), swaps `autoexec_personal.cfg` back. Each batch produces one `batch-{start}-{end}.mp4` file. Filesystem-based resume: existing `batch-*.mp4` files ≥1MB are automatically skipped.
 7. **Concatenate Rounds** — `python scripts/concat_rounds.py <renders_folder>` → `combined.mp4` (incremental batch-by-batch concat with gap/overlap validation, then upscale to 1440p). Each batch file is deleted after successful append.
-8. **Overlay** — `python scripts/overlay_pov.py --video <video.mp4> --demo <demo> --steam-id <id> [--round N]`. Applies keyboard overlay (demoparser2 full extraction) + utility throw flight PiP (CSDM flight renders at bottom-left). Requires CS2UtilArchive with throws.parquet. Renders flight clips via `build_flight_command()` — ~1-2 min per throw.
-9. **Generate Thumbnail** — `python -m thumbnail <match_url> --player <nick> --map <map> --demo <dem> --steam-id <id> [--tournament "IEM Atlanta 2026"]`. Auto-extracts random kill frame as blurred background. Or `--background <frame.jpg>`.
+8. **Render Util-Cams (prep + render)** — `python scripts/render_util_cams.py --util-cams-root <pov>/utility_cams --data-dir <data-dir> [--steamid <id>] [--chunk-size 0]`. Two-phase: **(1) PREP** filters throws.parquet by `--steamid` (optional, default = all players) + `flight_ticks > 0` + `is_renderable=True`, creates `unnamed/<throw_id_slug>/` util_cam dir + `_throw_poses.json` per throw (one dir per throw_id, no aggregation); **(2) RENDER** discovers dirs needing render (no `.mp4`), calls CS2UtilArchive's `render_spot_batch` in batched chunks. **Cameras convention** (from manifest, set by prep): smoke → `"throw,flight"` → mp4 `throw_flight_<slug>.mp4`; others → `"flight"` → mp4 `flight_<slug>.mp4`. CS2UtilArchive's `spot_deliverable_path` hardcodes `throw_flight_victims_spot1` for flash util_type — flash renders are renamed to `flight_<slug>.mp4` post-render to match convention. `--chunk-size 0` (default) renders all spots in one CS2 launch. Idempotent — re-runs are no-ops for already-rendered clips. Flags: `--prepare-only` (just create dirs), `--render-only` (skip prep, just render existing dirs). **Run after `extract_utils.py` produces throws.parquet** — script reads it via `--data-dir`.
+9. **Overlay** — `python scripts/overlay_pov.py --video <video.mp4> --demo <demo> --steam-id <id> [--round N]`. Applies keyboard overlay (demoparser2 full extraction) + utility throw flight PiP (CSDM flight renders at bottom-left). Requires CS2UtilArchive with throws.parquet. Renders flight clips via `build_flight_command()` — ~1-2 min per throw.
+10. **Generate Thumbnail** — `python -m thumbnail <match_url> --player <nick> --map <map> --demo <dem> --steam-id <id> [--tournament "IEM Atlanta 2026"]`. Auto-extracts random kill frame as blurred background. Or `--background <frame.jpg>`.
    Example: `python -m thumbnail "https://www.hltv.org/matches/2394166/faze-vs-vitality-iem-atlanta-2026" --player ropz --map Nuke --demo demos/hltv/.../faze-vs-vitality-m1-nuke-p2.dem --steam-id 76561197991272318 --tournament "IEM Atlanta 2026"`
-9. **Generate Title & Description** — `python scripts/generate_title.py <ratings_json> --player <nick> --map <map> [--tournament "..."]`. Outputs JSON with `title` and `description` from ratings data.
-9. **Upload to YouTube** — `python scripts/upload_youtube.py <video_path> --thumbnail <thumb.png> --title <title> --description <desc> --privacy public`. Requires Google Cloud OAuth (`client_secret.json`). First-time auth opens browser. Account must be phone-verified for custom thumbnails.
+11. **Generate Title & Description** — `python scripts/generate_title.py <ratings_json> --player <nick> --map <map> [--tournament "..."]`. Outputs JSON with `title` and `description` from ratings data.
+12. **Upload to YouTube** — `python scripts/upload_youtube.py <video_path> --thumbnail <thumb.png> --title <title> --description <desc> --privacy public`. Requires Google Cloud OAuth (`client_secret.json`). First-time auth opens browser. Account must be phone-verified for custom thumbnails.
    Default publish mode is `auto`: schedule at the next future 16:30 Australia/Sydney on a free local calendar day. The script keeps `youtube/.publish_schedule.json` as the slot ledger and rolls back a reserved slot if upload fails.
    Override with `--publish-at "YYYY-MM-DD HH:MM"` for an exact time, or keep `--publish-at auto` explicit.
    Or use `--meta <upload_meta.json>` to read title/description/tags from a metadata file. The pipeline writes `upload_meta.json` at step 5 (thumbnail), so step 6 can resume with only the youtube folder. The file also stores `resumable_uri`/`resumable_progress` during upload for crash recovery, and `youtube_id` after completion.
@@ -226,6 +253,15 @@ youtube/
     ├── thumbnail.png       (1280×720 PNG, auto-generated)
     ├── video.mp4           (1080p60, full match POV, concatenated rounds)
     └── upload_meta.json    (title, description, tags, upload status, youtube_id)
+```
+
+With `--dual-upload`, a second variant is added:
+```
+youtube/
+└── {match-slug}_{player}_{map}_overlay/
+    ├── thumbnail.png       (1280×720 PNG, with "W/ INPUT OVERLAY" badge)
+    ├── video.mp4           (overlay-enhanced POV, same dimensions, with keyboard + util cam)
+    └── upload_meta.json    (title suffix "| Input Overlay + Utility Cam", extra tags, overlay note in description)
 ```
 
 ## Architecture
