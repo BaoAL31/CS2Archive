@@ -76,31 +76,81 @@ def get_authenticated_service(scopes: list[str] | None = None, token_file: str |
     return build("youtube", "v3", credentials=creds)
 
 
-def last_long_form_upload_date(youtube) -> date | None:
-    """Return date+1 of latest long-form upload (not Shorts). None on error."""
-    from datetime import datetime, timedelta, timezone as dt_timezone
+def get_youtube_publish_dates(youtube) -> set[str] | None:
+    """Return set of YYYY-MM-DD dates with scheduled or published long-form vids.
+
+    Queries channel uploads playlist (paginated), then ``videos().list`` in
+    batches of 50 to fetch ``status.publishAt`` (actual public date for
+    scheduled vids) and ``status.privacyStatus``. Skips Shorts and unlisted.
+    Returns ``None`` on error so caller can fall back to local ledger.
+    """
+    from datetime import datetime
     try:
         channels = youtube.channels().list(part="contentDetails", mine=True).execute()
         if not channels.get("items"):
             return None
         uploads_id = channels["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
-        items = youtube.playlistItems().list(
-            part="snippet",
-            playlistId=uploads_id,
-            maxResults=50,
-        ).execute()
-        latest = None
-        for item in items.get("items", []):
-            title = item["snippet"].get("title", "")
-            if "#Shorts" in title or "#shorts" in title:
-                continue
-            published = item["snippet"]["publishedAt"]
-            dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
-            d = dt.date()
-            if latest is None or d > latest:
-                latest = d
-        if latest is None:
+
+        video_ids: list[str] = []
+        page_token: str | None = None
+        while True:
+            resp = youtube.playlistItems().list(
+                part="snippet",
+                playlistId=uploads_id,
+                maxResults=50,
+                pageToken=page_token,
+            ).execute()
+            for item in resp.get("items", []):
+                vid = (
+                    item.get("contentDetails", {}).get("videoId")
+                    or item.get("snippet", {}).get("resourceId", {}).get("videoId")
+                )
+                if vid:
+                    video_ids.append(vid)
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+
+        if not video_ids:
+            return set()
+
+        occupied: set[str] = set()
+        for i in range(0, len(video_ids), 50):
+            batch = video_ids[i:i + 50]
+            resp = youtube.videos().list(
+                part="status,snippet",
+                id=",".join(batch),
+            ).execute()
+            for v in resp.get("items", []):
+                title = v.get("snippet", {}).get("title", "")
+                if "#Shorts" in title or "#shorts" in title:
+                    continue
+                st = v.get("status", {})
+                privacy = st.get("privacyStatus", "public")
+                if privacy == "unlisted":
+                    continue
+                pub = st.get("publishAt") or v.get("snippet", {}).get("publishedAt", "")
+                if not pub:
+                    continue
+                dt = datetime.fromisoformat(pub.replace("Z", "+00:00"))
+                occupied.add(dt.date().isoformat())
+        return occupied
+    except Exception:
+        return None
+
+
+def last_long_form_upload_date(youtube) -> date | None:
+    """Return date+1 of latest long-form publish date. None on error.
+
+    Kept for backwards compat. New code should use
+    ``get_youtube_publish_dates`` which returns full set.
+    """
+    from datetime import timedelta
+    try:
+        dates = get_youtube_publish_dates(youtube)
+        if not dates:
             return None
+        latest = max(dates)
         return latest + timedelta(days=1)
     except Exception:
         return None
@@ -467,14 +517,37 @@ def main() -> None:
     original_privacy = privacy
     from datetime import date as _date
     start_date: _date | None = None
+    yt_publish_dates: set[str] = set()
     if args.publish_at == AUTO_PUBLISH_MODE:
-        free = last_long_form_upload_date(youtube)
-        if free:
-            start_date = free
-            print(f"  [Schedule] Next free date from YouTube: {free.isoformat()}", flush=True)
+        yt_publish_dates = get_youtube_publish_dates(youtube) or set()
+        if yt_publish_dates:
+            latest_yt = max(yt_publish_dates)
+            from datetime import date as _date, timedelta as _td
+            start_date = _date.fromisoformat(latest_yt) + _td(days=1)
+            print(
+                f"  [Schedule] YouTube: {len(yt_publish_dates)} occupied dates, "
+                f"latest={latest_yt}, next free from {start_date.isoformat()}",
+                flush=True,
+            )
         else:
-            print("  [Schedule] YouTube API query failed, using today as fallback", flush=True)
+            print("  [Schedule] YouTube API query failed/empty, using today as fallback", flush=True)
     reserved_publish_date: str | None = None
+    # In auto mode, load the ledger-occupied dates BEFORE entering the lock
+    # so the resolver can skip slots already reserved by other pending
+    # uploads. Without this, the resolver can pick a date the YouTube API
+    # says is free, but the ledger has reserved for a future video, and
+    # _reserve_publish_slot_locked below crashes with "Publish slot
+    # already reserved". (load_occupied_publish_dates also takes the lock,
+    # so it must be called outside the with-block below to avoid deadlock.)
+    occupied_dates: set[str] = set()
+    if args.publish_at == AUTO_PUBLISH_MODE:
+        # YouTube API dates are authoritative; ledger fills gap for
+        # in-flight reservations not yet uploaded to YouTube.
+        occupied_dates = set(yt_publish_dates)
+        try:
+            occupied_dates |= load_occupied_publish_dates()
+        except Exception as exc:
+            print(f"  [WARN] Could not load publish schedule ledger: {exc}", flush=True)
     try:
         with _publish_schedule_lock():
             privacy, publish_at_utc, publish_tz, publish_local = resolve_publish_schedule(
@@ -483,7 +556,7 @@ def main() -> None:
                 meta=meta,
                 privacy=privacy,
                 start_date=start_date,
-                occupied_dates=set(),
+                occupied_dates=occupied_dates,
             )
             if publish_at_utc:
                 reserved_publish_date = _reserve_publish_slot_locked(

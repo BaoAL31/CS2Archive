@@ -211,11 +211,15 @@ def main() -> None:
     ]))
 
     if args.variant == "overlay":
-        title = f"{title} | Input Overlay + Utility Cam"
+        # Strip " Rating" to keep title short — just the number
+        title = title.replace(" Rating", "")
+        title = f"{title} | W/ Inputs + Utility Cams"
+        if len(title) > 100:
+            title = title[:97].rstrip() + "..."
         description = (
             f"{description}\n\n"
             "This version includes a real-time keyboard & mouse input overlay "
-            "plus utility throw flight camera (chase-cam) PiP clips for smokes, "
+            "plus utility trajectory clips for smokes, "
             "flashes, molotovs, and other grenades."
         )
         extra_overlay_tags = [

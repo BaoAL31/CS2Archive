@@ -20,11 +20,14 @@ from cs2_minimizer import CS2Minimizer
 CSDM = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
 FFMPEG_PATH = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
 GAME_CFG = Path(r"D:\Steam\steamapps\common\Counter-Strike Global Offensive\game\csgo\cfg")
+CFG_BACKUP_DIR = Path(r"D:\Projects\CS2UtilArchive\cs2_config_backup")
 
-AUTOEXEC_RENDER = GAME_CFG / "autoexec_render.cfg"
-AUTOEXEC_PERSONAL = GAME_CFG / "autoexec_personal.cfg"
-AUTOEXEC_PERSONAL_BACKUP = GAME_CFG / "autoexec_personal_backup.cfg"
-AUTOEXEC_MAIN = GAME_CFG / "autoexec.cfg"
+# Source-of-truth personal cfgs live OUTSIDE Steam folder (Steam flags them).
+# Render writes to GAME_CFG/autoexec.cfg during rendering; finally restores from backup.
+AUTOEXEC_RENDER = GAME_CFG / "autoexec_render.cfg"  # pre-render render-crosshair template
+AUTOEXEC_PERSONAL = CFG_BACKUP_DIR / "autoexec_personal.cfg"
+AUTOEXEC_PERSONAL_BACKUP = CFG_BACKUP_DIR / "autoexec_personal_backup.cfg"
+AUTOEXEC_MAIN = GAME_CFG / "autoexec.cfg"  # active cfg CS2 reads on startup
 RENDER_CROSSHAIR_CFG = GAME_CFG / "render_crosshair.cfg"
 
 os.environ["HF_HOME"] = "D:/.cache/huggingface"
@@ -244,9 +247,16 @@ def _write_render_autoexec(cvars: list[str]) -> None:
 
 def _swap_autoexec(src: Path) -> None:
     if src == AUTOEXEC_PERSONAL and not AUTOEXEC_PERSONAL.exists():
-        src = AUTOEXEC_PERSONAL_BACKUP
+        if AUTOEXEC_PERSONAL_BACKUP.exists():
+            src = AUTOEXEC_PERSONAL_BACKUP
+        else:
+            print(f"  [ERROR] No personal autoexec found at {AUTOEXEC_PERSONAL} or {AUTOEXEC_PERSONAL_BACKUP}")
+            print(f"          CS2 will keep using the last-rendered crosshair cfg until you fix this.")
+            return
     if src.exists():
         shutil.copy2(str(src), str(AUTOEXEC_MAIN))
+    else:
+        print(f"  [ERROR] Swap source missing: {src}")
 
 
 def _kill_stale_processes() -> None:

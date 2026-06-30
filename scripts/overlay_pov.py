@@ -539,6 +539,7 @@ def _run_batch_util_cams_subprocess(
     data_dir: Path,
     util_cams_root: Path,
     chunk_size: int = 0,
+    demo_data_dir_name: str | None = None,
 ) -> int:
     """Shell out to scripts/render_util_cams.py for util_cam prep + render.
 
@@ -551,6 +552,14 @@ def _run_batch_util_cams_subprocess(
     """
     import subprocess
     script_path = Path(__file__).resolve().parent / "render_util_cams.py"
+    # Extract demo_id from the per-demo data dir name. Caller passes the
+    # leaf explicitly because the parent (data_dir) doesn't start with "demo=".
+    # Leaf: "demo=2395002-furia-vs-falcons-m2-anubis" → "2395002-furia-vs-falcons-m2-anubis".
+    demo_id = None
+    if demo_data_dir_name and demo_data_dir_name.startswith("demo="):
+        demo_id = demo_data_dir_name[len("demo="):]
+    elif data_dir and data_dir.name.startswith("demo="):
+        demo_id = data_dir.name[len("demo="):]
     cmd = [
         sys.executable, str(script_path),
         "--util-cams-root", str(util_cams_root.resolve()),
@@ -558,6 +567,8 @@ def _run_batch_util_cams_subprocess(
         "--steamid", str(steam_id),
         "--chunk-size", str(chunk_size),
     ]
+    if demo_id:
+        cmd += ["--demo-id", demo_id]
     _log(f"  [flight] CMD: {' '.join(cmd)}")
     try:
         result = subprocess.run(
@@ -624,6 +635,7 @@ def _render_throw_flight_clips(
     round_offsets: dict[int, float] | None = None,
     round_tick_ranges: dict[int, tuple[int, int]] | None = None,
     total_duration_seconds: float = 0.0,
+    util_cams_root: Path | None = None,
 ) -> list[PipClip]:
     """Render CSDM flight clips for each player throw.
 
@@ -667,19 +679,27 @@ def _render_throw_flight_clips(
     else:
         _log(f"  [flight] WARN: no CS2UtilArchive data dir — flight cams will be skipped")
 
-    # Resolve utility_cams directory near the video (persistent render cache)
-    video_dir = video_path.parent if video_path else output_dir
-    util_cams_root: Path | None = None
-    p = video_dir
-    for _ in range(5):
-        cand = p / "utility_cams"
-        if cand.is_dir():
-            util_cams_root = cand
-            break
-        p = p.parent
-    if util_cams_root is None:
-        util_cams_root = video_dir / "utility_cams"
-    util_cams_root.mkdir(parents=True, exist_ok=True)
+    # Resolve utility_cams directory. Explicit --util-cams-root wins (used by
+    # pipeline in dual-upload mode to point at the persistent render cache
+    # under renders/, not a freshly-created dir under youtube/).
+    if util_cams_root is not None:
+        util_cams_root = Path(util_cams_root)
+        util_cams_root.mkdir(parents=True, exist_ok=True)
+    else:
+        # Walk up from video looking for an existing utility_cams/ cache.
+        video_dir = video_path.parent if video_path else output_dir
+        resolved: Path | None = None
+        p = video_dir
+        for _ in range(5):
+            cand = p / "utility_cams"
+            if cand.is_dir():
+                resolved = cand
+                break
+            p = p.parent
+        if resolved is None:
+            resolved = video_dir / "utility_cams"
+        resolved.mkdir(parents=True, exist_ok=True)
+        util_cams_root = resolved
 
     # Build per-round frame ranges from round_offsets
     round_frame_ranges = {}
@@ -717,14 +737,16 @@ def _render_throw_flight_clips(
 
     if needs_render and data_dir is not None:
         _log(f"  [flight] Subprocess: batch_util_cams.py (batched, one CS2 launch per chunk)")
-        # data_dir is the per-demo dir (throws.parquet sits inside it).
-        # batch_util_cams.py expects the parent (containing demo=* subdirs).
+        # data_dir is the per-demo dir (e.g. demo=2395002-furia-vs-falcons-m2-anubis).
+        # batch_util_cams.py expects the PARENT (containing demo=* subdirs).
+        # Pass both: parent to the subprocess, leaf to extract --demo-id.
         data_dir_parent = data_dir.parent
         _run_batch_util_cams_subprocess(
             demo_path=demo_path,
             steam_id=steam_id,
             data_dir=data_dir_parent,
             util_cams_root=util_cams_root,
+            demo_data_dir_name=data_dir.name,
         )
         # Re-scan after batch render to pick up newly written mp4s + _throw_poses.json
         pre_rendered = _scan_utility_cams_clips(video_path) if video_path else {}
@@ -981,6 +1003,7 @@ def run_overlay(
     steam_id: str,
     round_num: int | None = None,
     batches: int = 5,
+    util_cams_root: Path | None = None,
 ) -> None:
     """Apply keyboard overlay + utility throw flight PiP onto video_path (in place)."""
     if not video_path.exists():
@@ -1170,6 +1193,7 @@ def run_overlay(
             round_offsets=round_offsets or None,
             round_tick_ranges=round_tick_ranges or None,
             total_duration_seconds=video_total_seconds,
+            util_cams_root=util_cams_root,
         )
         if flight_clips:
             _log(f"Flight clips: {len(flight_clips)} ({time.time()-t3:.1f}s)")
@@ -1478,8 +1502,11 @@ def main() -> None:
                              "0=single-pass (slow on large videos). "
                              "Smaller filter graph per batch -> 2-3x speedup; "
                              "crash resumes from last completed batch.")
+    parser.add_argument("--util-cams-root", type=Path, default=None,
+                        help="Path to utility_cams/ cache dir. Default: walk up from video.")
     args = parser.parse_args()
-    run_overlay(Path(args.video), Path(args.demo), args.steam_id, args.round, args.batches)
+    run_overlay(Path(args.video), Path(args.demo), args.steam_id, args.round, args.batches,
+                util_cams_root=args.util_cams_root)
 
 
 if __name__ == "__main__":

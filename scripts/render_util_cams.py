@@ -275,17 +275,49 @@ def _write_throw_poses(entry: BatchSpotJob, out_path: Path) -> None:
           f"({throw_id}; {n_total} throw(s) in dir)", flush=True)
 
 
-def _resolve_throws_parquet(data_dir: Path, util_cams_root: Path) -> tuple[pd.DataFrame | None, Path | None]:
+def _resolve_throws_parquet(
+    data_dir: Path,
+    util_cams_root: Path,
+    demo_id: str | None = None,
+) -> tuple[pd.DataFrame | None, Path | None]:
     """Find throws.parquet matching the util_cam dir naming.
 
     CS2Archive util_cam leaf = throw_id slug like "2395002-furia-vs-falcons-m3-inferno_e142_s1"
     (or legacy "furia-vs-falcons-m3-inferno").
     CS2UtilArchive demo dir = "demo=2395002-furia-vs-falcons-m3-inferno"
 
-    Strategy: extract demo_id from throw_id slug (everything before _e<digits>_s<digits>),
-    then look up matching demo=* dir.
+    Strategy:
+      1. If --demo-id is given, look up demo=<id>/throws.parquet directly.
+      2. Otherwise, extract demo_id from existing util_cam dir slugs
+         (everything before _e<digits>_s<digits>), then look up matching demo=* dir.
     """
     import re
+    demo_dir_by_stem: dict[str, Path] = {}
+    for d in data_dir.iterdir():
+        if not (d.is_dir() and d.name.startswith("demo=")):
+            continue
+        stem = d.name[len("demo="):]
+        demo_dir_by_stem[stem] = d
+        # Also map short slug
+        slug = "-".join(stem.split("-")[1:]) if "-" in stem else stem
+        demo_dir_by_stem[slug] = d
+
+    # 1. Explicit --demo-id (works on first run with empty util_cams_root)
+    if demo_id:
+        if demo_id in demo_dir_by_stem:
+            tp = demo_dir_by_stem[demo_id] / "throws.parquet"
+            if tp.is_file():
+                return pd.read_parquet(tp), demo_dir_by_stem[demo_id]
+        # Also try short slug form
+        m = re.match(r"^\d+-(.+)$", demo_id)
+        if m:
+            short = m.group(1)
+            if short in demo_dir_by_stem:
+                tp = demo_dir_by_stem[short] / "throws.parquet"
+                if tp.is_file():
+                    return pd.read_parquet(tp), demo_dir_by_stem[short]
+
+    # 2. Fallback: discover from existing util_cam dirs
     util_dirs = _discover_util_cams(util_cams_root)
     needed_demo_ids: set[str] = set()
     for ud in util_dirs:
@@ -297,16 +329,6 @@ def _resolve_throws_parquet(data_dir: Path, util_cams_root: Path) -> tuple[pd.Da
         else:
             # Legacy short slug
             needed_demo_ids.add(leaf)
-
-    demo_dir_by_stem: dict[str, Path] = {}
-    for d in data_dir.iterdir():
-        if not (d.is_dir() and d.name.startswith("demo=")):
-            continue
-        stem = d.name[len("demo="):]
-        demo_dir_by_stem[stem] = d
-        # Also map short slug
-        slug = "-".join(stem.split("-")[1:]) if "-" in stem else stem
-        demo_dir_by_stem[slug] = d
 
     for leaf in needed_demo_ids:
         if leaf in demo_dir_by_stem:
@@ -459,6 +481,9 @@ def main() -> int:
                     help="CS2UtilArchive per-demo data dir (parent of throws.parquet)")
     ap.add_argument("--steamid", type=int, default=None,
                     help="Filter throws.parquet by thrower_steamid (default: all players)")
+    ap.add_argument("--demo-id", default=None,
+                    help="Full demo slug like '2395002-furia-vs-falcons-m2-anubis'. "
+                         "Required on first run when util_cams_root has no dirs yet.")
     ap.add_argument("--chunk-size", type=int, default=0,
                     help="Spots per CS2 launch (default 0 = all in one launch).")
     ap.add_argument("--prepare-only", action="store_true",
@@ -480,7 +505,9 @@ def main() -> int:
 
     # Phase 1: PREP
     if not args.render_only:
-        throws_df, matched_demo_dir = _resolve_throws_parquet(data_dir, util_cams_root)
+        throws_df, matched_demo_dir = _resolve_throws_parquet(
+            data_dir, util_cams_root, demo_id=args.demo_id,
+        )
         if throws_df is None:
             # No unrendered util_cam dirs → look at ANY util_cam dir (rendered or
             # not) to find the demo_id. Fall back to data_dir scan only if even

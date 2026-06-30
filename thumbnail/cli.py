@@ -161,7 +161,7 @@ def main() -> None:
         "--variant",
         choices=["raw", "overlay"],
         default="raw",
-        help="Variant: 'raw' (default) or 'overlay' (adds W/ INPUT OVERLAY badge)",
+        help="Variant: 'raw' (default) or 'overlay' (adds W/ INPUT OVERLAY and + UTIL CAMS badges)",
     )
     parser.add_argument("--output", "-o", help="Output path (defaults to youtube/...)")
     args = parser.parse_args()
