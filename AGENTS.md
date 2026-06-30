@@ -57,6 +57,7 @@ python scripts/pipeline.py --backlog backlog/spirit-vs-falcons-iem-cologne-major
 - **`--batches N`** — rounds per render batch (default: 10). Each batch produces one MP4 named `batch-{start:03d}-{end:03d}.mp4`. `--batches 1` is equivalent to the old per-round model.
 - **`--until N`** — stop after step N (e.g. `--until 5` runs through thumbnail, skips upload/cleanup). Default: run through step 7.
 - **`--dual-upload`** — produce and upload a **second independent variant** with the keyboard + util-cam overlay applied. Default behavior (no flag) is 100% unchanged.
+- **`--overlay-only`** — upload only the overlay variant. Implies `--dual-upload`'s overlay branch but skips raw video copy / raw outro / raw thumbnail / raw upload. No `youtube/{run_id}/` dir created, no `youtube_id` state key. Use when you only want the keyboard+util-cam version on the channel. State stored under `overlay_only=True` for resume.
 
 ### Dual-Upload (`--dual-upload`)
 
@@ -82,6 +83,8 @@ Both variants get independent `upload_meta.json`, independent YouTube video IDs 
 **Cost:** adds one full overlay rendering (~30–60 min for 20+ throws) and one extra YouTube upload. Use only for matches where the overlay version adds value (high-profile matches, educational content).
 
 **Backwards compat:** without `--dual-upload`, behavior is **identical** to before — step 4 still runs the overlay script but its sidecar output is left orphaned exactly as before. No new directories created. No new state keys. Existing `youtube/{run_id}/` and `.pipeline/{run_id}.json` files unaffected.
+
+**`--overlay-only`** is a strict subset of `--dual-upload` for the overlay branch. Resuming a failed overlay-only run with the same flag re-runs only the missing overlay work; no raw artifacts are ever produced.
 
 ### Chaining pipelines (upload overlap)
 
@@ -259,10 +262,12 @@ With `--dual-upload`, a second variant is added:
 ```
 youtube/
 └── {match-slug}_{player}_{map}_overlay/
-    ├── thumbnail.png       (1280×720 PNG, with "W/ INPUT OVERLAY" badge)
+    ├── thumbnail.png       (1280×720 PNG, with W/ INPUT OVERLAY + + UTIL CAMS badges bottom-right)
     ├── video.mp4           (overlay-enhanced POV, same dimensions, with keyboard + util cam)
     └── upload_meta.json    (title suffix "| Input Overlay + Utility Cam", extra tags, overlay note in description)
 ```
+
+**Overlay thumbnail background (canon):** for `variant=overlay`, the pipeline extracts a single frame from `combined.overlay.mp4` (the actual overlay video) at ~40% duration, scales to 1920×1080, and passes it to the thumbnail CLI as `--background`. The keyboard overlay and util-cam PiP are faintly visible behind the Gaussian blur — proof the variant has real overlay content. Falls back to kill-frame extraction (from raw demo) if the overlay video is missing.
 
 ## Architecture
 

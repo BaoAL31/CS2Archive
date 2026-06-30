@@ -179,6 +179,13 @@ class Pipeline:
         self.state.setdefault("data", {})
         self.state["data"]["steam_id"] = self.steam_id
 
+        # Resume-safe: if a prior run set overlay_only and the user didn't
+        # re-pass --overlay-only on resume, honor the persisted choice.
+        if self.state["data"].get("overlay_only") and not self.overlay_only:
+            self.overlay_only = True
+            self.dual_upload = True
+            self.overlay_youtube_dir = self.youtube_dir.with_name(self.youtube_dir.name + "_overlay")
+
         if self.state["data"].get("demo_path"):
             self.demo_path = Path(self.state["data"]["demo_path"])
         self.state["data"]["render_dir"] = str(self.render_dir)
@@ -187,6 +194,8 @@ class Pipeline:
         if self.dual_upload and self.overlay_youtube_dir is not None:
             self.state["data"]["overlay_youtube_dir"] = str(self.overlay_youtube_dir)
             self.state["data"]["dual_upload"] = True
+        if self.overlay_only:
+            self.state["data"]["overlay_only"] = True
         if self.avatar_path:
             self.state["data"]["avatar_path"] = str(self.avatar_path)
 
@@ -367,25 +376,30 @@ class Pipeline:
         if combined.stat().st_size < 100000:
             fail(3, "CONCAT_OUTPUT_TOO_SMALL", f"combined.mp4 suspiciously small: {combined.stat().st_size} bytes")
 
-        self.youtube_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(str(combined), str(self.youtube_dir / "video.mp4"))
-        vid_size = (self.youtube_dir / "video.mp4").stat().st_size
-        print(f"  [OK] Copied video.mp4 ({vid_size / 1e9:.1f} GB)")
-
-        # Copy round_offsets sidecar (required by overlay_pov.py for per-round
-        # tick mapping and batched overlay boundaries). concat_rounds.py writes
-        # it as combined.round_offsets.json next to combined.mp4. overlay_pov.py
-        # looks for <video_stem>.round_offsets.json next to video.mp4.
+        # overlay-only: skip raw youtube dir entirely. The overlay variant
+        # becomes the only output. (Raw combined.mp4 is still produced by
+        # concat_rounds.py in render_dir; we just don't copy it to a
+        # youtube/{run_id}/ dir, never add outro/thumbnail/upload for it.)
         offsets_src = self.render_dir / f"{self.render_dir.name}.round_offsets.json"
         if not offsets_src.is_file():
             offsets_src = self.render_dir / "combined.round_offsets.json"
-        if offsets_src.is_file():
-            shutil.copy2(str(offsets_src),
-                         str(self.youtube_dir / "video.round_offsets.json"))
-            print(f"  [OK] Copied video.round_offsets.json")
-        else:
-            print(f"  [warn] round_offsets.json not found in render dir; "
-                  f"overlay_pov.py will fall back to linear tick mapping")
+        if not self.overlay_only:
+            self.youtube_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(combined), str(self.youtube_dir / "video.mp4"))
+            vid_size = (self.youtube_dir / "video.mp4").stat().st_size
+            print(f"  [OK] Copied video.mp4 ({vid_size / 1e9:.1f} GB)")
+
+            # Copy round_offsets sidecar (required by overlay_pov.py for per-round
+            # tick mapping and batched overlay boundaries). concat_rounds.py writes
+            # it as combined.round_offsets.json next to combined.mp4. overlay_pov.py
+            # looks for <video_stem>.round_offsets.json next to video.mp4.
+            if offsets_src.is_file():
+                shutil.copy2(str(offsets_src),
+                             str(self.youtube_dir / "video.round_offsets.json"))
+                print(f"  [OK] Copied video.round_offsets.json")
+            else:
+                print(f"  [warn] round_offsets.json not found in render dir; "
+                      f"overlay_pov.py will fall back to linear tick mapping")
 
         # Dual-upload: also copy raw combined into the overlay variant dir.
         # Step 4 will overwrite this with the overlay-enhanced version.
@@ -497,7 +511,8 @@ class Pipeline:
         print(f"  [OK] Outro appended in {youtube_dir.name}/ ({vid_mb:.0f} MB)")
 
     def step_outro(self) -> None:
-        self._append_outro(self.youtube_dir, step_num=5)
+        if not self.overlay_only:
+            self._append_outro(self.youtube_dir, step_num=5)
         if self.dual_upload and self.overlay_youtube_dir is not None:
             self._append_outro(self.overlay_youtube_dir, step_num=5)
 
@@ -553,7 +568,8 @@ class Pipeline:
         self._write_upload_meta(youtube_dir, variant=variant, step_num=step_num)
 
     def step_thumbnail(self) -> None:
-        self._generate_thumbnail(self.youtube_dir, variant="raw", step_num=6)
+        if not self.overlay_only:
+            self._generate_thumbnail(self.youtube_dir, variant="raw", step_num=6)
         if self.dual_upload and self.overlay_youtube_dir is not None:
             self._generate_thumbnail(
                 self.overlay_youtube_dir, variant="overlay", step_num=6,
@@ -685,9 +701,10 @@ class Pipeline:
                  f"[{variant}] could not extract video ID: {out[:200]}")
 
     def step_upload(self) -> None:
-        self._upload_variant(
-            self.youtube_dir, variant="raw", state_key="youtube_id", step_num=7,
-        )
+        if not self.overlay_only:
+            self._upload_variant(
+                self.youtube_dir, variant="raw", state_key="youtube_id", step_num=7,
+            )
         if self.dual_upload and self.overlay_youtube_dir is not None:
             self._upload_variant(
                 self.overlay_youtube_dir, variant="overlay",
@@ -730,6 +747,14 @@ def main() -> None:
         action="store_true",
         help="Produce and upload a second, independent overlay variant "
              "(separate youtube dir, title, thumbnail, description).",
+    )
+    parser.add_argument(
+        "--overlay-only",
+        action="store_true",
+        help="Upload only the overlay variant. Skips raw video copy, raw "
+             "outro, raw thumbnail, and raw upload. Implies --dual-upload's "
+             "overlay branch. Use this when you only ever want the "
+             "keyboard+util-cam version on the channel.",
     )
     parser.add_argument(
         "--overlay-batches",
