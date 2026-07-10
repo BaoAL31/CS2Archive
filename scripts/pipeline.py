@@ -1,5 +1,5 @@
 """
-E2E pipeline: backlog metadata -> analyze -> render -> concat -> thumbnail -> upload.
+E2E pipeline: backlog metadata -> analyze -> render -> concat -> overlay -> outro -> thumbnail.
 Reads all POV metadata from a backlog file.
 Structured errors for agent parsing.
 Auto-downloads missing demos from HuggingFace if hf_root is set.
@@ -13,9 +13,14 @@ Steps (use --step N to start at a specific step):
   3 = concat     Concatenate rounds, copy to youtube/
   4 = overlay    Apply input overlay + util cam (skipped unless --dual-upload)
   5 = outro      Generate 5s silent outro, concat onto video.mp4
-  6 = thumbnail  Generate 1280x720 thumbnail
-  7 = upload     Upload to YouTube
-  8 = cleanup    Remove renders folder + pipeline state
+  6 = thumbnail  Generate 1280x720 thumbnail + write upload_meta.json
+  7 = cleanup    Remove renders folder + pipeline state
+
+NOTE: Uploading is NOT done by the pipeline. The pipeline only produces the
+finished video, thumbnail, and upload_meta.json (title/description/tags/
+thumbnail_path/youtube_id=None/upload_status="pending"). A separate script,
+scripts/upload_pending.py, scans every upload_meta.json under youtube/ and
+uploads any that are still pending.
 
 Dual-upload (--dual-upload): produces a second, independent variant with
 keyboard/utility overlay. Raw variant -> youtube/{run_id}/
@@ -61,8 +66,7 @@ STEPS = {
     4: "overlay",
     5: "outro",
     6: "thumbnail",
-    7: "upload",
-    8: "cleanup",
+    7: "cleanup",
 }
 
 REQUIRED_META_FIELDS = [
@@ -157,9 +161,11 @@ class Pipeline:
         self.start_step = args.step if args.step is not None else 1
         self._cli_step = args.step  # None = no explicit --step → allow auto-skip
         self.end_step = args.until if args.until is not None else max(STEPS.keys())
-        # --no-cleanup caps end_step at 7 (skip step 8).
+        # --no-cleanup caps end_step at one below the last step (skip cleanup).
+        # Default run therefore stops after thumbnail (step 6), producing the
+        # finished video + upload_meta.json but NOT uploading or cleaning up.
         if getattr(args, "no_cleanup", True) and self.end_step == max(STEPS.keys()):
-            self.end_step = 7
+            self.end_step = max(STEPS.keys()) - 1
 
         # Dual-upload: when True, also process an overlay variant as a second
         # independent upload (separate youtube dir, title, thumbnail, meta).
@@ -407,7 +413,7 @@ class Pipeline:
     # ── Step 3: Concat ───────────────────────────────────────────────────
 
     def _copy_video_to_youtube(
-        self, youtube_dir: Path, source: Path, offsets_src: Path | None,
+        self, youtube_dir: Path, source: Path,
         label: str,
     ) -> None:
         """Copy ``source`` to ``youtube_dir/video.mp4`` unless a non-trivial
@@ -444,6 +450,25 @@ class Pipeline:
             shutil.copy2(str(src), str(youtube_dir / "video.round_offsets.json"))
             print(f"  [OK] Copied video.round_offsets.json to {youtube_dir.name}")
 
+    def _copy_overlay_result_to_youtube(self, overlay: Path) -> None:
+        """Copy .overlay.mp4 from renders work dir to overlay youtube dir.
+        Resume-safe: skips if target >= 1MB."""
+        if self.overlay_youtube_dir is None:
+            print("  [skip] no overlay_youtube_dir configured")
+            return
+        target = self.overlay_youtube_dir / "video.mp4"
+        if target.exists() and target.stat().st_size > 1_000_000:
+            print(f"  [skip] overlay video.mp4 already present "
+                  f"({target.stat().st_size / 1e9:.1f} GB)")
+            return
+        if not overlay.exists():
+            fail(4, "OVERLAY_OUTPUT_MISSING",
+                 f"overlay result not found: {overlay}")
+        self.overlay_youtube_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(overlay), str(target))
+        print(f"  [OK] Copied overlay video.mp4 "
+              f"({target.stat().st_size / 1e9:.1f} GB)")
+
     def step_concat(self) -> None:
         if not self.render_dir.exists():
             fail(3, "CONCAT_RENDER_DIR_MISSING", f"render dir not found: {self.render_dir}")
@@ -467,12 +492,11 @@ class Pipeline:
             self._copy_video_to_youtube(self.youtube_dir, combined, label="raw")
             self._copy_round_offsets(self.youtube_dir)
 
-        # Dual-upload: also copy raw combined into the overlay variant dir.
-        # Step 4 will overwrite this with the overlay-enhanced version.
-        if self.dual_upload and self.overlay_youtube_dir is not None:
-            self.overlay_youtube_dir.mkdir(parents=True, exist_ok=True)
-            self._copy_video_to_youtube(self.overlay_youtube_dir, combined, label="overlay")
-            self._copy_round_offsets(self.overlay_youtube_dir)
+        # Note: do NOT copy combined.mp4 to overlay_youtube_dir here.
+        # Step 4 (overlay) creates the overlay dir and writes the overlaid
+        # video. Copying the raw video here would let step 4 silently skip
+        # (or fail to produce overlay) and leave a raw video in the overlay
+        # dir that would then be uploaded under the overlay variant name.
 
     # ── Step 4: Overlay ───────────────────────────────────────────────────
 
@@ -483,7 +507,9 @@ class Pipeline:
         (orphaned) behavior is preserved: overlay_pov.py writes a sidecar
         video.overlay.mp4 next to video.mp4 which is otherwise unused."""
         if self.dual_upload and self.overlay_youtube_dir is not None:
-            target_dir = self.overlay_youtube_dir
+            # Work under renders/ so intermediate files (batches, sidecar)
+            # don't clutter youtube/. Only copy final result to youtube/.
+            target_dir = self.render_dir / ".overlay_work"
         else:
             target_dir = self.youtube_dir
 
@@ -501,21 +527,47 @@ class Pipeline:
                 shutil.copy2(str(external), str(video_path))
                 print(f"  [recover] copied pre-rendered overlay "
                       f"({external.stat().st_size / 1e9:.1f} GB) from "
-                      f"{external.parent.name}/{external.name} -> overlay dir; "
+                  f"{external.parent.name}/{external.name} -> overlay work dir; "
                       f"skipping overlay_pov.py (already overlaid)")
+                self._copy_overlay_result_to_youtube(overlay=video_path)
                 return
             else:
-                print(f"  [skip] video.mp4 not found in {target_dir.name} "
-                      f"and no pre-rendered combined.overlay.mp4 in renders/")
-                return
+                if self.dual_upload:
+                    # Copy raw combined.mp4 to renders/.overlay_work/ as working file.
+                    src = self.render_dir / "combined.mp4"
+                    if not src.exists() or src.stat().st_size < 100_000:
+                        fail(4, "OVERLAY_NO_INPUT",
+                             f"combined.mp4 missing/empty in render_dir")
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(src), str(video_path))
+                    # Copy sidecar (round_offsets.json) alongside video.mp4
+                    # overlay_pov.py looks for <video>.round_offsets.json next to video
+                    sidecar_src = self.render_dir / "combined.round_offsets.json"
+                    if sidecar_src.is_file():
+                        sidecar_dst = target_dir / "video.round_offsets.json"
+                        shutil.copy2(str(sidecar_src), str(sidecar_dst))
+                        print(f"  [setup] copied sidecar to {sidecar_dst.name}")
+                    print(f"  [setup] copied combined.mp4 to renders/.overlay_work/ "
+                          f"for overlay_pov.py")
+                else:
+                    print(f"  [skip] video.mp4 not found in {target_dir.name} "
+                          f"and no pre-rendered combined.overlay.mp4 in renders/")
+                    return
         if not self.demo_path or not self.demo_path.exists():
+            if self.dual_upload:
+                fail(4, "OVERLAY_NO_DEMO",
+                     f"demo required for overlay but not found: {self.demo_path}")
             print("  [skip] demo not found")
             return
         steam_id = self.state["data"].get("steam_id", self.meta.get("steam_id", ""))
         if not steam_id:
+            if self.dual_upload:
+                fail(4, "OVERLAY_NO_STEAM_ID", "no steam_id for overlay")
             print("  [skip] no steam_id")
             return
 
+        work_dir = self.render_dir / ".overlay_work"
+        work_dir.mkdir(parents=True, exist_ok=True)
         r = self._run_py([
             "scripts/overlay_pov.py",
             "--video", str(video_path),
@@ -523,13 +575,13 @@ class Pipeline:
             "--steam-id", steam_id,
             "--batches", str(getattr(self.args, "overlay_batches", 10)),
             "--util-cams-root", str(self.render_dir / "utility_cams"),
+            "--work-dir", str(work_dir),
         ], timeout=7200)
         if r.returncode != 0:
             fail(4, "OVERLAY_FAILED", f"overlay_pov.py exited {r.returncode}")
 
         overlay_sidecar = video_path.with_suffix(".overlay.mp4")
         if not overlay_sidecar.exists():
-            # Overlay script did not produce a sidecar (e.g. nothing to overlay).
             if self.dual_upload:
                 fail(4, "OVERLAY_NO_OUTPUT",
                      f"overlay_pov.py succeeded but {overlay_sidecar} not found")
@@ -537,21 +589,14 @@ class Pipeline:
             return
 
         if self.dual_upload:
-            # Replace raw video.mp4 in the overlay dir with the overlaid version.
-            video_path.unlink()
-            shutil.move(str(overlay_sidecar), str(video_path))
-            mb = video_path.stat().st_size / 1024 / 1024
-            print(f"  [OK] Overlay applied to {target_dir.name}/video.mp4 ({mb:.0f} MB)")
+            # Copy overlay result from renders/ work dir -> youtube/ variant dir
+            self._copy_overlay_result_to_youtube(overlay=overlay_sidecar)
+            # Clean up renders/.overlay_work/
+            shutil.rmtree(target_dir, ignore_errors=True)
         else:
-            # Legacy behavior: sidecar left orphaned next to raw video.mp4.
+            # Legacy: sidecar lives next to raw video.mp4
             mb = overlay_sidecar.stat().st_size / 1024 / 1024
             print(f"  [OK] Overlay applied to video.mp4 (sidecar: {overlay_sidecar.name}, {mb:.0f} MB)")
-
-        # Cleanup any leftover batch-overlay-*.mp4 files (should already be
-        # removed by overlay_pov.py on success, but defensive cleanup in case
-        # of partial success or interrupted run).
-        for bf in target_dir.glob("batch-overlay-*.mp4"):
-            bf.unlink(missing_ok=True)
 
     def _append_outro(self, youtube_dir: Path, step_num: int = 5) -> None:
         """Generate a 5s silent outro and append it to video.mp4 inside
@@ -724,7 +769,8 @@ class Pipeline:
                 fail(step_num, "THUMBNAIL_BAD_SIZE",
                      f"thumbnail dimensions {im.size} != expected 1280x720")
         except ImportError:
-            pass
+            fail(step_num, "THUMBNAIL_PIL_MISSING",
+                 "PIL/Pillow not installed — required for thumbnail dimension validation")
 
         if bg_cleanup:
             try:
@@ -743,7 +789,7 @@ class Pipeline:
                 self.overlay_youtube_dir, variant="overlay", step_num=6,
             )
 
-    # ── Step 7: Upload ─────────────────────────────────────────────────
+    # ── Upload meta writer (runs inside thumbnail step) ────────────────
 
     def _write_upload_meta(
         self,
@@ -793,102 +839,7 @@ class Pipeline:
         meta_path.write_text(json.dumps(upload_meta, indent=2))
         print(f"  [OK] upload_meta.json written [{variant}]")
 
-    def _upload_variant(
-        self,
-        youtube_dir: Path,
-        variant: str,
-        state_key: str,
-        step_num: int = 7,
-    ) -> None:
-        """Upload a single variant (raw or overlay) to YouTube. Reads
-        upload_meta.json, runs upload_youtube.py, captures the YouTube ID,
-        and persists it under ``state_key`` in pipeline state.
-
-        Resume-safe: if upload_meta.json already has a ``youtube_id`` or
-        state already has one, the upload is skipped (variant was already
-        uploaded on a prior run)."""
-        video = youtube_dir / "video.mp4"
-        thumb = youtube_dir / "thumbnail.jpg"
-
-        meta_path = youtube_dir / "upload_meta.json"
-        if not meta_path.exists():
-            self._write_upload_meta(youtube_dir, variant=variant, step_num=step_num)
-
-        # Resume: trust any youtube_id we already have (state OR meta). Sync
-        # the meta to "completed" so a later run doesn't re-upload. Also
-        # clears any stale resumable_* fields from a partial prior attempt
-        # so upload_youtube.py can't accidentally resume a dead session.
-        try:
-            existing = json.loads(meta_path.read_text(encoding="utf-8"))
-        except Exception:
-            existing = {}
-        existing_id = existing.get("youtube_id") or self.state["data"].get(state_key)
-        if existing_id:
-            if existing.get("upload_status") != "completed":
-                existing["youtube_id"] = existing_id
-                existing["upload_status"] = "completed"
-                existing.pop("resumable_uri", None)
-                existing.pop("resumable_progress", None)
-                existing.pop("video_size", None)
-                meta_path.write_text(json.dumps(existing, indent=2))
-            self.state["data"][state_key] = existing_id
-            print(f"  [skip] {variant} already uploaded: https://youtu.be/{existing_id}")
-            return
-
-        if not video.exists():
-            fail(step_num, "UPLOAD_VIDEO_MISSING",
-                 f"[{variant}] video not found: {video}")
-        if video.stat().st_size < 100000:
-            fail(step_num, "UPLOAD_VIDEO_TOO_SMALL",
-                 f"[{variant}] video too small: {video.stat().st_size} bytes")
-
-        cmd = [
-            "scripts/upload_youtube.py",
-            str(video),
-            "--meta", str(meta_path),
-            "--privacy", "private",
-        ]
-        if thumb.exists():
-            cmd += ["--thumbnail", str(thumb)]
-
-        env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
-        proc = subprocess.Popen(
-            [PY] + cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            env=env, text=True, encoding="utf-8",
-        )
-        out_lines: list[str] = []
-        if proc.stdout:
-            for line in proc.stdout:
-                print(line, end="")
-                out_lines.append(line)
-        proc.wait()
-        out = "".join(out_lines)
-
-        if proc.returncode != 0:
-            fail(step_num, "UPLOAD_FAILED",
-                 f"[{variant}] upload exited {proc.returncode}: {out[:300]}")
-
-        m = re.search(r"https://youtu\.be/([a-zA-Z0-9_-]+)", out)
-        if m:
-            vid_id = m.group(1)
-            self.state["data"][state_key] = vid_id
-            print(f"  [OK] [{variant}] Uploaded: https://youtu.be/{vid_id}")
-        else:
-            fail(step_num, "UPLOAD_NO_VIDEO_ID",
-                 f"[{variant}] could not extract video ID: {out[:200]}")
-
-    def step_upload(self) -> None:
-        if not self.overlay_only:
-            self._upload_variant(
-                self.youtube_dir, variant="raw", state_key="youtube_id", step_num=7,
-            )
-        if self.dual_upload and self.overlay_youtube_dir is not None:
-            self._upload_variant(
-                self.overlay_youtube_dir, variant="overlay",
-                state_key="overlay_youtube_id", step_num=7,
-            )
-
-    # ── Step 8: Cleanup ────────────────────────────────────────────────
+    # ── Step 7: Cleanup ────────────────────────────────────────────────
 
     def step_cleanup(self) -> None:
         removed = []
@@ -915,11 +866,11 @@ class Pipeline:
 def main() -> None:
     parser = argparse.ArgumentParser(description="E2E Pipeline: backlog .md -> render -> thumbnail -> upload")
     parser.add_argument("--backlog", required=True, help="Path to backlog markdown file with BACKLOG_META")
-    parser.add_argument("--step", type=int, default=None, choices=range(1, 9),
-                        help="Start from step N (1=analyze..8=cleanup). "
+    parser.add_argument("--step", type=int, default=None, choices=range(1, 8),
+                        help="Start from step N (1=analyze..7=cleanup). "
                              "Default: auto-resume from last completed step.")
     parser.add_argument("--until", type=int, default=None, choices=range(1, 8),
-                        help="Stop after step N (default: 7)")
+                        help="Stop after step N (default: 6 = thumbnail, before cleanup)")
     parser.add_argument(
         "--dual-upload",
         action="store_true",
@@ -945,15 +896,15 @@ def main() -> None:
     parser.add_argument(
         "--no-cleanup",
         action="store_true", default=True,
-        help="Skip step 8 (delete renders/ + state file). ON BY DEFAULT. "
+        help="Skip step 7 (delete renders/ + state file). ON BY DEFAULT. "
              "Keeps render cache and pipeline state on disk for re-runs. "
-             "Pass --cleanup to run step 8 explicitly.",
+             "Pass --cleanup to run step 7 explicitly.",
     )
     parser.add_argument(
         "--cleanup",
         dest="no_cleanup",
         action="store_false",
-        help="Run step 8 cleanup (delete renders/ + state file). "
+        help="Run step 7 cleanup (delete renders/ + state file). "
              "Default: --no-cleanup. Use this flag to opt in.",
     )
     args = parser.parse_args()
@@ -963,7 +914,7 @@ def main() -> None:
     print(f"  CS2Archive Pipeline")
     print(f"  Player: {meta.get('player', '?')} | Map: {meta.get('map', '?')}")
     print(f"  Demo:   {meta.get('demo_path', '(unknown)')}")
-    print(f"  Step:   {args.step}" + (f" -> {args.until}" if args.until else f" -> 7"))
+    print(f"  Step:   {args.step}" + (f" -> {args.until}" if args.until else f" -> 6 (thumbnail; upload handled by upload_pending.py)"))
     print(f"{'='*60}")
 
     Pipeline(args).run()
