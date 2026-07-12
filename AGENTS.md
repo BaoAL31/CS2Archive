@@ -286,7 +286,8 @@ main.py → routing dict → commands/*.py (subparser + handle) → scrapers/*.p
 - `downloader.py` — file management, archive extraction, download history JSON.
 - `models.py` — Pydantic models shared across modules.
 - `thumbnail/` — thumbnail generator package (Pillow-based compositing, 1280×720 output).
-- `scripts/` — utility scripts for the pipeline (render, concat, cleanup, upload, `pipeline_chain.py`).
+- `scripts/` — utility scripts for the pipeline (render, concat, cleanup, upload, `pipeline_chain.py`) plus shared helpers (`cs2_minimizer.py`, `crosshair_code.py`).
+- `docs/` — design/context notes (`CONTEXT.md`, batching, dual-upload).
 - `assets/` — static resources (map images, fonts, CS2 config files).
 - `grafipy-out/` — knowledge graph (from `/graphify`). Not project code.
 
@@ -294,7 +295,7 @@ main.py → routing dict → commands/*.py (subparser + handle) → scrapers/*.p
 
 Installed from mattpocock/skills (see `skills-lock.json`):
 - `/grill-me` — stress-test a plan via relentless questioning
-- `/grill-with-docs` — same but also updates CONTEXT.md + ADRs
+- `/grill-with-docs` — same but also updates `docs/CONTEXT.md` + ADRs
 - `/handoff` — compact session into handoff doc for next agent
 - `/caveman` — ultra-compressed mode
 - `/wikify` — generate a Karpathy-style wiki from a thesis, project, paper, or report. Extracts concepts, methods, papers, datasets, and architecture into interlinked Markdown wiki articles.

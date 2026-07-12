@@ -10,8 +10,12 @@ import tempfile
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_SCRIPTS_DIR = _PROJECT_ROOT / "scripts"
 TMP_DIR = _PROJECT_ROOT / "tmp"
 TMP_DIR.mkdir(parents=True, exist_ok=True)
+for _p in (str(_PROJECT_ROOT), str(_SCRIPTS_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from rich.console import Console
 

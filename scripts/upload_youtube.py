@@ -76,84 +76,95 @@ def get_authenticated_service(scopes: list[str] | None = None, token_file: str |
     return build("youtube", "v3", credentials=creds)
 
 
-def get_youtube_publish_dates(youtube) -> set[str] | None:
+def get_youtube_publish_dates(youtube) -> set[str]:
     """Return set of YYYY-MM-DD dates with scheduled or published long-form vids.
 
     Queries channel uploads playlist (paginated), then ``videos().list`` in
     batches of 50 to fetch ``status.publishAt`` (actual public date for
     scheduled vids) and ``status.privacyStatus``. Skips Shorts and unlisted.
-    Returns ``None`` on error so caller can fall back to local ledger.
+    Raises on API error — no silent fallback.
     """
     from datetime import datetime
-    try:
-        channels = youtube.channels().list(part="contentDetails", mine=True).execute()
-        if not channels.get("items"):
-            return None
-        uploads_id = channels["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
+    channels = youtube.channels().list(part="contentDetails", mine=True).execute()
+    if not channels.get("items"):
+        return set()
+    uploads_id = channels["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
 
-        video_ids: list[str] = []
-        page_token: str | None = None
-        while True:
-            resp = youtube.playlistItems().list(
-                part="snippet",
-                playlistId=uploads_id,
-                maxResults=50,
-                pageToken=page_token,
-            ).execute()
-            for item in resp.get("items", []):
-                vid = (
-                    item.get("contentDetails", {}).get("videoId")
-                    or item.get("snippet", {}).get("resourceId", {}).get("videoId")
-                )
-                if vid:
-                    video_ids.append(vid)
-            page_token = resp.get("nextPageToken")
-            if not page_token:
-                break
+    video_ids: list[str] = []
+    page_token: str | None = None
+    while True:
+        resp = youtube.playlistItems().list(
+            part="snippet",
+            playlistId=uploads_id,
+            maxResults=50,
+            pageToken=page_token,
+        ).execute()
+        for item in resp.get("items", []):
+            vid = (
+                item.get("contentDetails", {}).get("videoId")
+                or item.get("snippet", {}).get("resourceId", {}).get("videoId")
+            )
+            if vid:
+                video_ids.append(vid)
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
 
-        if not video_ids:
-            return set()
+    if not video_ids:
+        return set()
 
-        occupied: set[str] = set()
-        for i in range(0, len(video_ids), 50):
-            batch = video_ids[i:i + 50]
-            resp = youtube.videos().list(
-                part="status,snippet",
-                id=",".join(batch),
-            ).execute()
-            for v in resp.get("items", []):
-                title = v.get("snippet", {}).get("title", "")
-                if "#Shorts" in title or "#shorts" in title:
-                    continue
-                st = v.get("status", {})
-                privacy = st.get("privacyStatus", "public")
-                if privacy == "unlisted":
-                    continue
-                pub = st.get("publishAt") or v.get("snippet", {}).get("publishedAt", "")
-                if not pub:
-                    continue
-                dt = datetime.fromisoformat(pub.replace("Z", "+00:00"))
-                occupied.add(dt.date().isoformat())
-        return occupied
-    except Exception:
-        return None
+    import re
+
+    def _is_short(v: dict) -> bool:
+        """True if this video is a YouTube Short (< 60s or #Shorts tag)."""
+        title = v.get("snippet", {}).get("title", "")
+        if "#Shorts" in title or "#shorts" in title:
+            return True
+        dur = v.get("contentDetails", {}).get("duration", "")
+        if dur:
+            # ISO 8601 duration PT1M30S, PT30S, PT1H
+            m = re.match(r"^PT(?:(\d+)M)?(?:(\d+)S)?$", dur)
+            if m:
+                mins = int(m.group(1) or 0)
+                secs = int(m.group(2) or 0)
+                if mins == 0 and secs < 60:
+                    return True
+        return False
+
+    occupied: set[str] = set()
+    for i in range(0, len(video_ids), 50):
+        batch = video_ids[i:i + 50]
+        resp = youtube.videos().list(
+            part="status,snippet,contentDetails",
+            id=",".join(batch),
+        ).execute()
+        for v in resp.get("items", []):
+            if _is_short(v):
+                continue
+            st = v.get("status", {})
+            privacy = st.get("privacyStatus", "public")
+            if privacy == "unlisted":
+                continue
+            pub = st.get("publishAt") or v.get("snippet", {}).get("publishedAt", "")
+            if not pub:
+                continue
+            dt = datetime.fromisoformat(pub.replace("Z", "+00:00"))
+            occupied.add(dt.date().isoformat())
+    return occupied
 
 
 def last_long_form_upload_date(youtube) -> date | None:
-    """Return date+1 of latest long-form publish date. None on error.
+    """Return date+1 of latest long-form publish date. Raises on error.
 
     Kept for backwards compat. New code should use
     ``get_youtube_publish_dates`` which returns full set.
     """
     from datetime import timedelta
-    try:
-        dates = get_youtube_publish_dates(youtube)
-        if not dates:
-            return None
-        latest = max(dates)
-        return latest + timedelta(days=1)
-    except Exception:
+    dates = get_youtube_publish_dates(youtube)
+    if not dates:
         return None
+    latest = max(dates)
+    return latest + timedelta(days=1)
 
 
 def _session_path(video_path: str) -> str:
@@ -444,6 +455,17 @@ def main() -> None:
         help=f"IANA timezone for --publish-at (default: {DEFAULT_PUBLISH_TZ})",
     )
     parser.add_argument("--update-thumbnail", help="Update thumbnail for an existing video ID")
+    parser.add_argument(
+        "--also-bilibili",
+        action="store_true",
+        help="After a successful YouTube upload, also upload to bilibili.tv "
+             "(requires .bilibili_storage.json; uses scripts/upload_bilibili.py)",
+    )
+    parser.add_argument(
+        "--bilibili-only",
+        action="store_true",
+        help="Skip YouTube; only upload to bilibili.tv from --meta / video",
+    )
     args = parser.parse_args()
 
     # Standalone thumbnail update mode
@@ -460,29 +482,28 @@ def main() -> None:
         print("Done!", flush=True)
         return
 
-    print("Authenticating with Google...", flush=True)
-    youtube = get_authenticated_service()
-
     # Upload mode
-    if not args.video:
+    if not args.video and not args.meta and not args.bilibili_only:
         print("[ERROR] <video> path required (use --update-thumbnail to only set a thumbnail)", flush=True)
         sys.exit(1)
 
-    video = Path(args.video)
+    meta = {}
+    meta_path_obj: Path | None = None
+    if args.meta:
+        meta_path_obj = Path(args.meta)
+        if not meta_path_obj.exists():
+            print(f"[ERROR] Meta file not found: {meta_path_obj}")
+            sys.exit(1)
+        meta = json.loads(meta_path_obj.read_text())
+
+    video = Path(args.video or meta.get("video_path", ""))
     if not video.exists():
         print(f"[ERROR] Video not found: {video}")
         sys.exit(1)
 
-    meta = {}
-    if args.meta:
-        meta_path = Path(args.meta)
-        if not meta_path.exists():
-            print(f"[ERROR] Meta file not found: {meta_path}")
-            sys.exit(1)
-        meta = json.loads(meta_path.read_text())
-    elif video.parent.name and (video.parent / "upload_meta.json").exists():
-        meta_path = video.parent / "upload_meta.json"
-        meta = json.loads(meta_path.read_text())
+    if not meta_path_obj and (video.parent / "upload_meta.json").exists():
+        meta_path_obj = video.parent / "upload_meta.json"
+        meta = json.loads(meta_path_obj.read_text())
 
     title = args.title or meta.get("title")
     if not title:
@@ -509,10 +530,53 @@ def main() -> None:
         print(f"[ERROR] Thumbnail not found: {thumbnail}")
         sys.exit(1)
 
+    meta_file_path = str(meta_path_obj or (video.parent / "upload_meta.json"))
+
+    def _run_bilibili() -> None:
+        from upload_bilibili import is_bilibili_pending, resolve_publish, upload_to_bilibili
+
+        meta_now = meta
+        if meta_path_obj and meta_path_obj.exists():
+            meta_now = json.loads(meta_path_obj.read_text(encoding="utf-8"))
+        if not is_bilibili_pending(meta_now):
+            print(
+                f"  [bili] already completed aid={meta_now.get('bilibili_aid')}",
+                flush=True,
+            )
+            return
+        thumb_path = Path(thumbnail) if thumbnail else None
+        if thumb_path and not thumb_path.exists():
+            alt = thumb_path.with_suffix(".jpg")
+            thumb_path = alt if alt.exists() else None
+        print("Uploading to bilibili.tv...", flush=True)
+        # Prefer schedule already written into meta (CLI --publish-at / auto).
+        pub = resolve_publish(meta_now)
+        aid = upload_to_bilibili(
+            video,
+            title=title,
+            description=description,
+            tags=list(tags or []),
+            thumbnail_path=thumb_path,
+            meta_path=meta_path_obj,
+            publish_at=pub,
+            variant=meta_now.get("variant"),
+        )
+        print(f"  Bilibili aid={aid}", flush=True)
+
+    if args.bilibili_only:
+        try:
+            _run_bilibili()
+            print("Done!", flush=True)
+        except Exception as e:
+            print(f"[ERROR] bilibili upload failed: {e}", flush=True)
+            sys.exit(1)
+        return
+
+    print("Authenticating with Google...", flush=True)
+    youtube = get_authenticated_service()
+
     if args.publish_at is None and "publish_at" not in meta:
         args.publish_at = AUTO_PUBLISH_MODE
-
-    meta_file_path = str(video.parent / "upload_meta.json")
 
     original_privacy = privacy
     from datetime import date as _date
@@ -530,7 +594,7 @@ def main() -> None:
                 flush=True,
             )
         else:
-            print("  [Schedule] YouTube API query failed/empty, using today as fallback", flush=True)
+            print("  [Schedule] No existing videos found on channel — no occupied dates to reserve", flush=True)
     reserved_publish_date: str | None = None
     # In auto mode, load the ledger-occupied dates BEFORE entering the lock
     # so the resolver can skip slots already reserved by other pending
@@ -541,13 +605,8 @@ def main() -> None:
     # so it must be called outside the with-block below to avoid deadlock.)
     occupied_dates: set[str] = set()
     if args.publish_at == AUTO_PUBLISH_MODE:
-        # YouTube API dates are authoritative; ledger fills gap for
-        # in-flight reservations not yet uploaded to YouTube.
+        # Only YouTube API dates — no local ledger.
         occupied_dates = set(yt_publish_dates)
-        try:
-            occupied_dates |= load_occupied_publish_dates()
-        except Exception as exc:
-            print(f"  [WARN] Could not load publish schedule ledger: {exc}", flush=True)
     try:
         with _publish_schedule_lock():
             privacy, publish_at_utc, publish_tz, publish_local = resolve_publish_schedule(
@@ -591,6 +650,13 @@ def main() -> None:
         if publish_at_utc:
             _record_publish_meta(meta_file_path, publish_local, publish_tz, publish_at_utc)
         print("Done!", flush=True)
+
+        if args.also_bilibili:
+            try:
+                _run_bilibili()
+            except Exception as e:
+                print(f"[ERROR] YouTube OK but bilibili failed: {e}", flush=True)
+                sys.exit(1)
     except BaseException:
         if reserved_publish_date:
             try:

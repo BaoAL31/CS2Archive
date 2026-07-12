@@ -148,15 +148,21 @@ def main() -> None:
     stage_raw = data.get("match_stage", "") if isinstance(data, dict) else ""
     stage = normalize_stage(stage_raw)
 
-    # Concrete title format: Player | Rating | TeamA vs TeamB | Map | Stage | Tournament
-    title = " | ".join(filter(None, [
-        args.player,
-        f"{rating} Rating" if rating != "?.??" else "",
-        f"{team_a_short} vs {team_b_short}",
-        args.map,
-        stage or None,
-        tournament_short or None,
-    ]))
+    # Title sections with removable priority (None = never drop).
+    # Trim priority when over YouTube's 100-char limit: 1=rating, 2=stage.
+    # Player / teams / map / tournament are always kept.
+    sections = [(args.player, None)]
+    if rating != "?.??":
+        rating_text = f"{rating}" if args.variant == "overlay" else f"{rating} Rating"
+        sections.append((rating_text, 1))
+    sections.append((f"{team_a_short} vs {team_b_short}", None))
+    sections.append((args.map, None))
+    if stage:
+        sections.append((stage, 2))
+    if tournament_short:
+        sections.append((tournament_short, None))
+
+    title = " | ".join(t for t, _ in sections)
 
     desc_lines = [
         f"{args.player}'s POV on {args.map}",
@@ -211,9 +217,16 @@ def main() -> None:
     ]))
 
     if args.variant == "overlay":
-        # Strip " Rating" to keep title short — just the number
-        title = title.replace(" Rating", "")
-        title = f"{title} | W/ Inputs + Utility Cams"
+        suffix = " | W/ Inputs + Util Overlay"
+        # Drop removable sections by priority (rating -> stage) until the
+        # full title+suffix fits YouTube's 100-char limit.
+        removable = sorted([s for s in sections if s[1] is not None],
+                           key=lambda s: s[1])
+        while len(title + suffix) > 100 and removable:
+            victim = removable.pop(0)
+            sections = [s for s in sections if s != victim]
+            title = " | ".join(t for t, _ in sections)
+        title = title + suffix
         if len(title) > 100:
             title = title[:97].rstrip() + "..."
         description = (

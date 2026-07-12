@@ -13,6 +13,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -20,6 +21,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 os.chdir(str(PROJECT_ROOT))
+
+# Redirect HuggingFace cache to D: drive (must be set before importing huggingface_hub)
+os.environ.setdefault("HF_HOME", "D:/.cache/huggingface")
+os.environ.setdefault("HF_HUB_CACHE", "D:/.cache/huggingface/hub")
 
 BACKLOG_DIR = PROJECT_ROOT / "backlog"
 
@@ -164,6 +169,45 @@ def _save_ratings_json(match_url: str, ratings: dict) -> Path:
     return path
 
 
+HF_REPO = "cs2povarchive/cs2-demos"
+
+
+def _download_match_from_hf(hf_root: str, slug: str, demo_folder: Path) -> list[Path]:
+    """Download all .dem files for a match from the HuggingFace dataset.
+
+    Remote layout: {hf_root}/{slug}/{filename}.dem  (slug already includes match id).
+    """
+    from huggingface_hub import HfApi, hf_hub_download
+
+    if not hf_root:
+        raise ValueError("hf_root (tournament) is empty; cannot locate demo on HuggingFace.")
+
+    api = HfApi()
+    prefix = f"{hf_root}/{slug}"
+    print(f"[HF] Listing {HF_REPO}:{prefix} ...")
+    items = list(api.list_repo_tree(HF_REPO, repo_type="dataset", path_in_repo=hf_root, recursive=True))
+    dems = [i for i in items if i.path.startswith(prefix + "/") and i.path.endswith(".dem")]
+    if not dems:
+        raise FileNotFoundError(
+            f"No .dem files found on HuggingFace under '{prefix}/'. "
+            f"Cannot create backlog without demos."
+        )
+
+    demo_folder.mkdir(parents=True, exist_ok=True)
+    out: list[Path] = []
+    for it in dems:
+        fname = Path(it.path).name
+        local = demo_folder / fname
+        if local.exists():
+            out.append(local)
+            continue
+        print(f"  [HF] Downloading {it.path}")
+        cached = hf_hub_download(repo_id=HF_REPO, filename=it.path, repo_type="dataset")
+        shutil.copy2(cached, local)
+        out.append(local)
+    return out
+
+
 async def main() -> None:
     if len(sys.argv) < 2:
         print(f"Usage: python {sys.argv[0]} <hltv_url>")
@@ -171,51 +215,38 @@ async def main() -> None:
 
     match_url = sys.argv[1]
 
-    from scrapers.hltv_acquire import acquire_match, match_slug_from_url, match_demo_dir
+    from scrapers.hltv_acquire import match_slug_from_url, match_demo_dir
     from scrapers.hltv import HLTVScraper
-    from models import DownloadStatus, DownloadResult, MatchInfo, DemoSource
     from scrapers.ratings import get_match_ratings
 
     slug = match_slug_from_url(match_url)
     demo_folder = match_demo_dir(slug)
+    demo_folder.mkdir(parents=True, exist_ok=True)
     existing_demos = list(demo_folder.glob("*.dem"))
-
-    if existing_demos:
-        print(f"[SKIP] Demos already exist in {demo_folder}")
-        result = DownloadResult(
-            match=MatchInfo(
-                match_id="",
-                source=DemoSource.HLTV,
-                url=match_url,
-                team1="",
-                team2="",
-            ),
-            status=DownloadStatus.SKIPPED,
-            demo_path=existing_demos[0],
-        )
-    else:
-        print("[DL] Acquiring match...")
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, acquire_match, match_url)
-
-        if result.status.name == "FAILED":
-            print(f"[ERR] Acquisition failed: {result.error}")
-            sys.exit(1)
-
-        print(f"[OK] Acquired to {result.demo_path.parent}")
 
     print("[SCRAPE] Scraping ratings...")
     ratings = await get_match_ratings(match_url)
-
     if not ratings or not ratings.get("tables"):
         print("[ERR] No ratings found")
         sys.exit(1)
-
     ratings_path = _save_ratings_json(match_url, ratings)
     print(f"[OK] Ratings saved to {ratings_path}")
 
     tournament = ratings.get("tournament", "")
     print(f"[OK] Tournament: {tournament}")
+    hf_root = re.sub(r"[^\w]", "_", tournament.lower()).strip("_") if tournament else ""
+    print(f"[OK] HF root: {hf_root}")
+
+    if existing_demos:
+        print(f"[SKIP] Demos already exist in {demo_folder}")
+    else:
+        print("[HF] Demos not found locally. Downloading from HuggingFace...")
+        try:
+            demos = _download_match_from_hf(hf_root, slug, demo_folder)
+        except Exception as e:
+            print(f"[ERR] HuggingFace download failed: {e}")
+            sys.exit(1)
+        print(f"[OK] Downloaded {len(demos)} demo(s) to {demo_folder}")
 
     unique_players = sorted({
         p["nickname"].strip()
@@ -223,24 +254,26 @@ async def main() -> None:
         for p in t["players"]
     })
     print(f"[AVATAR] Fetching {len(unique_players)} unique players (1 Chrome instance)...")
-    scraper = HLTVScraper(headless=False)
+    avatar_cache: dict[str, str] = {}
     try:
-        await scraper._ensure_browser()
-        avatar_cache: dict[str, str] = {}
-        for i, nick in enumerate(unique_players):
-            cached = _existing_avatar_path(nick)
-            if cached:
-                avatar_cache[nick] = cached
-                continue
-            try:
-                avatar_cache[nick] = await _fetch_avatar(nick, match_url, ratings_path, scraper=scraper)
-            except Exception as e:
-                print(f"  [WARN] Avatar failed for {nick}: {e}")
-            if i < len(unique_players) - 1:
-                import asyncio
-                await asyncio.sleep(2)
-    finally:
-        await scraper.close()
+        scraper = HLTVScraper(headless=True)
+        try:
+            await scraper._ensure_browser()
+            for i, nick in enumerate(unique_players):
+                cached = _existing_avatar_path(nick)
+                if cached:
+                    avatar_cache[nick] = cached
+                    continue
+                try:
+                    avatar_cache[nick] = await _fetch_avatar(nick, match_url, ratings_path, scraper=scraper)
+                except Exception as e:
+                    print(f"  [WARN] Avatar failed for {nick}: {e}")
+                if i < len(unique_players) - 1:
+                    await asyncio.sleep(2)
+        finally:
+            await scraper.close()
+    except Exception as e:
+        print(f"  [WARN] Avatar browser unavailable, skipping avatars: {e}")
 
     for table in ratings["tables"]:
         if table["map"] == "Series Overall":
@@ -257,7 +290,7 @@ async def main() -> None:
                 rating=rating,
                 kd=player.get("kd", ""),
                 team=table["team"],
-                demo_path=result.demo_path,
+                demo_path=demo_folder,
                 ratings_path=ratings_path,
                 tournament=tournament,
                 avatar_rel=avatar_cache.get(nick, ""),

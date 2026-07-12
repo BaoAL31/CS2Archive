@@ -22,8 +22,8 @@ def _concat_two(a: Path, b: Path, out: Path) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         lst = Path(tmp) / "files.txt"
         with open(lst, "w") as f:
-            f.write(f"file '{a.resolve()}'\n")
-            f.write(f"file '{b.resolve()}'\n")
+            f.write(f"file '{a.resolve().as_posix()}'\n")
+            f.write(f"file '{b.resolve().as_posix()}'\n")
         r = subprocess.run(
             ["ffmpeg", "-f", "concat", "-safe", "0", "-i", str(lst),
              "-c", "copy", str(out)],
@@ -154,6 +154,7 @@ def concat_rounds(folder: Path) -> Path:
             tmp = folder / "_tmp.mp4"
             _concat_two(combined, f, tmp)
             tmp.replace(combined)
+            f.unlink()  # consumed into combined; remaining batch-*.mp4 = not-yet-concatted (resume signal)
             mb = combined.stat().st_size / 1024 / 1024
             print(f"  {f.name} appended ({mb:.0f} MB)")
 
@@ -236,16 +237,40 @@ def _is_valid_video(path: Path) -> bool:
     return r.returncode == 0
 
 
+def _check_gpu_available() -> bool:
+    """Check if GPU is available for CUDA upscaling via nvidia-smi."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,process_name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.strip().split('\n'):
+            if 'ffmpeg' in line.lower():
+                return False
+        return True
+    except Exception:
+        return True  # optimistic if nvidia-smi fails
+
+
 def _upscale(src: Path, dst: Path, w: int, h: int) -> None:
     src_mb = src.stat().st_size / 1024 / 1024
-    print(f"\n  [Upscale] {src_mb:.0f} MB -> {w}x{h} (GPU CUDA Lanczos + NVENC)...", end=" ", flush=True)
+    print(f"\n  [Upscale] {src_mb:.0f} MB -> {w}x{h} (CPU Spline36 + NVENC)...", end=" ", flush=True)
+    
+    # Pre-flight GPU check
+    if not _check_gpu_available():
+        print("\n[ERROR] GPU not available — another ffmpeg process may be holding CUDA")
+        print("  Kill stale ffmpeg processes with: taskkill /f /im ffmpeg.exe")
+        sys.exit(1)
+    
     temp = dst.with_suffix(".temp.mp4")
     t0 = time.time()
     cmd = [
-        "ffmpeg", "-y", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-i", str(src),
-        "-vf", f"scale_cuda={w}:{h}:interp_algo=lanczos,hwdownload,format=nv12",
-        "-c:v", "h264_nvenc", "-preset", "p7", "-rc", "vbr_hq", "-cq", "18", "-b:v", "0", "-maxrate", "50M",
+        "ffmpeg", "-y", "-i", str(src),
+        "-vf", f"scale={w}:{h}:flags=spline,format=nv12",
+        "-c:v", "h264_nvenc", "-preset", "p7", "-rc", "vbr_hq", "-cq", "16", "-b:v", "0", "-maxrate", "50M",
         "-profile:v", "high", "-pix_fmt", "yuv420p", "-level", "5.1",
+        "-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
+        "-movflags", "+faststart",
         "-c:a", "copy", str(temp),
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)

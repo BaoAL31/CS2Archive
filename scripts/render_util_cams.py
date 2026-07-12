@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 import time
 from pathlib import Path
@@ -54,71 +55,91 @@ from scripts.render.batch_csdm import (
     chunk_demo_batch,
     render_spot_batch,
 )
-from scripts.render.paths import util_render_slug
+from scripts.render.paths import util_render_slug, clip_name_for_cameras
+from scripts.build_player_manifest import build_manifest
 
 
 # ---------------------------------------------------------------------------
 # Phase 1: PREP — create util_cam dirs + _throw_poses.json
 # ---------------------------------------------------------------------------
 
-def _cameras_for_util(util_type: str) -> str:
-    """Manifest cameras convention: smoke=flight+orbit, others=flight."""
-    if util_type == "smoke":
-        return "flight,orbit"
-    return "flight"
-
-
 def _prepare_util_cams(
-    throws_df: pd.DataFrame,
+    steam_id: str,
+    demo_id: str,
+    data_dir: Path,
+    demos_dir: Path,
     util_cams_root: Path,
-    steamid: int | None,
 ) -> tuple[int, int, int]:
-    """Create util_cam dirs + _throw_poses.json for unrendered throws.
+    """Create util_cam dirs + _throw_poses.json via canonical CS2UtilArchive manifest builder.
 
-    One dir per throw_id: unnamed/<throw_id_slug>/. Cameras field set per
-    util_type (smoke=throw,flight; others=flight) so render output names
-    follow convention.
+    ``data_dir`` is the ROOT data dir (parent of ``demo=*`` subdirs).
+    ``build_manifest()`` receives it as-is and reconstructs the path:
+    ``data_dir / f"demo={demo_id}" / "throws.parquet"``.
 
-    Returns (created, skipped_already_rendered, total_throws_filtered).
+    Default cameras: smoke/fire=flight,detonate, others=flight.
+
+    Returns (created, skipped_already_rendered, total_entries).
     """
-    df = throws_df.copy()
-    if steamid is not None:
-        df = df[df["thrower_steamid"] == int(steamid)]
-    df = df[(df["flight_ticks"] > 0) & (df["is_renderable"] == True)].copy()
-
-    if df.empty:
-        print(f"[prep] no renderable throws" + (f" for steamid={steamid}" if steamid else ""))
+    manifest = build_manifest(
+        steam_id=steam_id,
+        demo_id=demo_id,
+        data_dir=data_dir,
+        demos_dir=demos_dir,
+        cameras_smoke="flight,detonate",
+        cameras_fire="flight,detonate",
+        cameras_other="flight",
+    )
+    entries = manifest["entries"]
+    if not entries:
+        print(f"[prep] no renderable throws for steamid={steam_id}")
         return 0, 0, 0
+
+    # Load per-throw map name from the parquet (manifest entries lack it).
+    map_by_throw: dict[str, str] = {}
+    tp = data_dir / f"demo={demo_id}" / "throws.parquet"
+    if tp.is_file():
+        try:
+            tdf = pd.read_parquet(tp)
+            if "map" in tdf.columns:
+                for _, r in tdf.iterrows():
+                    map_by_throw[str(r["throw_id"])] = str(r["map"])
+        except Exception:
+            pass
+
+    # Group throws by util_id (map:type:side:land coords) to mirror
+    # CS2UtilArchive's util_id-keyed folder architecture: one dir per
+    # util_id (no match id), with multiple throw clips inside it.
+    groups: dict[str, list[dict]] = {}
+    for entry in entries:
+        uid = _util_id_for_entry(entry, map_by_throw)
+        groups.setdefault(uid, []).append(entry)
 
     created = 0
     skipped = 0
-    for _, row in df.iterrows():
-        tid = str(row["throw_id"])
-        tid_slug = tid.replace(":", "_")
-        util_dir = util_cams_root / "unnamed" / tid_slug
-        existing = list(util_dir.glob("*.mp4")) if util_dir.is_dir() else []
-        if existing:
+    for uid, grp in groups.items():
+        uid_slug = util_render_slug(uid)
+        util_dir = util_cams_root / "unnamed" / uid_slug
+        # A util_id group needs render if ANY of its throws lacks a clip.
+        needs: list[dict] = []
+        for entry in grp:
+            cam = entry.get("cameras") or _cameras_for_type(entry.get("util_type", ""))
+            clip = util_dir / f"{clip_name_for_cameras(cam, entry['throw_id'])}.mp4"
+            if not (clip.is_file() and clip.stat().st_size > 1_000_000):
+                needs.append(entry)
+        if not needs:
             skipped += 1
             continue
         util_dir.mkdir(parents=True, exist_ok=True)
-        rel_x = int(round(float(row.get("release_x", 0) or 0)))
-        rel_y = int(round(float(row.get("release_y", 0) or 0)))
-        rel_z = int(round(float(row.get("release_z", 0) or 0)))
-        pos = [rel_x, rel_y, rel_z]
-        util_type = str(row.get("util_type", ""))
-        cameras = _cameras_for_util(util_type)
-        poses_data = {
-            "1": {"pos": pos},
-            "_throws": {tid: {"pos": pos}},
-            "_cameras": cameras,
-        }
+        poses_data = _build_poses_json(grp, demo_id)
         (util_dir / "_throw_poses.json").write_text(
             json.dumps(poses_data, indent=2), encoding="utf-8"
         )
         created += 1
-        print(f"  [prep] {tid_slug} ({util_type}, {cameras})", flush=True)
+        for entry in needs:
+            print(f"  [prep] {uid_slug} ({entry.get('util_type','')}, "
+                  f"{entry.get('cameras','flight')}) throw {entry['throw_id']}", flush=True)
 
-    return created, skipped, len(df)
+    return created, skipped, len(entries)
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +149,7 @@ def _prepare_util_cams(
 def _discover_util_cams(util_cams_root: Path) -> list[Path]:
     """Yield util_cam dirs that have a _throw_poses.json and no existing mp4.
 
-    Layout: <util_cams_root>/unnamed/<util_slug>/<demo_id>/
+    Layout: <util_cams_root>/unnamed/<throw_id_slug>/ (match-id prefix stripped)
     """
     out: list[Path] = []
     for poses_f in sorted(util_cams_root.rglob("_throw_poses.json")):
@@ -168,19 +189,57 @@ def _find_demo_for_id(util_cams_root: Path, demo_id: str) -> Path:
     return Path(demo_id + ".dem")
 
 
-def _build_job(util_dir: Path, throws_df: pd.DataFrame, util_cams_root: Path) -> tuple[dict | None, str]:
-    """Construct a batch job from a util_cam dir + throws.parquet.
+def _cameras_for_type(util_type: str) -> str:
+    """Canonical camera set per util type (matches CS2UtilArchive)."""
+    return "flight,detonate" if str(util_type).lower() in ("smoke", "fire", "molotov", "incendiary") else "flight"
 
-    Util_cam dir naming: unnamed/<throw_id_slug>/. Demo_id is extracted from
-    the throw_id (everything before :e<digits>:s<digits>).
+
+def _util_id_for_row(row: dict) -> str:
+    """util_id = map:type:side:land_x_land_y_land_z (no match id)."""
+    map_name = str(row.get("map") or row.get("map_name") or "de_anubis")
+    util_type = str(row.get("util_type", "")).lower()
+    side = str(row.get("thrower_side", "T") or "T").upper()
+    lx = float(row.get("land_x", 0) or 0)
+    ly = float(row.get("land_y", 0) or 0)
+    lz = float(row.get("land_z", 0) or 0)
+    return f"{map_name}:{util_type}:{side}:{int(round(lx))}_{int(round(ly))}_{int(round(lz))}"
+
+
+def _util_id_for_entry(entry: dict, map_by_throw: dict[str, str]) -> str:
+    """util_id for a manifest entry (map resolved from throws.parquet)."""
+    tid = str(entry["throw_id"])
+    map_name = map_by_throw.get(tid) or "de_anubis"
+    util_type = str(entry.get("util_type", "")).lower()
+    side = str(entry.get("thrower_side", "T") or "T").upper()
+    land = entry.get("land_pos") or entry.get("release_pos") or [0, 0, 0]
+    lx, ly, lz = float(land[0]), float(land[1]), float(land[2])
+    return f"{map_name}:{util_type}:{side}:{int(round(lx))}_{int(round(ly))}_{int(round(lz))}"
+
+
+def _build_poses_json(grp: list[dict], demo_id: str) -> dict:
+    """Aggregate throws in a util_id group into one _throw_poses.json."""
+    data: dict = {
+        "_throws": {},
+        "_cameras": (grp[0].get("cameras") or "flight"),
+        "_demo_id": demo_id,
+    }
+    for i, entry in enumerate(grp, start=1):
+        pos = [
+            int(round(float(entry.get("release_x", 0) or 0))),
+            int(round(float(entry.get("release_y", 0) or 0))),
+            int(round(float(entry.get("release_z", 0) or 0))),
+        ]
+        data[str(i)] = {"pos": pos}
+        data["_throws"][str(entry["throw_id"])] = {"pos": pos}
+    return data
+
+
+def _build_job(util_dir: Path, throw_id: str, throws_df: pd.DataFrame, util_cams_root: Path) -> tuple[dict | None, str]:
+    """Construct a batch job for one throw_id inside a util_id-keyed dir.
+
+    Dir naming: unnamed/<util_id_slug>/ (no match id). Multiple throw_ids
+    may share the dir (same landing spot, different entity/segment).
     """
-    import re
-    poses = json.loads((util_dir / "_throw_poses.json").read_text(encoding="utf-8"))
-    throw_map = poses.get("_throws", {})
-    if not throw_map:
-        return None, ""
-    throw_id = next(iter(throw_map.keys()))
-
     rows = throws_df[throws_df["throw_id"] == throw_id]
     if rows.empty:
         return None, throw_id
@@ -190,25 +249,15 @@ def _build_job(util_dir: Path, throws_df: pd.DataFrame, util_cams_root: Path) ->
     if not bool(row.get("has_trajectory", False)):
         return None, throw_id
 
-    # demo_id from throws.parquet row (handles both full slug with match_id
-    # and short slug variants). The throws.parquet is the source of truth.
     demo_id = str(row.get("demo_id", "") or "")
     if not demo_id:
-        # Fallback: strip _e\d+_s\d+ suffix from util_dir.name
-        leaf = util_dir.name
-        m = re.match(r"^(.+)_e\d+_s\d+$", leaf)
-        demo_id = m.group(1) if m else leaf
-    util_slug = util_dir.parent.name
-    release_x = int(row.get("release_x", 0) or 0)
-    release_y = int(row.get("release_y", 0) or 0)
-    release_z = int(row.get("release_z", 0) or 0)
-    map_name = str(row.get("map", "") or "")
-    util_type = str(row.get("util_type", "") or "")
-    thrower_side = str(row.get("thrower_side", "T") or "T").upper()
-    util_id = f"{map_name}:{util_type}:{thrower_side}:{release_x}_{release_y}_{release_z}"
-
-    # Cameras from _throw_poses.json (set by prep), else util_type default
-    cameras = poses.get("_cameras") or ("throw,flight" if util_type == "smoke" else "flight")
+        try:
+            poses = json.loads((util_dir / "_throw_poses.json").read_text(encoding="utf-8"))
+            demo_id = str(poses.get("_demo_id", "") or "")
+        except Exception:
+            demo_id = ""
+    util_id = _util_id_for_row(row)
+    cameras = row.get("cameras") or _cameras_for_type(row.get("util_type", ""))
 
     demo_path = str(_find_demo_for_id(util_cams_root, demo_id))
     if not Path(demo_path).is_file():
@@ -225,7 +274,7 @@ def _build_job(util_dir: Path, throws_df: pd.DataFrame, util_cams_root: Path) ->
         "util_id": util_id,
         "demo_id": demo_id,
         "demo_path": demo_path,
-        "util_type": util_type,
+        "util_type": str(row.get("util_type", "") or ""),
         "throw_id": throw_id,
         "thrower_steamid": str(int(row.get("thrower_steamid", 0) or 0)),
         "round_num": int(row.get("round_num", 0) or 0),
@@ -345,36 +394,52 @@ def _render_util_cams(
     chunk_size: int,
     dry_run: bool,
     debug: bool,
+    demo_id: str | None = None,
 ) -> int:
-    """Render util_cam dirs needing render via CS2UtilArchive render_spot_batch."""
+    """Render util_cam dirs needing render via CS2UtilArchive render_spot_batch.
+
+    Each util_id dir may hold multiple throw clips; we expand to one
+    BatchSpotJob per throw whose clip is missing, sharing the util_dir.
+    """
     util_dirs = _discover_util_cams(util_cams_root)
-    print(f"[render] discovered {len(util_dirs)} util_cam dirs needing render")
+    print(f"[render] discovered {len(util_dirs)} util_cam dirs")
     if not util_dirs:
         return 0
 
-    throws_df, matched_demo_dir = _resolve_throws_parquet(data_dir, util_cams_root)
+    throws_df, matched_demo_dir = _resolve_throws_parquet(data_dir, util_cams_root, demo_id)
     if throws_df is None:
-        print(f"[FAIL] no throws.parquet found for any util_cam demo_id under {data_dir}",
+        print(f"[FAIL] no throws.parquet found for demo_id under {data_dir}",
               file=sys.stderr)
         return 1
     print(f"[render] loaded {len(throws_df)} throws from "
           f"data/{matched_demo_dir.name}/throws.parquet")
 
-    entries: list[BatchSpotJob] = []
-    skipped: list[tuple[str, str]] = []
+    jobs_by_dir: dict[Path, list[BatchSpotJob]] = {}
+    skipped = 0
     for util_dir in util_dirs:
-        job, throw_id = _build_job(util_dir, throws_df, util_cams_root)
-        if job is None:
-            skipped.append((str(util_dir), throw_id or "(no throw_id)"))
+        poses_f = util_dir / "_throw_poses.json"
+        if not poses_f.is_file():
             continue
-        entries.append(BatchSpotJob(job=job, util_dir=util_dir))
+        try:
+            poses = json.loads(poses_f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        throw_map = poses.get("_throws", {})
+        if not throw_map:
+            continue
+        for tid in throw_map:
+            cam = poses.get("_cameras") or "flight"
+            clip = util_dir / f"{clip_name_for_cameras(cam, tid)}.mp4"
+            if clip.is_file() and clip.stat().st_size > 1_000_000:
+                skipped += 1
+                continue
+            job, _ = _build_job(util_dir, tid, throws_df, util_cams_root)
+            if job is None:
+                continue
+            jobs_by_dir.setdefault(util_dir, []).append(BatchSpotJob(job=job, util_dir=util_dir))
 
-    print(f"[render] built {len(entries)} batchable jobs, {len(skipped)} skipped")
-    for util_dir, reason in skipped[:5]:
-        print(f"  SKIP: {util_dir} ({reason})")
-    if len(skipped) > 5:
-        print(f"  ... and {len(skipped) - 5} more skips")
-
+    entries: list[BatchSpotJob] = [j for js in jobs_by_dir.values() for j in js]
+    print(f"[render] built {len(entries)} batchable jobs, {skipped} skipped (already rendered)")
     if not entries:
         print("[render] nothing to render")
         return 0
@@ -382,8 +447,8 @@ def _render_util_cams(
     by_demo: dict[str, list[BatchSpotJob]] = {}
     for entry in entries:
         by_demo.setdefault(str(entry.job["demo_id"]), []).append(entry)
-    for demo_id in by_demo:
-        by_demo[demo_id].sort(key=lambda e: int(e.job["throw_tick"]))
+    for d in by_demo:
+        by_demo[d].sort(key=lambda e: int(e.job["throw_tick"]))
 
     options = BatchRenderOptions(
         data_dir=str(data_dir),
@@ -413,7 +478,7 @@ def _render_util_cams(
         if n_chunks == len(demo_entries):
             print(
                 f"  [WARN] chunk_size={chunk_size} produced {n_chunks} chunks "
-                f"for {len(demo_entries)} spots → effectively one CS2 launch per spot. "
+                f"for {len(demo_entries)} spots → one CS2 launch per spot. "
                 f"Increase --chunk-size or set 0 to verify true batching.",
                 file=sys.stderr,
             )
@@ -446,7 +511,7 @@ def _render_util_cams(
             if len(chunk) > 1 and per_spot > 50.0:
                 msg = (
                     f"  [FAIL] per-spot time {per_spot:.0f}s in chunk of {len(chunk)} "
-                    f"is over 50s — looks like sequential CS2 launches, not batching. "
+                    f"looks like sequential CS2 launches, not batching. "
                     f"Debug: check {work_dir / label}/"
                 )
                 print(msg, file=sys.stderr, flush=True)
@@ -473,17 +538,18 @@ def _render_util_cams(
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Prepare util_cam dirs from throws.parquet + render via CS2UtilArchive.",
+        description="Prepare util_cam dirs via CS2UtilArchive canonical manifest + render.",
     )
     ap.add_argument("--util-cams-root", required=True,
-                    help="Path to <pov>/utility_cams (must contain unnamed/<slug>/<demo_id>/)")
+                    help="Path to <pov>/utility_cams (must contain unnamed/<util_id_slug>/)")
     ap.add_argument("--data-dir", required=True,
                     help="CS2UtilArchive per-demo data dir (parent of throws.parquet)")
     ap.add_argument("--steamid", type=int, default=None,
-                    help="Filter throws.parquet by thrower_steamid (default: all players)")
-    ap.add_argument("--demo-id", default=None,
-                    help="Full demo slug like '2395002-furia-vs-falcons-m2-anubis'. "
-                         "Required on first run when util_cams_root has no dirs yet.")
+                    help="Filter throws.parquet by thrower_steamid")
+    ap.add_argument("--demo-id", required=True,
+                    help="Full demo slug like '2395002-furia-vs-falcons-m2-anubis'")
+    ap.add_argument("--demos-dir", required=True,
+                    help="Parent dir of extracted .dem folders")
     ap.add_argument("--chunk-size", type=int, default=0,
                     help="Spots per CS2 launch (default 0 = all in one launch).")
     ap.add_argument("--prepare-only", action="store_true",
@@ -502,40 +568,18 @@ def main() -> int:
 
     util_cams_root = Path(args.util_cams_root).resolve()
     data_dir = Path(args.data_dir).resolve()
+    demos_dir = Path(args.demos_dir).resolve()
 
-    # Phase 1: PREP
+    # Phase 1: PREP — use canonical manifest builder
     if not args.render_only:
-        throws_df, matched_demo_dir = _resolve_throws_parquet(
-            data_dir, util_cams_root, demo_id=args.demo_id,
-        )
-        if throws_df is None:
-            # No unrendered util_cam dirs → look at ANY util_cam dir (rendered or
-            # not) to find the demo_id. Fall back to data_dir scan only if even
-            # that fails.
-            all_dirs = [p.parent for p in util_cams_root.rglob("_throw_poses.json")] \
-                if util_cams_root.is_dir() else []
-            if all_dirs:
-                leaf = all_dirs[0].name
-                for d in data_dir.iterdir():
-                    if not (d.is_dir() and d.name.startswith("demo=")):
-                        continue
-                    stem = d.name[len("demo="):]
-                    slug = "-".join(stem.split("-")[1:]) if "-" in stem else stem
-                    if slug == leaf:
-                        tp = d / "throws.parquet"
-                        if tp.is_file():
-                            throws_df = pd.read_parquet(tp)
-                            matched_demo_dir = d
-                            break
-            if throws_df is None:
-                print(f"[FAIL] no throws.parquet found for util_cams_root demo_id "
-                      f"under {data_dir}", file=sys.stderr)
-                return 1
-        print(f"[prep] using {matched_demo_dir.name}/throws.parquet ({len(throws_df)} throws)")
-        if args.steamid is not None:
-            print(f"[prep] filter: thrower_steamid == {args.steamid}")
+        print(f"[prep] building manifest via CS2UtilArchive build_manifest()")
+        print(f"[prep] steamid={args.steamid} demo={args.demo_id}")
         created, already_rendered, total = _prepare_util_cams(
-            throws_df, util_cams_root, args.steamid,
+            steam_id=str(args.steamid),
+            demo_id=args.demo_id,
+            data_dir=data_dir,
+            demos_dir=demos_dir,
+            util_cams_root=util_cams_root,
         )
         print(f"[prep] {created} new dirs, {already_rendered} already rendered, "
               f"{total} throws matched")
@@ -545,7 +589,7 @@ def main() -> int:
 
     # Phase 2: RENDER
     return _render_util_cams(
-        util_cams_root, data_dir, args.chunk_size, args.dry_run, args.debug,
+        util_cams_root, data_dir, args.chunk_size, args.dry_run, args.debug, args.demo_id,
     )
 
 

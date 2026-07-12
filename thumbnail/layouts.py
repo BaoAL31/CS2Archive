@@ -29,7 +29,7 @@ def _draw_pill(
     text: str,
     font,
     *,
-    right: int,
+    left: int,
     top: int,
     padding_x: int = 18,
     padding_y: int = 10,
@@ -37,16 +37,16 @@ def _draw_pill(
     fill: tuple = (0, 0, 0, 200),
     text_fill: tuple = (255, 255, 255, 255),
 ) -> int:
-    """Draw a single pill anchored to the right edge, return its bottom y."""
+    """Draw a single pill anchored to the left edge, return its bottom y."""
     bbox = draw.textbbox((0, 0), text, font=font)
     text_w = bbox[2] - bbox[0]
     text_h = bbox[3] - bbox[1]
     badge_w = text_w + padding_x * 2
     badge_h = text_h + padding_y * 2
 
-    x0 = right - badge_w
+    x0 = left
     y0 = top
-    x1 = right
+    x1 = left + badge_w
     y1 = y0 + badge_h
 
     draw.rounded_rectangle([x0, y0, x1, y1], radius=corner_radius, fill=fill)
@@ -61,7 +61,7 @@ def _draw_pill(
 
 
 def _draw_overlay_badge(img: Image.Image) -> None:
-    """Draw stacked pills in bottom-right corner for the overlay variant.
+    """Draw stacked pills in top-left corner for the overlay variant.
 
     Primary: ``W/ INPUT OVERLAY`` (always-on keyboard state).
     Secondary: ``+ UTIL CAMS`` (sparse PiP utility throw flights).
@@ -87,22 +87,19 @@ def _draw_overlay_badge(img: Image.Image) -> None:
     main_h = (bbox1[3] - bbox1[1]) + 7 * 2
     sub_h = (bbox2[3] - bbox2[1]) + 7 * 2
 
-    right_edge = WIDTH - margin
-    bottom = HEIGHT - margin
+    left_edge = margin
+    top_edge = margin
 
     # Stack from top: main (bigger) on top, sub (smaller) on bottom, with gap.
-    # Compute absolute top of stack so total fits inside bottom margin.
-    total_h = main_h + pill_gap + sub_h
-    stack_top = bottom - total_h
-    main_top = stack_top
-    sub_top = stack_top + main_h + pill_gap
+    main_top = top_edge
+    sub_top = top_edge + main_h + pill_gap
 
     # Primary pill on top
     _draw_pill(
         draw,
         "W/ INPUT OVERLAY",
         font_main,
-        right=right_edge,
+        left=left_edge,
         top=main_top,
     )
 
@@ -111,7 +108,7 @@ def _draw_overlay_badge(img: Image.Image) -> None:
         draw,
         "+ UTIL CAMS",
         font_sub,
-        right=right_edge,
+        left=left_edge,
         top=sub_top,
         padding_x=14,
         padding_y=7,

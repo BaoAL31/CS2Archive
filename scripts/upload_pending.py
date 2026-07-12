@@ -16,11 +16,17 @@ Resume-safe: a completed meta (youtube_id set, upload_status="completed") is
 skipped, so re-running only uploads what's left. upload_youtube.py also stores
 resumable_* fields in the meta file for crash recovery within a single upload.
 
+With --also-bilibili, after YouTube (or when YouTube is already done) this also
+runs the bilibili.tv upload via upload_youtube.py --also-bilibili /
+--bilibili-only. Bilibili status is stored separately in the same meta
+(bilibili_aid / bilibili_upload_status).
+
 Usage:
     python scripts/upload_pending.py                 # upload every pending meta
     python scripts/upload_pending.py --dry-run       # list what would upload
     python scripts/upload_pending.py --limit 1       # upload at most one
     python scripts/upload_pending.py --dir youtube/my-match   # restrict scope
+    python scripts/upload_pending.py --also-bilibili # YouTube + bilibili.tv
 """
 
 from __future__ import annotations
@@ -39,16 +45,26 @@ if str(SCRIPTS_DIR) not in sys.path:
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from upload_bilibili import is_bilibili_pending  # noqa: E402
+
 PY = sys.executable
 UPLOAD_YOUTUBE = SCRIPTS_DIR / "upload_youtube.py"
 DEFAULT_YOUTUBE_DIR = PROJECT_ROOT / "youtube"
 
 
-def _is_pending(meta: dict) -> bool:
+def _is_youtube_pending(meta: dict) -> bool:
     return not (meta.get("upload_status") == "completed" and meta.get("youtube_id"))
 
 
-def find_pending(youtube_dir: Path) -> list[Path]:
+def _needs_upload(meta: dict, also_bilibili: bool) -> bool:
+    if _is_youtube_pending(meta):
+        return True
+    if also_bilibili and is_bilibili_pending(meta):
+        return True
+    return False
+
+
+def find_pending(youtube_dir: Path, also_bilibili: bool = False) -> list[Path]:
     """Return paths of upload_meta.json files that still need uploading."""
     pending: list[Path] = []
     for meta_path in sorted(youtube_dir.rglob("upload_meta.json")):
@@ -57,7 +73,7 @@ def find_pending(youtube_dir: Path) -> list[Path]:
         except Exception as e:
             print(f"  [skip] could not parse {meta_path}: {e}")
             continue
-        if not _is_pending(meta):
+        if not _needs_upload(meta, also_bilibili):
             continue
         video = meta.get("video_path")
         if not video or not Path(video).exists():
@@ -67,48 +83,87 @@ def find_pending(youtube_dir: Path) -> list[Path]:
     return pending
 
 
-def upload_one(meta_path: Path, meta: dict, dry_run: bool) -> bool:
+def upload_one(meta_path: Path, meta: dict, dry_run: bool, also_bilibili: bool) -> bool:
     """Upload a single pending meta. Returns True on success.
 
-    Success means upload_youtube.py exited 0 AND the meta file now carries a
-    youtube_id. Failure (or dry-run) returns False.
+    Success means upload_youtube.py exited 0 AND the expected platform IDs
+    are present in the meta file afterward.
     """
     video = Path(meta["video_path"])
     thumb = meta.get("thumbnail_path")
     privacy = meta.get("privacy", "private")
-
-    cmd = [
-        PY, str(UPLOAD_YOUTUBE),
-        str(video),
-        "--meta", str(meta_path),
-        "--privacy", privacy,
-    ]
-    if thumb and Path(thumb).exists():
-        cmd += ["--thumbnail", str(thumb)]
+    yt_pending = _is_youtube_pending(meta)
+    bili_pending = also_bilibili and is_bilibili_pending(meta)
 
     if dry_run:
-        print(f"  [dry-run] would upload: {video} "
-              f"(privacy={privacy}, thumbnail={'yes' if thumb else 'no'})")
+        parts = []
+        if yt_pending:
+            parts.append("youtube")
+        if bili_pending:
+            parts.append("bilibili")
+        print(
+            f"  [dry-run] would upload ({'+'.join(parts) or 'nothing'}): {video} "
+            f"(privacy={privacy}, thumbnail={'yes' if thumb else 'no'})"
+        )
         return False
 
-    print(f"  Uploading: {video}")
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
-    r = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=env)
-    if r.returncode != 0:
-        print(f"  [FAIL] upload exited {r.returncode}: {video}")
-        return False
+    if yt_pending:
+        cmd = [
+            PY, str(UPLOAD_YOUTUBE),
+            str(video),
+            "--meta", str(meta_path),
+            "--privacy", privacy,
+        ]
+        if thumb and Path(thumb).exists():
+            cmd += ["--thumbnail", str(thumb)]
+        if also_bilibili:
+            cmd.append("--also-bilibili")
 
-    # Confirm the meta now carries a youtube_id (upload_youtube.py writes it).
+        print(f"  Uploading: {video}")
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+        r = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=env)
+        if r.returncode != 0:
+            print(f"  [FAIL] upload exited {r.returncode}: {video}")
+            return False
+    elif bili_pending:
+        cmd = [
+            PY, str(UPLOAD_YOUTUBE),
+            str(video),
+            "--meta", str(meta_path),
+            "--bilibili-only",
+        ]
+        if thumb and Path(thumb).exists():
+            cmd += ["--thumbnail", str(thumb)]
+        print(f"  Uploading bilibili only: {video}")
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+        r = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=env)
+        if r.returncode != 0:
+            print(f"  [FAIL] bilibili upload exited {r.returncode}: {video}")
+            return False
+    else:
+        return True
+
     try:
         updated = json.loads(meta_path.read_text(encoding="utf-8"))
     except Exception:
         updated = {}
+
+    ok = True
     vid = updated.get("youtube_id")
-    if vid:
-        print(f"  [OK] Uploaded: https://youtu.be/{vid}")
-        return True
-    print(f"  [WARN] upload_youtube.py exited 0 but no youtube_id in {meta_path.name}")
-    return False
+    if yt_pending or not also_bilibili:
+        if vid:
+            print(f"  [OK] Uploaded: https://youtu.be/{vid}")
+        else:
+            print(f"  [WARN] upload_youtube.py exited 0 but no youtube_id in {meta_path.name}")
+            ok = False
+    if also_bilibili:
+        aid = updated.get("bilibili_aid")
+        if aid and updated.get("bilibili_upload_status") == "completed":
+            print(f"  [OK] Bilibili: aid={aid}")
+        else:
+            print(f"  [WARN] bilibili not completed in {meta_path.name}")
+            ok = False
+    return ok
 
 
 def main() -> None:
@@ -123,6 +178,10 @@ def main() -> None:
     parser.add_argument(
         "--limit", type=int, default=0,
         help="Upload at most N pending metas (default: 0 = all)")
+    parser.add_argument(
+        "--also-bilibili", action="store_true",
+        help="Also upload to bilibili.tv (same title/schedule/tags; needs "
+             ".bilibili_storage.json). Resume-safe via bilibili_aid in meta.")
     args = parser.parse_args()
 
     youtube_dir = Path(args.dir)
@@ -130,7 +189,7 @@ def main() -> None:
         print(f"[ERROR] directory not found: {youtube_dir}")
         sys.exit(1)
 
-    pending = find_pending(youtube_dir)
+    pending = find_pending(youtube_dir, also_bilibili=args.also_bilibili)
     print(f"Found {len(pending)} pending upload(s) under {youtube_dir}")
     if args.limit > 0:
         pending = pending[:args.limit]
@@ -148,14 +207,14 @@ def main() -> None:
             print(f"  [skip] could not re-read {meta_path}: {e}")
             failed += 1
             continue
-        if upload_one(meta_path, meta, args.dry_run):
+        if upload_one(meta_path, meta, args.dry_run, args.also_bilibili):
             ok += 1
         else:
             if not args.dry_run:
                 failed += 1
 
     print(f"\nDone. uploaded={ok} failed={failed} "
-          f"(dry_run={args.dry_run})")
+          f"(dry_run={args.dry_run}, also_bilibili={args.also_bilibili})")
     if failed and not args.dry_run:
         sys.exit(1)
 

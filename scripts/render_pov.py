@@ -12,8 +12,10 @@ import time
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
+_SCRIPTS_DIR = _PROJECT_ROOT / "scripts"
+for _p in (str(_PROJECT_ROOT), str(_SCRIPTS_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from cs2_minimizer import CS2Minimizer
 
@@ -95,8 +97,8 @@ BASE_FLAGS = [
     "--concatenate-sequences",
     "--ffmpeg-executable-path", FFMPEG_PATH,
     "--ffmpeg-video-codec", "h264_nvenc",
-    "--ffmpeg-crf", "18",
-    "--ffmpeg-output-parameters=-cq 18 -preset p7 -profile:v high -pix_fmt yuv420p -level 5.1",
+    "--ffmpeg-crf", "16",
+    "--ffmpeg-output-parameters=-cq 16 -preset p7 -profile:v high -pix_fmt yuv420p -level 5.1",
     "--recording-system", "HLAE",
     "--close-game-after-recording",
 ]
@@ -431,7 +433,8 @@ def main() -> None:
                 vid = run_csdm(cmd, out_name, expected=out_path)
 
                 if vid is None:
-                    continue
+                    print(f"[ERROR] run_csdm returned None for {out_name} — no video produced")
+                    sys.exit(1)
 
                 total_rendered += len(batch)
 
