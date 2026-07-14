@@ -65,6 +65,16 @@ def shorten_team(name: str) -> str:
 def shorten_tournament(name: str) -> str:
     """Shorten verbose tournament names for titles."""
     name = name.strip()
+    # Explicit abbreviations for verbose tournament names. Keep these tight
+    # so the title stays under YouTube's 100-char limit (and leaves room
+    # for the rating section, which is trimmed first when over budget).
+    # Keyed case-insensitively because shorten_tournament receives the raw
+    # tournament string (e.g. "XSE Pro League Guangzhou 2026").
+    ABBREV = {
+        "xse pro league guangzhou 2026": "XSE PL 2026",
+    }
+    if name.lower() in ABBREV:
+        return ABBREV[name.lower()]
     result = name.title()
     for short, full in {
         "Iem": "IEM",

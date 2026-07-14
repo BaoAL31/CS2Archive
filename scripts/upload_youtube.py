@@ -116,18 +116,26 @@ def get_youtube_publish_dates(youtube) -> set[str]:
     import re
 
     def _is_short(v: dict) -> bool:
-        """True if this video is a YouTube Short (< 60s or #Shorts tag)."""
+        """True if this video is a YouTube Short.
+
+        Shorts are vertical clips YouTube classifies as such: either tagged
+        with #Shorts, or <= 3 minutes (YouTube's Short duration limit). They
+        MUST be excluded from the long-form publish schedule so they don't
+        consume a daily long-form slot — long-form POV matches (20+ min) are
+        the only uploads that should reserve one.
+        """
         title = v.get("snippet", {}).get("title", "")
         if "#Shorts" in title or "#shorts" in title:
             return True
         dur = v.get("contentDetails", {}).get("duration", "")
         if dur:
-            # ISO 8601 duration PT1M30S, PT30S, PT1H
-            m = re.match(r"^PT(?:(\d+)M)?(?:(\d+)S)?$", dur)
+            # ISO 8601 duration: PT#H#M#S (Shorts are < 3 min, so no H).
+            m = re.match(r"^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$", dur)
             if m:
-                mins = int(m.group(1) or 0)
-                secs = int(m.group(2) or 0)
-                if mins == 0 and secs < 60:
+                total = (int(m.group(1) or 0) * 3600
+                         + int(m.group(2) or 0) * 60
+                         + int(m.group(3) or 0))
+                if total <= 180:
                     return True
         return False
 

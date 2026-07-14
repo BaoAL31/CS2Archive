@@ -110,6 +110,46 @@ def test_concat_multi_round_batches() -> None:
         assert 0.8 < dur < 1.5, f"expected ~1.0s, got {dur:.2f}s"
 
 
+def _make_fake_round_dur(folder: Path, name: str, duration: float) -> Path:
+    vid = folder / name
+    subprocess.run(
+        [FFMPEG, "-y", "-f", "lavfi", "-i", f"color=c=black:s=320x240:d={duration}",
+         "-c:v", "libx264", "-r", "30", "-pix_fmt", "yuv420p", str(vid)],
+        capture_output=True, timeout=30,
+    )
+    return vid
+
+
+def test_concat_sidecar_duration_matches_video() -> None:
+    """Regression: each batch duration must be probed BEFORE consume.
+
+    Probing `combined` after append recorded cumulative duration as the
+    later batch's duration, so total_duration_seconds ≈ 2× video length and
+    late round_offsets landed past EOF (Twistzz Cache: 4195s sidecar vs
+    2202s video, round 22 at 3093s).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = Path(tmp)
+        _make_fake_round_dur(folder, "batch-001-020.mp4", 2.0)
+        _make_fake_round_dur(folder, "batch-021-022.mp4", 0.5)
+        concat_rounds.concat_rounds(folder)
+        combined = folder / "combined.mp4"
+        video_dur = _get_duration(combined)
+        side = json.loads((folder / "combined.round_offsets.json").read_text())
+        assert abs(side["total_duration_seconds"] - video_dur) < 0.15, (
+            f"sidecar total {side['total_duration_seconds']:.3f}s != "
+            f"video {video_dur:.3f}s (batches={side['batches']})"
+        )
+        assert abs(side["batches"][0]["duration_seconds"] - 2.0) < 0.15
+        assert abs(side["batches"][1]["duration_seconds"] - 0.5) < 0.15
+        # Last round offset must be inside the video, not past EOF.
+        last_off = side["round_offsets"]["22"]
+        assert last_off < video_dur, (
+            f"round 22 offset {last_off:.3f}s past video end {video_dur:.3f}s"
+        )
+        assert last_off > video_dur * 0.5  # roughly in the second batch
+
+
 def test_concat_resume_partial() -> None:
     """Simulate crash after 2/3 batches: combined.mp4 already has
     batches 1-2, batch-003-003.mp4 still on disk. On resume only
@@ -136,5 +176,6 @@ if __name__ == "__main__":
     test_concat_gap_detected()
     test_concat_overlap_detected()
     test_concat_multi_round_batches()
+    test_concat_sidecar_duration_matches_video()
     test_concat_resume_partial()
     print("PASS")

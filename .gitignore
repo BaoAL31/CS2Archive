@@ -62,3 +62,20 @@ pg.log
 backlog/
 # CodeGraph index
 .codegraph/
+
+# Bilibili session/cookies
+.bilibili_storage.json
+.bili-chrome-profile/
+.bili-cloak-profile/
+
+# Tool/browser caches & agent infra
+.hlae_update/
+.playwright-mcp/
+.pi/
+.pi-subagents/
+.subagent-briefs/
+
+# Local logs
+logs/
+*.log
+.upload_*.sh

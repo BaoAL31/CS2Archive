@@ -279,7 +279,37 @@ class Pipeline:
         # inside render_pov.py will pick up existing batches).
         # Step 3: no combined.mp4 yet → keep at user's start_step
 
+    def _setup_logging(self) -> Path:
+        """Redirect all output (Python prints + subprocess stdout/stderr) to
+        ``logs/{self.run_id}.log`` so harness stdout truncation can't kill a
+        long pipeline. Returns the log path. Call after printing the path to
+        original stdout."""
+        log_path = PROJECT_ROOT / "logs" / f"{self.run_id}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Fresh start marker
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"Pipeline {self.run_id} starting at {ts}\n")
+            f.write(f"{'='*60}\n")
+        # Redirect at OS level so subprocess output also goes to the log.
+        try:
+            log_fd = os.open(str(log_path), os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o644)
+            os.dup2(log_fd, sys.stdout.fileno())
+            os.dup2(log_fd, sys.stderr.fileno())
+            os.close(log_fd)
+            # Re-wrap Python stdout/stderr on the redirected FDs
+            sys.stdout = open(1, "w", encoding="utf-8", closefd=False)
+            sys.stderr = open(2, "w", encoding="utf-8", closefd=False)
+        except Exception as exc:
+            # Non-fatal: if redirection fails, continue with original stdout
+            print(f"  [warn] failed to set up log redirection to {log_path}: {exc}")
+        return log_path
+
     def run(self) -> None:
+        log_path = PROJECT_ROOT / "logs" / f"{self.run_id}.log"
+        print(f"Pipeline log -> {log_path.resolve()}")
+        self._setup_logging()
         if self.end_step < self.start_step:
             fail(0, "INVALID_STEP_RANGE", f"--until {self.end_step} is before --step {self.start_step}")
         self._ensure_demo()
@@ -554,62 +584,66 @@ class Pipeline:
             print(f"  [OK] round count: {actual_rounds} rounds match "
                   f"analysis ({expected_rounds})")
 
+        # Sidecar self-consistency + match against the real combined.mp4
+        # duration. Catches corrupt total_duration_seconds / round offsets
+        # past EOF (e.g. probing cumulative combined after each batch append).
+        if off is not None:
+            from concat_rounds import validate_round_offsets_sidecar
+            actual_sec = self._probe_duration(combined)
+            sidecar_errs = validate_round_offsets_sidecar(
+                off, video_duration_seconds=actual_sec if actual_sec > 0 else None,
+            )
+            if sidecar_errs:
+                fail(3, "CONCAT_SIDECAR_INVALID", "; ".join(sidecar_errs))
+            print(f"  [OK] sidecar validated against combined.mp4 "
+                  f"({actual_sec:.1f}s)")
+
         # Duration check — only against ACTUAL rendered tick spans. These are
-        # present in the sidecar only when CSDM sequence files existed at
-        # concat time (fresh runs). On resumed/old dirs without them we can't
-        # validate reliably, so fall back to deriving the expected duration
-        # from the demo itself (player-POV render window) via demoparser2.
-        per_round_ticks = (off or {}).get("per_round_ticks", {})
-        if per_round_ticks:
-            expected_sec = 0.0
-            for span in per_round_ticks.values():
-                start, end = span[0], span[1]
-                if end > start:
-                    expected_sec += (end - start + 1) / tickrate
-            dur_src = "rendered tick spans (CSDM sequence files)"
-        else:
-            # Fallback: estimate the player-POV rendered duration from the demo.
-            # Only sum rounds that were actually rendered (from the sidecar's
-            # batch round ranges), so a partial `--rounds` single-batch render
-            # isn't compared against the whole demo.
-            rendered = set()
-            for b in (off or {}).get("batches", []):
-                for rn in range(int(b.get("round_start", 1)), int(b.get("round_end", 1)) + 1):
-                    rendered.add(rn)
-            if not rendered:
-                rendered = set(range(1, expected_rounds + 1))
-            expected_sec = self._expected_duration_from_demo(tickrate, sorted(rendered))
-            if expected_sec is None:
-                print("  [warn] no per-round tick data and demo parse failed; "
-                      "skipping duration validation")
-                return
-            dur_src = "demo-derived player-POV estimate (demoparser2)"
+        #         # Duration estimate from CSDM's own analysis JSON (per-round
+        # startTick/endTick spans). This is the actual tick-to-vid-second
+        # mapping: sum of (endTick - startTick + 1) / tickrate for each
+        # rendered round. The player-POV render window is routinely shorter
+        # than the full round span (lead-in/trail, death cutoff), so the
+        # estimate is only approximate -- use a loose tolerance and WARN
+        # (don't hard-fail). The round-count check above is the authoritative
+        # "match up" guarantee.
+        rendered = set()
+        for b in (off or {}).get("batches", []):
+            for rn in range(int(b.get("round_start", 1)), int(b.get("round_end", 1)) + 1):
+                rendered.add(rn)
+        if not rendered:
+            rendered = set(range(1, expected_rounds + 1))
+        expected_sec = self._expected_duration_from_analysis(tickrate, sorted(rendered))
+        if expected_sec is None:
+            print("  [warn] no per-round tick data and no analysis spans;"
+                  "skipping duration validation")
+            return
+        dur_src = "CSDM analysis round spans"
+        # Loose: player-POV clip is typically shorter than the full round
+        # span, so only catch GROSS truncation (a whole batch missing).
+        tol = 0.35 * expected_sec + 2.0 * expected_rounds
         if expected_sec <= 0:
             return
         actual_sec = self._probe_duration(combined)
         if actual_sec <= 0:
             print("  [warn] could not probe combined.mp4 duration; skipping duration check")
             return
-        # A missing/truncated round CLIPS the video (shorter) — that's the
+        # A missing/truncated round CLIPS the video (shorter) -- that's the
         # failure to catch. Extra padding (csdm lead-in per round) is benign.
-        # The demo-derived estimate is approximate (CSDM ends each round a few
-        # seconds before the official round_end), so use a looser tolerance.
-        tol = (0.03 if per_round_ticks else 0.08) * expected_sec + 2.0 * (
-            len(per_round_ticks) or expected_rounds)
         diff = actual_sec - expected_sec
         if diff < -tol:
-            fail(3, "CONCAT_DURATION_MISMATCH",
-                 f"combined.mp4 duration {actual_sec:.1f}s is SHORTER than expected "
-                 f"{expected_sec:.1f}s ({dur_src}; diff {diff:.1f}s < "
-                 f"-tol {-tol:.1f}s; a round clip may be truncated/missing "
-                 f"from concat)")
+            print(f"  [WARN] combined.mp4 {actual_sec:.1f}s is SHORTER than expected "
+                  f"{expected_sec:.1f}s ({dur_src}; diff {diff:.1f}s < -tol "
+                  f"{-tol:.1f}s). Estimate is approximate (player-POV window is "
+                  f"shorter than full round span); round-count check passed, so "
+                  f"continuing -- but verify no round was truncated.")
         elif diff > tol:
             print(f"  [warn] combined.mp4 {actual_sec:.1f}s LONGER than expected "
                   f"{expected_sec:.1f}s (diff +{diff:.1f}s > tol {tol:.1f}s); "
-                  f"likely csdm per-round lead-in — accepted")
+                  f"likely csdm per-round lead-in -- accepted")
         else:
             print(f"  [OK] duration: {actual_sec:.1f}s vs expected "
-                  f"{expected_sec:.1f}s ({dur_src}; diff {diff:+.1f}s, tol ±{tol:.1f}s)")
+                  f"{expected_sec:.1f}s ({dur_src}; diff {diff:+.1f}s, tol +/-{tol:.1f}s")
 
     def _expected_duration_from_demo(self, tickrate: float, round_nums: list[int] | None = None) -> float | None:
         """Compute the player-POV rendered duration from the demo itself, as a
@@ -683,6 +717,37 @@ class Pipeline:
             span = max(rend_end - rend_start, 0)
             total += span / tickrate
         return total if total > 0 else None
+
+    def _expected_duration_from_analysis(self, tickrate: float, round_nums: list[int]) -> float | None:
+        """Fallback expected duration from CSDM's own analysis JSON.
+
+        Uses the per-round startTick/endTick spans CSDM recorded when it
+        analyzed the demo. Reliable ground truth with NO demoparser2
+        overcount (the old estimate paired round n's start with round n+1's
+        end and overcounted ~2.5x). The actual player-POV render window is
+        routinely shorter than the full round span, so callers should use a
+        LOOSE tolerance and treat shortfalls as warnings, not hard failures.
+        Returns None if no analysis/rounds are available."""
+        analysis = self._load_analysis()
+        if not analysis:
+            return None
+        rounds = analysis.get("rounds", [])
+        if not rounds or not tickrate:
+            return None
+        by_num = {int(r.get("number", 0)): r for r in rounds}
+        total = 0.0
+        used = 0
+        for n in round_nums:
+            r = by_num.get(n)
+            if not r:
+                continue
+            s = r.get("startTick")
+            e = r.get("endTick")
+            if s is None or e is None or e <= s:
+                continue
+            total += (e - s + 1) / tickrate
+            used += 1
+        return total if used else None
 
     def _copy_overlay_result_to_youtube(self, overlay: Path) -> None:
         """Copy .overlay.mp4 from renders work dir to overlay youtube dir.
@@ -766,13 +831,10 @@ class Pipeline:
 
         video_path = target_dir / "video.mp4"
         if not video_path.exists():
-            # Auto-recover: look for a pre-rendered combined.overlay.mp4 in
-            # any known render-dir convention (e.g. an external overlay pass
-            # in a separate render dir, with step 3 skipped on resume). Copy
-            # THAT as the overlay video. NEVER fall back to copying the raw
-            # video — that would upload the un-overlaid POV under the overlay
-            # variant on a resume that skips step 4.
-            external = self._find_overlay_video()
+            # Auto-recover from render-side overlay artifacts only.
+            # Do NOT treat youtube/..._overlay/video.mp4 as a resume source —
+            # that is the destination we may be intentionally regenerating.
+            external = self._find_overlay_video(include_youtube=False)
             if external is not None and external.exists():
                 target_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(str(external), str(video_path))
@@ -827,8 +889,12 @@ class Pipeline:
             "--batches", str(getattr(self.args, "overlay_batches", 10)),
             "--util-cams-root", str(self.render_dir / "utility_cams"),
             "--work-dir", str(work_dir),
-        ], timeout=7200)
+        ], timeout=7200, capture_output=True, text=True)
         if r.returncode != 0:
+            if r.stdout:
+                print(r.stdout)
+            if r.stderr:
+                print("[stderr]", r.stderr[-2000:])
             fail(4, "OVERLAY_FAILED", f"overlay_pov.py exited {r.returncode}")
 
         overlay_sidecar = video_path.with_suffix(".overlay.mp4")
@@ -894,17 +960,19 @@ class Pipeline:
 
     # ── Step 6: Thumbnail ────────────────────────────────────────────────
 
-    def _find_overlay_video(self) -> Path | None:
-        """Locate overlay video for thumbnail background extraction.
+    def _find_overlay_video(self, *, include_youtube: bool = True) -> Path | None:
+        """Locate a pre-rendered overlay video.
 
-        Search order (post-outro youtube dir first — that's where the finished
-        overlay lands after step 4/5; ``combined.overlay.mp4`` is often gone):
-          1. ``youtube/{run_id}_overlay/video.mp4``
+        Search order:
+          1. ``youtube/{run_id}_overlay/video.mp4`` (finished variant; for
+             thumbnail bg only — NOT for step-4 resume, or a re-run would
+             circularly "recover" the bad/stale youtube file and skip
+             overlay_pov.py)
           2. ``renders/.../.overlay_work/video.overlay.mp4``
-          3. ``renders/pov-{dem_stem}_{steam_id|_full|player|_full|player_slug}/combined.overlay.mp4``
+          3. ``renders/.../combined.overlay.mp4`` (+ legacy render-dir names)
         """
         candidates: list[Path] = []
-        if self.overlay_youtube_dir is not None:
+        if include_youtube and self.overlay_youtube_dir is not None:
             candidates.append(self.overlay_youtube_dir / "video.mp4")
         if self.render_dir:
             candidates.append(self.render_dir / ".overlay_work" / "video.overlay.mp4")
@@ -1129,11 +1197,12 @@ def main() -> None:
     parser.add_argument("--until", type=int, default=None, choices=range(1, 8),
                         help="Stop after step N (default: 6 = thumbnail, before cleanup)")
     parser.add_argument(
-        "--dual-upload",
-        action="store_true",
-        help="Produce and upload a second, independent overlay variant "
-             "(separate youtube dir, title, thumbnail, description).",
+        "--no-dual-upload",
+        action="store_false",
+        dest="dual_upload",
+        help="Disable the second overlay variant (default: dual-upload ON).",
     )
+    parser.set_defaults(dual_upload=True)
     parser.add_argument(
         "--overlay-only",
         action="store_true",

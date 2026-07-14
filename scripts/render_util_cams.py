@@ -147,17 +147,37 @@ def _prepare_util_cams(
 # ---------------------------------------------------------------------------
 
 def _discover_util_cams(util_cams_root: Path) -> list[Path]:
-    """Yield util_cam dirs that have a _throw_poses.json and no existing mp4.
+    """Yield util_cam dirs that still need rendering.
 
-    Layout: <util_cams_root>/unnamed/<throw_id_slug>/ (match-id prefix stripped)
+    A dir needs rendering if ANY throw listed in its ``_throw_poses.json`` is
+    missing its EXPECTED clip (named per the dir's ``_cameras`` field), e.g.
+    ``flight_detonate_<slug>.mp4`` for smokes/molotov. We must check the
+    SPECIFIC expected clip, NOT just "any *.mp4 exists": a dir can hold the
+    separate ``flight`` + ``detonate`` clips while its COMBINED
+    ``flight_detonate`` clip failed to render. Treating "has any mp4" as
+    "already rendered" skips the dir forever and the combined clip is never
+    produced — which is exactly how smokes ended up showing only the
+    standalone detonate in the overlay.
     """
     out: list[Path] = []
     for poses_f in sorted(util_cams_root.rglob("_throw_poses.json")):
         util_dir = poses_f.parent
-        existing = list(util_dir.glob("*.mp4"))
-        if existing:
-            continue  # already rendered
-        out.append(util_dir)
+        try:
+            poses = json.loads(poses_f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        cam = poses.get("_cameras") or "flight"
+        throw_map = poses.get("_throws", {})
+        if not throw_map:
+            continue
+        needs_render = False
+        for tid in throw_map:
+            clip = util_dir / f"{clip_name_for_cameras(cam, tid)}.mp4"
+            if not (clip.is_file() and clip.stat().st_size > 1_000_000):
+                needs_render = True
+                break
+        if needs_render:
+            out.append(util_dir)
     return out
 
 

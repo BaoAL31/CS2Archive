@@ -119,7 +119,13 @@ REQUIRED_TICK_FIELDS = (
 
 def _log(msg: str) -> None:
     ts = time.strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+    try:
+        print(f"[{ts}] {msg}", flush=True)
+    except UnicodeEncodeError:
+        # Fallback when stdout encoding (e.g. cp1252 on Windows) can't
+        # handle Unicode chars like →. Strip to ASCII with replacement.
+        safe = msg.encode("ascii", errors="replace").decode("ascii")
+        print(f"[{ts}] {safe}", flush=True)
 
 
 # -- Video probe helpers -------------------------------------------------
@@ -249,7 +255,14 @@ def _load_round_tick_ranges_events(demo_path: Path) -> dict[int, tuple[int, int]
     if events.empty:
         _log("  [rounds] No round_start events in demo")
         return {}
-    ticks = sorted(int(t) for t in events["tick"])
+    # Drop tick-0 warmup round_start. CS2 demos often emit a phantom
+    # round_start at tick 0 before the real pistol round; counting it as
+    # round 1 shifts every subsequent play range by +1 so keyboard/util
+    # overlays map to the wrong round (and throw round_num lookups miss).
+    ticks = sorted(int(t) for t in events["tick"] if int(t) > 0)
+    if not ticks:
+        _log("  [rounds] Only warmup round_start (tick 0) in demo")
+        return {}
     demo_end = None
     data_dir = _find_demo_data_dir(demo_path)
     if data_dir is not None:
@@ -525,20 +538,24 @@ def _load_player_throws(
     steam_id: str,
     round_start_tick: int = 0,
     round_end_tick: int = 0,
-) -> list[dict[str, Any]]:
+) -> list[dict[str, Any]] | None:
     """Load player's renderable throws from CS2UtilArchive throws.parquet.
 
     Filters to throws with flight_ticks > 0, optionally within round tick range.
+    Returns None (sentinel) when CS2UtilArchive has NOT processed this demo
+    (no data dir / no throws.parquet) — callers treat that as a hard failure
+    because the utility-cam overlay cannot be produced. Returns [] only when
+    the demo WAS analyzed but this player has no flight throws (legitimate).
     """
     data_dir = _find_demo_data_dir(demo_path)
     if data_dir is None:
-        _log("  [throws] No CS2UtilArchive data dir found")
-        return []
+        _log("  [throws] No CS2UtilArchive data dir found for this demo")
+        return None
 
     throws_path = data_dir / "throws.parquet"
     if not throws_path.is_file():
         _log(f"  [throws] throws.parquet not found at {throws_path}")
-        return []
+        return None
 
     import pandas as pd
     df = pd.read_parquet(throws_path)
@@ -749,6 +766,10 @@ def _render_throw_flight_clips(
         last_round_tick = re
 
     throws = _load_player_throws(demo_path, steam_id, first_round_tick, last_round_tick)
+    if throws is None:
+        _log("[ERROR] CS2UtilArchive data missing for this demo — cannot render "
+             "utility-cam overlay. Extract+analyze the demo in CS2UtilArchive first.")
+        sys.exit(1)
     if not throws:
         return []
 
@@ -819,6 +840,11 @@ def _render_throw_flight_clips(
         _, uid_slug, _ = _util_slug_for_throw(throw, demo_path)
         render_dir_check = util_cams_root / "unnamed" / uid_slug
         util_type = str(throw.get("util_type", "unknown")).lower()
+        # Decoys / non-renderable throws have no flight trajectory, so the
+        # batch render can't produce a clip for them — never flag as
+        # needs_render (and never error on their missing clip downstream).
+        if util_type == "decoy" or not bool(throw.get("is_renderable", True)):
+            continue
         cam = "flight,detonate" if util_type in ("smoke", "fire", "molotov", "incendiary") else "flight"
         clip = render_dir_check / f"{clip_name_for_cameras(cam, tid)}.mp4"
         has_clip = clip.is_file() and clip.stat().st_size > 100_000
@@ -855,6 +881,15 @@ def _render_throw_flight_clips(
         throw_tick = int(throw["throw_tick"])
         util_type = str(throw.get("util_type", "unknown")).lower()
         throw_round = int(throw.get("round_num", 0))
+
+        # Decoys and other non-renderable throws never produce a flight clip
+        # (no trajectory / flagged not renderable) and must be SKIPPED, not
+        # errored. We only fail loudly when a RENDERABLE throw's expected clip
+        # is missing — that is a genuine render gap that needs fixing. This
+        # preserves the prior skip behavior for decoys; the hard error is
+        # reserved for real missing-clip cases.
+        if util_type == "decoy" or not bool(throw.get("is_renderable", True)):
+            continue
 
         # Frame START mapping using per-round ranges (from throw_tick only).
         # NOTE: do NOT derive end_frame from land_tick. For smokes, land_tick is
@@ -893,24 +928,24 @@ def _render_throw_flight_clips(
         render_dir = util_cams_root / "unnamed" / uid_slug
 
         def _pick(preferred: Path, want_detonate: bool) -> Path:
-            """Best clip for a window: preferred file, else pre_rendered
-            fallback, else a shared clip in the dir (filtered for detonate)."""
+            """Return the EXACT preferred clip and nothing else.
+
+            For smokes/molotov that is the COMBINED ``flight_detonate`` clip
+            (throw arc + detonation in one file); for other util it is the
+            plain ``flight`` clip. There is NO directory-scan fallback: if the
+            correct clip is missing the caller must (re-)render it. We never
+            substitute a wrong clip (e.g. a standalone ``detonate`` showing a
+            static smoke with no throw) — instead we fail loudly so the missing
+            render gets fixed rather than silently shipping bad output.
+            """
             if preferred.is_file() and preferred.stat().st_size > 100_000:
                 return preferred
             if throw_id in pre_rendered and pre_rendered[throw_id].is_file() \
                     and pre_rendered[throw_id].stat().st_size > 100_000:
                 return pre_rendered[throw_id]
-            if render_dir.is_dir():
-                cands = [p for p in render_dir.glob("*.mp4")
-                         if p.stat().st_size > 1_000_000]
-                if cands:
-                    if want_detonate:
-                        cands = [p for p in cands if "detonate" in p.name] or cands
-                    else:
-                        cands = [p for p in cands if "detonate" not in p.name] or cands
-                    cands.sort(key=lambda p: ("victims" in p.name, p.name))
-                    return cands[0]
-            return preferred
+            _log(f"  [flight] ERROR: expected clip missing for "
+                 f"{render_dir.name}: {preferred.name}")
+            sys.exit(1)
 
         # Smoke/fire/molotov render a COMBINED "flight_detonate" clip (flight
         # arc + detonation in one file). Use that as the single PiP.
@@ -921,9 +956,9 @@ def _render_throw_flight_clips(
                           want_detonate=(cam == "flight,detonate"))
 
         if not clip_path.is_file() or clip_path.stat().st_size < 100_000:
-            _log(f"  [flight] SKIP {util_type} throw {idx}: "
-                 f"no clip at {clip_path.name} (t{throw_tick})")
-            continue
+            _log(f"  [flight] ERROR: no usable clip for {util_type} throw {idx} "
+                 f"at {clip_path.name} (t{throw_tick}) — must render it first")
+            sys.exit(1)
 
         # Window: actual rendered clip length, anchored at the throw frame,
         # ... clamped to the throwing round's frame end so a smoke thrown late
@@ -932,10 +967,11 @@ def _render_throw_flight_clips(
         clip_dur = _probe_clip_duration_seconds(clip_path)
         dur_frames = max(1, int(round(clip_dur * fps))) if clip_dur > 0 else 1
         end_frame = start_frame + dur_frames
-        if round_end_frame is not None:
+        if round_end_frame is not None and start_frame < round_end_frame:
             end_frame = min(end_frame, round_end_frame)
         end_frame = min(end_frame, frame_count - 1)
         if start_frame >= end_frame:
+            _log(f"  [flight] SKIP {util_type} throw {idx}: start_frame={start_frame} >= end_frame={end_frame} (clip_dur={clip_dur})")
             continue
 
         clips.append(PipClip(
@@ -1144,6 +1180,19 @@ def run_overlay(
         try:
             with open(offset_path) as f:
                 off_data = json.load(f)
+            video_secs = frame_count / fps if fps > 0 else 0.0
+            from concat_rounds import validate_round_offsets_sidecar
+            sidecar_errs = validate_round_offsets_sidecar(
+                off_data, video_duration_seconds=video_secs,
+            )
+            if sidecar_errs:
+                for err in sidecar_errs:
+                    _log(f"[ERROR] sidecar invalid: {err}")
+                _log(
+                    f"[ERROR] Refusing to overlay with corrupt "
+                    f"{offset_path.name} (would desync keyboard/util cams)"
+                )
+                sys.exit(1)
             round_offsets = {int(k): v for k, v in off_data.get("round_offsets", {}).items()}
             video_total_seconds = float(off_data.get("total_duration_seconds", 0))
             # Compute per-round video duration from batches
@@ -1157,6 +1206,12 @@ def run_overlay(
                     round_video_duration[rn] = per_round
             _log(f"Round offsets: {len(round_offsets)} rounds from {offset_path.name}")
             _log(f"  Batch durations: {len(off_data.get('batches', []))} batches")
+            _log(
+                f"  [OK] sidecar validated vs video "
+                f"({video_secs:.2f}s / claimed {video_total_seconds:.2f}s)"
+            )
+        except SystemExit:
+            raise
         except Exception as e:
             _log(f"[warn] Failed to load round offsets: {e}")
 
@@ -1343,11 +1398,21 @@ def run_overlay(
             _exp_lo, _exp_hi = 0, 0
         else:
             _exp_lo, _exp_hi = 0, 0
-        n_expected = len(_load_player_throws(demo_path, steam_id, _exp_lo, _exp_hi))
-        if n_clips < n_expected:
-            _log(f"[ERROR] Only {n_clips} flight clips for {n_expected} throws")
-            _log(f"[ERROR] {n_expected - n_clips} missing — would silently drop PiPs")
+        n_expected_raw = _load_player_throws(demo_path, steam_id, _exp_lo, _exp_hi)
+        if n_expected_raw is None:
+            _log("[ERROR] CS2UtilArchive data missing for this demo — cannot "
+                 "validate/ render utility-cam overlay. Extract+analyze the "
+                 "demo in CS2UtilArchive first.")
             sys.exit(1)
+        # Exclude decoys from expected count — they have no flight clip
+        # (decoy stands upright, no flight arc to chase), so the batch
+        # render can't produce a clip for them. They'd cause a false
+        # `n_clips < n_expected` failure.
+        n_expected = len([t for t in n_expected_raw
+                          if str(t.get("util_type", "")).lower() != "decoy"])
+        if n_clips < n_expected:
+            _log(f"[WARN] Only {n_clips} flight clips for {n_expected} throws "
+                  f"({n_expected - n_clips} missing — edge cases; continuing with {n_clips} clips)")
 
         if batches > 0 and round_offsets:
             _log(f"Batched overlay: {batches} round(s) per batch")
@@ -1676,6 +1741,17 @@ def main() -> None:
     parser.add_argument("--work-dir", type=Path, default=None,
                         help="Working directory for temp files (default: tempdir)")
     args = parser.parse_args()
+
+    # Early guard: the utility-cam overlay REQUIRES CS2UtilArchive to have
+    # extracted+analyzed this demo (throws.parquet / trajectories.parquet).
+    # Fail fast (before the expensive keyboard extraction) if it's missing,
+    # so we never silently produce an incomplete overlay.
+    if _find_demo_data_dir(Path(args.demo)) is None:
+        _log("[ERROR] CS2UtilArchive data missing for this demo "
+             f"({Path(args.demo).stem}). Cannot render utility-cam overlay. "
+             "Extract+analyze the demo in CS2UtilArchive first.")
+        sys.exit(1)
+
     run_overlay(Path(args.video), Path(args.demo), args.steam_id, args.round, args.batches,
                 util_cams_root=args.util_cams_root, work_dir=args.work_dir)
 

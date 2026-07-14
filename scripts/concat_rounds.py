@@ -76,9 +76,10 @@ def _parse_sequence_files(folder: Path, batch_files: list[Path]) -> dict | None:
 
     Maps sequence index -> round number within the batch (in render order).
     Returns {per_round_ticks, per_round_durations} or None if no sequences.
+    Searches recursively: CSDM may nest these in a subdir (e.g. `19-sequence/`).
     """
     seqs = []
-    for f in folder.glob("sequence-*-tick-*-to-*.mp4"):
+    for f in folder.rglob("sequence-*-tick-*-to-*.mp4"):
         m = _SEQ_RE.match(f.name)
         if not m:
             continue
@@ -128,23 +129,164 @@ def _probe_duration(path: Path) -> float:
     return float(data.get("format", {}).get("duration", 0))
 
 
+def validate_round_offsets_sidecar(
+    data: dict,
+    *,
+    video_duration_seconds: float | None = None,
+) -> list[str]:
+    """Validate a ``*.round_offsets.json`` payload.
+
+    Returns a list of error strings (empty = OK). Catches the class of bugs
+    where batch durations were probed from cumulative ``combined.mp4`` after
+    append — sidecar claimed ~2× the real video length and late round
+    offsets landed past EOF (e.g. total 4195s / round 22 at 3093s on a
+    2202s POV).
+    """
+    errors: list[str] = []
+    if not isinstance(data, dict):
+        return ["sidecar is not a JSON object"]
+
+    try:
+        total_rounds = int(data.get("total_rounds") or 0)
+        total_dur = float(data.get("total_duration_seconds") or 0)
+    except (TypeError, ValueError):
+        return ["sidecar total_rounds/total_duration_seconds not numeric"]
+
+    raw_offsets = data.get("round_offsets") or {}
+    if not isinstance(raw_offsets, dict) or not raw_offsets:
+        errors.append("round_offsets missing or empty")
+        return errors
+
+    try:
+        offsets = {int(k): float(v) for k, v in raw_offsets.items()}
+    except (TypeError, ValueError):
+        return ["round_offsets keys/values not numeric"]
+
+    if total_rounds and total_rounds != len(offsets):
+        errors.append(
+            f"total_rounds={total_rounds} but round_offsets has {len(offsets)} entries"
+        )
+
+    sorted_rns = sorted(offsets)
+    if sorted_rns[0] != 1:
+        errors.append(f"round_offsets should start at round 1, got {sorted_rns[0]}")
+    if sorted_rns != list(range(sorted_rns[0], sorted_rns[-1] + 1)):
+        errors.append(f"round_offsets has gaps: {sorted_rns}")
+
+    if offsets[sorted_rns[0]] < -0.01:
+        errors.append(f"first round offset is negative: {offsets[sorted_rns[0]]}")
+    for prev, rn in zip(sorted_rns, sorted_rns[1:]):
+        if offsets[rn] + 1e-6 < offsets[prev]:
+            errors.append(
+                f"round_offsets not monotonic: r{prev}={offsets[prev]:.3f} > "
+                f"r{rn}={offsets[rn]:.3f}"
+            )
+
+    batches = data.get("batches") or []
+    if batches:
+        try:
+            batch_sum = sum(float(b["duration_seconds"]) for b in batches)
+        except (KeyError, TypeError, ValueError):
+            errors.append("batches[].duration_seconds missing or not numeric")
+            batch_sum = None
+        if batch_sum is not None and total_dur > 0:
+            if abs(batch_sum - total_dur) > 0.5:
+                errors.append(
+                    f"sum(batch durations)={batch_sum:.3f}s != "
+                    f"total_duration_seconds={total_dur:.3f}s"
+                )
+
+    per_durs = data.get("per_round_durations") or {}
+    if per_durs and total_dur > 0:
+        try:
+            pr_sum = sum(float(v) for v in per_durs.values())
+        except (TypeError, ValueError):
+            errors.append("per_round_durations values not numeric")
+            pr_sum = None
+        if pr_sum is not None and abs(pr_sum - total_dur) > 0.5:
+            errors.append(
+                f"sum(per_round_durations)={pr_sum:.3f}s != "
+                f"total_duration_seconds={total_dur:.3f}s"
+            )
+
+    # Hard gate vs the real video — this is the check that would have caught
+    # the Twistzz Cache 4195s-vs-2202s sidecar corruption.
+    if video_duration_seconds is not None and video_duration_seconds > 0:
+        tol = max(2.0, video_duration_seconds * 0.02)
+        if total_dur <= 0:
+            errors.append("total_duration_seconds missing/zero while video was probed")
+        elif abs(total_dur - video_duration_seconds) > tol:
+            errors.append(
+                f"total_duration_seconds={total_dur:.3f}s does not match video "
+                f"duration={video_duration_seconds:.3f}s (tol ±{tol:.1f}s) — "
+                f"sidecar is corrupt or from a different concat"
+            )
+        last_off = offsets[sorted_rns[-1]]
+        if last_off >= video_duration_seconds:
+            errors.append(
+                f"last round (r{sorted_rns[-1]}) offset {last_off:.3f}s is past "
+                f"video end {video_duration_seconds:.3f}s"
+            )
+        for rn, off in offsets.items():
+            if off >= video_duration_seconds:
+                errors.append(
+                    f"round {rn} offset {off:.3f}s is past video end "
+                    f"{video_duration_seconds:.3f}s"
+                )
+                break
+
+    return errors
+
+
 def concat_rounds(folder: Path) -> Path:
     combined = folder / "combined.mp4"
-    files, _ = _parse_batches(folder, combined_exists=combined.exists())
-    total_rounds = sum(
+    offset_path = folder / "combined.round_offsets.json"
+    resuming = combined.exists()
+    files, _ = _parse_batches(folder, combined_exists=resuming)
+    new_rounds = sum(
         int(_BATCH_RE.match(f.name).group(2)) - int(_BATCH_RE.match(f.name).group(1)) + 1
         for f in files
     )
 
-    print(f"Concatenating {len(files)} batch(es) ({total_rounds} rounds) -> {combined}")
+    print(f"Concatenating {len(files)} batch(es) ({new_rounds} rounds) -> {combined}")
 
-    round_offsets = {}  # round_num -> start_seconds
+    round_offsets: dict[int, float] = {}
     batch_offsets: list[dict] = []
     cumulative = 0.0
+
+    # Resume: seed offsets/batches from the existing sidecar and set
+    # cumulative from the probed combined duration so newly appended batches
+    # continue the timeline instead of rewriting a partial sidecar.
+    if resuming:
+        cumulative = _probe_duration(combined)
+        if offset_path.is_file():
+            prev = json.loads(offset_path.read_text(encoding="utf-8"))
+            round_offsets = {
+                int(k): float(v) for k, v in (prev.get("round_offsets") or {}).items()
+            }
+            batch_offsets = list(prev.get("batches") or [])
+            print(
+                f"  [resume] seeded {len(round_offsets)} rounds from sidecar; "
+                f"combined={cumulative:.2f}s"
+            )
+        elif cumulative > 0:
+            print(
+                "  [warn] resume without sidecar — cannot reconstruct offsets "
+                "for rounds already inside combined.mp4"
+            )
 
     for f in files:
         m = _BATCH_RE.match(f.name)
         s, e = int(m.group(1)), int(m.group(2))
+
+        # Probe THIS batch before consuming it. After rename/unlink, probing
+        # `combined` would return the cumulative duration so far — which for
+        # batch N>1 double-counts earlier batches into total_duration_seconds
+        # and pushes later round_offsets past the end of the video
+        # (e.g. round 22 at 3093s in a 2202s POV).
+        dur = _probe_duration(f)
+        if dur <= 0:
+            print(f"  [warn] ffprobe returned 0 duration for {f.name}")
 
         if not combined.exists():
             f.rename(combined)
@@ -158,8 +300,7 @@ def concat_rounds(folder: Path) -> Path:
             mb = combined.stat().st_size / 1024 / 1024
             print(f"  {f.name} appended ({mb:.0f} MB)")
 
-        # Probe batch duration, distribute evenly across rounds in batch
-        dur = _probe_duration(combined if not f.is_file() else f)
+        # Distribute this batch's duration evenly across its rounds
         per_round = dur / (e - s + 1)
         for r in range(s, e + 1):
             offset = cumulative + (r - s) * per_round
@@ -179,22 +320,36 @@ def concat_rounds(folder: Path) -> Path:
     # even-split `per_round` estimate above when sequences are absent.
     seq_fields = _parse_sequence_files(folder, files)
     if seq_fields:
-        # Replace per-round durations with probed sequence durations.
         per_round_ticks = seq_fields["per_round_ticks"]
         per_round_durations = seq_fields["per_round_durations"]
-        cumulative = 0.0
-        for rn in sorted(per_round_durations.keys()):
-            round_offsets[rn] = cumulative
-            cumulative += per_round_durations[rn]
-        # Rewrite batch durations so they sum to the new cumulative total.
-        for b in batch_offsets:
-            rn_start, rn_end = b["round_start"], b["round_end"]
-            b["duration_seconds"] = sum(
-                per_round_durations[r] for r in range(rn_start, rn_end + 1)
-                if r in per_round_durations
+        seq_rounds = sorted(per_round_durations.keys())
+        # On resume, only trust sequences when they cover a contiguous 1..N
+        # that includes every round we already tracked — otherwise keep the
+        # seeded even-split offsets for prior rounds.
+        covers_all = (
+            seq_rounds == list(range(1, seq_rounds[-1] + 1))
+            and (not round_offsets or seq_rounds[-1] >= max(round_offsets))
+        )
+        if covers_all:
+            cumulative = 0.0
+            round_offsets = {}
+            for rn in seq_rounds:
+                round_offsets[rn] = cumulative
+                cumulative += per_round_durations[rn]
+            for b in batch_offsets:
+                rn_start, rn_end = b["round_start"], b["round_end"]
+                b["duration_seconds"] = sum(
+                    per_round_durations[r] for r in range(rn_start, rn_end + 1)
+                    if r in per_round_durations
+                )
+        else:
+            print(
+                "  [warn] sequence files don't cover all rounds on resume; "
+                "keeping even-split / seeded offsets"
             )
+            seq_fields = None
 
-    offset_path = folder / "combined.round_offsets.json"
+    total_rounds = len(round_offsets)
     payload = {
         "total_rounds": total_rounds,
         "total_duration_seconds": cumulative,
@@ -211,6 +366,19 @@ def concat_rounds(folder: Path) -> Path:
     with open(offset_path, "w") as f:
         json.dump(payload, f, indent=2)
     print(f"\nRound offsets: {offset_path} ({len(round_offsets)} rounds)")
+
+    video_dur = _probe_duration(combined)
+    sidecar_errs = validate_round_offsets_sidecar(
+        payload, video_duration_seconds=video_dur,
+    )
+    if sidecar_errs:
+        for err in sidecar_errs:
+            print(f"  [SIDECAR_INVALID] {err}")
+        sys.exit(1)
+    print(
+        f"  [OK] sidecar validated against combined.mp4 "
+        f"({video_dur:.2f}s, {len(round_offsets)} rounds)"
+    )
 
     print(f"\nDone. {combined} ({combined.stat().st_size // 1024 // 1024} MB)")
     return combined
