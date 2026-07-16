@@ -470,7 +470,7 @@ def _upscale(src: Path, dst: Path, w: int, h: int) -> None:
     cmd = [
         "ffmpeg", "-y", "-i", str(src),
         "-vf", f"scale={w}:{h}:flags=spline,format=nv12",
-        "-c:v", "h264_nvenc", "-preset", "p7", "-rc", "vbr_hq", "-cq", "16", "-b:v", "0", "-maxrate", "50M",
+        "-c:v", "h264_nvenc", "-preset", "p7", "-rc", "cq", "-cq", "14",
         "-profile:v", "high", "-pix_fmt", "yuv420p", "-level", "5.1",
         "-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
         "-movflags", "+faststart",

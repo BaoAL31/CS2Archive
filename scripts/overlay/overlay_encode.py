@@ -82,8 +82,9 @@ def _ffmpeg_encode(
         cmd.extend(["-i", str(inp)])
     cmd.extend([
         *fc_args, "-map", out_label, "-map", "0:a?", "-shortest",
-        # Match raw concat quality (concat_rounds.py): cq 16 / p7
-        "-c:v", "h264_nvenc", "-cq", "16", "-preset", "p7",
+        # Max quality for YouTube: constant-quality nvenc, no bitrate cap, slowest preset.
+        # CQ 14 (lower = better); p7 = slowest/highest-quality nvenc preset.
+        "-c:v", "h264_nvenc", "-rc", "cq", "-cq", "14", "-preset", "p7",
         "-profile:v", "high", "-pix_fmt", "yuv420p",
         "-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
         "-c:a", "aac", "-b:a", "256k",
@@ -92,7 +93,7 @@ def _ffmpeg_encode(
         "-g", "60", "-keyint_min", "60",
         "-f", "mp4", str(tmp_path),
     ])
-    _log(f"  [ffmpeg] nvenc preset p7 cq 16 (match raw; no libx fallback)")
+    _log(f"  [ffmpeg] nvenc preset p7 cq 14 (max quality; no libx fallback)")
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=21600)  # 6h
     if result.returncode != 0 or not tmp_path.is_file():
         _log(f"[ERROR] nvenc ffmpeg failed: rc={result.returncode}")
