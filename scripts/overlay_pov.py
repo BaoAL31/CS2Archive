@@ -36,8 +36,15 @@ from dataclasses import dataclass
 from typing import Any
 
 # -- Point at CS2UtilArchive for overlay pipeline + parquet data ----------
-_CS2UTIL_ROOT = Path(r"D:\Projects\CS2UtilArchive")
-_CS2UTIL_SCRIPTS = _CS2UTIL_ROOT / "scripts"
+# Shared constants/helpers live in the overlay subpackage's _common module
+# (also imported by overlay_utilcams / overlay_encode) to avoid cycles.
+from overlay._common import (
+    _CS2UTIL_ROOT,
+    _CS2UTIL_SCRIPTS,
+    TICKRATE,
+    _log,
+    _probe_clip_duration_seconds,
+)
 for _p in (str(_CS2UTIL_SCRIPTS), str(_CS2UTIL_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -57,8 +64,28 @@ from scripts.input_overlay_decode import (
 )
 from scripts.render.paths import flight_clip_name, clip_name_for_cameras, util_render_slug
 
+# Per-concern modules (kept out of this file to limit its size).
+from overlay.overlay_utilcams import (
+    PipClip,
+    _find_demo_data_dir,
+    _cs2util_results_dir,
+    _load_player_throws,
+    _build_round_frame_ranges,
+    _rm_empty_dir,
+    _util_slug_for_throw,
+    _run_batch_util_cams_subprocess,
+    _scan_utility_cams_clips,
+    _render_throw_flight_clips,
+)
+from overlay.overlay_encode import (
+    _overlay_output_valid,
+    _ffmpeg_encode,
+    _ffmpeg_segment_copy,
+    _concat_overlay_batches,
+    _compute_batch_boundaries,
+)
+
 # -- Constants -----------------------------------------------------------
-TICKRATE = 64.0
 
 # --- Util PiP burn-in geometry -----------------------------------------
 # Preferred body = video_height * 2 // 5; shrinks if PIP_MAX_SIMULTANEOUS
@@ -74,9 +101,6 @@ FLIGHT_DIR_NAME = "throw_flights"
 OVERLAY_BATCH_PREFIX = "batch-overlay-"
 
 
-def _overlay_output_valid(path: Path) -> bool:
-    """Return True if a batch/final overlay file is present and non-empty."""
-    return path.is_file() and path.stat().st_size > 100_000
 
 
 def _pip_body(video_height: int) -> int:
@@ -117,43 +141,10 @@ REQUIRED_TICK_FIELDS = (
 )
 
 
-def _log(msg: str) -> None:
-    ts = time.strftime("%H:%M:%S")
-    try:
-        print(f"[{ts}] {msg}", flush=True)
-    except UnicodeEncodeError:
-        # Fallback when stdout encoding (e.g. cp1252 on Windows) can't
-        # handle Unicode chars like →. Strip to ASCII with replacement.
-        safe = msg.encode("ascii", errors="replace").decode("ascii")
-        print(f"[{ts}] {safe}", flush=True)
-
-
-# -- Video probe helpers -------------------------------------------------
-
 # Cache: flight clip path -> duration in seconds. Probing once per clip is
 # cheap (~50ms) and skips repeated ffprobe calls for shared clips.
 _CLIP_DUR_CACHE: dict[str, float] = {}
 
-
-def _probe_clip_duration_seconds(clip_path: Path) -> float:
-    """Return video duration in seconds (cached). Falls back to 0.0 on error."""
-    key = str(clip_path)
-    cached = _CLIP_DUR_CACHE.get(key)
-    if cached is not None:
-        return cached
-    try:
-        cmd = [
-            "ffprobe", "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=duration",
-            "-of", "json", str(clip_path),
-        ]
-        r = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        dur = float(json.loads(r.stdout)["streams"][0]["duration"])
-    except Exception:
-        dur = 0.0
-    _CLIP_DUR_CACHE[key] = dur
-    return dur
 
 
 def _probe_video_info(video_path: Path) -> tuple[int, int, float, int]:
@@ -174,40 +165,6 @@ def _probe_video_info(video_path: Path) -> tuple[int, int, float, int]:
 
 
 # -- CS2UtilArchive data dir lookup --------------------------------------
-
-
-def _cs2util_results_dir() -> Path | None:
-    d = _CS2UTIL_ROOT / "results"
-    return d if d.is_dir() else None
-
-
-def _find_demo_data_dir(demo_path: Path) -> Path | None:
-    """Find CS2UtilArchive data dir for this demo (where throws.parquet lives)."""
-    results = _cs2util_results_dir()
-    if results is None:
-        return None
-    exact = demo_path.stem
-    broad = re.sub(r"-p\d+$", "", demo_path.stem, flags=re.IGNORECASE)
-
-    # Search all project subdirs: results/*/data/demo=<name>/
-    for project_dir in results.iterdir():
-        if not project_dir.is_dir():
-            continue
-        data_dir = project_dir / "data"
-        if not data_dir.is_dir():
-            continue
-        for d in data_dir.iterdir():
-            if not d.is_dir() or not d.name.startswith("demo="):
-                continue
-            dn = d.name[len("demo="):]
-            if dn == exact or broad in dn:
-                return d
-    return None
-
-
-# -- Round tick ranges ---------------------------------------------------
-
-
 def _load_round_tick_ranges(demo_path: Path) -> dict[int, tuple[int, int]]:
     """Load round (start_tick, end_tick) pairs.
 
@@ -524,470 +481,6 @@ def _extract_keyboard_states(
 # -- Utility throw: CSDM flight renders ----------------------------------
 
 
-@dataclass
-class PipClip:
-    clip_path: Path
-    start_frame: int
-    end_frame: int
-    util_type: str
-    pip_index: int = 0
-
-
-def _load_player_throws(
-    demo_path: Path,
-    steam_id: str,
-    round_start_tick: int = 0,
-    round_end_tick: int = 0,
-) -> list[dict[str, Any]] | None:
-    """Load player's renderable throws from CS2UtilArchive throws.parquet.
-
-    Filters to throws with flight_ticks > 0, optionally within round tick range.
-    Returns None (sentinel) when CS2UtilArchive has NOT processed this demo
-    (no data dir / no throws.parquet) — callers treat that as a hard failure
-    because the utility-cam overlay cannot be produced. Returns [] only when
-    the demo WAS analyzed but this player has no flight throws (legitimate).
-    """
-    data_dir = _find_demo_data_dir(demo_path)
-    if data_dir is None:
-        _log("  [throws] No CS2UtilArchive data dir found for this demo")
-        return None
-
-    throws_path = data_dir / "throws.parquet"
-    if not throws_path.is_file():
-        _log(f"  [throws] throws.parquet not found at {throws_path}")
-        return None
-
-    import pandas as pd
-    df = pd.read_parquet(throws_path)
-    sid = int(steam_id)
-    player_df = df[
-        (df["thrower_steamid"] == sid)
-        & (df["flight_ticks"] > 0)
-    ].copy()
-
-    if round_start_tick > 0:
-        end = round_end_tick if round_end_tick > 0 else round_start_tick + int(45 * 60 * TICKRATE)
-        player_df = player_df[
-            (player_df["throw_tick"] >= round_start_tick)
-            & (player_df["throw_tick"] <= end)
-        ]
-
-    if player_df.empty:
-        _log("  [throws] No throws with flight for this player")
-        return []
-
-    _log(f"  [throws] {len(player_df)} renderable throws")
-    side_counts = player_df["thrower_side"].value_counts().to_dict()
-    t_count = int(side_counts.get("T", 0))
-    ct_count = int(side_counts.get("CT", 0))
-    _log(f"  [throws] side breakdown: T={t_count} CT={ct_count}")
-    if (t_count == 0 or ct_count == 0) and (t_count + ct_count) > 0:
-        missing = "CT" if ct_count == 0 else "T"
-        _log(f"  [throws] NOTE: zero throws on {missing} side — data observation, not pipeline bug")
-    return [dict(row) for _, row in player_df.iterrows()]
-
-
-def _build_round_frame_ranges(
-    round_offsets: dict[int, float],
-    round_tick_ranges: dict[int, tuple[int, int]],
-    fps: float,
-    total_frames: int,
-) -> dict[int, tuple[int, int]]:
-    """Build per-round frame ranges from round_offsets sidecar.
-
-    Returns {round_num: (start_frame, end_frame)}.
-    """
-    sorted_rounds = sorted(round_offsets.keys())
-    result: dict[int, tuple[int, int]] = {}
-    for i, rn in enumerate(sorted_rounds):
-        start_frame = int(round_offsets[rn] * fps)
-        if i + 1 < len(sorted_rounds):
-            end_frame = int(round_offsets[sorted_rounds[i + 1]] * fps) - 1
-        else:
-            end_frame = total_frames - 1
-        result[rn] = (start_frame, end_frame)
-    return result
-
-
-def _rm_empty_dir(d: Path) -> None:
-    """Remove *d* if it exists and contains no files (skips subdirs)."""
-    if d.is_dir() and not any(d.iterdir()):
-        try:
-            d.rmdir()
-        except OSError:
-            pass
-
-
-def _util_slug_for_throw(throw: dict, demo_path: Path) -> tuple[str, str, str]:
-    """Return (util_id, util_slug, demo_id) for a throw row.
-
-    util_id = ``<map>:<util_type>:<side>:<land_x>_<land_y>_<land_z>`` (landing
-    position, no match id) — matches CS2UtilArchive's render_utils folder
-    architecture. util_slug = util_render_slug(util_id).
-    """
-    map_name = str(throw.get("map") or throw.get("map_name") or demo_path.stem)
-    util_type = str(throw.get("util_type", "unknown")).lower()
-    side = str(throw.get("thrower_side", "T") or "T").upper()
-    land_x = int(round(float(throw.get("land_x", 0) or 0)))
-    land_y = int(round(float(throw.get("land_y", 0) or 0)))
-    land_z = int(round(float(throw.get("land_z", 0) or 0)))
-    util_id = f"{map_name}:{util_type}:{side}:{land_x}_{land_y}_{land_z}"
-    util_slug = util_render_slug(util_id)
-    demo_id = re.sub(r"^\d{6,}-", "", str(throw.get("demo_id", demo_path.stem)))
-    return util_id, util_slug, demo_id
-
-
-def _run_batch_util_cams_subprocess(
-    demo_path: Path,
-    steam_id: str,
-    data_dir: Path,
-    util_cams_root: Path,
-    chunk_size: int = 0,
-    demo_data_dir_name: str | None = None,
-) -> int:
-    """Shell out to scripts/render_util_cams.py for util_cam prep + render.
-
-    Bypasses the inline run_csdm loop (Bug A: random POV instead of chase cam
-    when the inject thread races csdm's actions-file write). render_util_cams.py
-    handles BOTH prep (filter throws.parquet by steamid, create util_cam dirs
-    + _throw_poses.json) and render (call CS2UtilArchive's render_spot_batch
-    in one CS2 launch per chunk of N spots). Idempotent — re-runs are no-ops
-    for already-rendered clips.
-    """
-    import subprocess
-    script_path = Path(__file__).resolve().parent / "render_util_cams.py"
-    # Extract demo_id from the per-demo data dir name. Caller passes the
-    # leaf explicitly because the parent (data_dir) doesn't start with "demo=".
-    # Leaf: "demo=2395002-furia-vs-falcons-m2-anubis" → "2395002-furia-vs-falcons-m2-anubis".
-    demo_id = None
-    if demo_data_dir_name and demo_data_dir_name.startswith("demo="):
-        demo_id = demo_data_dir_name[len("demo="):]
-    elif data_dir and data_dir.name.startswith("demo="):
-        demo_id = data_dir.name[len("demo="):]
-    cmd = [
-        sys.executable, str(script_path),
-        "--util-cams-root", str(util_cams_root.resolve()),
-        "--data-dir", str(data_dir.resolve()),
-        "--steamid", str(steam_id),
-        "--chunk-size", str(chunk_size),
-    ]
-    if demo_id:
-        cmd += ["--demo-id", demo_id]
-    # Derive demos_dir from CS2UtilArchive project root
-    demos_dir = _CS2UTIL_ROOT / "demos" / "extracted"
-    cmd += ["--demos-dir", str(demos_dir.resolve())]
-    _log(f"  [flight] CMD: {' '.join(cmd)}")
-    try:
-        result = subprocess.run(
-            cmd, cwd=str(util_cams_root.parent.parent.parent),
-            check=False,
-        )
-        return result.returncode
-    except Exception as exc:
-        _log(f"  [flight] render_util_cams.py subprocess failed: {exc}")
-        return 1
-
-
-def _scan_utility_cams_clips(video_path: Path) -> dict[str, Path]:
-    """Scan utility_cams for pre-rendered clips (orbit + victims + flight).
-
-    Uses _throw_poses.json files to map throw_id -> mp4 clip, since the
-    _throws dict in each json maps throw_ids to camera positions for that
-    camera pose directory. Multiple throw_ids can share one .mp4 (one-shot
-    victim POVs); matched by entity ID in filename when ambiguous.
-    """
-    pre_rendered: dict[str, Path] = {}
-    p = video_path.parent
-    util_cams = None
-    for _ in range(5):
-        cand = p / "utility_cams"
-        if cand.is_dir():
-            util_cams = cand
-            break
-        p = p.parent
-    if not util_cams or not util_cams.is_dir():
-        return {}
-
-    for poses_f in util_cams.rglob("_throw_poses.json"):
-        try:
-            poses = json.loads(poses_f.read_text())
-        except Exception:
-            continue
-        throw_map = poses.get("_throws", {})
-        if not throw_map:
-            continue
-        mp4s = sorted(poses_f.parent.glob("*.mp4"))
-        if not mp4s:
-            continue
-        for tid in throw_map:
-            # Match by entity ID substring in filename.
-            # New naming: flight_<short-slug>.mp4 or flight_orbit_<short-slug>.mp4
-            # Each throw_id has its own dir + 1 mp4 (1:1 mapping).
-            ent_part = tid.split(":")[1] if ":" in tid else ""
-            matching = [m for m in mp4s if ent_part and ent_part in m.name]
-            if len(matching) == 1:
-                pre_rendered[tid] = matching[0]
-            elif matching:
-                pre_rendered[tid] = matching[0]
-    return pre_rendered
-
-
-def _render_throw_flight_clips(
-    demo_path: Path,
-    steam_id: str,
-    fps: float,
-    frame_count: int,
-    output_dir: Path,
-    video_path: Path | None = None,
-    round_offsets: dict[int, float] | None = None,
-    round_tick_ranges: dict[int, tuple[int, int]] | None = None,
-    total_duration_seconds: float = 0.0,
-    util_cams_root: Path | None = None,
-) -> list[PipClip]:
-    """Render CSDM flight clips for each player throw.
-
-    Shells out to scripts/batch_util_cams.py (Batched CSDM — one CS2 launch
-    per chunk of N spots, spec_goto precomputed). Fix for Bug A: inline
-    run_csdm loop races csdm's actions-file write → random POV instead of
-    chase cam. See scripts/batch_util_cams.py for batching details.
-    Outputs 1920x1080 clips to <util_cams_root>/unnamed/<throw_id_slug>/ (match-id
-    prefix stripped, matching CS2UtilArchive's render_utils folder architecture).
-    Returns PipClip metadata sorted by start_frame.
-    """
-    # Determine first round tick for filtering
-    first_round_tick = 0
-    last_round_tick = 0
-    if round_tick_ranges and round_offsets:
-        first_round = min(round_offsets.keys())
-        last_round = max(round_offsets.keys())
-        rs, _ = round_tick_ranges.get(first_round, (0, 0))
-        _, re = round_tick_ranges.get(last_round, (0, 0))
-        first_round_tick = rs
-        last_round_tick = re
-
-    throws = _load_player_throws(demo_path, steam_id, first_round_tick, last_round_tick)
-    if throws is None:
-        _log("[ERROR] CS2UtilArchive data missing for this demo — cannot render "
-             "utility-cam overlay. Extract+analyze the demo in CS2UtilArchive first.")
-        sys.exit(1)
-    if not throws:
-        return []
-
-    # Load trajectories once (per-throw chase-cam injection needs them).
-    # Bug A fix: without trajectories + throw_pose + run_csdm inject thread,
-    # csdm free-cams a random POV instead of chasing the grenade.
-    data_dir = _find_demo_data_dir(demo_path)
-    traj_by_throw: dict[str, Any] = {}
-    if data_dir is not None:
-        traj_path = data_dir / "trajectories.parquet"
-        if traj_path.is_file():
-            import pandas as _pd
-            _traj_df = _pd.read_parquet(traj_path)
-            for tid, sub in _traj_df.groupby("throw_id"):
-                traj_by_throw[str(tid)] = sub.sort_values("tick").copy()
-            _log(f"  [flight] Loaded {len(traj_by_throw)} trajectories")
-        else:
-            _log(f"  [flight] WARN: {traj_path.name} missing — flight cams will be skipped")
-    else:
-        _log(f"  [flight] WARN: no CS2UtilArchive data dir — flight cams will be skipped")
-
-    # Resolve utility_cams directory. Explicit --util-cams-root wins (used by
-    # pipeline in dual-upload mode to point at the persistent render cache
-    # under renders/, not a freshly-created dir under youtube/).
-    if util_cams_root is not None:
-        util_cams_root = Path(util_cams_root)
-        util_cams_root.mkdir(parents=True, exist_ok=True)
-    else:
-        # Walk up from video looking for an existing utility_cams/ cache.
-        video_dir = video_path.parent if video_path else output_dir
-        resolved: Path | None = None
-        p = video_dir
-        for _ in range(5):
-            cand = p / "utility_cams"
-            if cand.is_dir():
-                resolved = cand
-                break
-            p = p.parent
-        if resolved is None:
-            resolved = video_dir / "utility_cams"
-        resolved.mkdir(parents=True, exist_ok=True)
-        util_cams_root = resolved
-
-    # Build per-round frame ranges from round_offsets
-    round_frame_ranges = {}
-    if round_offsets and round_tick_ranges:
-        round_frame_ranges = _build_round_frame_ranges(
-            round_offsets, round_tick_ranges, fps, frame_count,
-        )
-        _log(f"  [flight] {len(round_frame_ranges)} round frame ranges")
-
-    # Scan pre-rendered clips from utility_cams (_throw_poses.json -> mp4)
-    pre_rendered: dict[str, Path] = {} if video_path is None else _scan_utility_cams_clips(video_path)
-    if pre_rendered:
-        _log(f"  [flight] Found {len(pre_rendered)} pre-rendered clips in utility_cams")
-
-    # Determine if any throw still needs rendering (skip subprocess if all done).
-    # A throw is "covered" if either:
-    #   (a) its throw_id is in pre_rendered, OR
-    #   (b) its util_cam dir contains a shared throw_flight_*.mp4 ≥1MB
-    #       (a different throw at the same release position was batched)
-    needs_render = False
-    for throw in throws:
-        tid = str(throw.get("throw_id", ""))
-        # util_id-keyed dir: unnamed/<util_id_slug>/ (no match id), matching
-        # CS2UtilArchive's render_utils folder architecture. Multiple throws
-        # at the same landing spot share one dir.
-        _, uid_slug, _ = _util_slug_for_throw(throw, demo_path)
-        render_dir_check = util_cams_root / "unnamed" / uid_slug
-        util_type = str(throw.get("util_type", "unknown")).lower()
-        # Decoys / non-renderable throws have no flight trajectory, so the
-        # batch render can't produce a clip for them — never flag as
-        # needs_render (and never error on their missing clip downstream).
-        if util_type == "decoy" or not bool(throw.get("is_renderable", True)):
-            continue
-        cam = "flight,detonate" if util_type in ("smoke", "fire", "molotov", "incendiary") else "flight"
-        clip = render_dir_check / f"{clip_name_for_cameras(cam, tid)}.mp4"
-        has_clip = clip.is_file() and clip.stat().st_size > 100_000
-        if tid in pre_rendered or has_clip:
-            continue
-        needs_render = True
-        break
-
-    if needs_render and data_dir is not None:
-        _log(f"  [flight] Subprocess: batch_util_cams.py (batched, one CS2 launch per chunk)")
-        # data_dir is the per-demo dir (e.g. demo=2395002-furia-vs-falcons-m2-anubis).
-        # batch_util_cams.py expects the PARENT (containing demo=* subdirs).
-        # Pass both: parent to the subprocess, leaf to extract --demo-id.
-        data_dir_parent = data_dir.parent
-        rc = _run_batch_util_cams_subprocess(
-            demo_path=demo_path,
-            steam_id=steam_id,
-            data_dir=data_dir_parent,
-            util_cams_root=util_cams_root,
-            demo_data_dir_name=data_dir.name,
-        )
-        if rc != 0:
-            _log(f"  [flight] batch render FAILED (rc={rc}) — aborting flight clips")
-            return []
-        # Re-scan after batch render to pick up newly written mp4s + _throw_poses.json
-        pre_rendered = _scan_utility_cams_clips(video_path) if video_path else {}
-        if pre_rendered:
-            _log(f"  [flight] After batch: {len(pre_rendered)} clips now available")
-    elif needs_render and data_dir is None:
-        _log(f"  [flight] WARN: no CS2UtilArchive data dir — cannot batch-render")
-
-    clips: list[PipClip] = []
-    for idx, throw in enumerate(throws):
-        throw_tick = int(throw["throw_tick"])
-        util_type = str(throw.get("util_type", "unknown")).lower()
-        throw_round = int(throw.get("round_num", 0))
-
-        # Decoys and other non-renderable throws never produce a flight clip
-        # (no trajectory / flagged not renderable) and must be SKIPPED, not
-        # errored. We only fail loudly when a RENDERABLE throw's expected clip
-        # is missing — that is a genuine render gap that needs fixing. This
-        # preserves the prior skip behavior for decoys; the hard error is
-        # reserved for real missing-clip cases.
-        if util_type == "decoy" or not bool(throw.get("is_renderable", True)):
-            continue
-
-        # Frame START mapping using per-round ranges (from throw_tick only).
-        # NOTE: do NOT derive end_frame from land_tick. For smokes, land_tick is
-        # the smoke's LIFE-END (~19s after throw, smoke lifetime, not the brief
-        # airborne flight). land_tick for a late-round smoke lands in a LATER
-        # round's ticks, which mapped end_frame crossed the round (and 5x
-        # batch) boundary. In batched overlay that PipClip's [start,end] window
-        # then overlapped the NEXT batch -> re-included there, and the rebase
-        # `max(0, start_frame - batch_start)` clamped it to frame 0 -> the
-        # full clip replayed at the start of the next round. The window width
-        # does NOT trim ffmpeg playback (eof_action=pass plays the whole clip),
-        # so end_frame only drives batch inclusion + PiP stacking. We derive
-        # it from the actual rendered clip duration, clamped to the throwing
-        # round's end, so a PiP can never bleed into a later round's batch.
-        round_end_frame: int | None = None
-        if throw_round in round_frame_ranges:
-            fs, fe = round_frame_ranges[throw_round]
-            round_end_frame = fe
-            if throw_round in round_tick_ranges:
-                rs, re = round_tick_ranges[throw_round]
-                rf = (re - rs) or 1
-                start_frame = int(fs + (throw_tick - rs) / rf * (fe - fs))
-            else:
-                start_frame = int(throw_tick * fps / TICKRATE)
-        elif first_round_tick > 0:
-            start_frame = int((throw_tick - first_round_tick) * fps / TICKRATE)
-        else:
-            start_frame = int(throw_tick * fps / TICKRATE)
-
-        start_frame = max(0, start_frame)
-
-        throw_id = str(throw.get("throw_id", ""))
-        # util_id-keyed dir (no match id); clip name via clip_name_for_cameras,
-        # matching what render_util_cams.py / render_spot_batch wrote.
-        _, uid_slug, _ = _util_slug_for_throw(throw, demo_path)
-        render_dir = util_cams_root / "unnamed" / uid_slug
-
-        def _pick(preferred: Path, want_detonate: bool) -> Path:
-            """Return the EXACT preferred clip and nothing else.
-
-            For smokes/molotov that is the COMBINED ``flight_detonate`` clip
-            (throw arc + detonation in one file); for other util it is the
-            plain ``flight`` clip. There is NO directory-scan fallback: if the
-            correct clip is missing the caller must (re-)render it. We never
-            substitute a wrong clip (e.g. a standalone ``detonate`` showing a
-            static smoke with no throw) — instead we fail loudly so the missing
-            render gets fixed rather than silently shipping bad output.
-            """
-            if preferred.is_file() and preferred.stat().st_size > 100_000:
-                return preferred
-            if throw_id in pre_rendered and pre_rendered[throw_id].is_file() \
-                    and pre_rendered[throw_id].stat().st_size > 100_000:
-                return pre_rendered[throw_id]
-            _log(f"  [flight] ERROR: expected clip missing for "
-                 f"{render_dir.name}: {preferred.name}")
-            sys.exit(1)
-
-        # Smoke/fire/molotov render a COMBINED "flight_detonate" clip (flight
-        # arc + detonation in one file). Use that as the single PiP.
-        # flash/he/decoy use the plain flight clip. (Never the standalone
-        # detonate_*.mp4.)
-        cam = "flight,detonate" if util_type in ("smoke", "fire", "molotov", "incendiary") else "flight"
-        clip_path = _pick(render_dir / f"{clip_name_for_cameras(cam, throw_id)}.mp4",
-                          want_detonate=(cam == "flight,detonate"))
-
-        if not clip_path.is_file() or clip_path.stat().st_size < 100_000:
-            _log(f"  [flight] ERROR: no usable clip for {util_type} throw {idx} "
-                 f"at {clip_path.name} (t{throw_tick}) — must render it first")
-            sys.exit(1)
-
-        # Window: actual rendered clip length, anchored at the throw frame,
-        # ... clamped to the throwing round's frame end so a smoke thrown late
-        # in a round cannot bleed into a later round's batch (which would
-        # otherwise replay the clip at frame 0 of that batch = next-round start).
-        clip_dur = _probe_clip_duration_seconds(clip_path)
-        dur_frames = max(1, int(round(clip_dur * fps))) if clip_dur > 0 else 1
-        end_frame = start_frame + dur_frames
-        if round_end_frame is not None and start_frame < round_end_frame:
-            end_frame = min(end_frame, round_end_frame)
-        end_frame = min(end_frame, frame_count - 1)
-        if start_frame >= end_frame:
-            _log(f"  [flight] SKIP {util_type} throw {idx}: start_frame={start_frame} >= end_frame={end_frame} (clip_dur={clip_dur})")
-            continue
-
-        clips.append(PipClip(
-            clip_path=clip_path,
-            start_frame=start_frame,
-            end_frame=end_frame,
-            util_type=util_type,
-        ))
-
-    _log(f"  [flight] {len(clips)} throw clips rendered")
-    return sorted(clips, key=lambda c: c.start_frame)
-
-
-# -- Composite overlay ---------------------------------------------------
-
-
 def _build_pip_chain(
     flight_clips: list[PipClip],
     width: int,
@@ -1119,36 +612,6 @@ def _build_pip_overlay(
     return ";".join(parts), tag
 
 
-def _compute_batch_boundaries(
-    round_offsets: dict[int, float],
-    fps: float,
-    frame_count: int,
-    batch_size: int,
-) -> list[tuple[int, int, int, float, float]]:
-    """Group sorted rounds into chunks of ``batch_size`` and return
-    ``[(round_start, round_end, batch_start_frame, batch_start_sec, batch_end_sec), ...]``.
-
-    The last batch's end_sec clamps to ``frame_count / fps``. ``batch_end_sec``
-    for intermediate batches is the start_sec of the next batch's first round.
-    """
-    if batch_size < 1 or not round_offsets:
-        return []
-    sorted_rounds = sorted(round_offsets.keys())
-    total_seconds = frame_count / fps
-    boundaries: list[tuple[int, int, int, float, float]] = []
-    for i in range(0, len(sorted_rounds), batch_size):
-        chunk = sorted_rounds[i:i + batch_size]
-        rn_start, rn_end = chunk[0], chunk[-1]
-        start_sec = float(round_offsets[rn_start])
-        if i + batch_size < len(sorted_rounds):
-            end_sec = float(round_offsets[sorted_rounds[i + batch_size]])
-        else:
-            end_sec = total_seconds
-        start_frame = int(start_sec * fps)
-        boundaries.append((rn_start, rn_end, start_frame, start_sec, end_sec))
-    return boundaries
-
-
 def run_overlay(
     video_path: Path,
     demo_path: Path,
@@ -1254,43 +717,27 @@ def run_overlay(
             f"{len(sidecar_play_ticks)} rounds, {cumulative:.2f}s total"
         )
     else:
-        # Sidecar lacks per_round_ticks/durations. The concat sidecar's
-        # round_offsets are equally spaced (batch_duration / rounds_per_batch)
-        # which is WRONG — real rounds vary from ~28s to ~115s.
-        # Compute authoritative per-round play ranges (freeze_end - margin →
-        # death+margin / round_end+margin) and accumulate correct video offsets.
-        # This matches what CSDM --event rounds actually recorded (skip freeze,
-        # stop at death or round_end).
-        play_ranges = _load_pov_play_tick_ranges(demo_path, steam_id)
-        if play_ranges:
-            round_tick_ranges = play_ranges
-            sorted_rns = sorted(play_ranges.keys())
-            cumulative = 0.0
-            for rn in sorted_rns:
-                ps, pe = play_ranges[rn]
-                dur = (pe - ps) / TICKRATE
-                round_offsets[rn] = cumulative
-                round_video_duration[rn] = dur
-                cumulative += dur
-            _log(
-                f"  [sync] event-driven play ranges (freeze_end→death/round_end): "
-                f"{len(play_ranges)} rounds, {cumulative:.2f}s total"
-            )
-        else:
-            round_tick_ranges = _load_round_tick_ranges(demo_path)
-            if not round_tick_ranges:
-                round_tick_ranges = full_round_tick_ranges
-            if round_offsets:
-                sorted_rns = sorted(round_offsets.keys())
-                for i, rn in enumerate(sorted_rns):
-                    nxt = sorted_rns[i + 1] if i + 1 < len(sorted_rns) else None
-                    dur = (round_offsets[nxt] - round_offsets[rn]) if nxt else round_video_duration.get(rn, 0.0)
-                    if dur and dur > 0:
-                        round_video_duration[rn] = dur
-            _log(
-                f"  [sync] full-round (round_start events) mapping: "
-                f"{len(round_tick_ranges)} rounds, {sum(round_video_duration.values()):.2f}s video"
-            )
+        # Sidecar is missing per_round_ticks/per_round_durations. Without the
+        # authoritative per-round tick + duration data we CANNOT map demo ticks
+        # to video frames correctly — every silent fallback (event-driven play
+        # ranges, full-round tick spans) drifts from the actual recorded video
+        # and desyncs the overlay (observed ~78s off on uniform-round videos,
+        # plus an inverted round-1 range). Refuse instead of guessing.
+        #
+        # Fix at the source: concat_rounds.py must persist per_round_ticks +
+        # per_round_durations into the sidecar, derived from the real CSDM
+        # sequence-*-tick-N-to-M.mp4 clips. If the render used
+        # --concatenate-sequences those clips are deleted and the sidecar is
+        # untrustworthy — render per-round sequences (no --concatenate-sequences)
+        # so concat can recover the tick spans.
+        _log(
+            "[ERROR] Sidecar missing per_round_ticks/per_round_durations — "
+            "cannot sync overlay ticks to video frames. Refusing to guess. "
+            "Re-run concat with per-round sequence clips preserved (no "
+            "--concatenate-sequences) so concat_rounds.py writes authoritative "
+            "per-round tick/duration data into the sidecar."
+        )
+        sys.exit(1)
 
     # Determine round_start_tick (needed for legacy single-round mode)
     round_start_tick = 0
@@ -1600,126 +1047,6 @@ def run_overlay(
         else:
             _log(f"Leaving work dir {work_dir} (caller-owned) with overlay output")
     _log(f"Total: {time.time()-t_overall:.1f}s")
-
-
-def _ffmpeg_encode(
-    main_input: str,
-    extra_inputs: list[Path],
-    fc_args: list[str],
-    out_label: str,
-    output_path: str,
-    segment: tuple[float, float] | None = None,
-) -> None:
-    """Run ffmpeg with h264_nvenc. No CPU fallback (libx forbidden by user).
-
-    When ``segment`` is set, ``-ss {start} -to {end}`` is applied as INPUT
-    options on the main video so both video and audio streams are trimmed
-    frame-accurately by ffmpeg's demuxer. Keyframe-aligned (input-side
-    seeking is fast; visible round-boundary jumps are avoided by the
-    round_offsets sidecar using actual per-round frames).
-
-    Atomic write: ffmpeg renders to ``{output}.part`` and the file is
-    renamed onto ``output_path`` only after a successful exit. A cancelled /
-    crashed encode therefore leaves a stale ``.part`` (never the final name),
-    so resume checks (``_overlay_output_valid``) cannot mistake a partial
-    file for a complete one.
-    """
-    out_path = Path(output_path)
-    tmp_path = out_path.with_name(out_path.name + ".part")
-    tmp_path.unlink(missing_ok=True)
-    cmd = ["ffmpeg", "-y"]
-    if segment is not None:
-        start_sec, end_sec = segment
-        if start_sec > 0:
-            cmd.extend(["-ss", f"{start_sec:.6f}"])
-        cmd.extend(["-to", f"{end_sec:.6f}"])
-    cmd.extend(["-i", main_input])
-    for inp in extra_inputs:
-        cmd.extend(["-i", str(inp)])
-    cmd.extend([
-        *fc_args, "-map", out_label, "-map", "0:a?", "-shortest",
-        # Match raw concat quality (concat_rounds.py): cq 16 / p7
-        "-c:v", "h264_nvenc", "-cq", "16", "-preset", "p7",
-        "-profile:v", "high", "-pix_fmt", "yuv420p",
-        "-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
-        "-c:a", "aac", "-b:a", "256k",
-        "-af", "asetpts=PTS-STARTPTS",
-        "-movflags", "+faststart",
-        "-g", "60", "-keyint_min", "60",
-        "-f", "mp4", str(tmp_path),
-    ])
-    _log(f"  [ffmpeg] nvenc preset p7 cq 16 (match raw; no libx fallback)")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=21600)  # 6h
-    if result.returncode != 0 or not tmp_path.is_file():
-        _log(f"[ERROR] nvenc ffmpeg failed: rc={result.returncode}")
-        _log(f"  stderr: {(result.stderr or '')[-400:]}")
-        tmp_path.unlink(missing_ok=True)
-        sys.exit(1)
-    os.replace(tmp_path, out_path)
-
-
-def _ffmpeg_segment_copy(
-    video_path: Path,
-    start_sec: float,
-    end_sec: float,
-    output_path: Path,
-) -> None:
-    """Stream-copy a video segment when no overlay applies to this batch.
-
-    Fast path (no encode) used when a batch has zero key presses AND zero
-    flight PiP clips — output is byte-identical (codec params) to the
-    other batch-overlay-*.mp4 files so the final concat stream-copy works.
-    """
-    tmp_path = output_path.with_name(output_path.name + ".part")
-    tmp_path.unlink(missing_ok=True)
-    cmd = ["ffmpeg", "-y"]
-    if start_sec > 0:
-        cmd.extend(["-ss", f"{start_sec:.6f}"])
-    cmd.extend(["-to", f"{end_sec:.6f}", "-i", str(video_path), "-c", "copy",
-                "-movflags", "+faststart", "-f", "mp4", str(tmp_path)])
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-    if result.returncode != 0 or not tmp_path.is_file():
-        _log(f"[ERROR] ffmpeg segment copy failed: rc={result.returncode}")
-        _log(f"  stderr: {(result.stderr or '')[-400:]}")
-        tmp_path.unlink(missing_ok=True)
-        sys.exit(1)
-    os.replace(tmp_path, output_path)
-
-
-def _concat_overlay_batches(batch_files: list[Path], output_path: Path) -> None:
-    """Concat batch-overlay-*.mp4 files via ffmpeg stream copy (no re-encode).
-
-    Validates the merged file is non-empty. Raises ``SystemExit`` on ffmpeg
-    failure. Stream copy requires all inputs to share codec params (same
-    _ffmpeg_encode call produces all batches, so this holds).
-    """
-    if not batch_files:
-        _log("[ERROR] no batch files to concat")
-        sys.exit(1)
-    with tempfile.TemporaryDirectory() as tmp:
-        lst = Path(tmp) / "files.txt"
-        with open(lst, "w", encoding="utf-8") as f:
-            for bf in batch_files:
-                f.write(f"file '{bf.resolve()}'\n")
-        tmp_path = output_path.with_name(output_path.name + ".part")
-        tmp_path.unlink(missing_ok=True)
-        cmd = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
-            "-c", "copy", "-movflags", "+faststart", "-f", "mp4", str(tmp_path),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-        if result.returncode != 0 or not tmp_path.is_file():
-            _log(f"[ERROR] ffmpeg batch concat failed: rc={result.returncode}")
-            _log(f"  stderr: {(result.stderr or '')[-400:]}")
-            tmp_path.unlink(missing_ok=True)
-            sys.exit(1)
-        os.replace(tmp_path, output_path)
-    if not _overlay_output_valid(output_path):
-        _log(f"[ERROR] concat output too small: {output_path}")
-        sys.exit(1)
-
-
-# -- CLI -----------------------------------------------------------------
 
 
 def main() -> None:
