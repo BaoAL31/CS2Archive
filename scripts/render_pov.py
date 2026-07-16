@@ -94,7 +94,11 @@ BASE_FLAGS = [
     "--no-show-only-death-notices",
     "--show-assists",
     "--record-audio",
-    "--concatenate-sequences",
+    # NOTE: --concatenate-sequences intentionally omitted. Without it CSDM
+    # emits one sequence-{i}-tick-{A}-to-{B}.mp4 per round. We keep those files
+    # so concat_rounds.py can read the real per-round tick spans and write
+    # per_round_ticks (required for a synced overlay). The batch file is no
+    # longer produced by CSDM; concat consumes the round-* files directly.
     "--ffmpeg-executable-path", FFMPEG_PATH,
     "--ffmpeg-video-codec", "h264_nvenc",
     "--ffmpeg-crf", "16",
@@ -102,6 +106,33 @@ BASE_FLAGS = [
     "--recording-system", "HLAE",
     "--close-game-after-recording",
 ]
+
+# CSDM per-round sequence output (no --concatenate-sequences) and our renamed
+# per-round file (round number encoded, unique + deterministic for resume).
+_SEQ_RENDER_RE = re.compile(r"^sequence-(\d+)-tick-(\d+)-to-(\d+)\.mp4$")
+_ROUND_RENDER_RE = re.compile(r"^round-(\d+)-tick-(\d+)-to-(\d+)\.mp4$")
+
+
+def _rename_sequence_files(output_dir: Path, global_rounds: list[int]) -> None:
+    """After csdm renders a batch without --concatenate-sequences, rename the
+    freshly-written sequence-{i}-tick-{A}-to-{B}.mp4 files to
+    round-{global:03d}-tick-{A}-to-{B}.mp4. Sequence index i (1-based) maps to
+    global_rounds[i-1] because csdm renders --rounds in order. Renaming makes
+    each round's file unique + addressable for concat + resume."""
+    seqs = sorted(
+        (p for p in output_dir.rglob("sequence-*-tick-*-to-*.mp4")),
+        key=lambda p: int(_SEQ_RENDER_RE.match(p.name).group(1)),
+    )
+    if len(seqs) != len(global_rounds):
+        print(
+            f"  [warn] sequence file count ({len(seqs)}) != rounds "
+            f"({len(global_rounds)}); naming may be off"
+        )
+    for i, p in enumerate(seqs):
+        m = _SEQ_RENDER_RE.match(p.name)
+        a, b = m.group(2), m.group(3)
+        gr = global_rounds[i] if i < len(global_rounds) else global_rounds[-1]
+        p.rename(output_dir / f"round-{gr:03d}-tick-{a}-to-{b}.mp4")
 
 
 def resolve_output_dir(output: str | None, first_demo_path: str, steam_id: str) -> Path:
@@ -407,13 +438,25 @@ def main() -> None:
                 global_start = global_round + local_start
                 global_end = global_round + local_end
 
-                out_name = f"batch-{global_start:03d}-{global_end:03d}"
-                expected_batches.append(out_name + ".mp4")
-                out_path = output_dir / (out_name + ".mp4")
-
-                if out_path.exists() and os.path.getsize(out_path) >= 1_048_576:
-                    mb = os.path.getsize(out_path) / 1024 / 1024
-                    print(f"  [SKIP] {out_name}.mp4 exists ({mb:.0f} MB)")
+                # Per-round sequence files (no --concatenate-sequences): csdm
+                # emits sequence-{i}-tick-{A}-to-{B}.mp4 per round. Rename to
+                # round-{global:03d}-tick-A-to-B.mp4 so concat + resume can
+                # address each round deterministically, and concat_rounds.py can
+                # read the real per-round tick spans for per_round_ticks.
+                global_rounds = [global_round + r for r in batch]
+                already = {
+                    int(_ROUND_RENDER_RE.match(p.name).group(1))
+                    for p in output_dir.glob("round-*-tick-*-to-*.mp4")
+                    if p.stat().st_size >= 1_048_576
+                }
+                missing = [gr for gr in global_rounds if gr not in already]
+                if not missing:
+                    existing = [
+                        p for p in output_dir.glob("round-*-tick-*-to-*.mp4")
+                        if int(_ROUND_RENDER_RE.match(p.name).group(1)) in set(global_rounds)
+                    ]
+                    mb_total = sum(p.stat().st_size for p in existing) / 1024 / 1024
+                    print(f"  [SKIP] rounds {global_rounds} already rendered ({mb_total:.0f} MB)")
                     total_rendered += len(batch)
                     continue
 
@@ -422,7 +465,6 @@ def main() -> None:
                     "--steamids", args.steam_id,
                     "--event", "rounds",
                     "--rounds", ",".join(str(r) for r in batch),
-                    "--output-file-name", out_name,
                     "--output", str(output_dir),
                     "--framerate", str(args.framerate),
                     "--width", str(args.width),
@@ -430,12 +472,11 @@ def main() -> None:
                     "--cfg", str(abs_cfg_path()),
                 ] + BASE_FLAGS
 
-                vid = run_csdm(cmd, out_name, expected=out_path)
-
-                if vid is None:
-                    print(f"[ERROR] run_csdm returned None for {out_name} — no video produced")
-                    sys.exit(1)
-
+                # csdm writes per-round sequence files; do NOT expect a single
+                # batch file. run_csdm returns the newest mp4 (a sequence file)
+                # which we ignore — we rename the new sequence files below.
+                run_csdm(cmd, f"rounds {global_rounds[0]}-{global_rounds[-1]}", expected=None)
+                _rename_sequence_files(output_dir, global_rounds)
                 total_rendered += len(batch)
 
             global_round += n_rounds

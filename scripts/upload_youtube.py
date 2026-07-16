@@ -613,8 +613,10 @@ def main() -> None:
     # so it must be called outside the with-block below to avoid deadlock.)
     occupied_dates: set[str] = set()
     if args.publish_at == AUTO_PUBLISH_MODE:
-        # Only YouTube API dates — no local ledger.
         occupied_dates = set(yt_publish_dates)
+        # Load local ledger dates so resolver skips slots reserved by other pending uploads.
+        ledger_dates = load_occupied_publish_dates()
+        occupied_dates.update(ledger_dates)
     try:
         with _publish_schedule_lock():
             privacy, publish_at_utc, publish_tz, publish_local = resolve_publish_schedule(

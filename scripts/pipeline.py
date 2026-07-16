@@ -161,7 +161,7 @@ class Pipeline:
         self.start_step = args.step if args.step is not None else 1
         self._cli_step = args.step  # None = no explicit --step → allow auto-skip
         self.end_step = args.until if args.until is not None else max(STEPS.keys())
-        # --no-cleanup caps end_step at one below the last step (skip cleanup).
+        # Default is no-cleanup (skip step 7) unless --cleanup is passed.
         # Default run therefore stops after thumbnail (step 6), producing the
         # finished video + upload_meta.json but NOT uploading or cleaning up.
         if getattr(args, "no_cleanup", True) and self.end_step == max(STEPS.keys()):
@@ -1212,6 +1212,16 @@ def main() -> None:
              "keyboard+util-cam version on the channel.",
     )
     parser.add_argument(
+        "--batches",
+        type=int,
+        default=20,
+        help="Rounds per render batch passed to render_pov.py (default: 20). "
+             "Set to 1 to force one CSDM call per round, which makes CSDM emit "
+             "per-round sequence-*-tick-*.mp4 files (real per-round tick spans) "
+             "so concat_rounds.py can write authoritative per_round_ticks for a "
+             "synced overlay. Higher values batch rounds into one call.",
+    )
+    parser.add_argument(
         "--overlay-batches",
         type=int,
         default=10,
@@ -1220,18 +1230,13 @@ def main() -> None:
              "resume. Set 0 for single-pass (original behavior).",
     )
     parser.add_argument(
-        "--no-cleanup",
-        action="store_true", default=True,
-        help="Skip step 7 (delete renders/ + state file). ON BY DEFAULT. "
-             "Keeps render cache and pipeline state on disk for re-runs. "
-             "Pass --cleanup to run step 7 explicitly.",
-    )
-    parser.add_argument(
         "--cleanup",
         dest="no_cleanup",
         action="store_false",
+        default=True,
         help="Run step 7 cleanup (delete renders/ + state file). "
-             "Default: --no-cleanup. Use this flag to opt in.",
+             "Default: cleanup OFF (renders/ + pipeline state kept for "
+             "re-runs). Pass --cleanup to opt in.",
     )
     args = parser.parse_args()
 

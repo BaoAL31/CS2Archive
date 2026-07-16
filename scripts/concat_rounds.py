@@ -13,6 +13,17 @@ FFMPEG = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
 FFPROBE = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffprobe.exe"
 
 _BATCH_RE = re.compile(r"batch-(\d+)-(\d+)\.mp4$")
+_ROUND_SEQ_RE = re.compile(r"round-(\d+)-tick-(\d+)-to-(\d+)\.mp4$")
+
+
+def _batch_range(f: Path) -> tuple[int, int]:
+    """Return (start_round, end_round) for a batch or per-round sequence file."""
+    m = _ROUND_SEQ_RE.match(f.name)
+    if m:
+        rn = int(m.group(1))
+        return (rn, rn)
+    m = _BATCH_RE.match(f.name)
+    return (int(m.group(1)), int(m.group(2)))
 
 
 def _concat_two(a: Path, b: Path, out: Path) -> None:
@@ -37,17 +48,20 @@ def _concat_two(a: Path, b: Path, out: Path) -> None:
 
 
 def _parse_batches(folder: Path, combined_exists: bool = False) -> tuple[list[Path], int]:
-    files = sorted(
+    batch_files = sorted(
         [f for f in folder.glob("batch-*.mp4") if _BATCH_RE.match(f.name)],
         key=lambda f: int(_BATCH_RE.match(f.name).group(1)),
     )
+    round_files = sorted(
+        [f for f in folder.glob("round-*.mp4") if _ROUND_SEQ_RE.match(f.name)],
+        key=lambda f: int(_ROUND_SEQ_RE.match(f.name).group(1)),
+    )
+    files = sorted(batch_files + round_files, key=lambda f: _batch_range(f)[0])
     if not files:
-        raise FileNotFoundError(f"No batch-*.mp4 files in {folder}")
-    # Use first batch's start as expected (allows partial batches like rounds 20-21)
-    expected_start = int(_BATCH_RE.match(files[0].name).group(1))
+        raise FileNotFoundError(f"No batch-*.mp4 / round-*.mp4 files in {folder}")
+    expected_start = _batch_range(files[0])[0]
     for f in files:
-        m = _BATCH_RE.match(f.name)
-        start, end = int(m.group(1)), int(m.group(2))
+        start, end = _batch_range(f)
         if start > end:
             raise ValueError(f"Invalid batch range (start > end): {f.name}")
         if start < expected_start:
@@ -65,19 +79,39 @@ def _parse_batches(folder: Path, combined_exists: bool = False) -> tuple[list[Pa
             )
             raise ValueError(f"CONCAT_BATCH_GAP: {msg}")
         expected_start = end + 1
-    return files, int(_BATCH_RE.match(files[0].name).group(1))
+    return files, _batch_range(files[0])[0]
 
 
 _SEQ_RE = re.compile(r"sequence-(\d+)-tick-(\d+)-to-(\d+)\.mp4$")
 
 
-def _parse_sequence_files(folder: Path, batch_files: list[Path]) -> dict | None:
-    """Parse sequence-*-tick-START-to-END.mp4 files left by CSDM.
+def _parse_sequence_files(folder: Path, batch_files: list[Path] | None = None) -> dict | None:
+    """Parse round-*-tick-START-to-END.mp4 (preferred) or legacy
+    sequence-*-tick-START-to-END.mp4 files left by CSDM.
 
-    Maps sequence index -> round number within the batch (in render order).
-    Returns {per_round_ticks, per_round_durations} or None if no sequences.
-    Searches recursively: CSDM may nest these in a subdir (e.g. `19-sequence/`).
+    Round number is encoded in the filename for round-* files (authoritative);
+    legacy sequence-* files are paired in order with batch_files. Returns
+    {per_round_ticks, per_round_durations} or None if no sequence/round files.
     """
+    # Preferred: round-{rn:03d}-tick-A-to-B.mp4 (round encoded in filename)
+    items = []
+    for f in folder.rglob("round-*-tick-*-to-*.mp4"):
+        m = _ROUND_SEQ_RE.match(f.name)
+        if m:
+            items.append((int(m.group(1)), int(m.group(2)), int(m.group(3)), f))
+    if items:
+        per_round_ticks: dict[int, tuple[int, int]] = {}
+        per_round_durations: dict[int, float] = {}
+        for rn, a, b, f in items:
+            per_round_ticks[rn] = (a, b)
+            per_round_durations[rn] = _probe_duration(f)
+        print(
+            f"  [seq] {len(items)} round files parsed: "
+            f"{sum(per_round_durations.values()):.2f}s total across rounds"
+        )
+        return {"per_round_ticks": per_round_ticks, "per_round_durations": per_round_durations}
+
+    # Legacy: sequence-{i}-tick-*.mp4 paired by order with batch_files
     seqs = []
     for f in folder.rglob("sequence-*-tick-*-to-*.mp4"):
         m = _SEQ_RE.match(f.name)
@@ -87,31 +121,27 @@ def _parse_sequence_files(folder: Path, batch_files: list[Path]) -> dict | None:
     if not seqs:
         return None
     seqs.sort(key=lambda x: x[0])
-
-    # Distribute sequence files across rounds in the batch_files order.
-    # CSDM writes one sequence file per rendered round; we pair them in order
-    # with the round ranges spanned by the batch files.
     round_nums: list[int] = []
-    for b in batch_files:
-        m = _BATCH_RE.match(b.name)
-        if not m:
-            continue
-        for rn in range(int(m.group(1)), int(m.group(2)) + 1):
-            round_nums.append(rn)
-    if len(seqs) != len(round_nums):
+    if batch_files:
+        for b in batch_files:
+            m = _BATCH_RE.match(b.name)
+            if not m:
+                continue
+            for rn in range(int(m.group(1)), int(m.group(2)) + 1):
+                round_nums.append(rn)
+    if not round_nums or len(seqs) != len(round_nums):
         print(
-            f"  [warn] sequence files ({len(seqs)}) != rounds in batches ({len(round_nums)}); "
-            f"keeping even-split durations"
+            f"  [warn] legacy sequence files ({len(seqs)}) != rounds in batches "
+            f"({len(round_nums)}); keeping even-split durations"
         )
         return None
-
-    per_round_ticks: dict[int, tuple[int, int]] = {}
-    per_round_durations: dict[int, float] = {}
-    for (seq_idx, start_tick, end_tick, f), rn in zip(seqs, round_nums):
-        per_round_ticks[rn] = (start_tick, end_tick)
+    per_round_ticks = {}
+    per_round_durations = {}
+    for (si, a, b, f), rn in zip(seqs, round_nums):
+        per_round_ticks[rn] = (a, b)
         per_round_durations[rn] = _probe_duration(f)
     print(
-        f"  [seq] {len(seqs)} sequence files parsed: "
+        f"  [seq] {len(seqs)} legacy sequence files parsed: "
         f"{sum(per_round_durations.values()):.2f}s total across rounds"
     )
     return {"per_round_ticks": per_round_ticks, "per_round_durations": per_round_durations}
@@ -244,11 +274,18 @@ def concat_rounds(folder: Path) -> Path:
     resuming = combined.exists()
     files, _ = _parse_batches(folder, combined_exists=resuming)
     new_rounds = sum(
-        int(_BATCH_RE.match(f.name).group(2)) - int(_BATCH_RE.match(f.name).group(1)) + 1
+        _batch_range(f)[1] - _batch_range(f)[0] + 1
         for f in files
     )
 
     print(f"Concatenating {len(files)} batch(es) ({new_rounds} rounds) -> {combined}")
+
+    # Parse sequence/round tick spans BEFORE consuming files: the per-round
+    # round-*.mp4 files get deleted as they are concatenated into combined.mp4,
+    # so their tick spans must be read first.
+    seq_fields = _parse_sequence_files(folder, files)
+    if seq_fields:
+        print(f"  [seq] per-round tick spans available ({len(seq_fields['per_round_ticks'])} rounds)")
 
     round_offsets: dict[int, float] = {}
     batch_offsets: list[dict] = []
@@ -276,8 +313,7 @@ def concat_rounds(folder: Path) -> Path:
             )
 
     for f in files:
-        m = _BATCH_RE.match(f.name)
-        s, e = int(m.group(1)), int(m.group(2))
+        s, e = _batch_range(f)
 
         # Probe THIS batch before consuming it. After rename/unlink, probing
         # `combined` would return the cumulative duration so far — which for
@@ -318,7 +354,6 @@ def concat_rounds(folder: Path) -> Path:
     # this is ground truth (avoids concat's even-split approximation when
     # rounds have unequal freeze + play + death spans). Falls back to the
     # even-split `per_round` estimate above when sequences are absent.
-    seq_fields = _parse_sequence_files(folder, files)
     if seq_fields:
         per_round_ticks = seq_fields["per_round_ticks"]
         per_round_durations = seq_fields["per_round_durations"]

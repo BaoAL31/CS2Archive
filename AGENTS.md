@@ -13,12 +13,12 @@ Reads all POV metadata from the backlog file. Runs steps 1-6 in order (analyze �
 | 1 | analyze | `csdm analyze <demo>` |
 | 2 | render | `python scripts/render_pov.py <demo> <steam_id>` |
 | 3 | concat | `python scripts/concat_rounds.py <renders_folder>` |
-| **4** | **overlay (optional)** | `python scripts/overlay_pov.py --video <video.mp4> --demo <demo> --steam-id <id> [--round N]` |
+| **4** | **overlay** | `python scripts/overlay_pov.py --video <video.mp4> --demo <demo> --steam-id <id> [--round N]` |
 | 5 | outro | `python scripts/generate_outro.py <video.mp4>` |
 | 6 | thumbnail | `python -m thumbnail <url> --player <nick> --map <map> --demo <dem> --steam-id <id>` |
 | 7 | cleanup | `python scripts/cleanup_renders.py <renders_folder>` |
 
-**Uploading is a separate step.** The pipeline stops at step 6 (thumbnail) and writes `upload_meta.json` (with `youtube_id=null`, `upload_status="pending"`) for every variant. Run `python scripts/upload_pending.py` afterward to upload all pending metas (it scans `youtube/*/upload_meta.json` and uploads any not yet completed). Omit step 4 to skip overlay entirely. Use `--step 4` to include it, or run pipeline up to step 3 and then manually invoke overlay.
+**Uploading is a separate step.** The pipeline stops at step 6 (thumbnail) and writes `upload_meta.json` (with `youtube_id=null`, `upload_status="pending"`) for every variant. Run `python scripts/upload_pending.py` afterward to upload all pending metas (it scans `youtube/*/upload_meta.json` and uploads any not yet completed). Step 4 (overlay) runs by default because dual-upload is on. To skip overlay entirely, run with `--until 3`. Raw-only mode (`--no-dual-upload`) still executes step 4 but discards the overlay output.
 
 **Overlay step (step 4) does two things:**
 1. Extracts keyboard states via demoparser2 (full round, not sparse parquet)
@@ -59,12 +59,12 @@ python scripts/upload_pending.py
 - **`--resume-from-round N`** — deprecated. Render now uses filesystem-based resume: existing `batch-*.mp4` files ≥1MB are automatically skipped on re-run. To re-render a specific batch, manually delete its file.
 - **`--batches N`** — rounds per render batch (default: 10). Each batch produces one MP4 named `batch-{start:03d}-{end:03d}.mp4`. `--batches 1` is equivalent to the old per-round model.
 - **`--until N`** — stop after step N (e.g. `--until 5` runs through outro, skips thumbnail/cleanup). Default: run through step 6 (thumbnail; upload handled separately by `upload_pending.py`).
-- **`--dual-upload`** — produce and upload a **second independent variant** with the keyboard + util-cam overlay applied. Default behavior (no flag) is 100% unchanged.
+- **`--dual-upload`** — now the **default**: dual-upload is ON unless you pass `--no-dual-upload`. Produces a second independent variant with the keyboard + util-cam overlay. Raw-only mode is the opt-in.
 - **`--overlay-only`** — render/upload only the overlay variant. Implies `--dual-upload`'s overlay branch but skips raw video copy / raw outro / raw thumbnail. No `youtube/{run_id}/` dir created. Use when you only want the keyboard+util-cam version on the channel. State stored under `overlay_only=True` for resume.
 
 ### Dual-Upload (`--dual-upload`)
 
-When passed, the pipeline produces **two** separate YouTube uploads from one backlog entry:
+By default (and whenever `--dual-upload` is in effect), the pipeline produces **two** separate uploads from one backlog entry:
 
 | Variant | YouTube dir | Title suffix | Thumbnail | Description |
 |---|---|---|---|---|
@@ -75,7 +75,7 @@ Both variants get independent `upload_meta.json`; `upload_pending.py` records ea
 
 **Data flow:**
 1. Step 3 (concat): `combined.mp4` copied to both `youtube/{run_id}/` and `youtube/{run_id}_overlay/`
-2. Step 4 (overlay): runs `overlay_pov.py` on the overlay dir's `video.mp4`; output replaces `video.mp4` in the overlay dir. Skipped in raw-only mode (no `--dual-upload`) so cost is zero.
+2. Step 4 (overlay): runs `overlay_pov.py` on the overlay dir's `video.mp4`; output replaces `video.mp4` in the overlay dir. Skipped in raw-only mode (`--no-dual-upload`) so cost is zero.
 3. Step 5 (outro): appended to both `video.mp4` files
 4. Step 6 (thumbnail): two thumbnails generated, each with its own `upload_meta.json`
 5. Upload: handled by a separate `upload_pending.py` pass — both variants uploaded, each from its own `upload_meta.json`, skipped if already completed.
@@ -83,11 +83,20 @@ Both variants get independent `upload_meta.json`; `upload_pending.py` records ea
 
 **Resume:** Upload is resume-safe: `upload_pending.py` skips any `upload_meta.json` whose `upload_status == "completed"` (youtube_id set), so re-running only uploads what's left. Re-running the pipeline with the same `--dual-upload` flag re-runs only the missing render/overlay/thumbnail work.
 
-**Cost:** adds one full overlay rendering (~30–60 min for 20+ throws) and one extra YouTube upload. Use only for matches where the overlay version adds value (high-profile matches, educational content).
+**Cost:** raw-only mode (`--no-dual-upload`) skips the ~30–60 min overlay render (20+ throws) and the extra upload. Default dual-upload adds both.
 
-**Backwards compat:** without `--dual-upload`, behavior is **identical** to before — step 4 still runs the overlay script but its sidecar output is left orphaned exactly as before. No new directories created. No new state keys. Existing `youtube/{run_id}/` and `.pipeline/{run_id}.json` files unaffected.
+**Raw-only mode (`--no-dual-upload`):** step 4 still runs `overlay_pov.py` but its output is left as an orphan sidecar next to `video.mp4`; no `youtube/{run_id}_overlay/` directory is created. The only added state key vs raw-only is `dual_upload=False`. Existing `youtube/{run_id}/` and `.pipeline/{run_id}.json` files are otherwise unaffected.
 
 **`--overlay-only`** is a strict subset of `--dual-upload` for the overlay branch. Resuming a failed overlay-only run with the same flag re-runs only the missing overlay work; no raw artifacts are ever produced.
+
+### Bilibili Mirror & Other Utilities
+
+These tools sit outside the core `pipeline.py` → `upload_pending.py` flow but are wired into it:
+
+- **Bilibili mirror** — `scripts/upload_bilibili.py` uploads the same `upload_meta.json` variants to `studio.bilibili.tv` (Playwright + Chrome; tags capped at 10 chips, remainder appended to description; videos >~3.8 GB re-encoded to `video_bili.mp4`). Auth: `scripts/bilibili_login.py` (one-time headed-Chrome login, saves `.bilibili_storage.json`). `scripts/bili_check_session.py` verifies that session. `upload_pending.py` uploads both YouTube and Bilibili pending metas via `is_bilibili_pending`.
+- **HuggingFace demo sync** — `scripts/upload_demos_to_hf.py` (parallel, resumable), `scripts/upload_hf_demos.py`, `scripts/upload_hf_demos_git.py` (git-lfs), and `scripts/batch_upload_hf.py` (resumable IEM Cologne Major 2026 batch push) upload `.dem` files to `cs2povarchive/cs2-demos`, which backs the pipeline's `hf_root` auto-download.
+- **Shorts & scheduling** — `scripts/upload_youtube_shorts.py` (Short upload with optional scheduled publish) and `scripts/youtube_schedule.py` (timezone-aware wall-clock → UTC helpers used by `upload_youtube.py`).
+- **Render helpers** — `scripts/crosshair_code.py` (CS2 share-code ↔ crosshair decode/encode) and `scripts/cs2_minimizer.py` (minimizes the CS2 window to stop focus theft during HLAE capture).
 
 ### Chaining pipelines (upload overlap)
 
