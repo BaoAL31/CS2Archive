@@ -43,6 +43,10 @@ vault/
 .cloak-hltv-profile/
 .cdp-hltv-profile/
 
+# FACEIT browser session (contains login cookies — never commit)
+.faceit_profile/
+faceit_pros.json
+
 # IDE
 .vscode/
 .idea/

@@ -13,18 +13,14 @@ class Settings(BaseSettings):
     """Application settings loaded from .env file and environment variables."""
 
     # ── API Keys ──────────────────────────────────────────────────────────
-    faceit_api_key: str = Field(default="", description="FACEIT Data API key")
-    faceit_downloads_token: str = Field(default="", description="FACEIT Downloads API token")
+    faceit_api_key: str = Field(default="", description="FACEIT Data API v4 key (player/match lookup only)")
     youtube_api_key: str = Field(default="", description="YouTube Data API v3 key")
 
     # ── Paths ─────────────────────────────────────────────────────────────
     demo_storage_dir: Path = Field(default=Path("./demos"), description="Root directory for downloaded demos")
 
-    # ── FACEIT API ────────────────────────────────────────────────────────
+    # ── FACEIT ───────────────────────────────────────────────────────────
     faceit_data_api_base: str = "https://open.faceit.com/data/v4"
-    faceit_downloads_api_url: str = "https://api.faceit.com/download/v2/demos"
-
-    # ── HLTV ──────────────────────────────────────────────────────────────
     hltv_base_url: str = "https://www.hltv.org"
     hltv_demo_download_url: str = "https://www.hltv.org/interfaces/download.php"
 
@@ -68,10 +64,6 @@ class Settings(BaseSettings):
     @property
     def has_faceit_key(self) -> bool:
         return bool(self.faceit_api_key and self.faceit_api_key != "your_data_api_key_here")
-
-    @property
-    def has_faceit_downloads(self) -> bool:
-        return bool(self.faceit_downloads_token)
 
 
 # Singleton settings instance
