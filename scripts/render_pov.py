@@ -101,8 +101,8 @@ BASE_FLAGS = [
     # longer produced by CSDM; concat consumes the round-* files directly.
     "--ffmpeg-executable-path", FFMPEG_PATH,
     "--ffmpeg-video-codec", "h264_nvenc",
-    "--ffmpeg-crf", "16",
-    "--ffmpeg-output-parameters=-cq 16 -preset p7 -profile:v high -pix_fmt yuv420p -level 5.1",
+    "--ffmpeg-crf", "14",
+    "--ffmpeg-output-parameters=-cq 14 -preset p7 -profile:v high -pix_fmt yuv420p -level 5.1",
     "--recording-system", "HLAE",
     "--close-game-after-recording",
 ]
@@ -125,9 +125,10 @@ def _rename_sequence_files(output_dir: Path, global_rounds: list[int]) -> None:
     )
     if len(seqs) != len(global_rounds):
         print(
-            f"  [warn] sequence file count ({len(seqs)}) != rounds "
-            f"({len(global_rounds)}); naming may be off"
+            f"  [ERROR] sequence file count ({len(seqs)}) != rounds "
+            f"({len(global_rounds)}); csdm dropped round(s)"
         )
+        sys.exit(1)
     for i, p in enumerate(seqs):
         m = _SEQ_RENDER_RE.match(p.name)
         a, b = m.group(2), m.group(3)
@@ -278,6 +279,31 @@ def _write_render_autoexec(cvars: list[str]) -> None:
     RENDER_CROSSHAIR_CFG.write_text(content, encoding="utf-8")
 
 
+def _viewmodel_cvars_from_args(args: argparse.Namespace) -> list[str]:
+    """Build viewmodel convars from CLI flags or prosettings nickname lookup."""
+    from scrapers.prosettings import resolve_video_settings, viewmodel_convars
+
+    settings: dict = {}
+    if getattr(args, "viewmodel_fov", None) is not None:
+        settings["viewmodel_fov"] = args.viewmodel_fov
+    if getattr(args, "viewmodel_offset_x", None) is not None:
+        settings["viewmodel_offset_x"] = args.viewmodel_offset_x
+    if getattr(args, "viewmodel_offset_y", None) is not None:
+        settings["viewmodel_offset_y"] = args.viewmodel_offset_y
+    if getattr(args, "viewmodel_offset_z", None) is not None:
+        settings["viewmodel_offset_z"] = args.viewmodel_offset_z
+    if getattr(args, "viewmodel_presetpos", None) is not None:
+        settings["viewmodel_presetpos"] = args.viewmodel_presetpos
+
+    if not settings and getattr(args, "player", None):
+        try:
+            settings = resolve_video_settings(args.player, refresh_if_missing=True)
+        except Exception as e:
+            print(f"  [WARN] viewmodel lookup failed: {e}")
+            settings = {}
+    return viewmodel_convars(settings)
+
+
 def _swap_autoexec(src: Path) -> None:
     if src == AUTOEXEC_PERSONAL and not AUTOEXEC_PERSONAL.exists():
         if AUTOEXEC_PERSONAL_BACKUP.exists():
@@ -345,6 +371,13 @@ def main() -> None:
                         help="HLTV match ID for HF path prefix (e.g. 2395002). Required when hf_root set and local demo missing.")
     parser.add_argument("--overlay", action="store_true",
                         help="Apply input overlay + util cam trajectory after render.")
+    parser.add_argument("--player", default="",
+                        help="Player nickname for prosettings viewmodel lookup.")
+    parser.add_argument("--viewmodel-fov", type=float, default=None)
+    parser.add_argument("--viewmodel-offset-x", type=float, default=None)
+    parser.add_argument("--viewmodel-offset-y", type=float, default=None)
+    parser.add_argument("--viewmodel-offset-z", type=float, default=None)
+    parser.add_argument("--viewmodel-presetpos", type=int, default=None)
     args = parser.parse_args()
 
     _kill_stale_processes()
@@ -360,13 +393,17 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     cvars = _get_player_crosshair(args.steam_id, parts)
+    vm_cvars = _viewmodel_cvars_from_args(args)
+    if vm_cvars:
+        print(f"  Viewmodel: {' | '.join(vm_cvars)}")
+        cvars = list(cvars) + vm_cvars
     if cvars:
-        print(f"  Player crosshair extracted ({len(cvars)} cvars)")
+        print(f"  Player crosshair/viewmodel ({len(cvars)} cvars)")
         _write_render_autoexec(cvars)
         _swap_autoexec(AUTOEXEC_RENDER)
         print(f"  Swapped {AUTOEXEC_RENDER.name} -> {AUTOEXEC_MAIN.name}")
     else:
-        print("  [WARN] No crosshair found in demo — keeping current autoexec.cfg")
+        print("  [WARN] No crosshair/viewmodel — keeping current autoexec.cfg")
 
     print(f"Output:  {output_dir}")
     print(f"Batch size: {args.batches} round(s) per batch")
@@ -449,8 +486,8 @@ def main() -> None:
                     for p in output_dir.glob("round-*-tick-*-to-*.mp4")
                     if p.stat().st_size >= 1_048_576
                 }
-                missing = [gr for gr in global_rounds if gr not in already]
-                if not missing:
+                missing_global = [gr for gr in global_rounds if gr not in already]
+                if not missing_global:
                     existing = [
                         p for p in output_dir.glob("round-*-tick-*-to-*.mp4")
                         if int(_ROUND_RENDER_RE.match(p.name).group(1)) in set(global_rounds)
@@ -460,11 +497,13 @@ def main() -> None:
                     total_rendered += len(batch)
                     continue
 
+                # Resume: only ask csdm for the missing local rounds in this batch.
+                missing_local = [gr - global_round for gr in missing_global]
                 cmd = [
                     CSDM, "video", str(Path(part).resolve()),
                     "--steamids", args.steam_id,
                     "--event", "rounds",
-                    "--rounds", ",".join(str(r) for r in batch),
+                    "--rounds", ",".join(str(r) for r in missing_local),
                     "--output", str(output_dir),
                     "--framerate", str(args.framerate),
                     "--width", str(args.width),
@@ -475,8 +514,18 @@ def main() -> None:
                 # csdm writes per-round sequence files; do NOT expect a single
                 # batch file. run_csdm returns the newest mp4 (a sequence file)
                 # which we ignore — we rename the new sequence files below.
-                run_csdm(cmd, f"rounds {global_rounds[0]}-{global_rounds[-1]}", expected=None)
-                _rename_sequence_files(output_dir, global_rounds)
+                run_csdm(cmd, f"rounds {missing_global[0]}-{missing_global[-1]}", expected=None)
+                _rename_sequence_files(output_dir, missing_global)
+                still = [
+                    gr for gr in missing_global
+                    if not any(
+                        p.stat().st_size >= 1_048_576
+                        for p in output_dir.glob(f"round-{gr:03d}-tick-*-to-*.mp4")
+                    )
+                ]
+                if still:
+                    print(f"[ERROR] After render, still missing rounds: {still}")
+                    sys.exit(1)
                 total_rendered += len(batch)
 
             global_round += n_rounds

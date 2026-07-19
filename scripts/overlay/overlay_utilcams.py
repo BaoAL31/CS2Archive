@@ -241,13 +241,22 @@ def _run_batch_util_cams_subprocess(
         return 1
 
 
+def _throw_id_file_slug(throw_id: str) -> str:
+    """Filesystem slug for a throw_id (match-id stripped, colons → underscores).
+
+    ``2395001-foo:e246:s2`` → ``foo_e246_s2``. Must include segment (``_sN``)
+    so ``e246:s2`` never matches ``e246_s4`` filenames.
+    """
+    stripped = re.sub(r"^\d{6,}-", "", str(throw_id))
+    return stripped.replace(":", "_")
+
+
 def _scan_utility_cams_clips(video_path: Path) -> dict[str, Path]:
     """Scan utility_cams for pre-rendered clips (orbit + victims + flight).
 
-    Uses _throw_poses.json files to map throw_id -> mp4 clip, since the
-    _throws dict in each json maps throw_ids to camera positions for that
-    camera pose directory. Multiple throw_ids can share one .mp4 (one-shot
-    victim POVs); matched by entity ID in filename when ambiguous.
+    Uses _throw_poses.json files to map throw_id -> mp4 clip. Matches by the
+    full throw slug (``…_eN_sM``), never by bare entity id — substring match
+    on ``e246`` alone wrongly picks ``e246_s4`` for throw ``e246:s2``.
     """
     pre_rendered: dict[str, Path] = {}
     p = video_path.parent
@@ -273,16 +282,53 @@ def _scan_utility_cams_clips(video_path: Path) -> dict[str, Path]:
         if not mp4s:
             continue
         for tid in throw_map:
-            # Match by entity ID substring in filename.
-            # New naming: flight_<short-slug>.mp4 or flight_orbit_<short-slug>.mp4
-            # Each throw_id has its own dir + 1 mp4 (1:1 mapping).
-            ent_part = tid.split(":")[1] if ":" in tid else ""
-            matching = [m for m in mp4s if ent_part and ent_part in m.name]
-            if len(matching) == 1:
-                pre_rendered[tid] = matching[0]
-            elif matching:
-                pre_rendered[tid] = matching[0]
+            slug = _throw_id_file_slug(tid)
+            if not slug:
+                continue
+            # Prefer flight clip; exact slug match (segment-inclusive).
+            matching = [
+                m for m in mp4s
+                if slug in m.stem and m.stem.endswith(slug)
+            ]
+            if not matching:
+                matching = [m for m in mp4s if f"_{slug}" in m.stem or m.stem.endswith(slug)]
+            flight = [m for m in matching if m.name.startswith("flight") and "detonate" not in m.name]
+            pick = flight[0] if flight else (matching[0] if matching else None)
+            if pick is not None:
+                pre_rendered[tid] = pick
     return pre_rendered
+
+
+def _map_throw_tick_to_frame(
+    throw_tick: int,
+    round_tick_ranges: dict[int, tuple[int, int]],
+    round_frame_ranges: dict[int, tuple[int, int]],
+) -> int | None:
+    """Map a demo throw_tick to a video frame using CSDM play tick spans.
+
+    Do NOT use throws.parquet ``round_num`` — it is often off-by-one vs the
+    CSDM sequence tick windows in the sidecar, which places PiPs in the wrong
+    round (e.g. a round-5 fire appearing in early-round video).
+
+    Returns None when the throw falls outside every recorded play window
+    (buy/freeze cut or death cut) — caller should skip the PiP.
+    """
+    for rn, (rs, re) in round_tick_ranges.items():
+        if rn not in round_frame_ranges:
+            continue
+        if rs <= throw_tick <= re:
+            fs, fe = round_frame_ranges[rn]
+            rf = (re - rs) or 1
+            return int(fs + (throw_tick - rs) / rf * (fe - fs))
+    # Within ~2s before a play window (still in freeze that CSDM trimmed):
+    # clamp to that round's first frame rather than dropping the util.
+    for rn, (rs, re) in sorted(round_tick_ranges.items()):
+        if rn not in round_frame_ranges:
+            continue
+        if 0 < (rs - throw_tick) <= int(2 * TICKRATE):
+            fs, _ = round_frame_ranges[rn]
+            return fs
+    return None
 
 
 def _render_throw_flight_clips(
@@ -453,35 +499,30 @@ def _render_throw_flight_clips(
         if util_type == "decoy" or not bool(throw.get("is_renderable", True)):
             continue
 
-        # Frame START mapping using per-round ranges (from throw_tick only).
-        # NOTE: do NOT derive end_frame from land_tick. For smokes, land_tick is
-        # the smoke's LIFE-END (~19s after throw, smoke lifetime, not the brief
-        # airborne flight). land_tick for a late-round smoke lands in a LATER
-        # round's ticks, which mapped end_frame crossed the round (and 5x
-        # batch) boundary. In batched overlay that PipClip's [start,end] window
-        # then overlapped the NEXT batch -> re-included there, and the rebase
-        # `max(0, start_frame - batch_start)` clamped it to frame 0 -> the
-        # full clip replayed at the start of the next round. The window width
-        # does NOT trim ffmpeg playback (eof_action=pass plays the whole clip),
-        # so end_frame only drives batch inclusion + PiP stacking. We derive
-        # it from the actual rendered clip duration, clamped to the throwing
-        # round's end, so a PiP can never bleed into a later round's batch.
+        # Frame START from throw_tick vs CSDM play tick windows — NOT parquet
+        # round_num (often off-by-one vs sequence files → PiP in wrong round).
         round_end_frame: int | None = None
-        if throw_round in round_frame_ranges:
-            fs, fe = round_frame_ranges[throw_round]
-            round_end_frame = fe
-            if throw_round in round_tick_ranges:
-                rs, re = round_tick_ranges[throw_round]
-                rf = (re - rs) or 1
-                start_frame = int(fs + (throw_tick - rs) / rf * (fe - fs))
-            else:
-                start_frame = int(throw_tick * fps / TICKRATE)
+        start_frame: int | None = None
+        if round_tick_ranges and round_frame_ranges:
+            start_frame = _map_throw_tick_to_frame(
+                throw_tick, round_tick_ranges, round_frame_ranges,
+            )
+            if start_frame is None:
+                # Outside every play window (freeze/death cut) — skip rather
+                # than misplace into an early round via max(0, …).
+                _log(f"  [flight] SKIP {util_type} throw {idx} t{throw_tick}: "
+                     f"outside CSDM play tick windows (would mis-time PiP)")
+                continue
+            for rn, (fs, fe) in round_frame_ranges.items():
+                if fs <= start_frame <= fe:
+                    round_end_frame = fe
+                    break
         elif first_round_tick > 0:
             start_frame = int((throw_tick - first_round_tick) * fps / TICKRATE)
         else:
             start_frame = int(throw_tick * fps / TICKRATE)
 
-        start_frame = max(0, start_frame)
+        start_frame = max(0, int(start_frame))
 
         throw_id = str(throw.get("throw_id", ""))
         # util_id-keyed dir (no match id); clip name via clip_name_for_cameras,

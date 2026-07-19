@@ -142,6 +142,7 @@ class Pipeline:
     def __init__(self, args):
         self.args = args
         self.meta = _parse_backlog(args.backlog)
+        self._ensure_video_settings()
 
         self.player = self.meta["player"]
         self.map_name = self.meta["map"]
@@ -213,6 +214,43 @@ class Pipeline:
             self.state["data"]["overlay_only"] = True
         if self.avatar_path:
             self.state["data"]["avatar_path"] = str(self.avatar_path)
+
+    def _ensure_video_settings(self) -> None:
+        """Fill capture dims + viewmodel from prosettings when backlog lacks them."""
+        need_capture = not (
+            int(self.meta.get("capture_width") or 0) >= 800
+            and int(self.meta.get("capture_height") or 0) >= 600
+        )
+        need_vm = self.meta.get("viewmodel_fov") is None
+        if not need_capture and not need_vm:
+            return
+        try:
+            from scrapers.prosettings import backlog_video_fields
+            fields = backlog_video_fields(self.meta.get("player", ""))
+            if need_capture:
+                for k in (
+                    "resolution", "aspect_ratio", "scaling_mode",
+                    "capture_width", "capture_height", "video_settings_source",
+                ):
+                    if k in fields:
+                        self.meta[k] = fields[k]
+                print(f"  [video] {fields['capture_width']}x{fields['capture_height']} "
+                      f"{fields.get('aspect_ratio', '')} {fields.get('scaling_mode', '')} "
+                      f"(source={fields.get('video_settings_source', '?')})")
+            if need_vm:
+                for k in (
+                    "viewmodel_fov", "viewmodel_offset_x", "viewmodel_offset_y",
+                    "viewmodel_offset_z", "viewmodel_presetpos",
+                ):
+                    if fields.get(k) is not None:
+                        self.meta[k] = fields[k]
+                if self.meta.get("viewmodel_fov") is not None:
+                    print(f"  [viewmodel] fov={self.meta.get('viewmodel_fov')} "
+                          f"xyz=({self.meta.get('viewmodel_offset_x')},"
+                          f"{self.meta.get('viewmodel_offset_y')},"
+                          f"{self.meta.get('viewmodel_offset_z')})")
+        except Exception as e:
+            print(f"  [WARN] video settings lookup failed: {e}")
 
     def _ensure_demo(self) -> None:
         if self.demo_path and self.demo_path.exists():
@@ -417,6 +455,27 @@ class Pipeline:
             "--output", str(self.render_dir),
             "--batches", str(getattr(self.args, "batches", 20)),
         ]
+        cap_w = int(self.meta.get("capture_width") or 0)
+        cap_h = int(self.meta.get("capture_height") or 0)
+        if cap_w >= 800 and cap_h >= 600:
+            render_args += ["--width", str(cap_w), "--height", str(cap_h)]
+            print(f"  [capture] {cap_w}x{cap_h} "
+                  f"({self.meta.get('aspect_ratio', '?')} "
+                  f"{self.meta.get('scaling_mode', '')}) "
+                  f"from {self.meta.get('video_settings_source', 'backlog')}")
+        player = (self.meta.get("player") or "").strip()
+        if player:
+            render_args += ["--player", player]
+        for flag, key in (
+            ("--viewmodel-fov", "viewmodel_fov"),
+            ("--viewmodel-offset-x", "viewmodel_offset_x"),
+            ("--viewmodel-offset-y", "viewmodel_offset_y"),
+            ("--viewmodel-offset-z", "viewmodel_offset_z"),
+            ("--viewmodel-presetpos", "viewmodel_presetpos"),
+        ):
+            val = self.meta.get(key)
+            if val is not None and val != "":
+                render_args += [flag, str(val)]
         hf_root = self.meta.get("hf_root", "").strip()
         if hf_root:
             render_args += ["--hf-root", hf_root]
@@ -426,29 +485,45 @@ class Pipeline:
         if r.returncode != 0:
             fail(2, "RENDER_FAILED", f"render_pov.py exited {r.returncode}")
 
+        round_re = re.compile(r"^round-(\d+)-tick-\d+-to-\d+\.mp4$")
+        round_files = sorted(
+            [f for f in self.render_dir.glob("round-*-tick-*-to-*.mp4") if round_re.match(f.name)],
+            key=lambda f: int(round_re.match(f.name).group(1)),
+        )
         batch_files = sorted(
             [f for f in self.render_dir.glob("batch-*.mp4") if re.match(r"batch-\d+-\d+\.mp4$", f.name)],
             key=lambda f: int(re.match(r"batch-(\d+)-\d+\.mp4$", f.name).group(1)),
         )
-        if not batch_files:
-            fail(2, "RENDER_NO_BATCHES", f"no batch-*.mp4 files in {self.render_dir}")
 
         round_count = self.state["data"].get("round_count", 0)
-        if round_count > 0:
-            last_batch = batch_files[-1]
-            last_end = int(re.match(r"batch-\d+-(\d+)\.mp4$", last_batch.name).group(1))
-            if last_end < round_count:
-                fail(2, "RENDER_INCOMPLETE",
-                     f"last batch ends at round {last_end}, expected {round_count}")
 
-        total_rounds = sum(
-            int(re.match(r"batch-\d+-(\d+)\.mp4$", f.name).group(1))
-            - int(re.match(r"batch-(\d+)-\d+\.mp4$", f.name).group(1))
-            + 1
-            for f in batch_files
-        )
-        total_mb = sum(f.stat().st_size for f in batch_files) / 1024 / 1024
-        print(f"  [OK] {len(batch_files)} batch(es), {total_rounds} round(s) ({total_mb:.0f} MB)")
+        if round_files:
+            nums = [int(round_re.match(f.name).group(1)) for f in round_files]
+            missing = [n for n in range(1, (round_count or max(nums)) + 1) if n not in set(nums)]
+            if missing:
+                fail(2, "RENDER_INCOMPLETE",
+                     f"missing round clips: {missing[:20]}{'...' if len(missing) > 20 else ''}")
+            total_mb = sum(f.stat().st_size for f in round_files) / 1024 / 1024
+            print(f"  [OK] {len(round_files)} round clip(s) ({total_mb:.0f} MB)")
+        elif batch_files:
+            # Legacy batch-*.mp4 layout
+            if round_count > 0:
+                last_batch = batch_files[-1]
+                last_end = int(re.match(r"batch-\d+-(\d+)\.mp4$", last_batch.name).group(1))
+                if last_end < round_count:
+                    fail(2, "RENDER_INCOMPLETE",
+                         f"last batch ends at round {last_end}, expected {round_count}")
+            total_rounds = sum(
+                int(re.match(r"batch-\d+-(\d+)\.mp4$", f.name).group(1))
+                - int(re.match(r"batch-(\d+)-\d+\.mp4$", f.name).group(1))
+                + 1
+                for f in batch_files
+            )
+            total_mb = sum(f.stat().st_size for f in batch_files) / 1024 / 1024
+            print(f"  [OK] {len(batch_files)} batch(es), {total_rounds} round(s) ({total_mb:.0f} MB)")
+        else:
+            fail(2, "RENDER_NO_CLIPS",
+                 f"no round-*.mp4 or batch-*.mp4 files in {self.render_dir}")
 
     # ── Step 3: Concat ───────────────────────────────────────────────────
 
@@ -787,7 +862,11 @@ class Pipeline:
         if not self.render_dir.exists():
             fail(3, "CONCAT_RENDER_DIR_MISSING", f"render dir not found: {self.render_dir}")
 
-        r = self._run_py(["scripts/concat_rounds.py", str(self.render_dir)], timeout=7200)
+        concat_args = ["scripts/concat_rounds.py", str(self.render_dir)]
+        scaling = (self.meta.get("scaling_mode") or "").strip()
+        if scaling:
+            concat_args += ["--scaling-mode", scaling]
+        r = self._run_py(concat_args, timeout=7200)
         if r.returncode != 0:
             fail(3, "CONCAT_FAILED", f"concat_rounds.py exited {r.returncode}")
 

@@ -135,6 +135,8 @@ async def create_backlog_entry(
 
     hf_root = re.sub(r"[^\w]", "_", tournament.lower()).strip("_")
 
+    from scrapers.prosettings import backlog_video_fields
+
     meta = {
         "player": player_clean,
         "map": map_name,
@@ -149,6 +151,7 @@ async def create_backlog_entry(
         "kd": kd,
         "team": team,
         "priority": priority,
+        **backlog_video_fields(player_clean),
         "pipeline_cmd": f'$env:PYTHONPATH=.; & C:/Users/jembo/anaconda3/envs/cs2archive/python.exe scripts/pipeline.py --backlog backlog/{match_slug}/{priority}/{slug}.json',
     }
 

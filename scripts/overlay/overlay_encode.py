@@ -71,6 +71,24 @@ def _ffmpeg_encode(
     out_path = Path(output_path)
     tmp_path = out_path.with_name(out_path.name + ".part")
     tmp_path.unlink(missing_ok=True)
+
+    # Force square pixels on the final label. Without this, an anamorphic
+    # master (e.g. 2560x1440 with SAR 3:4 from a 4:3 stretch that omitted
+    # setsar=1) makes ffmpeg composite keyboard/PiP sprites with the wrong
+    # sample aspect — overlays look permanently squished in the encode.
+    map_label = out_label
+    fc_out = list(fc_args)
+    if fc_out and fc_out[0] == "-filter_complex" and len(fc_out) >= 2:
+        fc_out[1] = f"{fc_out[1].rstrip().rstrip(';')};{out_label}setsar=1[__sar1]"
+        map_label = "[__sar1]"
+    elif fc_out and fc_out[0] == "-filter_complex_script" and len(fc_out) >= 2:
+        script = Path(fc_out[1])
+        body = script.read_text(encoding="utf-8").rstrip().rstrip(";")
+        script.write_text(
+            f"{body};{out_label}setsar=1[__sar1]\n", encoding="utf-8"
+        )
+        map_label = "[__sar1]"
+
     cmd = ["ffmpeg", "-y"]
     if segment is not None:
         start_sec, end_sec = segment
@@ -81,10 +99,10 @@ def _ffmpeg_encode(
     for inp in extra_inputs:
         cmd.extend(["-i", str(inp)])
     cmd.extend([
-        *fc_args, "-map", out_label, "-map", "0:a?", "-shortest",
+        *fc_out, "-map", map_label, "-map", "0:a?", "-shortest",
         # Max quality for YouTube: constant-quality nvenc, no bitrate cap, slowest preset.
         # CQ 14 (lower = better); p7 = slowest/highest-quality nvenc preset.
-        "-c:v", "h264_nvenc", "-rc", "cq", "-cq", "14", "-preset", "p7",
+        "-c:v", "h264_nvenc", "-preset", "p7", "-b:v", "0", "-cq", "14",
         "-profile:v", "high", "-pix_fmt", "yuv420p",
         "-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
         "-c:a", "aac", "-b:a", "256k",
