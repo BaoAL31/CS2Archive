@@ -455,22 +455,36 @@ def _check_gpu_available() -> bool:
         return True  # optimistic if nvidia-smi fails
 
 
-def _upscale(src: Path, dst: Path, w: int, h: int) -> None:
+def _scale_vf(w: int, h: int, scaling_mode: str = "") -> tuple[str, str]:
+    """One-pass scale to target WxH — always stretch (ignore Black Bars).
+
+    ``setsar=1`` is required: without it ffmpeg keeps the source DAR (e.g. 4:3)
+    by writing a non-square sample aspect ratio, so players display the file
+    pillarboxed/unsquished instead of anamorphically stretched to 16:9.
+    """
+    _ = scaling_mode
+    return f"scale={w}:{h}:flags=spline,setsar=1,format=nv12", "stretch"
+
+
+
+def _encode_scaled(src: Path, dst: Path, w: int, h: int, scaling_mode: str) -> None:
+    """Single encode: resample (stretch and/or upscale) straight to target WxH."""
     src_mb = src.stat().st_size / 1024 / 1024
-    print(f"\n  [Upscale] {src_mb:.0f} MB -> {w}x{h} (CPU Spline36 + NVENC)...", end=" ", flush=True)
-    
-    # Pre-flight GPU check
+    vf, label = _scale_vf(w, h, scaling_mode)
+    print(f"\n  [Scale] {src_mb:.0f} MB -> {w}x{h} ({label}, spline + NVENC CQ14)...",
+          end=" ", flush=True)
+
     if not _check_gpu_available():
         print("\n[ERROR] GPU not available — another ffmpeg process may be holding CUDA")
         print("  Kill stale ffmpeg processes with: taskkill /f /im ffmpeg.exe")
         sys.exit(1)
-    
+
     temp = dst.with_suffix(".temp.mp4")
     t0 = time.time()
     cmd = [
         "ffmpeg", "-y", "-i", str(src),
-        "-vf", f"scale={w}:{h}:flags=spline,format=nv12",
-        "-c:v", "h264_nvenc", "-preset", "p7", "-rc", "cq", "-cq", "14",
+        "-vf", vf,
+        "-c:v", "h264_nvenc", "-preset", "p7", "-b:v", "0", "-cq", "14",
         "-profile:v", "high", "-pix_fmt", "yuv420p", "-level", "5.1",
         "-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
         "-movflags", "+faststart",
@@ -480,13 +494,21 @@ def _upscale(src: Path, dst: Path, w: int, h: int) -> None:
     elapsed = time.time() - t0
     if r.returncode != 0:
         temp.unlink(missing_ok=True)
-        print(f"\n[ERROR] Upscale failed: {r.stderr[-300:]}")
-        print("  [Fallback] Retrying with CPU Lanczos...")
-        cmd[5] = f"scale={w}:{h}:flags=lanczos"
+        print(f"\n[ERROR] Scale failed: {r.stderr[-300:]}")
+        print("  [Fallback] Retrying with CPU Lanczos + libx264...")
+        vf_cpu = vf.replace("flags=spline", "flags=lanczos")
+        cmd = [
+            "ffmpeg", "-y", "-i", str(src),
+            "-vf", vf_cpu,
+            "-c:v", "libx264", "-crf", "15", "-preset", "slow",
+            "-profile:v", "high", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-c:a", "copy", str(temp),
+        ]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
         if r.returncode != 0:
             temp.unlink(missing_ok=True)
-            print(f"\n[ERROR] Upscale fallback also failed: {r.stderr[-300:]}")
+            print(f"\n[ERROR] Scale fallback also failed: {r.stderr[-300:]}")
             sys.exit(1)
     temp.replace(dst)
     mb = dst.stat().st_size / 1024 / 1024
@@ -497,8 +519,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Concatenate round clips into one video")
     parser.add_argument("folder", help="Folder containing batch-*.mp4 files")
     parser.add_argument("--output", "-o", help="Output path (default: folder/combined.mp4)")
-    parser.add_argument("--width", type=int, default=2560, help="Target width for upscale")
-    parser.add_argument("--height", type=int, default=1440, help="Target height for upscale")
+    parser.add_argument("--width", type=int, default=2560, help="Target width")
+    parser.add_argument("--height", type=int, default=1440, help="Target height")
+    parser.add_argument(
+        "--scaling-mode",
+        default="Stretched",
+        help="Ignored for encode (always stretch to target). Kept for backlog/CLI compat.",
+    )
     args = parser.parse_args()
 
     folder = Path(args.folder)
@@ -506,24 +533,46 @@ def main() -> None:
         print(f"[ERROR] Folder not found: {folder}")
         sys.exit(1)
 
+    combined = folder / "combined.mp4"
+    has_clips = any(folder.glob("batch-*.mp4")) or any(folder.glob("round-*.mp4"))
+    if combined.exists() and combined.stat().st_size >= 1_000_000 and not has_clips:
+        vid_w, vid_h = _get_resolution(combined)
+        if (vid_w, vid_h) == (args.width, args.height):
+            print(f"  [Skip] combined.mp4 already {vid_w}x{vid_h}, no clips left")
+            mb = combined.stat().st_size / 1024 / 1024
+            print(f"\nDone. {combined} ({mb:.0f} MB)")
+            return
+        print(f"  [Resume scale] combined.mp4 is {vid_w}x{vid_h}, scaling to "
+              f"{args.width}x{args.height}...")
+        scaled = folder / "_scaled.mp4"
+        for p in folder.glob("_scaled*"):
+            if not _is_valid_video(p):
+                p.unlink(missing_ok=True)
+        if not scaled.exists():
+            _encode_scaled(combined, scaled, args.width, args.height, args.scaling_mode)
+        scaled.replace(combined)
+        mb = combined.stat().st_size / 1024 / 1024
+        print(f"\nDone. {combined} ({mb:.0f} MB)")
+        return
+
     try:
         combined = concat_rounds(folder)
     except FileNotFoundError as e:
         print(f"[ERROR] {e}")
         sys.exit(1)
 
-    # Upscale to target resolution if needed (VP9 trick for YouTube)
+    # One encode: stretch/pillarbox + upscale to final 16:9 size (no 1080p middle).
     vid_w, vid_h = _get_resolution(combined)
-    if vid_h < args.height:
-        upscaled = folder / "_upscaled.mp4"
-        if upscaled.exists() and not _is_valid_video(upscaled):
-            print(f"\n  [Cleanup] Removing corrupt {upscaled.name}")
-            upscaled.unlink()
-        if not upscaled.exists():
-            _upscale(combined, upscaled, args.width, args.height)
-        upscaled.replace(combined)
+    if (vid_w, vid_h) == (args.width, args.height):
+        print(f"\n  [Skip scale] Already {vid_w}x{vid_h}")
     else:
-        print(f"\n  [Skip upscale] Already {vid_w}x{vid_h}")
+        scaled = folder / "_scaled.mp4"
+        if scaled.exists() and not _is_valid_video(scaled):
+            print(f"\n  [Cleanup] Removing corrupt {scaled.name}")
+            scaled.unlink()
+        if not scaled.exists():
+            _encode_scaled(combined, scaled, args.width, args.height, args.scaling_mode)
+        scaled.replace(combined)
 
     if args.output:
         output = Path(args.output)
