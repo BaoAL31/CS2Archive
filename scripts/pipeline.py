@@ -149,6 +149,9 @@ class Pipeline:
         self.hltv_url = self.meta["hltv_url"]
         self.steam_id = self.meta.get("steam_id", "")
         self.tournament = self.meta.get("tournament", "")
+        self.is_faceit = bool(self.meta.get("is_faceit")) or bool(
+            self.demo_path and "demos/faceit" in str(self.demo_path).replace("\\", "/")
+        )
 
         demo_path_str = self.meta.get("demo_path", "")
         self.demo_path = Path(demo_path_str) if demo_path_str else None
@@ -1119,6 +1122,33 @@ class Pipeline:
         youtube_dir.mkdir(parents=True, exist_ok=True)
         thumb = youtube_dir / "thumbnail.jpg"
 
+        if self.is_faceit:
+            # FACEIT path: blurred kill-frame + text, no ratings/avatar.
+            match_detail = self.meta.get("match_detail", "") or f"{self.player} FACEIT POV"
+            cmd = [
+                "scripts/faceit_thumbnail.py", str(self.demo_path),
+                "--player", self.player,
+                "--map", self.map_name,
+                "--match-detail", match_detail,
+                "--variant", variant,
+            ]
+            if self.steam_id:
+                cmd += ["--steam-id", self.steam_id]
+            if self.tournament:
+                cmd += ["--tournament", self.tournament]
+            cmd += ["--output", str(youtube_dir)]
+            r = self._run_py(cmd, timeout=300)
+            if r.returncode != 0:
+                fail(step_num, "THUMBNAIL_FAILED",
+                     f"faceit thumbnail exited {r.returncode} for variant={variant}")
+            if not thumb.exists():
+                fail(step_num, "THUMBNAIL_MISSING", f"thumbnail not created at {thumb}")
+            if thumb.stat().st_size < 1000:
+                fail(step_num, "THUMBNAIL_TOO_SMALL", f"thumbnail too small: {thumb.stat().st_size}")
+            print(f"  [OK] FACEIT Thumbnail [{variant}]: {thumb.name}")
+            self._write_upload_meta(youtube_dir, variant=variant, step_num=step_num)
+            return
+
         bg_override: Path | None = None
         bg_cleanup: Path | None = None
         if variant == "overlay":
@@ -1214,6 +1244,16 @@ class Pipeline:
             "--map", self.map_name,
             "--variant", variant,
         ]
+        if self.is_faceit:
+            titlize_args = [
+                "scripts/faceit_title.py", str(self.demo_path),
+                "--player", self.player,
+                "--map", self.map_name,
+            ]
+            if self.steam_id:
+                titlize_args += ["--steam-id", self.steam_id]
+            if self.tournament:
+                titlize_args += ["--tournament", self.tournament]
         if self.tournament:
             titlize_args += ["--tournament", self.tournament]
 

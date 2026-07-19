@@ -169,3 +169,48 @@ def generate(
         _draw_overlay_badge(bg)
 
     return bg
+
+
+def generate_faceit(
+    bg_path: Path,
+    player_name: str,
+    map_name: str,
+    match_detail: str,
+    tournament: str = "",
+    variant: str = "raw",
+) -> Image.Image:
+    """FACEIT thumbnail: blurred kill-frame background + text overlay.
+
+    No avatar/rating (FACEIT demos carry no HLTV-style stats). Just the POV
+    player, map, opponent/team line, and a FACEIT badge.
+    """
+    bg = load_background(bg_path)
+    draw = ImageDraw.Draw(bg)
+
+    # FACEIT badge (top-left pill)
+    _draw_pill(
+        draw, "FACEIT CS2", FONT_SIZES["tiny"],
+        left=int(WIDTH * 0.04), top=int(HEIGHT * 0.06),
+        fill=(250, 90, 30, 220), text_fill=(255, 255, 255, 255),
+    )
+
+    text_x = int(WIDTH * 0.5)
+    text_y_center = int(HEIGHT * 0.55)
+    lines = [
+        (player_name, FONT_SIZES["player"]),
+        (map_name, FONT_SIZES["stat"]),
+        (match_detail, FONT_SIZES["small"]),
+    ]
+    if tournament:
+        lines.append((tournament, FONT_SIZES["tiny"]))
+
+    total = sum(_line_height(s) for _, s in lines)
+    current_y = text_y_center - total // 2
+    for text, size in lines:
+        draw_text(draw, text, text_x, current_y, size, anchor="mm")
+        current_y += _line_height(size)
+
+    if variant == "overlay":
+        _draw_overlay_badge(bg)
+
+    return bg
