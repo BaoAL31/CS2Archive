@@ -32,6 +32,7 @@ venv/
 tmp/
 tmp_*/
 tmp_*.py
+tmp_*.png
 
 # Vault
 vault/
@@ -82,4 +83,4 @@ backlog/
 # Local logs
 logs/
 *.log
-.upload_*.sh
+.upload_*.shtoken_youtube_readonly.json

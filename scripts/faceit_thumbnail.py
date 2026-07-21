@@ -36,6 +36,13 @@ def main() -> None:
     ap.add_argument("--output", required=True, help="youtube dir to write thumbnail.jpg")
     args = ap.parse_args()
 
+    # Canonicalize player name (proper casing: NiKo, TeSeS, ...)
+    from faceit_names import canonical_nick, avatar_path
+    player = canonical_nick(args.player)
+    av_path = avatar_path(args.player)
+    if av_path is None:
+        print(f"  [WARN] No avatar for {player}")
+
     demo = Path(args.demo_path)
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -48,8 +55,9 @@ def main() -> None:
         Image.new("RGB", (1280, 720), (20, 20, 24)).save(bg)
 
     img = generate_faceit(
-        bg, args.player, args.map, args.match_detail,
+        bg, player, args.map, args.match_detail,
         tournament=args.tournament, variant=args.variant,
+        avatar_path=av_path,
     )
     img = img.convert("RGB")
     out = out_dir / "thumbnail.jpg"

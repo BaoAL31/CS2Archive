@@ -14,6 +14,7 @@ class Settings(BaseSettings):
 
     # ── API Keys ──────────────────────────────────────────────────────────
     faceit_api_key: str = Field(default="", description="FACEIT Data API v4 key (player/match lookup only)")
+    faceit_downloads_token: str = Field(default="", description="FACEIT Downloads API token (demo file download)")
     youtube_api_key: str = Field(default="", description="YouTube Data API v3 key")
 
     # ── Paths ─────────────────────────────────────────────────────────────
@@ -21,6 +22,7 @@ class Settings(BaseSettings):
 
     # ── FACEIT ───────────────────────────────────────────────────────────
     faceit_data_api_base: str = "https://open.faceit.com/data/v4"
+    faceit_downloads_api_base: str = "https://api.faceit.com/download/v2"
     hltv_base_url: str = "https://www.hltv.org"
     hltv_demo_download_url: str = "https://www.hltv.org/interfaces/download.php"
 
@@ -64,6 +66,10 @@ class Settings(BaseSettings):
     @property
     def has_faceit_key(self) -> bool:
         return bool(self.faceit_api_key and self.faceit_api_key != "your_data_api_key_here")
+
+    @property
+    def has_faceit_downloads_token(self) -> bool:
+        return bool(self.faceit_downloads_token and self.faceit_downloads_token != "your_downloads_token_here")
 
 
 # Singleton settings instance

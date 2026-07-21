@@ -45,6 +45,13 @@ def _demo_players(demo_path: Path) -> list[dict]:
 
 
 def _notable_nicks() -> set[str]:
+    # Use all known pros from player accounts (not just the watchlist) so any
+    # two recognizable pros in a match get flagged (e.g. niko + teses).
+    try:
+        from faceit_names import known_pros
+        return known_pros()
+    except Exception:
+        pass
     pros_path = PROJECT_ROOT / "faceit_pros.json"
     if not pros_path.exists():
         return set()
@@ -108,6 +115,10 @@ def main() -> None:
     players = _demo_players(demo)
     map_name = args.map or _map_from_demo(demo)
 
+    # Canonicalize the POV player name (proper casing: NiKo, TeSeS, ...)
+    from faceit_names import canonical_nick
+    player = canonical_nick(args.player)
+
     notable = []
     pro_set = _notable_nicks()
     for p in players:
@@ -117,11 +128,11 @@ def main() -> None:
         if p["steamid"] == args.steam_id:
             continue
         if nick.lower() in pro_set:
-            notable.append(nick)
+            notable.append(canonical_nick(nick))
 
-    title = build_title(args.player, map_name, notable, args.tournament)
-    description = build_description(args.player, map_name, notable, args.tournament, demo)
-    tags = ["FACEIT", "CS2", "POV", map_name, args.player] + notable
+    title = build_title(player, map_name, notable, args.tournament)
+    description = build_description(player, map_name, notable, args.tournament, demo)
+    tags = ["FACEIT", "CS2", "POV", map_name, player] + notable
     tags = list(dict.fromkeys(t for t in tags if t))[:10]
 
     print(json.dumps({

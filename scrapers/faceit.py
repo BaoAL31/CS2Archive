@@ -42,6 +42,33 @@ class FACEITClient:
 
     def __init__(self):
         self._client: Optional[httpx.AsyncClient] = None
+        self._elo_cache: dict[str, int] = {}
+
+    async def get_player_elo(self, player_id: str) -> Optional[int]:
+        """FACEIT ELO for a player (cached). None on failure."""
+        if player_id in self._elo_cache:
+            return self._elo_cache[player_id]
+        try:
+            data = await self._request("GET", f"/players/{player_id}")
+            elo = data.get("games", {}).get("cs2", {}).get("faceit_elo")
+            if elo is not None:
+                self._elo_cache[player_id] = int(elo)
+                return self._elo_cache[player_id]
+        except Exception:
+            pass
+        return None
+
+    async def get_player_steam_id(self, player_id: str) -> Optional[str]:
+        """steam_id_64 for a FACEIT player_id. None on failure."""
+        if player_id in self._elo_cache:
+            # elo cache keyed by player_id; we keep a separate steam cache
+            pass
+        try:
+            data = await self._request("GET", f"/players/{player_id}")
+            sid = data.get("steam_id_64")
+            return str(sid) if sid else None
+        except Exception:
+            return None
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -137,8 +164,155 @@ class FACEITClient:
             ))
         return matches
 
+    async def get_match_stats(self, match_id: str) -> Optional[dict]:
+        """FACEIT match stats: map, score, winner, per-player stat lines.
+
+        Returns {"map": str, "score": str, "teams": {team: score},
+                 "players": {nickname: {kills, deaths, kd, adr, hs, ...}}}
+        or None on failure.
+        """
+        try:
+            data = await self._get_client().get(f"/matches/{match_id}/stats")
+            data.raise_for_status()
+            payload = data.json()
+        except Exception as e:
+            console.print(f"[yellow]   [WARN] stats failed for {match_id}: {e}[/yellow]")
+            return None
+        out = {"map": "Unknown", "score": "", "teams": {}, "players": {}}
+        for rnd in payload.get("rounds", []):
+            rs = rnd.get("round_stats", {})
+            out["map"] = rs.get("Map", out["map"]).replace("de_", "")
+            out["score"] = rs.get("Score", out["score"])
+            for team in rnd.get("teams", []):
+                tname = team.get("team_stats", {}).get("Team", "Unknown")
+                tscore = team.get("team_stats", {}).get("Final Score", "?")
+                out["teams"][tname] = tscore
+                for p in team.get("players", []):
+                    ps = p.get("player_stats", {})
+                    out["players"][p.get("nickname", "?")] = {
+                        "kills": ps.get("Kills", "?"),
+                        "deaths": ps.get("Deaths", "?"),
+                        "kd": ps.get("K/D Ratio", "?"),
+                        "adr": ps.get("ADR", "?"),
+                        "hs": ps.get("Headshots %", "?"),
+                        "result": ps.get("Result", "?"),
+                        "player_id": p.get("player_id"),
+                    }
+        return out
+
 
 # Button text fragments that trigger the demo download on a FACEIT room page.
+class FACEITDownloadsClient:
+    """FACEIT Downloads API client (token-based, no browser).
+
+    Endpoint: POST https://api.faceit.com/download/v2/demos/download
+    Body: {"resource_url": "<demo_url from match payload>"}
+    Auth: Bearer FACEIT_DOWNLOADS_TOKEN (requires Downloads API scope).
+    Returns: {"payload": {"download_url": "<signed url>"}}
+
+    The resource_url comes from the match payload's `demo_url` field
+    (a list of CDN URLs in the current API). Pass the first element.
+    """
+
+    def __init__(self):
+        self._client: Optional[httpx.AsyncClient] = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                base_url=settings.faceit_downloads_api_base,
+                headers={
+                    "Authorization": f"Bearer {settings.faceit_downloads_token}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                timeout=httpx.Timeout(60.0),
+                follow_redirects=True,
+            )
+        return self._client
+
+    async def close(self) -> None:
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+
+    async def get_signed_url(self, resource_url: str) -> Optional[str]:
+        """Exchange a demo resource_url for a time-limited signed download URL.
+
+        Returns None on auth failure (400 invalid_token) or server error (500).
+        """
+        if not settings.has_faceit_downloads_token:
+            console.print("[yellow]   [WARN] FACEIT_DOWNLOADS_TOKEN not set; use browser scrape.[/yellow]")
+            return None
+        try:
+            client = self._get_client()
+            resp = await client.post("/demos/download",
+                                   json={"resource_url": resource_url})
+            if resp.status_code == 400:
+                console.print("[red]   [ERR] Downloads token rejected (invalid_token). Check scope.[/red]")
+                return None
+            if resp.status_code != 200:
+                console.print(f"[red]   [ERR] Downloads API {resp.status_code}: {resp.text[:160]}[/red]")
+                return None
+            return resp.json().get("payload", {}).get("download_url")
+        except Exception as e:
+            console.print(f"[red]   [ERR] Downloads API request failed: {e}[/red]")
+            return None
+
+    async def download_match(self, match_id: str, out_dir: Path) -> Optional[Path]:
+        """Resolve demo_url via Data API, get signed URL, stream to disk."""
+        from downloader import file_size_mb
+        # 1. fetch match payload for demo_url
+        try:
+            async with httpx.AsyncClient(
+                base_url=settings.faceit_data_api_base,
+                headers={"Authorization": f"Bearer {settings.faceit_api_key}"},
+                timeout=30.0,
+            ) as data:
+                m = await data.get(f"/matches/{match_id}")
+                m.raise_for_status()
+                payload = m.json()
+        except Exception as e:
+            console.print(f"[red]   [ERR] Match lookup failed: {e}[/red]")
+            return None
+        demo_url = payload.get("demo_url")
+        if isinstance(demo_url, list):
+            demo_url = demo_url[0] if demo_url else None
+        if not demo_url:
+            console.print("[red]   [ERR] No demo_url in match payload.[/red]")
+            return None
+
+        signed = await self.get_signed_url(demo_url)
+        if not signed:
+            return None
+
+        # 2. stream the signed url
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fname = demo_url.rsplit("/", 1)[-1]
+        dest = out_dir / fname
+        try:
+            async with httpx.AsyncClient(timeout=300.0, follow_redirects=True) as dl:
+                async with dl.stream("GET", signed) as r:
+                    r.raise_for_status()
+                    with open(dest, "wb") as f:
+                        async for chunk in r.aiter_bytes(8192):
+                            f.write(chunk)
+            console.print(f"[green]   [OK] Downloaded: {dest.name} ({file_size_mb(dest):.1f} MB)[/green]")
+            return dest
+        except Exception as e:
+            console.print(f"[red]   [ERR] Stream failed: {e}[/red]")
+            if dest.exists():
+                dest.unlink()
+            return None
+
+
+def download_demo_api(match_id: str) -> Optional[Path]:
+    """Download a FACEIT demo via the official Downloads API (token-based)."""
+    import asyncio
+    out_dir = settings.temp_dir
+    client = FACEITDownloadsClient()
+    return asyncio.run(client.download_match(match_id, out_dir))
+
+
 DOWNLOAD_BUTTON_TEXTS = ["watch demo", "download demo", "download", "demo"]
 
 
@@ -225,24 +399,68 @@ def _click_demo_and_save(page, out_dir: Path) -> Optional[Path]:
 
 
 def download_demo(match_id: str) -> DownloadResult:
-    """Full download flow: open room (authed) → click demo → extract → organize."""
+    """Full download flow.
+
+    Primary: FACEIT Downloads API (token-based, no browser) when
+    FACEIT_DOWNLOADS_TOKEN is configured. Falls back to the browser
+    scrape (authed Chrome click) if the API is unavailable.
+    """
     started = datetime.now()
     match_id = _resolve_match_id(match_id)
     match_info = MatchInfo(match_id=match_id, source=DemoSource.FACEIT)
+    console.print(f"\n[bold cyan][>>] FACEIT match:[/bold cyan] {match_id}")
+
+    existing = is_already_downloaded(match_id, DemoSource.FACEIT)
+    if existing:
+        console.print(f"[yellow]   [SKIP] Already downloaded: {existing}[/yellow]")
+        return DownloadResult(
+            match=match_info, status=DownloadStatus.SKIPPED,
+            demo_path=existing, file_size_mb=file_size_mb(existing),
+            started_at=started, completed_at=datetime.now(),
+        )
+
+    # ── Primary: token-based Downloads API ──────────────────────────────
+    if settings.has_faceit_downloads_token:
+        console.print("[cyan]   [API] Trying FACEIT Downloads API...[/cyan]")
+        saved = download_demo_api(match_id)
+        if saved:
+            return _finalize_download(match_info, saved, started)
+        console.print("[yellow]   [WARN] Downloads API failed; falling back to browser scrape.[/yellow]")
+
+    # ── Fallback: browser scrape ───────────────────────────────────────
+    return _download_demo_browser(match_id, match_info, started)
+
+
+def _finalize_download(match_info, saved, started) -> DownloadResult:
+    """Extract the archived demo and organize it into the FACEIT demo dir."""
+    from downloader import build_demo_path, record_download
+    console.print("[cyan]   [EXTRACT] Extracting .dem...[/cyan]")
+    dem_paths = extract_demo(saved, settings.temp_dir)
+    dem_path = dem_paths[0]
+    organized = build_demo_path(match_info)
+    organized.parent.mkdir(parents=True, exist_ok=True)
+    if organized.exists():
+        organized.unlink()
+    dem_path.replace(organized)
+    dem_path = organized
+    record_download(DownloadResult(
+        match=match_info, status=DownloadStatus.COMPLETED,
+        demo_path=dem_path, file_size_mb=file_size_mb(dem_path),
+        started_at=started, completed_at=datetime.now(),
+    ))
+    console.print(f"[bold green]   [DONE] Saved: {dem_path.name} ({file_size_mb(dem_path):.1f} MB)[/bold green]")
+    return DownloadResult(
+        match=match_info, status=DownloadStatus.COMPLETED,
+        demo_path=dem_path, file_size_mb=file_size_mb(dem_path),
+        started_at=started, completed_at=datetime.now(),
+    )
+
+
+def _download_demo_browser(match_id: str, match_info: MatchInfo, started) -> DownloadResult:
+    """Fallback: open room (authed) → click demo → extract → organize."""
     room_url = f"https://www.faceit.com/en/cs2/room/{match_id}"
 
     try:
-        console.print(f"\n[bold cyan][>>] FACEIT match:[/bold cyan] {match_id}")
-
-        existing = is_already_downloaded(match_id, DemoSource.FACEIT)
-        if existing:
-            console.print(f"[yellow]   [SKIP] Already downloaded: {existing}[/yellow]")
-            return DownloadResult(
-                match=match_info, status=DownloadStatus.SKIPPED,
-                demo_path=existing, file_size_mb=file_size_mb(existing),
-                started_at=started, completed_at=datetime.now(),
-            )
-
         pw, browser = _launch_context()
         try:
             page = browser.new_page()

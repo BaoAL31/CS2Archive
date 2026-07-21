@@ -19,11 +19,21 @@ def print_match_table(matches: list[MatchInfo], title: str) -> None:
     table.add_column("Teams", style="white", min_width=25)
     table.add_column("Map", style="magenta", width=12)
     table.add_column("Date", style="dim", width=12)
+    show_stats = any(m.player_kd for m in matches)
+    if show_stats:
+        table.add_column("K/D", style="green", width=8)
+        table.add_column("ADR", style="yellow", width=7)
+        table.add_column("HS%", style="blue", width=6)
+        table.add_column("ELO", style="magenta", width=7)
 
     for i, match in enumerate(matches, 1):
         date_str = match.date.strftime("%Y-%m-%d") if match.date else "-"
         teams = f"{match.team1} vs {match.team2}"
-        table.add_row(str(i), match.match_id[:12], teams, match.map_name, date_str)
+        row = [str(i), match.match_id[:12], teams, match.map_name, date_str]
+        if show_stats:
+            row += [match.player_kd or "-", match.player_adr or "-", match.player_hs or "-",
+                    str(match.match_elo) if match.match_elo else "-"]
+        table.add_row(*row)
 
     console.print()
     console.print(table)

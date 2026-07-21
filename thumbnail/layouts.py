@@ -178,13 +178,27 @@ def generate_faceit(
     match_detail: str,
     tournament: str = "",
     variant: str = "raw",
+    avatar_path: Path | None = None,
 ) -> Image.Image:
     """FACEIT thumbnail: blurred kill-frame background + text overlay.
 
-    No avatar/rating (FACEIT demos carry no HLTV-style stats). Just the POV
-    player, map, opponent/team line, and a FACEIT badge.
+    Avatar is composited when available (mirrors the HLTV layout). FACEIT demos
+    carry no HLTV-style ratings, so no K/D or Rating line is shown.
     """
     bg = load_background(bg_path)
+
+    if avatar_path is not None:
+        try:
+            player_img = cutout_player(avatar_path)
+            target_h = int(HEIGHT * AVATAR_HEIGHT_RATIO)
+            player_img = scale_player(player_img, target_h)
+            pw, ph = player_img.size
+            px = 0
+            py = HEIGHT - ph
+            bg.paste(player_img, (px, py), player_img)
+        except Exception as e:
+            print(f"  [WARN] faceit avatar composite failed: {e}")
+
     draw = ImageDraw.Draw(bg)
 
     # FACEIT badge (top-left pill)

@@ -92,8 +92,17 @@ async def _fetch_avatar(player_key: str, match_url: str, ratings_path: Path, *, 
 
 
 def _existing_avatar_path(nickname: str) -> str:
+    name = nickname.strip().lower()
+    # Nested layout: {nick}/hltv or {nick}/faceit, then legacy flat
+    for source in ("hltv", "faceit"):
+        folder = PROJECT_ROOT / "demos" / "avatars" / name / source
+        if folder.is_dir():
+            for ext in (".png", ".jpg", ".jpeg"):
+                p = folder / f"{name}{ext}"
+                if p.exists():
+                    return str(p.relative_to(PROJECT_ROOT)).replace("\\", "/")
     for ext in (".png", ".jpg", ".jpeg"):
-        p = PROJECT_ROOT / "demos" / "avatars" / f"{nickname.lower()}{ext}"
+        p = PROJECT_ROOT / "demos" / "avatars" / f"{name}{ext}"
         if p.exists():
             return str(p.relative_to(PROJECT_ROOT)).replace("\\", "/")
     return ""

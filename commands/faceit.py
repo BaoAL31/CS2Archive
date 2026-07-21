@@ -6,9 +6,10 @@ Usage:
     python main.py faceit player <name> [--count 5]
 
 Player lookup + match history use the free FACEIT Data API v4 key
-(FACEIT_API_KEY). Demo download opens the match room in a logged-in Chrome
-profile (.faceit_profile/) and clicks "Watch Demo" — no Downloads API token.
-Log in once with `python scripts/faceit_login_launcher.py`.
+(FACEIT_API_KEY). Demo download uses the FACEIT Downloads API
+(FACEIT_DOWNLOADS_TOKEN, Bearer) when configured, falling back to the
+browser scrape (authed Chrome, .faceit_profile/) if the API is unavailable.
+Log in once with `python scripts/faceit_login_launcher.py` for the fallback.
 """
 
 from __future__ import annotations
@@ -37,6 +38,11 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
     faceit_popular.add_argument("--count", type=int, default=2, help="Matches per pro (default: 2)")
     faceit_popular.add_argument("--pros", default="faceit_pros.json", help="Path to JSON list of pro nicknames")
 
+    faceit_recent = sub.add_parser("recent", help="List matches from curated pros within a time window (no download)")
+    faceit_recent.add_argument("--hours", type=int, default=48, help="Lookback window in hours (default: 48)")
+    faceit_recent.add_argument("--count", type=int, default=20, help="Max matches fetched per pro history (default: 20)")
+    faceit_recent.add_argument("--pros", default="faceit_pros.json", help="Path to JSON list of pro nicknames")
+
 
 def handle(args: argparse.Namespace) -> None:
     if args.action == "match":
@@ -47,6 +53,9 @@ def handle(args: argparse.Namespace) -> None:
     elif args.action == "popular":
         import asyncio
         asyncio.run(_cmd_popular(args.count, args.pros))
+    elif args.action == "recent":
+        import asyncio
+        asyncio.run(_cmd_recent(args.hours, args.count, args.pros))
     else:
         console.print("[yellow]Usage: python main.py faceit match <id|url> | faceit player <name>[/yellow]")
 
@@ -58,9 +67,111 @@ def _cmd_match(match_id: str) -> None:
     print_result_summary([result])
 
 
+async def _cmd_recent(hours: int, count: int, pros_path: str) -> None:
+    """List recent matches for curated pros within a time window (report only)."""
+    import json
+    from pathlib import Path
+
+    from scrapers.faceit import FACEITClient
+
+    path = Path(pros_path)
+    if not path.exists():
+        console.print(f"[red]   [ERR] Pro list not found: {pros_path}[/red]")
+        return
+    pros = json.loads(path.read_text()).get("pros", [])
+    if not pros:
+        console.print("[yellow]   No pros listed in config.[/yellow]")
+        return
+
+    client = FACEITClient()
+    try:
+        from datetime import datetime, timedelta
+        cutoff = datetime.now() - timedelta(hours=hours)
+        all_recent: list = []
+        match_pros: dict[str, set] = {}
+        # Stable-ID match sets (FACEIT player_id -> canonical nick, steam_id -> nick)
+        try:
+            from faceit_names import (
+                known_pro_faceit_ids, known_pro_steam_ids, faceit_nick,
+            )
+            known_fids = known_pro_faceit_ids()
+            known_sids = known_pro_steam_ids()
+        except Exception:
+            known_fids, known_sids = {}, {}
+            faceit_nick = lambda x: x
+        # cache lobby player_id -> steam_id to avoid repeat API calls
+        _steam_cache: dict[str, Optional[str]] = {}
+        async def _lobby_steam_id(player_id: str) -> Optional[str]:
+            if player_id not in _steam_cache:
+                _steam_cache[player_id] = await client.get_player_steam_id(player_id)
+            return _steam_cache[player_id]
+        for nick in pros:
+            # Resolve the watchlist nick to its real FACEIT nick (e.g. s1mple
+            # -> holaaaa) so get_player_id actually finds the player.
+            query = faceit_nick(nick)
+            pid = await client.get_player_id(query)
+            if not pid:
+                continue
+            matches = await client.get_player_matches(pid, limit=count)
+            recent = [m for m in matches if m.date and m.date >= cutoff]
+            if not recent:
+                continue
+            # enrich each match with stats (map, score, player K/D/ADR/HS)
+            for m in recent:
+                stats = await client.get_match_stats(m.match_id)
+                if not stats:
+                    continue
+                m.map_name = stats.get("map", m.map_name) or m.map_name
+                m.score = stats.get("score", m.score) or m.score
+                line = stats.get("players", {}).get(nick)
+                if line:
+                    m.player_kd = str(line.get("kd", ""))
+                    m.player_adr = str(line.get("adr", ""))
+                    m.player_hs = str(line.get("hs", ""))
+                    m.player_kills = str(line.get("kills", ""))
+                    m.player_deaths = str(line.get("deaths", ""))
+                # record ALL known pros in this match, matched by stable ID
+                # (FACEIT player_id OR steam_id_64) — not by fragile nickname.
+                match_pros.setdefault(m.match_id, set())
+                if pid in known_fids:
+                    match_pros[m.match_id].add(known_fids[pid])
+                for pl in stats.get("players", {}).values():
+                    pl_id = pl.get("player_id")
+                    if pl_id and pl_id in known_fids:
+                        match_pros[m.match_id].add(known_fids[pl_id])
+                        continue
+                    sid = await _lobby_steam_id(pl_id) if pl_id else None
+                    if sid and sid in known_sids:
+                        match_pros[m.match_id].add(known_sids[sid])
+                # avg lobby ELO across all 10 players
+                elo_sum = 0
+                elo_n = 0
+                for pl in stats.get("players", {}).values():
+                    pl_id = pl.get("player_id")
+                    if pl_id:
+                        e = await client.get_player_elo(pl_id)
+                        if e is not None:
+                            elo_sum += e
+                            elo_n += 1
+                if elo_n:
+                    m.match_elo = elo_sum // elo_n
+            console.print(f"\n[bold cyan]Pro:[/bold cyan] {nick}")
+            print_match_table(recent, f"{nick} — last {hours}h")
+            all_recent.extend(recent)
+        # multi-pro matches (>=2 known pros in same game)
+        multi = {mid: ps for mid, ps in match_pros.items() if len(ps) >= 2}
+        if multi:
+            console.print(f"\n[bold magenta]★ Matches with multiple known pros:[/bold magenta]")
+            for mid, ps in sorted(multi.items(), key=lambda x: -len(x[1])):
+                canon = ", ".join(sorted(ps))
+                console.print(f"  [magenta]{mid}[/magenta]  {canon}")
+        console.print(f"\n[bold]Total matches in window:[/bold] {len(all_recent)}  (multi-pro: {len(multi)})")
+    finally:
+        await client.close()
+
+
 async def _cmd_popular(count: int, pros_path: str) -> None:
     """Download recent matches for a curated list of pros (faceit_pros.json)."""
-    import asyncio
     import json
     from pathlib import Path
 

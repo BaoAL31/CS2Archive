@@ -33,6 +33,11 @@ console = Console(force_terminal=True)
 AVATAR_DIR = settings.demo_storage_dir / "avatars"
 MIN_RES = 300  # Reject images smaller than 300×300
 
+
+def _hltv_avatar_path(key: str) -> Path:
+    """Nested HLTV avatar path: demos/avatars/{key}/hltv/{key}.png"""
+    return AVATAR_DIR / key / "hltv" / f"{key}.png"
+
 _BODYSHOT_PLAYER_ID_RE = re.compile(r"playerbodyshot/(\d+)/", re.IGNORECASE)
 _BODYSHOT_QUERY_ID_RE = re.compile(r"[?&]playerid=(\d+)", re.IGNORECASE)
 _CDN_BODYSHOT_BASE = "https://img-cdn.hltv.org/playerbodyshot"
@@ -362,7 +367,7 @@ async def fetch_avatar_for_player(
 
     key = normalize_pipeline_player_key(player_key)
     AVATAR_DIR.mkdir(parents=True, exist_ok=True)
-    png_path = AVATAR_DIR / f"{key}.png"
+    png_path = _hltv_avatar_path(key)
 
     accounts = list_accounts()
     account = find_account_by_player_key(accounts, key)
@@ -464,7 +469,7 @@ async def get_player_avatars(match_url: str) -> dict[str, Path]:
 
         for entry in players:
             nickname = entry["nickname"]
-            png_path = AVATAR_DIR / f"{nickname}.png"
+            png_path = _hltv_avatar_path(nickname)
 
             if png_path.exists():
                 try:

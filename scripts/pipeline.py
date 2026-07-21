@@ -131,6 +131,9 @@ def _parse_backlog(path: str) -> dict:
         fail(0, "BACKLOG_PARSE_ERROR", f"Failed to parse {path}: {e}")
 
     missing = [f for f in REQUIRED_META_FIELDS if not meta.get(f)]
+    # FACEIT matches have no HLTV url/ratings — those fields are optional there.
+    if meta.get("is_faceit") or str(meta.get("demo_path", "")).replace("\\", "/").count("demos/faceit"):
+        missing = [f for f in missing if f not in ("hltv_url", "ratings_path")]
     if missing:
         fail(0, "BACKLOG_MISSING_FIELDS",
              f"Backlog missing required fields: {', '.join(missing)}")
@@ -146,7 +149,7 @@ class Pipeline:
 
         self.player = self.meta["player"]
         self.map_name = self.meta["map"]
-        self.hltv_url = self.meta["hltv_url"]
+        self.hltv_url = self.meta.get("hltv_url", "")
         self.steam_id = self.meta.get("steam_id", "")
         self.tournament = self.meta.get("tournament", "")
         self.is_faceit = bool(self.meta.get("is_faceit")) or bool(
@@ -180,8 +183,15 @@ class Pipeline:
 
         from scrapers.hltv_acquire import match_id_from_url
 
-        slug = self.hltv_url.rstrip("/").split("/")[-1]
-        self.match_id = match_id_from_url(self.hltv_url)
+        if self.is_faceit:
+            # FACEIT has no HLTV url — derive match id from demo stem / meta.
+            self.match_id = self.meta.get("faceit_match_id") or (
+                self.demo_path.stem.split(" - ")[0] if self.demo_path else "faceit"
+            )
+            slug = self.match_id
+        else:
+            slug = self.hltv_url.rstrip("/").split("/")[-1]
+            self.match_id = match_id_from_url(self.hltv_url)
         dem_stem = self.demo_path.stem if self.demo_path else slug
         self.render_dir = pov_render_dir(dem_stem, self.player)
         self.youtube_dir = PROJECT_ROOT / "youtube" / run_id_from_name(f"{self.match_id}_{dem_stem}_{self.player}_{self.map_name}")

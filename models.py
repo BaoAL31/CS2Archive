@@ -32,6 +32,13 @@ class MatchInfo(BaseModel):
     event: str = Field(default="", description="Tournament/event name")
     url: str = Field(default="", description="Source URL for the match page")
     demo_url: str = Field(default="", description="Direct demo download URL or resource URL")
+    # Player-specific stats (set when a POV player is resolved, e.g. FACEIT recent)
+    player_kd: str = Field(default="", description="Player K/D from match stats")
+    player_adr: str = Field(default="", description="Player ADR from match stats")
+    player_hs: str = Field(default="", description="Player headshot %% from match stats")
+    player_kills: str = Field(default="", description="Player kills from match stats")
+    player_deaths: str = Field(default="", description="Player deaths from match stats")
+    match_elo: int = Field(default=0, description="Avg FACEIT ELO of the 10 players (lobby skill)")
 
     @property
     def display_name(self) -> str:

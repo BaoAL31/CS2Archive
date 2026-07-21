@@ -245,9 +245,24 @@ def _pick_entry(nickname: str, entries: list[dict]) -> dict:
     # Prefer exact case match (NiKo vs niko).
     exact = [e for e in entries if e.get("nickname") == nickname]
     if len(exact) == 1:
+        # If the exact-case entry is legacy 4:3 stretched but a same-nick
+        # 16:9 Native entry exists, prefer the modern native settings.
+        if exact[0].get("aspect_ratio") != "16:9":
+            native = [e for e in entries
+                      if e.get("aspect_ratio") == "16:9"
+                      and e.get("scaling_mode", "").lower() == "native"]
+            if native:
+                return native[0]
         return exact[0]
     if exact:
-        return exact[0]
+        entries = exact
+    # Prefer 16:9 Native (modern default) over legacy 4:3 stretched when ambiguous.
+    native = [e for e in entries if e.get("aspect_ratio") == "16:9"
+              and e.get("scaling_mode", "").lower() == "native"]
+    if len(native) == 1:
+        return native[0]
+    if not entries:
+        return exact[0] if exact else entries[0]
     print(f"  [WARN] ambiguous prosettings nick {nickname!r}: "
           f"{[(e.get('nickname'), e.get('team')) for e in entries]} — using first")
     return entries[0]

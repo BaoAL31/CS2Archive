@@ -4,9 +4,16 @@ import json
 import re
 from pathlib import Path
 
+from PIL import Image
+
 ANALYSIS_DIR = Path("demos/analysis")
 AVATAR_DIR = Path("demos/avatars")
 YOUTUBE_DIR = Path("youtube")
+
+# Avatar subfolder layout: demos/avatars/{nick}/{source}/{nick}.png
+# where source is one of "hltv" or "faceit". HLTV takes priority.
+AVATAR_SOURCES = ("hltv", "faceit")
+AVATAR_EXTS = (".png", ".jpg", ".jpeg", ".webp")
 
 # HLTV human-readable map name → CS2 game file name
 MAP_NAME_MAP: dict[str, str] = {
@@ -83,15 +90,51 @@ def get_team_names(ratings: dict, map_name: str) -> tuple[str, str]:
 
 
 def get_avatar_path(nickname: str) -> Path | None:
+    """Return best avatar path for a nickname.
+
+    Resolution order (per player folder):
+      1. demos/avatars/{nick}/hltv/{nick}[_N].<ext>   (HLTV pro bodyshot wins)
+      2. demos/avatars/{nick}/faceit/{nick}[_N].<ext>
+      3. legacy flat demos/avatars/{nick}.<ext>   (pre-migration files)
+
+    Within a source folder, the largest PNG (by pixel area) is chosen so the
+    best-centered / highest-res variant wins.
+    """
     name = nickname.strip().lower()
-    png = AVATAR_DIR / f"{name}.png"
-    if png.exists():
-        return png
-    for ext in (".jpg", ".jpeg", ".webp"):
+
+    def _best_in(folder: Path) -> Path | None:
+        if not folder.is_dir():
+            return None
+        cands: list[Path] = []
+        for ext in AVATAR_EXTS:
+            cands.extend(folder.glob(f"{name}*.{ext.lstrip('.')}"))
+        if not cands:
+            return None
+        best = max(
+            cands,
+            key=lambda p: (Image.open(p).size[0] * Image.open(p).size[1])
+            if _safe_size(p)
+            else 0,
+        )
+        return best
+
+    for source in AVATAR_SOURCES:
+        p = _best_in(AVATAR_DIR / name / source)
+        if p:
+            return p
+    for ext in AVATAR_EXTS:
         p = AVATAR_DIR / f"{name}{ext}"
         if p.exists():
             return p
     return None
+
+
+def _safe_size(p: Path) -> bool:
+    try:
+        Image.open(p).size
+        return True
+    except Exception:
+        return False
 
 
 def get_slug_from_url(url: str) -> str | None:
