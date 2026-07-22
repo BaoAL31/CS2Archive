@@ -6,7 +6,7 @@ from pathlib import Path
 
 from playwright.async_api import async_playwright
 
-STORAGE_FILE = Path(__file__).parent.parent / ".bilibili_storage.json"
+STORAGE_FILE = Path(__file__).resolve().parents[2] / ".bilibili_storage.json"
 TARGET_URL = "https://www.bilibili.tv/en"
 
 async def main():

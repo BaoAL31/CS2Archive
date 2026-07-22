@@ -5,7 +5,7 @@ Structured errors for agent parsing.
 Auto-downloads missing demos from HuggingFace if hf_root is set.
 
 Usage:
-    python scripts/pipeline.py --backlog backlog/<match_slug>/<priority>/<slug>.json [--step N] [--dual-upload]
+    python scripts/pov/pipeline.py --backlog backlog/<match_slug>/<priority>/<slug>.json [--step N] [--dual-upload]
 
 Steps (use --step N to start at a specific step):
   1 = analyze    csdm analyze the demo
@@ -19,7 +19,7 @@ Steps (use --step N to start at a specific step):
 NOTE: Uploading is NOT done by the pipeline. The pipeline only produces the
 finished video, thumbnail, and upload_meta.json (title/description/tags/
 thumbnail_path/youtube_id=None/upload_status="pending"). A separate script,
-scripts/upload_pending.py, scans every upload_meta.json under youtube/ and
+scripts/upload/upload_pending.py, scans every upload_meta.json under youtube/ and
 uploads any that are still pending.
 
 Dual-upload (--dual-upload): produces a second, independent variant with
@@ -40,12 +40,11 @@ import tempfile
 import time
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-SCRIPTS_DIR = PROJECT_ROOT / "scripts"
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
+# scripts/ on path so _pathsetup + overlay package resolve
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _pathsetup import ensure, SCRIPTS_DIR
+
+PROJECT_ROOT = ensure()
 
 from assign_playlist import normalize_playlist_name
 # Redirect HF cache to D: drive before importing huggingface_hub
@@ -464,7 +463,7 @@ class Pipeline:
             fail(2, "RENDER_STEAM_NOT_RUNNING", "Steam must be running before rendering")
 
         render_args = [
-            "scripts/render_pov.py", str(self.demo_path), self.steam_id,
+            "scripts/pov/render_pov.py", str(self.demo_path), self.steam_id,
             "--output", str(self.render_dir),
             "--batches", str(getattr(self.args, "batches", 20)),
         ]
@@ -875,7 +874,7 @@ class Pipeline:
         if not self.render_dir.exists():
             fail(3, "CONCAT_RENDER_DIR_MISSING", f"render dir not found: {self.render_dir}")
 
-        concat_args = ["scripts/concat_rounds.py", str(self.render_dir)]
+        concat_args = ["scripts/pov/concat_rounds.py", str(self.render_dir)]
         scaling = (self.meta.get("scaling_mode") or "").strip()
         if scaling:
             concat_args += ["--scaling-mode", scaling]
@@ -974,7 +973,7 @@ class Pipeline:
         work_dir = self.render_dir / ".overlay_work"
         work_dir.mkdir(parents=True, exist_ok=True)
         r = self._run_py([
-            "scripts/overlay_pov.py",
+            "scripts/overlay/overlay_pov.py",
             "--video", str(video_path),
             "--demo", str(self.demo_path),
             "--steam-id", steam_id,
@@ -1014,7 +1013,7 @@ class Pipeline:
         if not video.exists():
             fail(step_num, "OUTRO_VIDEO_MISSING", f"video.mp4 not found in {youtube_dir}")
 
-        self._run_py(["scripts/generate_outro.py", str(video)], timeout=120)
+        self._run_py(["scripts/pov/generate_outro.py", str(video)], timeout=120)
 
         outro = youtube_dir / "outro.mp4"
         if not outro.exists():
@@ -1136,7 +1135,7 @@ class Pipeline:
             # FACEIT path: blurred kill-frame + text, no ratings/avatar.
             match_detail = self.meta.get("match_detail", "") or f"{self.player} FACEIT POV"
             cmd = [
-                "scripts/faceit_thumbnail.py", str(self.demo_path),
+                "scripts/faceit/faceit_thumbnail.py", str(self.demo_path),
                 "--player", self.player,
                 "--map", self.map_name,
                 "--match-detail", match_detail,
@@ -1249,14 +1248,14 @@ class Pipeline:
         thumb = youtube_dir / "thumbnail.jpg"
 
         titlize_args = [
-            "scripts/generate_title.py", str(self.ratings_json),
+            "scripts/pov/generate_title.py", str(self.ratings_json),
             "--player", self.player,
             "--map", self.map_name,
             "--variant", variant,
         ]
         if self.is_faceit:
             titlize_args = [
-                "scripts/faceit_title.py", str(self.demo_path),
+                "scripts/faceit/faceit_title.py", str(self.demo_path),
                 "--player", self.player,
                 "--map", self.map_name,
             ]

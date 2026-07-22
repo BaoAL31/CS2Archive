@@ -4,7 +4,7 @@ CS2Archive — Backlog Creator
 Downloads demos, scrapes ratings + tournament, resolves steam IDs,
 fetches avatars, and writes backlog entries as JSON.
 
-Usage: python scripts/create_backlog.py <hltv_url>
+Usage: python scripts/pov/create_backlog.py <hltv_url>
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import shutil
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 os.chdir(str(PROJECT_ROOT))
@@ -161,7 +161,7 @@ async def create_backlog_entry(
         "team": team,
         "priority": priority,
         **backlog_video_fields(player_clean),
-        "pipeline_cmd": f'$env:PYTHONPATH=.; & C:/Users/jembo/anaconda3/envs/cs2archive/python.exe scripts/pipeline.py --backlog backlog/{match_slug}/{priority}/{slug}.json',
+        "pipeline_cmd": f'$env:PYTHONPATH=.; & C:/Users/jembo/anaconda3/envs/cs2archive/python.exe scripts/pov/pipeline.py --backlog backlog/{match_slug}/{priority}/{slug}.json',
     }
 
     backlog_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")

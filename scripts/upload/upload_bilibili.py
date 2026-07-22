@@ -2,15 +2,15 @@
 Upload a finished POV video to bilibili.tv (studio.bilibili.tv).
 
 Uses Playwright + Chrome with `.bilibili_storage.json` (login once via
-`scripts/bilibili_login.py`). Reads the same `upload_meta.json` as YouTube.
+`scripts/upload/bilibili_login.py`). Reads the same `upload_meta.json` as YouTube.
 
 Studio hard-caps tags at 10 chips — remaining tags are appended to the
 description. Videos over ~3.8 GB are re-encoded to `video_bili.mp4`
 (1080p / ~15 Mbps NVENC) before upload.
 
 Usage:
-    python scripts/upload_bilibili.py --meta youtube/<run>/upload_meta.json
-    python scripts/upload_bilibili.py <video.mp4> --title "..." --thumbnail thumb.jpg
+    python scripts/upload/upload_bilibili.py --meta youtube/<run>/upload_meta.json
+    python scripts/upload/upload_bilibili.py <video.mp4> --title "..." --thumbnail thumb.jpg
 
 Called from upload_youtube.py / upload_pending.py with --also-bilibili.
 """
@@ -27,7 +27,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-_SCRIPTS_DIR = Path(__file__).resolve().parent
+_SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = _SCRIPTS_DIR.parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
@@ -405,7 +405,7 @@ def upload_to_bilibili(
     """Upload to bilibili.tv. Returns aid string. Updates meta_path when given."""
     if not STORAGE.exists():
         raise FileNotFoundError(
-            f"missing {STORAGE} — run: python scripts/bilibili_login.py"
+            f"missing {STORAGE} — run: python scripts/upload/bilibili_login.py"
         )
 
     tags = list(tags or [])
@@ -436,7 +436,7 @@ def upload_to_bilibili(
         page.goto("https://studio.bilibili.tv/archive/new", wait_until="domcontentloaded")
         page.wait_for_timeout(4000)
         if "SESSDATA" not in {c["name"] for c in ctx.cookies()}:
-            raise RuntimeError("bilibili session expired — re-run scripts/bilibili_login.py")
+            raise RuntimeError("bilibili session expired — re-run scripts/upload/bilibili_login.py")
         log("logged in")
 
         with page.expect_file_chooser(timeout=20000) as fc:

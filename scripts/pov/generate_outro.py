@@ -1,7 +1,7 @@
 """Generate a 5s silent outro clip for CS2Archive POV videos.
 
 Usage:
-    python scripts/generate_outro.py <video_path> [--output <path>]
+    python scripts/pov/generate_outro.py <video_path> [--output <path>]
 
 Detects resolution and framerate from <video_path>, renders a single black
 frame with centered text (top half), and encodes a 5-second h.264 clip
@@ -21,7 +21,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FONT_PATH = PROJECT_ROOT / "assets" / "fonts" / "Montserrat-Bold.ttf"
 DURATION = 5
 

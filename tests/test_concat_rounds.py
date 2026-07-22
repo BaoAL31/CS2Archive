@@ -1,4 +1,4 @@
-"""Tests for scripts/concat_rounds.py — batch-based incremental concat."""
+"""Tests for scripts/pov/concat_rounds.py — batch-based incremental concat."""
 
 from __future__ import annotations
 
@@ -8,7 +8,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
+from _pathsetup import ensure
+ensure()
 
 import concat_rounds
 

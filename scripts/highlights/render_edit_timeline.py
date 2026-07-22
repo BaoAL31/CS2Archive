@@ -168,8 +168,12 @@ def _get_player_crosshair_cvars(steam_id: str, demo_path: Path) -> list[str]:
     return cvars
 
 
-def _build_csdm_config(edit_tl: dict, demo_path: Path, output_dir: Path,
-                       segments: list[dict] | None = None) -> dict:
+def _build_csdm_config(
+    edit_tl: dict,
+    demo_path: Path,
+    output_dir: Path,
+    segments: list[dict] | None = None,
+) -> dict:
     """Build CSDM config JSON with segments as sequences.
 
     If *segments* is None, uses all segments from the edit timeline.
@@ -204,8 +208,15 @@ def _build_csdm_config(edit_tl: dict, demo_path: Path, output_dir: Path,
         pov_sid = seg["pov_steam_id"]
         cvars = crosshair_cache.get(pov_sid, [])
 
-        cfg_lines = ["crosshair 1", "cl_chatfilters 63", "snd_mvp_volume 0",
-                     "cl_draw_only_deathnotices 0", "cl_drawhud 1", "cl_showfps 0", "net_graph 0"] + cvars
+        cfg_lines = [
+            "crosshair 1",
+            "cl_chatfilters 63",
+            "snd_mvp_volume 0",
+            "cl_draw_only_deathnotices 0",
+            "cl_drawhud 1",
+            "cl_showfps 0",
+            "net_graph 0",
+        ] + cvars
         cfg_text = "\n".join(cfg_lines) + "\n"
 
         seq = {
@@ -221,7 +232,7 @@ def _build_csdm_config(edit_tl: dict, demo_path: Path, output_dir: Path,
             "playerCameras": [
                 {"tick": start_tick, "playerSteamId": pov_sid, "playerName": "pov"},
             ],
-            "playerVoicesEnabled": True,
+            "playerVoicesEnabled": False,
             "recordAudio": True,
             "deathNoticesDuration": 5,
         }
@@ -497,14 +508,21 @@ def _run_csdm_batch(config_path: Path, demo_path: str, segments: list[dict]) -> 
     return proc.returncode
 
 
-def _find_csdm_sequence_files(search_dir: Path, num_segments: int) -> list[Path]:
-    """Find CSDM sequence output files.
+def _find_csdm_sequence_files(
+    search_dir: Path,
+    num_segments: int,
+    segments: list[dict] | None = None,
+) -> list[Path]:
+    """Find CSDM sequence output files matched to *segments* (by tick range).
 
     CSDM may write either:
       1.  <N>-sequence/video.mp4  dirs
       2.  flat sequence-{N}-tick-{A}-to-{B}.mp4  files
+
+    Flat leftovers from prior batches accumulate in the same folder — never
+    return them by sequence-number order alone; match tick ranges instead.
     """
-    # First: look for <N>-sequence/video.mp4 dirs
+    # First: look for <N>-sequence/video.mp4 dirs (fresh CSDM dir layout)
     seq_dirs = sorted(
         [d for d in search_dir.iterdir()
          if d.is_dir() and re.match(r"^\d+-sequence$", d.name)],
@@ -523,13 +541,35 @@ def _find_csdm_sequence_files(search_dir: Path, num_segments: int) -> list[Path]
                 _dbg("find", f"  {d.name}/video.mp4 MISSING")
         return files
 
-    # Fallback: flat sequence-{N}-tick-{A}-to-{B}.mp4 files
-    flat_seq = sorted(
-        search_dir.glob("sequence-*-tick-*-to-*.mp4"),
-        key=lambda p: int(re.match(r"sequence-(\d+)", p.name).group(1)),
-    )
+    # Flat sequence-{N}-tick-{A}-to-{B}.mp4 — match by tick range when possible
+    flat_seq = list(search_dir.glob("sequence-*-tick-*-to-*.mp4"))
+    if flat_seq and segments:
+        by_ticks: dict[tuple[int, int], Path] = {}
+        for p in flat_seq:
+            m = re.match(r"sequence-\d+-tick-(\d+)-to-(\d+)", p.name)
+            if m:
+                by_ticks[(int(m.group(1)), int(m.group(2)))] = p
+        matched = []
+        for seg in segments:
+            key = (int(seg["start_tick"]), int(seg["end_tick"]))
+            p = by_ticks.get(key)
+            if p is None:
+                _dbg("find", f"  MISSING sequence for ticks {key[0]}-{key[1]}")
+            else:
+                matched.append(p)
+                _dbg("find", f"  matched {p.name} ({p.stat().st_size / 1e6:.1f} MB)")
+        if len(matched) == len(segments):
+            return matched
+        _dbg("find", f"[WARN] tick-match got {len(matched)}/{len(segments)}; falling back")
+
     if flat_seq:
-        _dbg("find", f"found {len(flat_seq)} flat sequence files")
+        # Last resort: only the newest num_segments files (this batch's outputs)
+        flat_seq = sorted(flat_seq, key=lambda p: p.stat().st_mtime)[-num_segments:]
+        flat_seq = sorted(
+            flat_seq,
+            key=lambda p: int(re.match(r"sequence-(\d+)", p.name).group(1)),
+        )
+        _dbg("find", f"found {len(flat_seq)} flat sequence files (mtime window)")
         for f in flat_seq:
             _dbg("find", f"  {f.name} ({f.stat().st_size / 1e6:.1f} MB)")
         return flat_seq
@@ -556,10 +596,13 @@ def _render_batch(
     all_segments: list[dict],
 ) -> bool:
     """Render one batch of segments. Returns True if rendered (or skipped as done)."""
-    # Check if this batch already has its output file
-    batch_file = render_dir / f"batch-{batch_start_global:03d}-{batch_end_global:03d}.mp4"
-    if batch_file.exists() and batch_file.stat().st_size >= 1_048_576:
-        _dbg("batch", f"[SKIP] batch {batch_idx+1} already done: {batch_file.name} ({batch_file.stat().st_size/1e6:.0f} MB)")
+    batch_seg_names = [
+        f"seg-{batch_start_global + i:03d}-pov-{seg.get('pov_steam_id', 'unknown')}-tick-{seg['start_tick']}-to-{seg['end_tick']}.mp4"
+        for i, seg in enumerate(segments)
+    ]
+    batch_seg_paths = [render_dir / n for n in batch_seg_names]
+    if batch_seg_paths and all(p.exists() and p.stat().st_size >= 1_048_576 for p in batch_seg_paths):
+        _dbg("batch", f"[SKIP] batch {batch_idx+1} already done ({len(batch_seg_paths)} seg files)")
         return True
 
     print(f"\n  Batch {batch_idx+1}: segments {batch_start_global}-{batch_end_global} ({len(segments)} segments)")
@@ -585,53 +628,42 @@ def _render_batch(
     _dbg("render", f"CSDM batch {batch_idx+1} finished in {elapsed:.0f}s")
 
     # CSDM writes <N>-sequence/video.mp4 into outputFolderPath.
-    seq_files = _find_csdm_sequence_files(render_dir, len(segments))
+    seq_files = _find_csdm_sequence_files(render_dir, len(segments), segments=segments)
     if len(seq_files) != len(segments):
         _dbg("render", f"[WARN] Expected {len(segments)} sequence files, found {len(seq_files)}")
 
-    # Rename sequence files to round-NNN naming for tracking
+    # Rename sequence files to seg-NNN-pov-STEAMID-tick-START-to-END naming
     for i, (seq_file, seg) in enumerate(zip(seq_files, segments)):
         start_tick = seg["start_tick"]
         end_tick = seg["end_tick"]
-        name = f"round-{batch_start_global+i:03d}-tick-{start_tick}-to-{end_tick}"
+        pov_id = seg.get("pov_steam_id", "unknown")
+        name = f"seg-{batch_start_global+i:03d}-pov-{pov_id}-tick-{start_tick}-to-{end_tick}"
         dest = render_dir / f"{name}.mp4"
-        if dest.exists() and dest.stat().st_size >= 1_048_576:
+        if dest.exists() and dest.stat().st_size >= 1_048_576 and dest.resolve() == seq_file.resolve():
             _dbg("finalize", f"[SKIP] {dest.name} already exists")
         else:
             shutil.copy2(str(seq_file), str(dest))
             mb = dest.stat().st_size / 1e6
-            _dbg("finalize", f"{seq_file.parent.name}/{seq_file.name} -> {dest.name} ({mb:.1f} MB)")
+            _dbg("finalize", f"{seq_file.name} -> {dest.name} ({mb:.1f} MB)")
+        # Remove the CSDM flat file so it can't pollute the next batch's finder.
+        if seq_file.exists() and seq_file.resolve() != dest.resolve():
+            try:
+                seq_file.unlink()
+            except OSError:
+                pass
 
     # Clean up <N>-sequence/ dirs left by CSDM
     for d in render_dir.iterdir():
         if d.is_dir() and re.match(r"^\d+-sequence$", d.name):
             shutil.rmtree(d, ignore_errors=True)
 
-    # Concat all round files for this batch into a single batch MP4
-    batch_round_files = sorted(
-        render_dir.glob(f"round-*-tick-*-to-*.mp4"),
-        key=lambda p: int(p.name.split("-")[1]),
-    )
-    # Only keep round files that belong to this batch
-    batch_round_files = [
-        p for p in batch_round_files
-        if batch_start_global + 1 <= int(p.name.split("-")[1]) <= batch_end_global
-    ]
-    if not batch_round_files:
-        _dbg("batch", f"[ERROR] No round files found for batch {batch_idx+1}")
+    ok_paths = [p for p in batch_seg_paths if p.exists() and p.stat().st_size >= 1_048_576]
+    if len(ok_paths) != len(segments):
+        _dbg("batch", f"[ERROR] Expected {len(segments)} seg files, got {len(ok_paths)}")
         return False
 
-    if len(batch_round_files) == 1:
-        shutil.copy2(str(batch_round_files[0]), str(batch_file))
-    else:
-        _concat_videos(batch_round_files, batch_file)
-
-    if not batch_file.exists() or batch_file.stat().st_size < 1_048_576:
-        _dbg("batch", f"[ERROR] Batch file {batch_file.name} missing or too small")
-        return False
-
-    mb = batch_file.stat().st_size / 1e6
-    _dbg("batch", f"batch {batch_idx+1} done: {batch_file.name} ({mb:.0f} MB)")
+    mb = sum(p.stat().st_size for p in ok_paths) / 1e6
+    _dbg("batch", f"batch {batch_idx+1} done: {len(ok_paths)} seg file(s) ({mb:.0f} MB total)")
     return True
 
 
@@ -709,36 +741,7 @@ def render_edit_timeline(
 
     elapsed = time.time() - t0
     _dbg("done", f"{rendered_count} batch(es) rendered in {elapsed:.0f}s to {render_dir}")
-
-    # After all batches are done, concat into combined.mp4 + upscale
-    if specific_batch is None:
-        batch_files = sorted(
-            render_dir.glob("batch-*-*.mp4"),
-            key=lambda p: int(p.name.split("-")[1]),
-        )
-        if batch_files:
-            combined = render_dir / "combined.mp4"
-            if len(batch_files) == 1:
-                shutil.copy2(str(batch_files[0]), str(combined))
-            else:
-                _concat_videos(batch_files, combined)
-
-            if combined.exists() and combined.stat().st_size >= 1_048_576:
-                mb = combined.stat().st_size / 1e6
-                _dbg("concat", f"combined.mp4: {mb:.0f} MB")
-
-                # Upscale to 2560x1440 (VP9 trick)
-                scaled = render_dir / "combined_scaled.mp4"
-                _encode_scaled(combined, scaled)
-                scaled.replace(combined)
-                _dbg("done", f"Upscaled combined.mp4 to {TARGET_WIDTH}x{TARGET_HEIGHT}")
-                print(f"\nDone! Final video: {combined}")
-            else:
-                print(f"\n[WARN] combined.mp4 missing or too small")
-        else:
-            print(f"\n[WARN] No batch files found for concat")
-    else:
-        print(f"\nBatch {specific_batch} rendered. Re-run without --batch to concat all batches.")
+    print(f"\nDone. Segment MP4s in {render_dir}")
 
     return render_dir
 

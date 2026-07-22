@@ -1,0 +1,29 @@
+{
+  "description": "Typical pre-fix LLM output for kills 0-11 (rounds 0-2). _fix_edit_timeline should produce cache_batch1_goal_segments.json.",
+  "segments": [
+    {
+      "start_tick": 1948,
+      "end_tick": 2769,
+      "pov_steam_id": "76561198044045107",
+      "segment_type": "multi_kill",
+      "kill_indices": [0, 1, 2, 3],
+      "rationale": "electroNic knife round multi_kill"
+    },
+    {
+      "start_tick": 3327,
+      "end_tick": 7000,
+      "pov_steam_id": "76561198838822582",
+      "segment_type": "multi_kill",
+      "kill_indices": [4, 5, 6, 7, 8],
+      "rationale": "mzinho round 1 lumped with trades"
+    },
+    {
+      "start_tick": 7192,
+      "end_tick": 10527,
+      "pov_steam_id": "76561198920720017",
+      "segment_type": "multi_kill",
+      "kill_indices": [9, 10, 11],
+      "rationale": "round 2 Senzu lumped"
+    }
+  ]
+}

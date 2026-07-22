@@ -2,7 +2,7 @@ import json, sys, os
 from pathlib import Path
 os.environ['HF_HOME'] = 'D:/.cache/huggingface'
 os.environ['HF_HUB_CACHE'] = 'D:/.cache/huggingface/hub'
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from huggingface_hub import HfApi
 api = HfApi()
 items = list(api.list_repo_tree("cs2povarchive/cs2-demos", repo_type="dataset",

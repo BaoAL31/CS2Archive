@@ -2,7 +2,7 @@
 
 ## Feature Summary
 
-`--dual-upload` flag on `scripts/pipeline.py` makes one backlog entry produce **two** independent YouTube uploads:
+`--dual-upload` flag on `scripts/pov/pipeline.py` makes one backlog entry produce **two** independent YouTube uploads:
 
 | Variant | YouTube dir | Title | Thumbnail | Description | Tags |
 |---|---|---|---|---|---|
@@ -13,7 +13,7 @@ Each variant has its own `upload_meta.json`, its own YouTube video ID (stored un
 
 ## Diff Summary Per File
 
-### `scripts/pipeline.py` (+213/-47 lines)
+### `scripts/pov/pipeline.py` (+213/-47 lines)
 
 **Added:**
 - CLI flag `--dual-upload` (in `main()` argparse)
@@ -36,7 +36,7 @@ Each variant has its own `upload_meta.json`, its own YouTube video ID (stored un
 
 **Backward compat:** Without `--dual-upload`, all new code paths are gated. `dual_upload=False`, `overlay_youtube_dir=None`, no new state keys, no new directories, no new uploads. Tested with `Pipeline(args.dual_upload=False)` — old state shape preserved exactly.
 
-### `scripts/generate_title.py` (+24/-0)
+### `scripts/pov/generate_title.py` (+24/-0)
 
 **Added:**
 - `--variant {raw,overlay}` argparse arg, default `raw`
@@ -78,9 +78,9 @@ Each variant has its own `upload_meta.json`, its own YouTube video ID (stored un
 ## Syntax Check Output
 
 ```
-$ python -c "import ast; ast.parse(open('scripts/pipeline.py').read())"
-scripts/pipeline.py: OK
-scripts/generate_title.py: OK
+$ python -c "import ast; ast.parse(open('scripts/pov/pipeline.py').read())"
+scripts/pov/pipeline.py: OK
+scripts/pov/generate_title.py: OK
 thumbnail/layouts.py: OK
 thumbnail/cli.py: OK
 ```
@@ -94,7 +94,7 @@ thumbnail/cli.py: OK
 # Caveat: overlay requires the demo + steam_id + ~30-60min for 20+ throws.
 # Faster smoke-test: just step 5 (outro) and step 6 (thumbnail) on existing renders.
 $env:PYTHONPATH = "."
-& "C:\Users\jembo\anaconda3\envs\cs2archive\python.exe" scripts/pipeline.py `
+& "C:\Users\jembo\anaconda3\envs\cs2archive\python.exe" scripts/pov/pipeline.py `
   --backlog backlog/furia-vs-falcons-iem-cologne-major/high/niko-inferno-furia-vs-falcons-iem-cologne-major.json `
   --dual-upload --step 6
 ```
@@ -119,7 +119,7 @@ $rawContent.upload_status = "completed"
 $rawContent | ConvertTo-Json | Set-Content $rawMeta
 
 # Re-run with --dual-upload --step 7
-& "C:\Users\jembo\anaconda3\envs\cs2archive\python.exe" scripts/pipeline.py `
+& "C:\Users\jembo\anaconda3\envs\cs2archive\python.exe" scripts/pov/pipeline.py `
   --backlog backlog/furia-vs-falcons-iem-cologne-major/high/niko-inferno-furia-vs-falcons-iem-cologne-major.json `
   --dual-upload --step 7
 ```
@@ -131,7 +131,7 @@ Expect:
 ### 3. Backward-compat test (no flag)
 
 ```powershell
-& "C:\Users\jembo\anaconda3\envs\cs2archive\python.exe" scripts/pipeline.py `
+& "C:\Users\jembo\anaconda3\envs\cs2archive\python.exe" scripts/pov/pipeline.py `
   --backlog backlog/.../niko-inferno-...json --step 6
 ```
 
@@ -161,21 +161,21 @@ Tested in code: a state file with no `dual_upload` key is loaded fine. `self.dua
 
 ## Modified Files
 
-- `scripts/pipeline.py` (modified)
-- `scripts/generate_title.py` (modified)
+- `scripts/pov/pipeline.py` (modified)
+- `scripts/pov/generate_title.py` (modified)
 - `thumbnail/layouts.py` (modified)
 - `thumbnail/cli.py` (modified)
 - `AGENTS.md` (modified)
 
 ## Test Commands Run
 
-- `python -c "import ast; ast.parse(open('scripts/pipeline.py').read())"` — passed
-- `python -c "import ast; ast.parse(open('scripts/generate_title.py').read())"` — passed
+- `python -c "import ast; ast.parse(open('scripts/pov/pipeline.py').read())"` — passed
+- `python -c "import ast; ast.parse(open('scripts/pov/generate_title.py').read())"` — passed
 - `python -c "import ast; ast.parse(open('thumbnail/layouts.py').read())"` — passed
 - `python -c "import ast; ast.parse(open('thumbnail/cli.py').read())"` — passed
-- `python scripts/pipeline.py --help` — shows `--dual-upload`
-- `python scripts/generate_title.py ... --variant overlay` — output has overlay suffix + tags + desc
-- `python scripts/generate_title.py ... --variant raw` — output is standard (no suffix, no overlay tags)
+- `python scripts/pov/pipeline.py --help` — shows `--dual-upload`
+- `python scripts/pov/generate_title.py ... --variant overlay` — output has overlay suffix + tags + desc
+- `python scripts/pov/generate_title.py ... --variant raw` — output is standard (no suffix, no overlay tags)
 - `python -c "generate()"` with `variant='raw'` and `variant='overlay'` — both render 1280x720, overlay one has the badge in top-right
 - `Pipeline(args).dual_upload` — True when flag set, False when not
 - `Pipeline(args).state['data']` — has `dual_upload`+`overlay_youtube_dir` when flag set, NOT when not

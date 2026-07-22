@@ -1,7 +1,7 @@
 """Generate a FACEIT POV thumbnail (blurred kill-frame + text, no avatar/ratings).
 
 Usage:
-    python scripts/faceit_thumbnail.py <demo_path> --player <nick> --map <map>
+    python scripts/faceit/faceit_thumbnail.py <demo_path> --player <nick> --map <map>
                                   [--steam-id <id>] [--match-detail <text>]
                                   [--tournament <name>] [--variant raw|overlay]
                                   --output <youtube_dir>
@@ -16,8 +16,11 @@ import argparse
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+from _pathsetup import ensure
+ensure()
 sys.path.insert(0, str(PROJECT_ROOT / "thumbnail"))
 
 from thumbnail.cli import extract_background_frame  # noqa: E402

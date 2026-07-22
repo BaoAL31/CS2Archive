@@ -1,0 +1,40 @@
+{
+  "description": "Golden batch-1 edit segments (segs 1-5) for team_teses vs SVNONETHREE Cache. Render with --batches 5 --batch 1.",
+  "segments": [
+    {
+      "start_tick": 1280,
+      "end_tick": 2769,
+      "pov_steam_id": "76561198044045107",
+      "segment_type": "multi_kill",
+      "kill_indices": [0, 1, 2, 3]
+    },
+    {
+      "start_tick": 4735,
+      "end_tick": 6436,
+      "pov_steam_id": "76561198838822582",
+      "segment_type": "multi_kill",
+      "kill_indices": [4, 5, 6]
+    },
+    {
+      "start_tick": 6340,
+      "end_tick": 6744,
+      "pov_steam_id": "76561198920720017",
+      "segment_type": "multi_kill",
+      "kill_indices": [8]
+    },
+    {
+      "start_tick": 8600,
+      "end_tick": 10143,
+      "pov_steam_id": "76561198920720017",
+      "segment_type": "multi_kill",
+      "kill_indices": [9, 10]
+    },
+    {
+      "start_tick": 10015,
+      "end_tick": 10399,
+      "pov_steam_id": "76561198044045107",
+      "segment_type": "multi_kill",
+      "kill_indices": [11]
+    }
+  ]
+}

@@ -12,9 +12,9 @@
 
 | File | Role |
 |---|---|
-| `scripts/overlay_pov.py` | Entry point. `run_overlay()` orchestrates keyboard extraction → sprite gen → flight clips → ffmpeg composite. |
-| `scripts/pipeline.py` | Pipeline runner. `step_overlay()` calls `overlay_pov.py` as subprocess, handles dual-upload. |
-| `scripts/concat_rounds.py` | Batch concat pattern (reference). Concat `batch-*.mp4` → `combined.mp4` with filesystem resume. |
+| `scripts/overlay/overlay_pov.py` | Entry point. `run_overlay()` orchestrates keyboard extraction → sprite gen → flight clips → ffmpeg composite. |
+| `scripts/pov/pipeline.py` | Pipeline runner. `step_overlay()` calls `overlay_pov.py` as subprocess, handles dual-upload. |
+| `scripts/pov/concat_rounds.py` | Batch concat pattern (reference). Concat `batch-*.mp4` → `combined.mp4` with filesystem resume. |
 | `D:/Projects/CS2UtilArchive/scripts/render/overlay_assets.py` | `build_png_overlay_filter()` — generates filter_complex string from `per_sig` dict. |
 | `D:/Projects/CS2UtilArchive/scripts/render/overlay_layout.py` | Layout constants, `_OVERLAY_SIGNALS`, `_iter_inclusive_runs()`. |
 | `D:/Projects/CS2UtilArchive/scripts/input_overlay_decode.py` | `decode_button_mask()`, `overlay_tick_from_row()`. |
@@ -187,7 +187,7 @@ def step_overlay(self) -> None:
     video_path = target_dir / "video.mp4"
 
     r = self._run_py([
-        "scripts/overlay_pov.py",
+        "scripts/overlay/overlay_pov.py",
         "--video", str(video_path),
         "--demo", str(self.demo_path),
         "--steam-id", steam_id,
@@ -283,8 +283,8 @@ Use `concat_rounds.py`'s pattern — ffmpeg stream copy concatinates all batches
 
 | File | Change | LOC |
 |---|---|---|
-| `scripts/overlay_pov.py` | Add `--batches N` flag. Add batch loop in `run_overlay()`. Slice `per_sig`, filter PiP clips per batch. Merge keyboard+PiP single-pass ffmpeg. Batch output naming. End-of-loop concat. | ~150 |
-| `scripts/pipeline.py` | Copy `round_offsets.json` alongside `video.mp4` in step_concat. Forward `--overlay-batches` to `overlay_pov.py`. Check round_offsets.json exists. | ~15 |
+| `scripts/overlay/overlay_pov.py` | Add `--batches N` flag. Add batch loop in `run_overlay()`. Slice `per_sig`, filter PiP clips per batch. Merge keyboard+PiP single-pass ffmpeg. Batch output naming. End-of-loop concat. | ~150 |
+| `scripts/pov/pipeline.py` | Copy `round_offsets.json` alongside `video.mp4` in step_concat. Forward `--overlay-batches` to `overlay_pov.py`. Check round_offsets.json exists. | ~15 |
 | Total | | ~165 |
 
 **No new files. No new dependencies. No changes to CS2UtilArchive.**

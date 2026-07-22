@@ -1,10 +1,10 @@
 """
 Scan youtube/*/upload_meta.json and upload any that are still pending.
 
-The pipeline (scripts/pipeline.py) only produces the finished video,
+The pipeline (scripts/pov/pipeline.py) only produces the finished video,
 thumbnail, and upload_meta.json (with youtube_id=None, upload_status="pending").
 This script does the actual uploading: for every upload_meta.json whose
-upload_status != "completed", it invokes scripts/upload_youtube.py --meta <path>,
+upload_status != "completed", it invokes scripts/upload/upload_youtube.py --meta <path>,
 which performs the upload, sets the thumbnail, and writes youtube_id +
 upload_status="completed" back into the same meta file.
 
@@ -22,11 +22,11 @@ runs the bilibili.tv upload via upload_youtube.py --also-bilibili /
 (bilibili_aid / bilibili_upload_status).
 
 Usage:
-    python scripts/upload_pending.py                 # upload every pending meta
-    python scripts/upload_pending.py --dry-run       # list what would upload
-    python scripts/upload_pending.py --limit 1       # upload at most one
-    python scripts/upload_pending.py --dir youtube/my-match   # restrict scope
-    python scripts/upload_pending.py --also-bilibili # YouTube + bilibili.tv
+    python scripts/upload/upload_pending.py                 # upload every pending meta
+    python scripts/upload/upload_pending.py --dry-run       # list what would upload
+    python scripts/upload/upload_pending.py --limit 1       # upload at most one
+    python scripts/upload/upload_pending.py --dir youtube/my-match   # restrict scope
+    python scripts/upload/upload_pending.py --also-bilibili # YouTube + bilibili.tv
 """
 
 from __future__ import annotations
@@ -38,17 +38,16 @@ import subprocess
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = PROJECT_ROOT / "scripts"
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(SCRIPTS_DIR))
+from _pathsetup import ensure
+ensure()
 
 from upload_bilibili import is_bilibili_pending  # noqa: E402
 
 PY = sys.executable
-UPLOAD_YOUTUBE = SCRIPTS_DIR / "upload_youtube.py"
+UPLOAD_YOUTUBE = SCRIPTS_DIR / "upload" / "upload_youtube.py"
 DEFAULT_YOUTUBE_DIR = PROJECT_ROOT / "youtube"
 
 

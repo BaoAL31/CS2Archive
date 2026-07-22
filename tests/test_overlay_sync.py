@@ -49,7 +49,7 @@ def _render(demo: Path, steam_id: str, round_num: int, out: Path) -> None:
     if (out / "combined.mp4").exists():
         (out / "combined.mp4").unlink()
     r = subprocess.run(
-        [PY, "scripts/render_pov.py", str(demo), steam_id,
+        [PY, "scripts/pov/render_pov.py", str(demo), steam_id,
          "--output", str(out.resolve()), "--rounds", str(round_num), "--batches", "1"],
         cwd=ROOT, shell=False,
     )
@@ -72,7 +72,7 @@ def _concat(out: Path) -> Path:
         raise RuntimeError("rerun needed")
     if not sidecar.exists():
         print(f"[concat] running concat_rounds.py -> {out}")
-        r = subprocess.run([PY, "scripts/concat_rounds.py", str(out)], cwd=ROOT)
+        r = subprocess.run([PY, "scripts/pov/concat_rounds.py", str(out)], cwd=ROOT)
         if r.returncode != 0:
             raise RuntimeError(f"concat_rounds.py exited {r.returncode}")
     return out / "combined.mp4"

@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 
-PROFILE = Path(__file__).resolve().parent.parent / ".faceit_profile"
+PROFILE = Path(__file__).resolve().parents[2] / ".faceit_profile"
 URL = sys.argv[1] if len(sys.argv) > 1 else (
     "https://www.faceit.com/en/cs2/room/1-9ee7de08-444a-4617-99a7-3fd5974de4f1"
 )

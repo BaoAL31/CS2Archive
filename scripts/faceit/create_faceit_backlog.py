@@ -5,7 +5,7 @@ entry carries is_faceit=true so the pipeline uses the FACEIT title/thumbnail
 path automatically.
 
 Usage:
-    python scripts/create_faceit_backlog.py <demo_path> --player <nick> --map <map>
+    python scripts/faceit/create_faceit_backlog.py <demo_path> --player <nick> --map <map>
                                   [--steam-id <id>] [--tournament <name>] [--priority high]
 """
 
@@ -17,7 +17,7 @@ import re
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 BACKLOG_DIR = PROJECT_ROOT / "backlog"
@@ -79,7 +79,7 @@ def main() -> None:
         "is_faceit": True,
         "pipeline_cmd": (
             f'$env:PYTHONPATH=.; & C:/Users/jembo/anaconda3/envs/cs2archive/python.exe '
-            f'scripts/pipeline.py --backlog {backlog_file.relative_to(PROJECT_ROOT).as_posix()}'
+            f'scripts/pov/pipeline.py --backlog {backlog_file.relative_to(PROJECT_ROOT).as_posix()}'
         ),
     }
     backlog_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")

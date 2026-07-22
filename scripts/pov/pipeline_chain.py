@@ -2,7 +2,7 @@
 Start the next pipeline when the previous run reaches upload (state step >= 6).
 
 Usage:
-    python scripts/pipeline_chain.py --watch <run_id> --then <pipeline args...>
+    python scripts/pov/pipeline_chain.py --watch <run_id> --then <pipeline args...>
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import sys
 import time
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 STATE_DIR = PROJECT_ROOT / ".pipeline"
 PY = sys.executable
 

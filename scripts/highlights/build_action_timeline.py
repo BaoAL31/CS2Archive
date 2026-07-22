@@ -130,6 +130,20 @@ def build_action_timeline(demo_path: Path) -> dict:
     if first_freeze is not None:
         round_starts.insert(0, (first_freeze, 0))
 
+    # Round freeze ends — per-live-round playable start signal.
+    _fe_by_round: dict[int, int] = {}
+    if not freeze_end.empty:
+        for _, row in freeze_end.sort_values("tick").iterrows():
+            tick = int(row["tick"])
+            if first_freeze is not None and tick < first_freeze:
+                continue
+            rn = int(row.get("round", 0) or 0)
+            if rn <= 0:
+                rn = _round_for_tick(tick, round_starts, first_freeze)
+            if rn > 0 and rn not in _fe_by_round:
+                _fe_by_round[rn] = tick
+    round_freeze_ends = [{"round": rn, "tick": t} for rn, t in sorted(_fe_by_round.items())]
+
     # Round ends — keep one per round (earliest tick wins)
     _re_by_round: dict[int, int] = {}
     if not round_end.empty:
@@ -173,8 +187,9 @@ def build_action_timeline(demo_path: Path) -> dict:
             continue
 
         attacker_is_pro = bool(attacker_sid and attacker_sid in pro_sids)
-        if not attacker_is_pro:
-            continue  # only Recognised Pro frags (unknown→pro excluded)
+        victim_is_pro = bool(victim_sid and victim_sid in pro_sids)
+        if not attacker_is_pro and not victim_is_pro:
+            continue  # keep kills involving at least one Recognised Pro (either side)
 
         attacker_name = (
             pro_sids.get(attacker_sid)
@@ -234,6 +249,7 @@ def build_action_timeline(demo_path: Path) -> dict:
         "kills": kills,
         "bomb_actions": bomb_actions,
         "round_starts": [{"round": rn, "tick": t} for t, rn in round_starts],
+        "round_freeze_ends": round_freeze_ends,
         "round_ends": round_ends,
     }
 

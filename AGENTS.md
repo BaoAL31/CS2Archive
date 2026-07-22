@@ -1,24 +1,55 @@
 # AGENTS.md — CS2Archive
 
-> **ALWAYS use `scripts/create_backlog.py` for data acquisition, then `scripts/pipeline.py` for rendering, then `scripts/upload_pending.py` to upload.** Individual step scripts exist for debugging or resuming a failed step — see below.
+> **ALWAYS use `scripts/pov/create_backlog.py` for data acquisition, then `scripts/pov/pipeline.py` for rendering, then `scripts/upload/upload_pending.py` to upload.** Individual step scripts exist for debugging or resuming a failed step — see below.
+
+## Scripts layout
+
+Scripts are grouped by product/concern (not a flat dump):
+
+| Folder | Contents |
+|---|---|
+| `scripts/pov/` | POV Archive pipeline (`pipeline.py`, render, concat, backlog, …) |
+| `scripts/overlay/` | Keyboard + util-cam overlay |
+| `scripts/faceit/` | FACEIT POV helpers (titles, thumbnails, names, backlog) |
+| `scripts/highlights/` | Highlight Reel / Kill Timeline (Kinocut path — separate from POV) |
+| `scripts/upload/` | YouTube + Bilibili publish |
+| `scripts/hf/` | HuggingFace demo sync |
+| `scripts/misc/` | One-offs |
+
+Import bootstrap: `scripts/_pathsetup.py` (`ensure()` adds all buckets to `sys.path`).
+
+Domain glossary for the highlights product: root `CONTEXT.md`.
+
+## Highlights (Kill Timeline) — FACEIT only
+
+Separate product from POV Archive. v1 builds **Kill Timeline data only** (no CSDM clip renders, no Kinocut yet).
+
+```powershell
+python scripts/highlights/build_action_timeline.py demos/faceit/<demo>.dem
+# -> renders/hl-{demo_stem}/action_timeline.json
+```
+
+- Hard-refuses demos outside `demos/faceit/`
+- Every kill where **at least one** of attacker or victim is a Recognised Pro (`.data/player_accounts.json`). Includes unknown→pro picks.
+- Recognised Pros = `player_accounts.json` only (no `faceit_pros.json`)
 
 ## Pipeline (Primary Entry Point)
 
-`python scripts/pipeline.py --backlog backlog/<match_slug>/<priority>/<slug>.json [--step N] [--until N]`
+`python scripts/pov/pipeline.py --backlog backlog/<match_slug>/<priority>/<slug>.json [--step N] [--until N]`
 
-Reads all POV metadata from the backlog file. Runs steps 1-6 in order (analyze → render → concat → overlay → outro → thumbnail), then writes `upload_meta.json` for each variant. **The pipeline does NOT upload** — a separate pass (`scripts/upload_pending.py`) uploads every pending `upload_meta.json` under `youtube/`. Resumable — state saved to `.pipeline/{run_id}.json`. Use `--step N` to start at a specific step.
+Reads all POV metadata from the backlog file. Runs steps 1-6 in order (analyze → render → concat → overlay → outro → thumbnail), then writes `upload_meta.json` for each variant. **The pipeline does NOT upload** — a separate pass (`scripts/upload/upload_pending.py`) uploads every pending `upload_meta.json` under `youtube/`. Resumable — state saved to `.pipeline/{run_id}.json`. Use `--step N` to start at a specific step.
 
 | Step | Name | Script for manual use / debugging |
 |---|---|---|
 | 1 | analyze | `csdm analyze <demo>` |
-| 2 | render | `python scripts/render_pov.py <demo> <steam_id>` |
-| 3 | concat | `python scripts/concat_rounds.py <renders_folder>` |
-| **4** | **overlay** | `python scripts/overlay_pov.py --video <video.mp4> --demo <demo> --steam-id <id> [--round N]` |
-| 5 | outro | `python scripts/generate_outro.py <video.mp4>` |
+| 2 | render | `python scripts/pov/render_pov.py <demo> <steam_id>` |
+| 3 | concat | `python scripts/pov/concat_rounds.py <renders_folder>` |
+| **4** | **overlay** | `python scripts/overlay/overlay_pov.py --video <video.mp4> --demo <demo> --steam-id <id> [--round N]` |
+| 5 | outro | `python scripts/pov/generate_outro.py <video.mp4>` |
 | 6 | thumbnail | `python -m thumbnail <url> --player <nick> --map <map> --demo <dem> --steam-id <id>` |
-| 7 | cleanup | `python scripts/cleanup_renders.py <renders_folder>` |
+| 7 | cleanup | `python scripts/pov/cleanup_renders.py <renders_folder>` |
 
-**Uploading is a separate step.** The pipeline stops at step 6 (thumbnail) and writes `upload_meta.json` (with `youtube_id=null`, `upload_status="pending"`) for every variant. Run `python scripts/upload_pending.py` afterward to upload all pending metas (it scans `youtube/*/upload_meta.json` and uploads any not yet completed). Step 4 (overlay) runs by default because dual-upload is on. To skip overlay entirely, run with `--until 3`. Raw-only mode (`--no-dual-upload`) still executes step 4 but discards the overlay output.
+**Uploading is a separate step.** The pipeline stops at step 6 (thumbnail) and writes `upload_meta.json` (with `youtube_id=null`, `upload_status="pending"`) for every variant. Run `python scripts/upload/upload_pending.py` afterward to upload all pending metas (it scans `youtube/*/upload_meta.json` and uploads any not yet completed). Step 4 (overlay) runs by default because dual-upload is on. To skip overlay entirely, run with `--until 3`. Raw-only mode (`--no-dual-upload`) still executes step 4 but discards the overlay output.
 
 **Overlay step (step 4) does two things:**
 1. Extracts keyboard states via demoparser2 (full round, not sparse parquet)
@@ -41,20 +72,20 @@ Grep for `[PIPELINE_ERROR]` and parse the JSON. Each error has a unique `code` f
 
 ```
 # 1. Pipeline produces finished video + thumbnail + upload_meta.json (stops at step 6)
-python scripts/pipeline.py --backlog backlog/spirit-vs-falcons-iem-cologne-major/high/tnir-mirage-spirit-vs-falcons-iem-cologne-major.json
+python scripts/pov/pipeline.py --backlog backlog/spirit-vs-falcons-iem-cologne-major/high/tnir-mirage-spirit-vs-falcons-iem-cologne-major.json
 
 # 2. Separate upload pass — uploads every pending upload_meta.json under youtube/
-python scripts/upload_pending.py
+python scripts/upload/upload_pending.py
 ```
 
 ### Notes
 
-- Pipeline reads `steam_id` from backlog entry (resolved by `create_backlog.py` from `.data/player_accounts.json`). No `--steam-id` CLI flag — source of truth is `.data/player_accounts.json` (via `python main.py player add/list`). Extract from demo: `python scripts/extract_steamids.py <demo_path>`.
+- Pipeline reads `steam_id` from backlog entry (resolved by `create_backlog.py` from `.data/player_accounts.json`). No `--steam-id` CLI flag — source of truth is `.data/player_accounts.json` (via `python main.py player add/list`). Extract from demo: `python scripts/pov/extract_steamids.py <demo_path>`.
 - `--demo` optional in pipeline: omit to download from `hltv_url` (CloakBrowser) or from HuggingFace if `hf_root` set; pass `.rar` or `.dem` to skip download.`--force` re-downloads.
 - **HF auto-download:** if `demo_path` not found locally and backlog has `hf_root` (e.g. `iem_cologne_major_2026`), pipeline pulls single `.dem` from `cs2povarchive/cs2-demos` dataset. Demo-level granularity — only the needed map is downloaded.
 - Render step verifies Steam is running before starting.
 - Each step validates its output before proceeding — failures halt the pipeline.
-- **Resume rule: ALWAYS check `.pipeline/{run_id}.json` before deleting any saved progress (combined.mp4, rendered clips, etc.). The pipeline state tells you which step was last completed. Run `python scripts/pipeline.py --backlog <path> --step <N>` (same backlog) to resume.
+- **Resume rule: ALWAYS check `.pipeline/{run_id}.json` before deleting any saved progress (combined.mp4, rendered clips, etc.). The pipeline state tells you which step was last completed. Run `python scripts/pov/pipeline.py --backlog <path> --step <N>` (same backlog) to resume.
 - **Render folder per POV** — `renders/pov-{demo-stem}_{player}/` (not demo-only). Multiple POVs on the same map share the match demo folder but never share a render folder. Legacy `pov-{demo-stem}/` (no player suffix) may still exist from older runs; safe to delete after confirming youtube output.
 - **`--resume-from-round N`** — deprecated. Render now uses filesystem-based resume: existing `batch-*.mp4` files ≥1MB are automatically skipped on re-run. To re-render a specific batch, manually delete its file.
 - **`--batches N`** — rounds per render batch (default: 10). Each batch produces one MP4 named `batch-{start:03d}-{end:03d}.mp4`. `--batches 1` is equivalent to the old per-round model.
@@ -93,14 +124,14 @@ Both variants get independent `upload_meta.json`; `upload_pending.py` records ea
 
 These tools sit outside the core `pipeline.py` → `upload_pending.py` flow but are wired into it:
 
-- **Bilibili mirror** — `scripts/upload_bilibili.py` uploads the same `upload_meta.json` variants to `studio.bilibili.tv` (Playwright + Chrome; tags capped at 10 chips, remainder appended to description; videos >~3.8 GB re-encoded to `video_bili.mp4`). Auth: `scripts/bilibili_login.py` (one-time headed-Chrome login, saves `.bilibili_storage.json`). `scripts/bili_check_session.py` verifies that session. `upload_pending.py` uploads both YouTube and Bilibili pending metas via `is_bilibili_pending`.
-- **HuggingFace demo sync** — `scripts/upload_demos_to_hf.py` (parallel, resumable), `scripts/upload_hf_demos.py`, `scripts/upload_hf_demos_git.py` (git-lfs), and `scripts/batch_upload_hf.py` (resumable IEM Cologne Major 2026 batch push) upload `.dem` files to `cs2povarchive/cs2-demos`, which backs the pipeline's `hf_root` auto-download.
-- **Shorts & scheduling** — `scripts/upload_youtube_shorts.py` (Short upload with optional scheduled publish) and `scripts/youtube_schedule.py` (timezone-aware wall-clock → UTC helpers used by `upload_youtube.py`).
-- **Render helpers** — `scripts/crosshair_code.py` (CS2 share-code ↔ crosshair decode/encode) and `scripts/cs2_minimizer.py` (minimizes the CS2 window to stop focus theft during HLAE capture).
+- **Bilibili mirror** — `scripts/upload/upload_bilibili.py` uploads the same `upload_meta.json` variants to `studio.bilibili.tv` (Playwright + Chrome; tags capped at 10 chips, remainder appended to description; videos >~3.8 GB re-encoded to `video_bili.mp4`). Auth: `scripts/upload/bilibili_login.py` (one-time headed-Chrome login, saves `.bilibili_storage.json`). `scripts/upload/bili_check_session.py` verifies that session. `upload_pending.py` uploads both YouTube and Bilibili pending metas via `is_bilibili_pending`.
+- **HuggingFace demo sync** — `scripts/hf/upload_demos_to_hf.py` (parallel, resumable), `scripts/hf/upload_hf_demos.py`, `scripts/hf/upload_hf_demos_git.py` (git-lfs), and `scripts/hf/batch_upload_hf.py` (resumable IEM Cologne Major 2026 batch push) upload `.dem` files to `cs2povarchive/cs2-demos`, which backs the pipeline's `hf_root` auto-download.
+- **Shorts & scheduling** — `scripts/upload/upload_youtube_shorts.py` (Short upload with optional scheduled publish) and `scripts/upload/youtube_schedule.py` (timezone-aware wall-clock → UTC helpers used by `upload_youtube.py`).
+- **Render helpers** — `scripts/pov/crosshair_code.py` (CS2 share-code ↔ crosshair decode/encode) and `scripts/pov/cs2_minimizer.py` (minimizes the CS2 window to stop focus theft during HLAE capture).
 
 ### Chaining pipelines (upload overlap)
 
-Use `scripts/pipeline_chain.py` to start the **next** POV when the **previous** reaches **thumbnail/upload-ready** (state `step >= 6`). Only one render (step 2) should run at a time; the actual YouTube upload runs separately via `upload_pending.py` and can overlap with the next POV’s acquire→render.
+Use `scripts/pov/pipeline_chain.py` to start the **next** POV when the **previous** reaches **thumbnail/upload-ready** (state `step >= 6`). Only one render (step 2) should run at a time; the actual YouTube upload runs separately via `upload_pending.py` and can overlap with the next POV’s acquire→render.
 
 **How it works:** polls `.pipeline/{run_id}.json` every 30s (`--poll`). When `"step" >= 6`, spawns `pipeline.py` with the args you pass after `--`. Does **not** read terminal output — only the state file.
 
@@ -108,11 +139,11 @@ Use `scripts/pipeline_chain.py` to start the **next** POV when the **previous** 
 
 ```powershell
 # When NiKo hits upload, start kyousuke (chain exits after launch)
-python scripts/pipeline_chain.py --watch falcons-vs-mouz-m3-nuke_NiKo_Nuke --no-wait -- `
+python scripts/pov/pipeline_chain.py --watch falcons-vs-mouz-m3-nuke_NiKo_Nuke --no-wait -- `
   --backlog backlog/falcons-vs-mouz-cs-asia-championships-2026/high/kyousuke-dust2-falcons-vs-mouz-cs-asia-championships-2026.json
 
 # Chain xelex after kyousuke (run in a second terminal)
-python scripts/pipeline_chain.py --watch falcons-vs-mouz-m2-dust2_kyousuke_Dust2 --no-wait -- `
+python scripts/pov/pipeline_chain.py --watch falcons-vs-mouz-m2-dust2_kyousuke_Dust2 --no-wait -- `
   --backlog backlog/falcons-vs-mouz-cs-asia-championships-2026/high/xelex-mirage-falcons-vs-mouz-cs-asia-championships-2026.json
 ```
 
@@ -125,26 +156,26 @@ python scripts/pipeline_chain.py --watch falcons-vs-mouz-m2-dust2_kyousuke_Dust2
 Use these when debugging a specific pipeline step failure or running steps manually:
 
 1. **Demo Download** — `python main.py hltv match <url>` (CloakBrowser, same as pipeline step 1). Archives and `.dem` files land in `demos/hltv/<match-slug>/`. Use `--force` to re-download.
-2. **Ratings** — `python main.py ratings <url>` scrapes HLTV Rating 3.0 for the match (saves to `demos/analysis/`). Check top players: `python scripts/best_per_map.py demos/analysis/{slug}_ratings.json`
+2. **Ratings** — `python main.py ratings <url>` scrapes HLTV Rating 3.0 for the match (saves to `demos/analysis/`). Check top players: `python scripts/pov/best_per_map.py demos/analysis/{slug}_ratings.json`
 3. **Avatars** — `scrapers/player_images.py`. Uses shared `HLTVScraper` (single Chrome instance) across all players. Navigates **player page** to capture 400×417 transparent PNG via response interception. Falls back to match page → rembg if player page fails. Rate-limited: 2s delay between players. Saved as `{nickname}.png` in `demos/avatars/`.
-4. **Player Steam ID** — `python main.py player add <nickname> --steam <url>` or `python main.py player list`. Extract from demo: `python scripts/extract_steamids.py <demo_path>`.
+4. **Player Steam ID** — `python main.py player add <nickname> --steam <url>` or `python main.py player list`. Extract from demo: `python scripts/pov/extract_steamids.py <demo_path>`.
 5. **CSDM Analysis** — `csdm analyze <demo>`. For PGL demos (PBDEMS2 format): `csdm analyze <demo> --source challengermode`.
-6. **Render POV Clip** — `python scripts/render_pov.py <demo_path> <steam_id> [--batches 3]`. Extracts player's crosshair from demo, writes to `autoexec_render.cfg`, copies over `autoexec.cfg` in CS2's cfg dir (`game/csgo/cfg/`), renders rounds in batches. On exit (even crash), swaps `autoexec_personal.cfg` back. Each batch produces one `batch-{start}-{end}.mp4` file. Filesystem-based resume: existing `batch-*.mp4` files ≥1MB are automatically skipped.
-7. **Concatenate Rounds** — `python scripts/concat_rounds.py <renders_folder>` → `combined.mp4` (incremental batch-by-batch concat with gap/overlap validation, then upscale to 1440p). Each batch file is deleted after successful append.
-8. **Render Util-Cams** — `python scripts/render_util_cams.py --util-cams-root <pov>/utility_cams --data-dir <data-dir> --demo-id <demo_id> [--steamid <id>] [--chunk-size 0]`. Uses CS2UtilArchive's **`build_player_manifest.build_manifest()`** for manifest generation (canonical entry builder) with `cameras_smoke="flight"`, `cameras_other="flight"` (overlay only needs chase-cam PiP, no thrower/detonate/orbit). Filters entries to `flight_ticks > 0`. Delegates rendering to **`render_utils.py` → `run_pipeline()`** which uses config-file batch CSDM (`render_spot_batch`) — one CS2 launch per chunk, precomputed camera inject, no thread-race issues. Output path: `<util_cams>/unnamed/<throw_id_slug>/flight_<throw_slug>.mp4` (match-id prefix stripped from `throw_id_slug`, matching CS2UtilArchive's render_utils folder architecture — no `project/map/demo_id` nesting under `utility_cams`). Idempotent — re-runs short-circuit via `_clip_index.json`.
-9. **Overlay** — `python scripts/overlay_pov.py --video <video.mp4> --demo <demo> --steam-id <id> [--round N] [--util-cams-root <path>]`. Applies keyboard overlay (demoparser2 full extraction) + utility throw flight PiP (CSDM flight renders at bottom-left). Delegates flight clip rendering to **`render_util_cams.py`** which uses CS2UtilArchive's canonical `build_player_manifest.build_manifest()` + `render_utils.py` batch CSDM pipeline. Clips land in `<util_cams>/unnamed/<throw_id_slug>/flight_<throw_slug>.mp4` (match id stripped, aligned with CS2UtilArchive's render_utils folder architecture). Pipeline passes `--util-cams-root <render_dir>/utility_cams`. Requires CS2UtilArchive with throws.parquet & extracted demos under `demos/extracted/`.
+6. **Render POV Clip** — `python scripts/pov/render_pov.py <demo_path> <steam_id> [--batches 3]`. Extracts player's crosshair from demo, writes to `autoexec_render.cfg`, copies over `autoexec.cfg` in CS2's cfg dir (`game/csgo/cfg/`), renders rounds in batches. On exit (even crash), swaps `autoexec_personal.cfg` back. Each batch produces one `batch-{start}-{end}.mp4` file. Filesystem-based resume: existing `batch-*.mp4` files ≥1MB are automatically skipped.
+7. **Concatenate Rounds** — `python scripts/pov/concat_rounds.py <renders_folder>` → `combined.mp4` (incremental batch-by-batch concat with gap/overlap validation, then upscale to 1440p). Each batch file is deleted after successful append.
+8. **Render Util-Cams** — `python scripts/overlay/render_util_cams.py --util-cams-root <pov>/utility_cams --data-dir <data-dir> --demo-id <demo_id> [--steamid <id>] [--chunk-size 0]`. Uses CS2UtilArchive's **`build_player_manifest.build_manifest()`** for manifest generation (canonical entry builder) with `cameras_smoke="flight"`, `cameras_other="flight"` (overlay only needs chase-cam PiP, no thrower/detonate/orbit). Filters entries to `flight_ticks > 0`. Delegates rendering to **`render_utils.py` → `run_pipeline()`** which uses config-file batch CSDM (`render_spot_batch`) — one CS2 launch per chunk, precomputed camera inject, no thread-race issues. Output path: `<util_cams>/unnamed/<throw_id_slug>/flight_<throw_slug>.mp4` (match-id prefix stripped from `throw_id_slug`, matching CS2UtilArchive's render_utils folder architecture — no `project/map/demo_id` nesting under `utility_cams`). Idempotent — re-runs short-circuit via `_clip_index.json`.
+9. **Overlay** — `python scripts/overlay/overlay_pov.py --video <video.mp4> --demo <demo> --steam-id <id> [--round N] [--util-cams-root <path>]`. Applies keyboard overlay (demoparser2 full extraction) + utility throw flight PiP (CSDM flight renders at bottom-left). Delegates flight clip rendering to **`render_util_cams.py`** which uses CS2UtilArchive's canonical `build_player_manifest.build_manifest()` + `render_utils.py` batch CSDM pipeline. Clips land in `<util_cams>/unnamed/<throw_id_slug>/flight_<throw_slug>.mp4` (match id stripped, aligned with CS2UtilArchive's render_utils folder architecture). Pipeline passes `--util-cams-root <render_dir>/utility_cams`. Requires CS2UtilArchive with throws.parquet & extracted demos under `demos/extracted/`.
 10. **Generate Thumbnail** — `python -m thumbnail <match_url> --player <nick> --map <map> --demo <dem> --steam-id <id> [--tournament "IEM Atlanta 2026"]`. Auto-extracts random kill frame as blurred background. Or `--background <frame.jpg>`.
    Example: `python -m thumbnail "https://www.hltv.org/matches/2394166/faze-vs-vitality-iem-atlanta-2026" --player ropz --map Nuke --demo demos/hltv/.../faze-vs-vitality-m1-nuke-p2.dem --steam-id 76561197991272318 --tournament "IEM Atlanta 2026"`
-11. **Generate Title & Description** — `python scripts/generate_title.py <ratings_json> --player <nick> --map <map> [--tournament "..."]`. Outputs JSON with `title` and `description` from ratings data.
-12. **Upload to YouTube** — `python scripts/upload_youtube.py <video_path> --thumbnail <thumb.png> --title <title> --description <desc> --privacy public`. Requires Google Cloud OAuth (`client_secret.json`). First-time auth opens browser. Account must be phone-verified for custom thumbnails.
+11. **Generate Title & Description** — `python scripts/pov/generate_title.py <ratings_json> --player <nick> --map <map> [--tournament "..."]`. Outputs JSON with `title` and `description` from ratings data.
+12. **Upload to YouTube** — `python scripts/upload/upload_youtube.py <video_path> --thumbnail <thumb.png> --title <title> --description <desc> --privacy public`. Requires Google Cloud OAuth (`client_secret.json`). First-time auth opens browser. Account must be phone-verified for custom thumbnails.
    Default publish mode is `auto`: schedule at the next future 16:30 Australia/Sydney on a free local calendar day. The script keeps `youtube/.publish_schedule.json` as the slot ledger and rolls back a reserved slot if upload fails.
    Override with `--publish-at "YYYY-MM-DD HH:MM"` for an exact time, or keep `--publish-at auto` explicit.
    Or use `--meta <upload_meta.json>` to read title/description/tags from a metadata file. The pipeline writes `upload_meta.json` at step 6 (thumbnail). The file also stores `resumable_uri`/`resumable_progress` during upload for crash recovery, and `youtube_id` after completion.
-13. **Upload pending metas (batch)** — `python scripts/upload_pending.py [--dry-run] [--limit N] [--dir <youtube_subdir>]`. Scans `youtube/*/upload_meta.json`, uploads any with `upload_status != "completed"` by invoking `upload_youtube.py --meta <path>` for each. Skips metas already completed (resume-safe) and metas whose video file is missing. Use after the pipeline finishes; re-running only uploads what's left.
+13. **Upload pending metas (batch)** — `python scripts/upload/upload_pending.py [--dry-run] [--limit N] [--dir <youtube_subdir>]`. Scans `youtube/*/upload_meta.json`, uploads any with `upload_status != "completed"` by invoking `upload_youtube.py --meta <path>` for each. Skips metas already completed (resume-safe) and metas whose video file is missing. Use after the pipeline finishes; re-running only uploads what's left.
 
 ## Backlog Creation
 
-`python scripts/create_backlog.py <hltv_url>` — downloads a match and generates prioritized backlog entries for every player/map combo.
+`python scripts/pov/create_backlog.py <hltv_url>` — downloads a match and generates prioritized backlog entries for every player/map combo.
 
 **Demos are downloaded automatically.** The script calls into `acquire_match()` then scrapes HLTV Rating 3.0, creating a per-player backlog card ranked by rating. It validates that the `.dem` file for each map exists on disk — if not found, it raises `FileNotFoundError` with the expected path, rather than writing a placeholder.
 
@@ -152,7 +183,7 @@ Each backlog entry contains full metadata as JSON: player, map, steam_id, demo_p
 
 ```powershell
 # 1. Download demo + create backlog entries (all-in-one)
-python scripts/create_backlog.py "https://www.hltv.org/matches/2394998/g2-vs-spirit-iem-cologne-major-2026"
+python scripts/pov/create_backlog.py "https://www.hltv.org/matches/2394998/g2-vs-spirit-iem-cologne-major-2026"
 ```
 
 Backlog entries land in `backlog/{match_slug}/{priority}/{player}-{map}-{match_slug}.json` with the simplified pipeline command. Use these as handoff cards for running pipelines.
@@ -180,7 +211,7 @@ Available commands:
 - All config in `config.py` (pydantic-settings, loads from `.env`)
 - **Python env:** uses same `cs2archive` conda env as sibling project. In non-interactive shells (OpenCode, CI), `conda activate` often fails — use direct-path bypass:
   ```powershell
-  $env:PYTHONPATH="."; & "C:\Users\jembo\anaconda3\envs\cs2archive\python.exe" scripts/pipeline.py <args>
+  $env:PYTHONPATH="."; & "C:\Users\jembo\anaconda3\envs\cs2archive\python.exe" scripts/pov/pipeline.py <args>
   ```
 
 ## Demo Video Rendering
@@ -212,7 +243,7 @@ For rendering a player's POV with full HUD (radar, health, ammo) and no x-ray, i
 & "C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd" video "<demo_path>" --mode player --steamids <steam64_id> --event rounds --rounds <N> --perspective player --no-show-x-ray --output "C:\full\path\to\renders\pov-folder" --framerate 60 --width 2560 --height 1440 --recording-system HLAE --close-game-after-recording --no-show-only-death-notices --show-assists --record-audio --concatenate-sequences --ffmpeg-video-codec h264_nvenc --ffmpeg-crf 15 --ffmpeg-output-parameters "-cq 15 -preset p7 -profile:v high -pix_fmt yuv420p -level 5.1" --cfg "C:\full\path\to\assets\cs2_pov.cfg"
 ```
 
-Use `python scripts/render_pov.py <demo_path> <steam_id>` instead — it wraps the above command with auto round-detection, p1/p2 split handling, and batch output naming.
+Use `python scripts/pov/render_pov.py <demo_path> <steam_id>` instead — it wraps the above command with auto round-detection, p1/p2 split handling, and batch output naming.
 
 All scripts pass `--cfg assets/cs2_pov.cfg` which configures HUD and restores keybinds via `exec autoexec`. The crosshair comes from CS2's `autoexec.cfg` in the game's `csgo/cfg/` directory — `render_pov.py` swaps `autoexec_render.cfg` (pro's crosshair, extracted from demo) and `autoexec_personal.cfg` (your crosshair) before/after rendering.
 
@@ -227,9 +258,9 @@ ffmpeg -f concat -safe 0 -i <filelist.txt> -c copy "renders\combined.mp4"
 
 ### Concatenating rendered rounds
 
-After rendering all rounds with `python scripts/render_pov.py`, join them into one video:
+After rendering all rounds with `python scripts/pov/render_pov.py`, join them into one video:
 ```powershell
-python scripts/concat_rounds.py <renders_folder>
+python scripts/pov/concat_rounds.py <renders_folder>
 ```
 Output is `combined.mp4` in the same folder. Concat is incremental (one batch at a time with ffmpeg stream copy), then upscaled to 1440p via CUDA Lanczos. Each batch file is deleted after successful append — remaining `batch-*.mp4` files on disk indicate which batches still need to be concat'd on resume.
 
@@ -295,8 +326,9 @@ main.py → routing dict → commands/*.py (subparser + handle) → scrapers/*.p
 - `downloader.py` — file management, archive extraction, download history JSON.
 - `models.py` — Pydantic models shared across modules.
 - `thumbnail/` — thumbnail generator package (Pillow-based compositing, 1280×720 output).
-- `scripts/` — utility scripts for the pipeline (render, concat, cleanup, upload, `pipeline_chain.py`) plus shared helpers (`cs2_minimizer.py`, `crosshair_code.py`).
-- `docs/` — design/context notes (`CONTEXT.md`, batching, dual-upload).
+- `scripts/` — utility scripts grouped by product (`pov/`, `overlay/`, `faceit/`, `highlights/`, `upload/`, `hf/`, `misc/`) plus `scripts/_pathsetup.py`
+- `docs/` — design/context notes (`CONTEXT.md`, batching, dual-upload) and `docs/adr/`
+- `CONTEXT.md` — domain glossary for the Highlight Reel / Kill Timeline product
 - `assets/` — static resources (map images, fonts, CS2 config files).
 - `grafipy-out/` — knowledge graph (from `/graphify`). Not project code.
 

@@ -12,19 +12,19 @@ or --render-only to run a single phase.
 
 Usage:
   # Full prep + render for one player on one map (NiKo on inferno, all sides):
-  python scripts/render_util_cams.py \\
+  python scripts/overlay/render_util_cams.py \\
       --util-cams-root D:/Projects/CS2Archive/renders/pov-furia-vs-falcons-m3-inferno_76561198041683378_full/utility_cams \\
       --data-dir D:/Projects/CS2UtilArchive/results/iem_cologne_major_2026/data \\
       --steamid 76561198041683378
 
   # All players (no filter):
-  python scripts/render_util_cams.py --util-cams-root ... --data-dir ...
+  python scripts/overlay/render_util_cams.py --util-cams-root ... --data-dir ...
 
   # Just prep dirs (no CS2 launch):
-  python scripts/render_util_cams.py --util-cams-root ... --data-dir ... --prepare-only
+  python scripts/overlay/render_util_cams.py --util-cams-root ... --data-dir ... --prepare-only
 
   # Just render existing dirs (skip prep):
-  python scripts/render_util_cams.py --util-cams-root ... --data-dir ... --render-only
+  python scripts/overlay/render_util_cams.py --util-cams-root ... --data-dir ... --render-only
 
 Batching verified by:
   - timing: each chunk should take 1-3 min (one CS2 launch)

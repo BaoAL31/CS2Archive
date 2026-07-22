@@ -26,7 +26,9 @@ import pandas as pd
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / 'scripts'))
+from _pathsetup import ensure
+ensure()
 
 import render_util_cams as ruc  # noqa: E402
 import overlay_pov as op  # noqa: E402

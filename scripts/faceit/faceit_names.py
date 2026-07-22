@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ACCOUNTS_PATH = PROJECT_ROOT / ".data" / "player_accounts.json"
 AVATAR_DIR = PROJECT_ROOT / "demos" / "avatars"
 
@@ -77,10 +77,8 @@ def known_pro_steam_ids() -> dict[str, str]:
 def faceit_nick(nickname: str) -> str:
     """Return the FACEIT query nick for a canonical nickname.
 
-    The watchlist (faceit_pros.json) may use canonical nicks like "s1mple"
-    or "NiKo" that don't resolve on FACEIT, while the real FACEIT nick
-    ("holaaaa", "niko") is stored in player_accounts.json. This maps the
-    canonical nick -> FACEIT nick so lookups succeed.
+    player_accounts may store a FACEIT nick that differs from the canonical
+    display nickname (e.g. display "s1mple" vs FACEIT "holaaaa").
     """
     _load()
     return _FACEIT_NICK.get(nickname) or _FACEIT_NICK.get(nickname.lower()) or nickname

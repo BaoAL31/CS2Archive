@@ -2,7 +2,7 @@
 Extract all player Steam IDs from a CS2 demo file.
 
 Usage:
-    python scripts/extract_steamids.py <demo_path>
+    python scripts/pov/extract_steamids.py <demo_path>
 
 Depends on csdm CLI being installed and the demo being analyzed.
 """
@@ -16,7 +16,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-TMP_DIR = Path(__file__).resolve().parent.parent / "tmp"
+TMP_DIR = Path(__file__).resolve().parents[2] / "tmp"
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 

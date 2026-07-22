@@ -11,11 +11,10 @@ import tempfile
 import time
 from pathlib import Path
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_SCRIPTS_DIR = _PROJECT_ROOT / "scripts"
-for _p in (str(_PROJECT_ROOT), str(_SCRIPTS_DIR)):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_PROJECT_ROOT / "scripts"))
+from _pathsetup import ensure
+ensure()
 
 from cs2_minimizer import CS2Minimizer
 
@@ -556,7 +555,7 @@ def main() -> None:
                     r = args.rounds.split(",")[0].split("-")[0]
                     round_arg = ["--round", r]
                 subprocess.run([
-                    sys.executable, "scripts/overlay_pov.py",
+                    sys.executable, "scripts/overlay/overlay_pov.py",
                     "--video", str(vid),
                     "--demo", demo_path,
                     "--steam-id", args.steam_id,

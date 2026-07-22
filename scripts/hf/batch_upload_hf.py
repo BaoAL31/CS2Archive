@@ -3,7 +3,7 @@ Batch upload IEM Cologne Major 2026 demos to HuggingFace.
 Resumable — state stored in .hf_upload_state.json.
 
 Usage:
-    python scripts/batch_upload_hf.py [--batch 5] [--start-id 2394774]
+    python scripts/hf/batch_upload_hf.py [--batch 5] [--start-id 2394774]
 
 Processes N matches per run. Cleans up local files after each upload.
 Re-run to continue from last processed match.

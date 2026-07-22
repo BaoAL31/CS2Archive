@@ -2,10 +2,10 @@
 Remove the entire renders folder after confirming video is in youtube/.
 
 Usage:
-    python scripts/cleanup_renders.py <renders_folder> --youtube <youtube_folder>
+    python scripts/pov/cleanup_renders.py <renders_folder> --youtube <youtube_folder>
 
 Example:
-    python scripts/cleanup_renders.py "renders/faze-vs-vitality-ropz-nuke" --youtube "youtube/faze-vs-vitality-iem-atlanta-2026_ropz_nuke"
+    python scripts/pov/cleanup_renders.py "renders/faze-vs-vitality-ropz-nuke" --youtube "youtube/faze-vs-vitality-iem-atlanta-2026_ropz_nuke"
 """
 
 from __future__ import annotations

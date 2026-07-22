@@ -1,0 +1,173 @@
+{
+  "demo_path": "demos/faceit/team_teses vs team_SVNONETHREE - cache.dem",
+  "map": "Cache",
+  "source": "faceit",
+  "kill_count": 12,
+  "kills": [
+    {
+      "tick": 2204,
+      "round": 0,
+      "attacker": "electroNic",
+      "attacker_steam_id": "76561198044045107",
+      "victim": "smF_-",
+      "victim_steam_id": "76561197971426269",
+      "weapon": "knife_m9_bayonet",
+      "is_bomb": false,
+      "headshot": false
+    },
+    {
+      "tick": 2214,
+      "round": 0,
+      "attacker": "s1mple",
+      "attacker_steam_id": "76561198034202275",
+      "victim": "TeSeS",
+      "victim_steam_id": "76561197996678278",
+      "weapon": "knife_karambit",
+      "is_bomb": false,
+      "headshot": false
+    },
+    {
+      "tick": 2302,
+      "round": 0,
+      "attacker": "electroNic",
+      "attacker_steam_id": "76561198044045107",
+      "victim": "BRIAN-_-HIZZ",
+      "victim_steam_id": "76561197993230696",
+      "weapon": "knife_m9_bayonet",
+      "is_bomb": false,
+      "headshot": false
+    },
+    {
+      "tick": 2449,
+      "round": 0,
+      "attacker": "electroNic",
+      "attacker_steam_id": "76561198044045107",
+      "victim": "holzt",
+      "victim_steam_id": "76561197980923031",
+      "weapon": "knife_m9_bayonet",
+      "is_bomb": false,
+      "headshot": false
+    },
+    {
+      "tick": 5844,
+      "round": 1,
+      "attacker": "mzinho",
+      "attacker_steam_id": "76561198838822582",
+      "victim": "TeSeS",
+      "victim_steam_id": "76561197996678278",
+      "weapon": "usp_silencer",
+      "is_bomb": false,
+      "headshot": true
+    },
+    {
+      "tick": 5961,
+      "round": 1,
+      "attacker": "mzinho",
+      "attacker_steam_id": "76561198838822582",
+      "victim": "BRIAN-_-HIZZ",
+      "victim_steam_id": "76561197993230696",
+      "weapon": "usp_silencer",
+      "is_bomb": false,
+      "headshot": true
+    },
+    {
+      "tick": 6180,
+      "round": 1,
+      "attacker": "mzinho",
+      "attacker_steam_id": "76561198838822582",
+      "victim": "dj_skullfuck",
+      "victim_steam_id": "76561197990871118",
+      "weapon": "usp_silencer",
+      "is_bomb": false,
+      "headshot": true
+    },
+    {
+      "tick": 6367,
+      "round": 1,
+      "attacker": "s1mple",
+      "attacker_steam_id": "76561198034202275",
+      "victim": "smF_-",
+      "victim_steam_id": "76561197971426269",
+      "weapon": "usp_silencer",
+      "is_bomb": false,
+      "headshot": true
+    },
+    {
+      "tick": 6616,
+      "round": 1,
+      "attacker": "Senzu-",
+      "attacker_steam_id": "76561198920720017",
+      "victim": "holzt",
+      "victim_steam_id": "76561197980923031",
+      "weapon": "usp_silencer",
+      "is_bomb": false,
+      "headshot": false
+    },
+    {
+      "tick": 9558,
+      "round": 2,
+      "attacker": "Senzu-",
+      "attacker_steam_id": "76561198920720017",
+      "victim": "holzt",
+      "victim_steam_id": "76561197980923031",
+      "weapon": "m4a1",
+      "is_bomb": false,
+      "headshot": true
+    },
+    {
+      "tick": 9951,
+      "round": 2,
+      "attacker": "Senzu-",
+      "attacker_steam_id": "76561198920720017",
+      "victim": "TeSeS",
+      "victim_steam_id": "76561197996678278",
+      "weapon": "m4a1",
+      "is_bomb": false,
+      "headshot": true
+    },
+    {
+      "tick": 10271,
+      "round": 2,
+      "attacker": "electroNic",
+      "attacker_steam_id": "76561198044045107",
+      "victim": "BRIAN-_-HIZZ",
+      "victim_steam_id": "76561197993230696",
+      "weapon": "famas",
+      "is_bomb": false,
+      "headshot": true
+    }
+  ],
+  "bomb_actions": [],
+  "round_starts": [
+    {
+      "round": 0,
+      "tick": 1280
+    },
+    {
+      "round": 1,
+      "tick": 3199
+    },
+    {
+      "round": 2,
+      "tick": 7064
+    },
+    {
+      "round": 3,
+      "tick": 10719
+    }
+  ],
+  "round_ends": [
+    {
+      "round": 2,
+      "tick": 7064
+    },
+    {
+      "round": 3,
+      "tick": 10719
+    },
+    {
+      "round": 4,
+      "tick": 18762
+    }
+  ]
+}

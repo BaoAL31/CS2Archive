@@ -2,11 +2,12 @@
 
 No HLTV ratings/avatars — FACEIT demos carry player names + steam IDs in the
 header (via demoparser2). The POV player comes from the backlog (--player /
---steam-id); any other demo player whose nickname is listed in faceit_pros.json
-is treated as a "notable name" and appended to the title.
+--steam-id); any other demo player who is a Recognised Pro
+(``.data/player_accounts.json``) is treated as a "notable name" and appended
+to the title.
 
 Usage:
-    python scripts/faceit_title.py <demo_path> --player <nick> [--map <map>]
+    python scripts/faceit/faceit_title.py <demo_path> --player <nick> [--map <map>]
                                   [--steam-id <id>] [--tournament <name>]
 Prints JSON: {"title": ..., "description": ..., "tags": [...]}
 """
@@ -19,8 +20,10 @@ import re
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+from _pathsetup import ensure
+ensure()
 
 MAP_DISPLAY = {
     "de_ancient": "Ancient", "de_mirage": "Mirage", "de_inferno": "Inferno",
@@ -45,19 +48,10 @@ def _demo_players(demo_path: Path) -> list[dict]:
 
 
 def _notable_nicks() -> set[str]:
-    # Use all known pros from player accounts (not just the watchlist) so any
-    # two recognizable pros in a match get flagged (e.g. niko + teses).
+    """Lowercase nick set for all Recognised Pros (player_accounts.json)."""
     try:
         from faceit_names import known_pros
         return known_pros()
-    except Exception:
-        pass
-    pros_path = PROJECT_ROOT / "faceit_pros.json"
-    if not pros_path.exists():
-        return set()
-    try:
-        data = json.loads(pros_path.read_text(encoding="utf-8"))
-        return {n.strip().lower() for n in data.get("pros", [])}
     except Exception:
         return set()
 

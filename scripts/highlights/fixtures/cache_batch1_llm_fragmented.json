@@ -1,0 +1,61 @@
+{
+  "description": "Fragmented LLM-style output (split streaks, cross-round lump, extra solos). General fix pass should still reach batch1 goal.",
+  "segments": [
+    {
+      "start_tick": 1948,
+      "end_tick": 2769,
+      "pov_steam_id": "76561198044045107",
+      "segment_type": "multi_kill",
+      "kill_indices": [0, 1, 2, 3],
+      "rationale": "knife round"
+    },
+    {
+      "start_tick": 4735,
+      "end_tick": 6153,
+      "pov_steam_id": "76561198838822582",
+      "segment_type": "multi_kill",
+      "kill_indices": [4, 5],
+      "rationale": "mzinho partial streak"
+    },
+    {
+      "start_tick": 5924,
+      "end_tick": 6308,
+      "pov_steam_id": "76561198838822582",
+      "segment_type": "default",
+      "kill_indices": [6],
+      "rationale": "mzinho third kill separate"
+    },
+    {
+      "start_tick": 6111,
+      "end_tick": 6495,
+      "pov_steam_id": "76561198034202275",
+      "segment_type": "default",
+      "kill_indices": [7],
+      "rationale": "trade solo"
+    },
+    {
+      "start_tick": 6360,
+      "end_tick": 7063,
+      "pov_steam_id": "76561198920720017",
+      "segment_type": "multi_kill",
+      "kill_indices": [8, 9],
+      "rationale": "cross-round lump"
+    },
+    {
+      "start_tick": 8600,
+      "end_tick": 10143,
+      "pov_steam_id": "76561198920720017",
+      "segment_type": "multi_kill",
+      "kill_indices": [10],
+      "rationale": "senzu second kill"
+    },
+    {
+      "start_tick": 10015,
+      "end_tick": 10399,
+      "pov_steam_id": "76561198044045107",
+      "segment_type": "default",
+      "kill_indices": [11],
+      "rationale": "electro solo r2"
+    }
+  ]
+}

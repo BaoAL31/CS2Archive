@@ -2,8 +2,8 @@
 Show the highest-rated player from each team on each map.
 
 Usage:
-    python scripts/best_per_map.py <ratings_json>
-    python scripts/best_per_map.py demos/analysis/faze-vs-vitality-iem-atlanta-2026_ratings.json
+    python scripts/pov/best_per_map.py <ratings_json>
+    python scripts/pov/best_per_map.py demos/analysis/faze-vs-vitality-iem-atlanta-2026_ratings.json
 
 Example output:
     Nuke      FaZe          Twistzz   31-24  1.52

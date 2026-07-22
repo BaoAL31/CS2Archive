@@ -2,10 +2,10 @@
 Upload a video to YouTube with a thumbnail.
 
 Usage:
-    python scripts/upload_youtube.py <video_path> --thumbnail <image.png> --title <title> [--description <desc>] [--privacy private|unlisted|public]
+    python scripts/upload/upload_youtube.py <video_path> --thumbnail <image.png> --title <title> [--description <desc>] [--privacy private|unlisted|public]
 
 Example:
-    python scripts/upload_youtube.py "youtube/faze-vs-vitality-iem-atlanta-2026_ropz_nuke/video.mp4" --thumbnail "youtube/faze-vs-vitality-iem-atlanta-2026_ropz_nuke/thumbnail.png" --title "ropz | 1.54 Rating | FaZe vs Vitality | Nuke | IEM Atlanta 2026"
+    python scripts/upload/upload_youtube.py "youtube/faze-vs-vitality-iem-atlanta-2026_ropz_nuke/video.mp4" --thumbnail "youtube/faze-vs-vitality-iem-atlanta-2026_ropz_nuke/thumbnail.png" --title "ropz | 1.54 Rating | FaZe vs Vitality | Nuke | IEM Atlanta 2026"
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 import httplib2
 
-_SCRIPTS_DIR = Path(__file__).resolve().parent
+_SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
@@ -51,7 +51,7 @@ THUMB_SCOPES = ["https://www.googleapis.com/auth/youtube"]
 CLIENT_SECRET = "client_secret.json"
 TOKEN_FILE = "token_youtube.json"
 THUMB_TOKEN_FILE = "token_youtube_thumb.json"
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCHEDULE_PATH = PROJECT_ROOT / "youtube" / ".publish_schedule.json"
 SCHEDULE_LOCK_PATH = PROJECT_ROOT / "youtube" / ".publish_schedule.lock"
 
@@ -467,7 +467,7 @@ def main() -> None:
         "--also-bilibili",
         action="store_true",
         help="After a successful YouTube upload, also upload to bilibili.tv "
-             "(requires .bilibili_storage.json; uses scripts/upload_bilibili.py)",
+             "(requires .bilibili_storage.json; uses scripts/upload/upload_bilibili.py)",
     )
     parser.add_argument(
         "--bilibili-only",

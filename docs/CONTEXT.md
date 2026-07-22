@@ -2,7 +2,7 @@
 
 ## 1. overlay_pov.py Structure
 
-File: `scripts/overlay_pov.py` (single `run_overlay()` entry point)
+File: `scripts/overlay/overlay_pov.py` (single `run_overlay()` entry point)
 
 ### Flow (top-down)
 

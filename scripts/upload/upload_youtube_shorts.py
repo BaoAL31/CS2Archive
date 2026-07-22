@@ -2,8 +2,8 @@
 Upload a YouTube Short with optional scheduled publish.
 
 Usage:
-    python scripts/upload_youtube_shorts.py <short.mp4> --meta upload_meta_shorts.json
-    python scripts/upload_youtube_shorts.py youtube/.../short.mp4 --publish-at "2026-06-12 17:00"
+    python scripts/upload/upload_youtube_shorts.py <short.mp4> --meta upload_meta_shorts.json
+    python scripts/upload/upload_youtube_shorts.py youtube/.../short.mp4 --publish-at "2026-06-12 17:00"
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import json
 import sys
 from pathlib import Path
 
-_SCRIPTS_DIR = Path(__file__).resolve().parent
+_SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 

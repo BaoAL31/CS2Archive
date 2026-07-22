@@ -35,6 +35,11 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
 
+# scripts/ on path so `overlay.*` package imports resolve when run as a file
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _pathsetup import ensure
+ensure()
+
 # -- Point at CS2UtilArchive for overlay pipeline + parquet data ----------
 # Shared constants/helpers live in the overlay subpackage's _common module
 # (also imported by overlay_utilcams / overlay_encode) to avoid cycles.

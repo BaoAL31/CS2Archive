@@ -7,8 +7,8 @@ best cutout, and save as demos/avatars/{nick}.png (replacing the HLTV-style
 cutout path so the thumbnail generator picks it up transparently).
 
 Usage:
-    python scripts/faceit_avatar.py donk [--top 3] [--force]
-    python scripts/faceit_avatar.py "m0NESY" --top 5
+    python scripts/faceit/faceit_avatar.py donk [--top 3] [--force]
+    python scripts/faceit/faceit_avatar.py "m0NESY" --top 5
 """
 
 from __future__ import annotations

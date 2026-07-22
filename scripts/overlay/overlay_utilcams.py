@@ -198,7 +198,7 @@ def _run_batch_util_cams_subprocess(
     chunk_size: int = 0,
     demo_data_dir_name: str | None = None,
 ) -> int:
-    """Shell out to scripts/render_util_cams.py for util_cam prep + render.
+    """Shell out to scripts/overlay/render_util_cams.py for util_cam prep + render.
 
     Bypasses the inline run_csdm loop (Bug A: random POV instead of chase cam
     when the inject thread races csdm's actions-file write). render_util_cams.py
@@ -208,7 +208,7 @@ def _run_batch_util_cams_subprocess(
     for already-rendered clips.
     """
     import subprocess
-    script_path = Path(__file__).resolve().parent.parent / "render_util_cams.py"
+    script_path = Path(__file__).resolve().parent / "render_util_cams.py"
     # Extract demo_id from the per-demo data dir name. Caller passes the
     # leaf explicitly because the parent (data_dir) doesn't start with "demo=".
     # Leaf: "demo=2395002-furia-vs-falcons-m2-anubis" → "2395002-furia-vs-falcons-m2-anubis".
