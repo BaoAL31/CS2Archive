@@ -151,12 +151,13 @@ class Pipeline:
         self.hltv_url = self.meta.get("hltv_url", "")
         self.steam_id = self.meta.get("steam_id", "")
         self.tournament = self.meta.get("tournament", "")
-        self.is_faceit = bool(self.meta.get("is_faceit")) or bool(
-            self.demo_path and "demos/faceit" in str(self.demo_path).replace("\\", "/")
-        )
 
         demo_path_str = self.meta.get("demo_path", "")
         self.demo_path = Path(demo_path_str) if demo_path_str else None
+
+        self.is_faceit = bool(self.meta.get("is_faceit")) or bool(
+            self.demo_path and "demos/faceit" in str(self.demo_path).replace("\\", "/")
+        )
 
         ratings_path_str = self.meta.get("ratings_path", "")
         self.ratings_json = Path(ratings_path_str) if ratings_path_str else PROJECT_ROOT / "demos" / "analysis" / ""
@@ -439,6 +440,17 @@ class Pipeline:
     def step_render(self) -> None:
         if not self.demo_path or not self.demo_path.exists():
             fail(2, "RENDER_DEMO_MISSING", f"demo not found: {self.demo_path}")
+
+        from render_version_check import RenderVersionError, assert_render_versions
+
+        try:
+            vers = assert_render_versions(self.demo_path)
+            print(
+                f"  [OK] versions demo={vers.get('demo')} cs2={vers.get('cs2')} "
+                f"hlae={vers.get('hlae')} csdm={vers.get('csdm')}"
+            )
+        except RenderVersionError as e:
+            fail(2, e.code, e.message)
 
         from cs2_minimizer import ensure_cs2_closed
 

@@ -383,6 +383,25 @@ def main() -> None:
     _check_nvenc()
 
     demo_path = _ensure_demo(args.demo, args.hf_root, args.hf_repo, args.match_slug, args.match_id)
+
+    from render_version_check import RenderVersionError, assert_render_versions
+
+    try:
+        vers = assert_render_versions(demo_path)
+        print(
+            f"  [OK] versions demo={vers.get('demo')} cs2={vers.get('cs2')} "
+            f"hlae={vers.get('hlae')} csdm={vers.get('csdm')}"
+        )
+    except RenderVersionError as e:
+        payload = json.dumps({
+            "error": True,
+            "step": 2,
+            "step_name": "render",
+            "code": e.code,
+            "message": e.message,
+        })
+        print(f"[PIPELINE_ERROR] {payload}")
+        sys.exit(1)
     parts = find_demo_parts(demo_path)
     print(f"Found {len(parts)} demo part(s):")
     for p in parts:
