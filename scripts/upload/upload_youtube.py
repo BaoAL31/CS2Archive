@@ -274,6 +274,18 @@ def release_publish_slot(publish_date: str, path: Path = SCHEDULE_PATH) -> None:
         _save_publish_schedule(schedule, path)
 
 
+def _cleanup_stale_ledger_entries(stale_dates: set[str], path: Path = SCHEDULE_PATH) -> None:
+    """Remove ledger entries for dates already occupied on YouTube."""
+    if not stale_dates:
+        return
+    with _publish_schedule_lock(path.with_name(".publish_schedule.lock")):
+        schedule = _load_publish_schedule(path)
+        removed = {d: schedule.pop(d) for d in stale_dates if d in schedule}
+        if removed:
+            _save_publish_schedule(schedule, path)
+            print(f"  [Schedule] Cleaned {len(removed)} stale ledger entr(y/ies): {', '.join(sorted(removed))}", flush=True)
+
+
 def _record_publish_meta(
     meta_file_path: str,
     publish_local: str,
@@ -616,6 +628,12 @@ def main() -> None:
         occupied_dates = set(yt_publish_dates)
         # Load local ledger dates so resolver skips slots reserved by other pending uploads.
         ledger_dates = load_occupied_publish_dates()
+        # Remove stale ledger entries: dates already occupied on YouTube
+        # (e.g. video was published but ledger entry was never cleaned up).
+        stale = ledger_dates & yt_publish_dates
+        if stale:
+            _cleanup_stale_ledger_entries(stale)
+            ledger_dates -= stale
         occupied_dates.update(ledger_dates)
     try:
         with _publish_schedule_lock():
@@ -660,6 +678,11 @@ def main() -> None:
         if publish_at_utc:
             _record_publish_meta(meta_file_path, publish_local, publish_tz, publish_at_utc)
         print("Done!", flush=True)
+        if reserved_publish_date:
+            try:
+                release_publish_slot(reserved_publish_date)
+            except Exception as release_error:
+                print(f"  [WARN] Could not release reserved publish slot: {release_error}", flush=True)
 
         if args.also_bilibili:
             try:
