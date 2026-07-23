@@ -83,14 +83,6 @@ def _resolve_steam_id(nickname: str) -> str:
     return ""
 
 
-async def _fetch_avatar(player_key: str, match_url: str, ratings_path: Path, *, scraper=None) -> str:
-    from scrapers.player_images import fetch_avatar_for_player
-
-    avatar_path = await fetch_avatar_for_player(player_key, match_url, ratings_path, scraper=scraper)
-    abs_path = PROJECT_ROOT.joinpath(avatar_path) if not avatar_path.is_absolute() else avatar_path
-    return str(abs_path.relative_to(PROJECT_ROOT)).replace("\\", "/")
-
-
 def _existing_avatar_path(nickname: str) -> str:
     name = nickname.strip().lower()
     # Nested layout: {nick}/hltv or {nick}/faceit, then legacy flat
@@ -228,7 +220,6 @@ async def main() -> None:
     match_url = sys.argv[1]
 
     from scrapers.hltv_acquire import match_slug_from_url, match_demo_dir
-    from scrapers.hltv import HLTVScraper
     from scrapers.ratings import get_match_ratings
 
     slug = match_slug_from_url(match_url)
@@ -265,25 +256,33 @@ async def main() -> None:
         for t in ratings["tables"]
         for p in t["players"]
     })
-    print(f"[AVATAR] Fetching {len(unique_players)} unique players (1 Chrome instance)...")
+    print(f"[AVATAR] Fetching {len(unique_players)} unique players (CloakBrowser)...")
     avatar_cache: dict[str, str] = {}
-    try:
-        scraper = HLTVScraper(headless=True)
-        try:
-            await scraper._ensure_browser()
+
+    def _fetch_avatars_sync():
+        from scrapers.player_images import CloakAvatarFetcher, _fetch_avatar_cloak
+        import time as _time
+
+        cache: dict[str, str] = {}
+        with CloakAvatarFetcher(headless=False) as fetcher:
             for i, nick in enumerate(unique_players):
                 cached = _existing_avatar_path(nick)
                 if cached:
-                    avatar_cache[nick] = cached
+                    cache[nick] = cached
                     continue
                 try:
-                    avatar_cache[nick] = await _fetch_avatar(nick, match_url, ratings_path, scraper=scraper)
+                    path = _fetch_avatar_cloak(nick, match_url, str(ratings_path), fetcher=fetcher)
+                    abs_path = PROJECT_ROOT.joinpath(path) if not path.is_absolute() else path
+                    cache[nick] = str(abs_path.relative_to(PROJECT_ROOT)).replace("\\", "/")
                 except Exception as e:
                     print(f"  [WARN] Avatar failed for {nick}: {e}")
                 if i < len(unique_players) - 1:
-                    await asyncio.sleep(2)
-        finally:
-            await scraper.close()
+                    _time.sleep(2)
+        return cache
+
+    try:
+        loop = asyncio.get_event_loop()
+        avatar_cache = await loop.run_in_executor(None, _fetch_avatars_sync)
     except Exception as e:
         print(f"  [WARN] Avatar browser unavailable, skipping avatars: {e}")
 

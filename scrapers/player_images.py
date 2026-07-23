@@ -4,12 +4,15 @@ CS2Archive — Player Profile Image Scraper
 Downloads high-res HLTV player body shots (400x417) from player pages.
 Resolves profile URLs via accounts → ratings → match roster, then fetches bodyshot.
 Rejects images below MIN_RES (300px) and falls back to match-page capture + rembg.
+
+Uses CloakBrowser (persistent profile + humanize) to bypass Cloudflare protection.
 """
 
 from __future__ import annotations
 
 import asyncio
 import re
+import time
 from io import BytesIO
 from pathlib import Path
 
@@ -33,36 +36,22 @@ console = Console(force_terminal=True)
 AVATAR_DIR = settings.demo_storage_dir / "avatars"
 MIN_RES = 300  # Reject images smaller than 300×300
 
+CLOAK_PROFILE = Path(".cloak-hltv-profile")
+
 
 def _hltv_avatar_path(key: str) -> Path:
     """Nested HLTV avatar path: demos/avatars/{key}/hltv/{key}.png"""
     return AVATAR_DIR / key / "hltv" / f"{key}.png"
 
+
 _BODYSHOT_PLAYER_ID_RE = re.compile(r"playerbodyshot/(\d+)/", re.IGNORECASE)
 _BODYSHOT_QUERY_ID_RE = re.compile(r"[?&]playerid=(\d+)", re.IGNORECASE)
 _CDN_BODYSHOT_BASE = "https://img-cdn.hltv.org/playerbodyshot"
 
-_BODYSHOT_LOCATORS = (
-    '.playerBodyshot img[src*="playerbodyshot"]',
-    'img.bodyshot-img[src*="playerbodyshot"]',
-)
-
 _PICK_PROFILE_BODYSHOT_JS = """
-([sel, expectedId]) => {
-    const all = Array.from(document.querySelectorAll(sel));
-    let imgs = all.filter((img) => {
-        const src = (img.currentSrc || img.src || '').toLowerCase();
-        return src.includes('playerbodyshot') && !src.includes('w=100') && !src.includes('h=100');
-    });
+() => {
+    const imgs = Array.from(document.querySelectorAll('img[src*="playerbodyshot"]'));
     if (!imgs.length) return null;
-    if (expectedId) {
-        const id = String(expectedId);
-        const matched = imgs.filter((img) => {
-            const src = (img.currentSrc || img.src || '').toLowerCase();
-            return src.includes('/playerbodyshot/' + id + '/') || src.includes('playerid=' + id);
-        });
-        if (matched.length) imgs = matched;
-    }
     let best = imgs[0];
     for (let i = 1; i < imgs.length; i++) {
         const area = imgs[i].naturalWidth * imgs[i].naturalHeight;
@@ -70,6 +59,31 @@ _PICK_PROFILE_BODYSHOT_JS = """
         if (area > bestArea) best = imgs[i];
     }
     return best.currentSrc || best.src;
+}
+"""
+
+_PICK_ROSTER_JS = """
+() => {
+    const imgs = document.querySelectorAll('div.players img.player-photo');
+    return Array.from(imgs).map(img => {
+        const alt = img.alt || '';
+        const m = alt.match(/'([^']+)'/);
+        const nick = m ? m[1].toLowerCase() : alt.split(' ').pop().toLowerCase();
+        const a = img.closest('a');
+        return { nickname: nick, playerUrl: a ? a.href : null };
+    });
+}
+"""
+
+_PICK_ROSTER_INDEX_JS = """
+() => {
+    const imgs = document.querySelectorAll('div.players img.player-photo');
+    return Array.from(imgs).map((img, index) => {
+        const alt = img.alt || '';
+        const m = alt.match(/'([^']+)'/);
+        const nick = m ? m[1].toLowerCase() : alt.split(' ').pop().toLowerCase();
+        return { nickname: nick, index };
+    });
 }
 """
 
@@ -110,14 +124,12 @@ def _cutout_bg(img_bytes: bytes) -> Image.Image:
 
 
 def _is_acceptable(im: Image.Image) -> bool:
-    # Size check
     if im.size[0] < MIN_RES or im.size[1] < MIN_RES:
         return False
-    # Reject fully transparent images (e.g., HLTV CDN placeholder with no bodyshot)
     if im.mode == "RGBA":
         alpha = im.getchannel("A")
         extrema = alpha.getextrema()
-        if extrema[0] == 0 and extrema[1] == 0:  # All pixels fully transparent
+        if extrema[0] == 0 and extrema[1] == 0:
             return False
     return True
 
@@ -132,173 +144,9 @@ def _upgrade_bodyshot_url(url: str, width: int = 400) -> str:
     return f"{url}{sep}w={width}"
 
 
-async def _fetch_profile_bodyshot(scraper, player_url: str) -> bytes | None:
-    """Profile-header bodyshot only — uses DOM-selected img src (hash CDN URLs)."""
-    expected_id = hltv_player_id_from_url(player_url) or ""
-    await scraper._ensure_browser()
-    try:
-        await scraper.navigate(player_url, timeout_ms=30000)
-    except Exception:
-        console.print(f"[yellow]   Profile page navigation failed: {player_url}[/yellow]")
-        return None
-
-    page = scraper._nav_page
-    await page.wait_for_timeout(5000)
-
-    picked_src: str | None = None
-    for sel in _BODYSHOT_LOCATORS:
-        try:
-            picked_src = await page.evaluate(_PICK_PROFILE_BODYSHOT_JS, [sel, expected_id])
-        except Exception:
-            continue
-        if picked_src:
-            break
-
-    if not picked_src:
-        return None
-
-    full_url = _upgrade_bodyshot_url(picked_src)
-
-    # CDN fetch — navigate same page to CDN URL
-    try:
-        await scraper._rate_limit()
-        resp = await page.goto(full_url, wait_until="domcontentloaded", timeout=30000)
-        if resp is None or not resp.ok:
-            return None
-        raw = await resp.body()
-        if len(raw) < 5000 or raw.startswith(b"<html"):
-            return None
-        im = Image.open(BytesIO(raw))
-        if not _is_acceptable(im):
-            return None
-        return raw
-    except Exception:
-        console.print(f"[yellow]   CDN navigation failed: {full_url}[/yellow]")
-        return None
-
-
-async def _fetch_cdn_bodyshot(scraper, player_id: str) -> bytes | None:
-    """Fetch bodyshot directly from HLTV CDN when profile DOM interception fails."""
-    await scraper._ensure_browser()
-    pid = (player_id or "").strip()
-    if not pid:
-        return None
-
-    page = scraper._nav_page
-    for cdn_url in _cdn_bodyshot_urls(pid):
-        try:
-            await scraper._rate_limit()
-            resp = await page.goto(cdn_url, wait_until="domcontentloaded", timeout=20000)
-        except Exception as e:
-            console.print(f"[dim]   CDN {cdn_url}: navigation error {type(e).__name__}[/dim]")
-            continue
-        if resp is None or not resp.ok:
-            console.print(f"[dim]   CDN {cdn_url}: response not ok[/dim]")
-            continue
-        raw = await resp.body()
-        if len(raw) <= 5000 or raw.startswith(b"<html"):
-            console.print(f"[dim]   CDN {cdn_url}: response too small or HTML[/dim]")
-            continue
-        im = Image.open(BytesIO(raw))
-        if _is_acceptable(im):
-            return raw
-        console.print(f"[dim]   CDN {cdn_url}: image not acceptable ({im.size})[/dim]")
-
-    return None
-
-
-async def _try_profile_and_cdn(scraper, resolution: dict) -> bytes | None:
-    """Try profile-page DOM capture, then CDN retry when player ID is known."""
-    player_url = str(resolution.get("player_url", "") or "").strip()
-    player_id = str(resolution.get("player_id", "") or "").strip() or (
-        hltv_player_id_from_url(player_url) or ""
-    )
-
-    if player_url:
-        raw = await _fetch_profile_bodyshot(scraper, player_url)
-        if raw:
-            return raw
-
-    if player_id:
-        console.print(
-            f"[yellow]   Profile bodyshot failed; trying CDN for player {player_id}[/yellow]"
-        )
-        return await _fetch_cdn_bodyshot(scraper, player_id)
-
-    return None
-
-
-async def _scrape_match_roster(scraper, match_url: str) -> list[dict]:
-    """Scrape match-page lineup for nickname → profile URL pairs."""
-    await scraper._ensure_browser()
-    try:
-        await scraper.navigate(match_url, timeout_ms=30000)
-    except Exception as e:
-        console.print(f"[yellow]   Roster scrape failed: {type(e).__name__}[/yellow]")
-        return []
-    await scraper._nav_page.wait_for_timeout(3000)
-
-    players = await scraper._nav_page.evaluate("""
-        () => {
-            const imgs = document.querySelectorAll('div.players img.player-photo');
-            return Array.from(imgs).map(img => {
-                const alt = img.alt || '';
-                const m = alt.match(/'([^']+)'/);
-                const nick = m ? m[1].toLowerCase() : alt.split(' ').pop().toLowerCase();
-                const a = img.closest('a');
-                return { nickname: nick, playerUrl: a ? a.href : null };
-            });
-        }
-    """)
-    return players or []
-
-
-async def _fetch_match_page_headshot(scraper, match_url: str, player_key: str) -> bytes | None:
-    """Last resort: screenshot match-page lineup photo for one player."""
-    await scraper._ensure_browser()
-    try:
-        await scraper.navigate(match_url, timeout_ms=30000)
-    except Exception as e:
-        console.print(f"[yellow]   [{player_key}] match page navigation failed: {type(e).__name__}[/yellow]")
-        return None
-    await scraper._nav_page.wait_for_timeout(3000)
-
-    page = scraper._nav_page
-    entries = await page.evaluate(
-        """
-        () => {
-            const imgs = document.querySelectorAll('div.players img.player-photo');
-            return Array.from(imgs).map((img, index) => {
-                const alt = img.alt || '';
-                const m = alt.match(/'([^']+)'/);
-                const nick = m ? m[1].toLowerCase() : alt.split(' ').pop().toLowerCase();
-                return { nickname: nick, index };
-            });
-        }
-        """
-    )
-    match = next((e for e in entries if e["nickname"] == player_key), None)
-    if not match:
-        console.print(f"[yellow]   [{player_key}] not found on match page for fallback[/yellow]")
-        return None
-
-    locator = page.locator("div.players img.player-photo").nth(match["index"])
-    shot = await locator.screenshot(type="png")
-    if not shot or len(shot) < 1000:
-        return None
-
-    im = Image.open(BytesIO(shot))
-    if _is_acceptable(im):
-        return shot
-    console.print(
-        f"[yellow]   [{player_key}] match-page photo too small ({im.size[0]}x{im.size[1]})[/yellow]"
-    )
-    return None
-
-
-async def _save_avatar_bytes(raw: bytes, png_path: Path) -> bool:
+def _save_avatar_bytes_sync(raw: bytes, png_path: Path) -> bool:
     """Save bodyshot bytes to PNG, applying rembg when the source is not transparent."""
-    loop = asyncio.get_event_loop()
+    png_path.parent.mkdir(parents=True, exist_ok=True)
     im = Image.open(BytesIO(raw))
     if not _is_acceptable(im):
         return False
@@ -307,7 +155,7 @@ async def _save_avatar_bytes(raw: bytes, png_path: Path) -> bool:
     if is_transparent:
         im.save(png_path, "PNG")
     else:
-        cut = await loop.run_in_executor(None, _cutout_bg, raw)
+        cut = _cutout_bg(raw)
         cut.save(png_path, "PNG")
 
     s = png_path.stat().st_size / 1024
@@ -315,6 +163,161 @@ async def _save_avatar_bytes(raw: bytes, png_path: Path) -> bool:
         f"[green]   [OK] {png_path.name} ({im.size[0]}x{im.size[1]}, {s:.0f} KB)[/green]"
     )
     return True
+
+
+async def _save_avatar_bytes(raw: bytes, png_path: Path) -> bool:
+    """Async wrapper around _save_avatar_bytes_sync."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _save_avatar_bytes_sync, raw, png_path)
+
+
+class CloakAvatarFetcher:
+    """Fetches HLTV player avatars using CloakBrowser to bypass Cloudflare."""
+
+    def __init__(self, headless: bool = False):
+        self._ctx = None
+        self._headless = headless
+
+    def __enter__(self):
+        from cloakbrowser import launch_persistent_context
+
+        CLOAK_PROFILE.mkdir(parents=True, exist_ok=True)
+        self._ctx = launch_persistent_context(
+            str(CLOAK_PROFILE.resolve()),
+            headless=self._headless,
+            viewport={"width": 1920, "height": 1080},
+            humanize=True,
+            channel="chrome",
+        )
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            if self._ctx:
+                self._ctx.close()
+        except Exception:
+            pass
+
+    @property
+    def ctx(self):
+        if self._ctx is None:
+            raise RuntimeError("CloakAvatarFetcher not entered as context manager")
+        return self._ctx
+
+    def _new_page(self):
+        return self.ctx.new_page()
+
+    def fetch_profile_bodyshot(self, player_url: str) -> bytes | None:
+        """Profile-header bodyshot — navigates to player page, picks bodyshot img, fetches CDN."""
+        page = self._new_page()
+        try:
+            page.goto(player_url, timeout=120_000)
+            page.wait_for_timeout(5000)
+
+            picked_src = page.evaluate(_PICK_PROFILE_BODYSHOT_JS)
+            if not picked_src:
+                return None
+
+            full_url = _upgrade_bodyshot_url(picked_src)
+            resp = page.goto(full_url, wait_until="domcontentloaded", timeout=60_000)
+            if not resp or not resp.ok:
+                return None
+
+            raw = resp.body()
+            if len(raw) < 5000 or raw.startswith(b"<html"):
+                return None
+
+            im = Image.open(BytesIO(raw))
+            if not _is_acceptable(im):
+                return None
+            return raw
+        except Exception as e:
+            console.print(f"[yellow]   Profile bodyshot failed for {player_url}: {type(e).__name__}[/yellow]")
+            return None
+        finally:
+            page.close()
+
+    def fetch_cdn_bodyshot(self, player_id: str) -> bytes | None:
+        """Fetch bodyshot directly from HLTV CDN when profile DOM interception fails."""
+        pid = (player_id or "").strip()
+        if not pid:
+            return None
+
+        for cdn_url in _cdn_bodyshot_urls(pid):
+            page = self._new_page()
+            try:
+                resp = page.goto(cdn_url, wait_until="domcontentloaded", timeout=60_000)
+                if not resp or not resp.ok:
+                    continue
+                raw = resp.body()
+                if len(raw) <= 5000 or raw.startswith(b"<html"):
+                    continue
+                im = Image.open(BytesIO(raw))
+                if _is_acceptable(im):
+                    return raw
+            except Exception:
+                continue
+            finally:
+                page.close()
+        return None
+
+    def try_profile_and_cdn(self, player_url: str, player_id: str) -> bytes | None:
+        """Try profile-page DOM capture, then CDN retry when player ID is known."""
+        if player_url:
+            raw = self.fetch_profile_bodyshot(player_url)
+            if raw:
+                return raw
+
+        if player_id:
+            console.print(f"[yellow]   Profile bodyshot failed; trying CDN for player {player_id}[/yellow]")
+            return self.fetch_cdn_bodyshot(player_id)
+
+        return None
+
+    def scrape_match_roster(self, match_url: str) -> list[dict]:
+        """Scrape match-page lineup for nickname → profile URL pairs."""
+        page = self._new_page()
+        try:
+            page.goto(match_url, timeout=120_000)
+            page.wait_for_timeout(3000)
+            players = page.evaluate(_PICK_ROSTER_JS)
+            return players or []
+        except Exception as e:
+            console.print(f"[yellow]   Roster scrape failed: {type(e).__name__}[/yellow]")
+            return []
+        finally:
+            page.close()
+
+    def fetch_match_page_headshot(self, match_url: str, player_key: str) -> bytes | None:
+        """Last resort: screenshot match-page lineup photo for one player."""
+        page = self._new_page()
+        try:
+            page.goto(match_url, timeout=120_000)
+            page.wait_for_timeout(3000)
+
+            entries = page.evaluate(_PICK_ROSTER_INDEX_JS)
+            match = next((e for e in entries if e["nickname"] == player_key), None)
+            if not match:
+                console.print(f"[yellow]   [{player_key}] not found on match page for fallback[/yellow]")
+                return None
+
+            locator = page.locator("div.players img.player-photo").nth(match["index"])
+            shot = locator.screenshot(type="png")
+            if not shot or len(shot) < 1000:
+                return None
+
+            im = Image.open(BytesIO(shot))
+            if _is_acceptable(im):
+                return shot
+            console.print(
+                f"[yellow]   [{player_key}] match-page photo too small ({im.size[0]}x{im.size[1]})[/yellow]"
+            )
+            return None
+        except Exception as e:
+            console.print(f"[yellow]   [{player_key}] match page fallback failed: {type(e).__name__}[/yellow]")
+            return None
+        finally:
+            page.close()
 
 
 def _has_hltv_identity(resolution: dict | None) -> bool:
@@ -348,6 +351,113 @@ def _promote_hltv_identity(account: object | None, resolution: dict) -> None:
     update_hltv_player(nickname, player_id, player_url)
 
 
+def _fetch_avatar_cloak(
+    key: str,
+    match_url: str,
+    ratings_path: Path | str,
+    *,
+    force: bool = False,
+    fetcher: CloakAvatarFetcher | None = None,
+) -> Path:
+    """Sync avatar fetch using CloakBrowser. Returns path to saved PNG."""
+    from player_accounts import list_accounts
+
+    key_norm = normalize_pipeline_player_key(key)
+    AVATAR_DIR.mkdir(parents=True, exist_ok=True)
+    png_path = _hltv_avatar_path(key_norm)
+
+    accounts = list_accounts()
+    account = find_account_by_player_key(accounts, key_norm)
+
+    if not force and avatar_cache_eligible(png_path, account):
+        console.print(f"[green]   [OK] {png_path.name} (cached)[/green]")
+        return png_path
+
+    ratings = load_ratings_json(ratings_path)
+    resolution = resolve_hltv_player(key_norm, accounts, ratings)
+
+    own_fetcher = False
+    if fetcher is None:
+        fetcher = CloakAvatarFetcher(headless=False)
+        own_fetcher = True
+
+    try:
+        if own_fetcher:
+            fetcher.__enter__()
+
+        if _has_hltv_identity(resolution):
+            label = resolution.get("player_url") or f"player/{resolution.get('player_id')}"
+            console.print(f"[dim]   Resolved HLTV profile via {resolution['source']}: {label}[/dim]")
+            player_url = str(resolution.get("player_url", "") or "").strip()
+            player_id = str(resolution.get("player_id", "") or "").strip() or (
+                hltv_player_id_from_url(player_url) or ""
+            )
+            raw = fetcher.try_profile_and_cdn(player_url, player_id)
+            if raw and _save_avatar_bytes_sync(raw, png_path):
+                _promote_hltv_identity(account, resolution)
+                console.print(f"[green]   Avatar resolution source: {resolution['source']}[/green]")
+                return png_path
+
+        roster = fetcher.scrape_match_roster(match_url)
+        roster_resolution = resolve_from_roster(roster, key_norm)
+        if _has_hltv_identity(roster_resolution):
+            label = (
+                roster_resolution.get("player_url")
+                or f"player/{roster_resolution.get('player_id')}"
+            )
+            console.print(f"[dim]   Resolved HLTV profile via roster: {label}[/dim]")
+            player_url = str(roster_resolution.get("player_url", "") or "").strip()
+            player_id = str(roster_resolution.get("player_id", "") or "").strip() or (
+                hltv_player_id_from_url(player_url) or ""
+            )
+            raw = fetcher.try_profile_and_cdn(player_url, player_id)
+            if raw and _save_avatar_bytes_sync(raw, png_path):
+                _promote_hltv_identity(account, roster_resolution)
+                console.print("[green]   Avatar resolution source: roster[/green]")
+                return png_path
+
+        if not _has_hltv_identity(resolution) and not _has_hltv_identity(roster_resolution):
+            search_url = f"{settings.hltv_base_url}/search?query={key_norm}"
+            page = fetcher._new_page()
+            try:
+                page.goto(search_url, timeout=120_000)
+                page.wait_for_timeout(3000)
+                search_html = page.content()
+            finally:
+                page.close()
+
+            search_resolution = resolve_from_search(search_html, ratings, key_norm)
+            if _has_hltv_identity(search_resolution):
+                label = (
+                    search_resolution.get("player_url")
+                    or f"player/{search_resolution.get('player_id')}"
+                )
+                console.print(f"[dim]   Resolved HLTV profile via search: {label}[/dim]")
+                player_url = str(search_resolution.get("player_url", "") or "").strip()
+                player_id = str(search_resolution.get("player_id", "") or "").strip() or (
+                    hltv_player_id_from_url(player_url) or ""
+                )
+                raw = fetcher.try_profile_and_cdn(player_url, player_id)
+                if raw and _save_avatar_bytes_sync(raw, png_path):
+                    _promote_hltv_identity(account, search_resolution)
+                    console.print("[green]   Avatar resolution source: search[/green]")
+                    return png_path
+
+        console.print("[yellow]   Profile bodyshot failed; trying match-page fallback[/yellow]")
+        raw = fetcher.fetch_match_page_headshot(match_url, key_norm)
+        if raw and _save_avatar_bytes_sync(raw, png_path):
+            promote_resolution = search_resolution or roster_resolution or resolution
+            if promote_resolution:
+                _promote_hltv_identity(account, promote_resolution)
+            console.print("[green]   Avatar resolution source: match_fallback[/green]")
+            return png_path
+    finally:
+        if own_fetcher:
+            fetcher.__exit__()
+
+    raise RuntimeError(f"no acceptable avatar for {key_norm}")
+
+
 async def fetch_avatar_for_player(
     player_key: str,
     match_url: str,
@@ -361,105 +471,23 @@ async def fetch_avatar_for_player(
 
     Skips network fetch when cached PNG is ≥300×300 and account has hltv_player_id,
     unless force=True.
-    Pass existing scraper to reuse browser across multiple calls.
+
+    Uses CloakBrowser to bypass Cloudflare protection on HLTV.
+    The ``scraper`` parameter is accepted for backward compatibility but ignored.
     """
-    from player_accounts import list_accounts
-
-    key = normalize_pipeline_player_key(player_key)
-    AVATAR_DIR.mkdir(parents=True, exist_ok=True)
-    png_path = _hltv_avatar_path(key)
-
-    accounts = list_accounts()
-    account = find_account_by_player_key(accounts, key)
-
-    if not force and avatar_cache_eligible(png_path, account):
-        console.print(f"[green]   [OK] {png_path.name} (cached)[/green]")
-        return png_path
-
-    ratings = load_ratings_json(ratings_path)
-    resolution = resolve_hltv_player(key, accounts, ratings)
-
-    from scrapers.hltv import HLTVScraper
-
-    own_scraper = False
-    if scraper is None:
-        scraper = HLTVScraper()
-        own_scraper = True
-    roster_resolution = None
-    search_resolution = None
-    try:
-        await scraper._ensure_browser()
-        if _has_hltv_identity(resolution):
-            label = resolution.get("player_url") or f"player/{resolution.get('player_id')}"
-            console.print(
-                f"[dim]   Resolved HLTV profile via {resolution['source']}: {label}[/dim]"
-            )
-            raw = await _try_profile_and_cdn(scraper, resolution)
-            if raw and await _save_avatar_bytes(raw, png_path):
-                _promote_hltv_identity(account, resolution)
-                console.print(
-                    f"[green]   Avatar resolution source: {resolution['source']}[/green]"
-                )
-                return png_path
-
-        roster = await _scrape_match_roster(scraper, match_url)
-        roster_resolution = resolve_from_roster(roster, key)
-        if _has_hltv_identity(roster_resolution):
-            label = (
-                roster_resolution.get("player_url")
-                or f"player/{roster_resolution.get('player_id')}"
-            )
-            console.print(f"[dim]   Resolved HLTV profile via roster: {label}[/dim]")
-            raw = await _try_profile_and_cdn(scraper, roster_resolution)
-            if raw and await _save_avatar_bytes(raw, png_path):
-                _promote_hltv_identity(account, roster_resolution)
-                console.print("[green]   Avatar resolution source: roster[/green]")
-                return png_path
-
-        if not _has_hltv_identity(resolution) and not _has_hltv_identity(
-            roster_resolution
-        ):
-            search_url = f"{settings.hltv_base_url}/search?query={key}"
-            search_html = await scraper._get_page_content(search_url)
-            search_resolution = resolve_from_search(search_html, ratings, key)
-            if _has_hltv_identity(search_resolution):
-                label = (
-                    search_resolution.get("player_url")
-                    or f"player/{search_resolution.get('player_id')}"
-                )
-                console.print(
-                    f"[dim]   Resolved HLTV profile via search: {label}[/dim]"
-                )
-                raw = await _try_profile_and_cdn(scraper, search_resolution)
-                if raw and await _save_avatar_bytes(raw, png_path):
-                    _promote_hltv_identity(account, search_resolution)
-                    console.print("[green]   Avatar resolution source: search[/green]")
-                    return png_path
-
-        console.print("[yellow]   Profile bodyshot failed; trying match-page fallback[/yellow]")
-        raw = await _fetch_match_page_headshot(scraper, match_url, key)
-        if raw and await _save_avatar_bytes(raw, png_path):
-            promote_resolution = search_resolution or roster_resolution or resolution
-            if promote_resolution:
-                _promote_hltv_identity(account, promote_resolution)
-            console.print("[green]   Avatar resolution source: match_fallback[/green]")
-            return png_path
-    finally:
-        if own_scraper:
-            await scraper.close()
-
-    raise RuntimeError(f"no acceptable avatar for {key}")
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, _fetch_avatar_cloak, player_key, match_url, str(ratings_path), force
+    )
 
 
 async def get_player_avatars(match_url: str) -> dict[str, Path]:
-    from scrapers.hltv import HLTVScraper
-
+    """Fetch all player avatars from a match page using CloakBrowser."""
     AVATAR_DIR.mkdir(parents=True, exist_ok=True)
     result: dict[str, Path] = {}
 
-    scraper = HLTVScraper()
-    try:
-        players = await _scrape_match_roster(scraper, match_url)
+    with CloakAvatarFetcher(headless=False) as fetcher:
+        players = fetcher.scrape_match_roster(match_url)
 
         if not players:
             console.print("[yellow]   No player photos found[/yellow]")
@@ -491,15 +519,13 @@ async def get_player_avatars(match_url: str) -> dict[str, Path]:
                 console.print(f"[yellow]   [{nickname}] no player URL[/yellow]")
                 continue
 
-            raw = await _fetch_profile_bodyshot(scraper, entry["playerUrl"])
+            raw = fetcher.fetch_profile_bodyshot(entry["playerUrl"])
 
             if not raw:
                 console.print(f"[yellow]   [{nickname}] no acceptable image captured[/yellow]")
                 continue
 
-            if await _save_avatar_bytes(raw, png_path):
+            if _save_avatar_bytes_sync(raw, png_path):
                 result[nickname] = png_path
 
         return result
-    finally:
-        await scraper.close()
