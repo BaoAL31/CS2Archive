@@ -52,7 +52,7 @@ def _detect_local_tz() -> str:
 
 
 DEFAULT_PUBLISH_TZ = _detect_local_tz()
-AUTO_PUBLISH_TIME = "16:30"
+AUTO_PUBLISH_TIMES = ["10:00", "16:30"]
 AUTO_PUBLISH_MODE = "auto"
 
 _PUBLISH_AT_FORMATS = (
@@ -81,6 +81,23 @@ def _parse_publish_time(publish_time: str) -> tuple[int, int]:
         raise ValueError(f"Unrecognized publish time {publish_time!r} (expected HH:MM)") from exc
     if hour < 0 or hour > 23 or minute < 0 or minute > 59:
         raise ValueError(f"Unrecognized publish time {publish_time!r} (expected HH:MM)")
+    return hour, minute
+
+
+def _parse_publish_times(publish_times: list[str] | str) -> list[tuple[int, int]]:
+    if isinstance(publish_times, str):
+        publish_times = [publish_times]
+    return [_parse_publish_time(t) for t in publish_times]
+
+
+def _parse_publish_time(time_str: str) -> tuple[int, int]:
+    """Parse a time string like 'HH:MM' or 'HH:MM:SS' and return (hour, minute)."""
+    parts = time_str.split(':')
+    if len(parts) < 2:
+        raise ValueError(f"Invalid time format: {time_str!r}")
+    hour = int(parts[0])
+    minute = int(parts[1])
+    # ignore seconds if present
     return hour, minute
 
 
@@ -125,17 +142,17 @@ def resolve_auto_publish_schedule(
     timezone: str | None,
     start_date: date | None = None,
     occupied_dates: Iterable[str] | None = None,
-    publish_time: str = AUTO_PUBLISH_TIME,
+    publish_times: list[str] | str = "16:30",
     now: datetime | None = None,
 ) -> tuple[str, str, str, str]:
-    """Resolve next future daily publish slot at ``publish_time`` in ``timezone``.
+    """Resolve next future daily publish slot at ``publish_times`` in ``timezone``.
 
     Returns (privacy, publish_at_utc, timezone_used, publish_at_local).
     Scheduled uploads force privacy to private (YouTube requirement).
     """
     tz = timezone or _detect_local_tz()
     tzinfo = ZoneInfo(tz)
-    hour, minute = _parse_publish_time(publish_time)
+    times = _parse_publish_times(publish_times)
     if now is None:
         now = datetime.now(tzinfo)
     elif now.tzinfo is None:
@@ -144,9 +161,14 @@ def resolve_auto_publish_schedule(
         now = now.astimezone(tzinfo)
 
     candidate_date = start_date or now.date()
-    slot_time = datetime.combine(candidate_date, time(hour, minute, tzinfo=tzinfo))
-    if now >= slot_time:
+
+    for hour, minute in times:
+        slot_time = datetime.combine(candidate_date, time(hour, minute, tzinfo=tzinfo))
+        if now < slot_time:
+            break
+    else:
         candidate_date += timedelta(days=1)
+        hour, minute = times[0]
 
     first_free = next_available_publish_date(
         candidate_date,
@@ -165,7 +187,7 @@ def resolve_publish_schedule(
     privacy: str,
     start_date: date | None = None,
     occupied_dates: Iterable[str] | None = None,
-    publish_time: str = AUTO_PUBLISH_TIME,
+    publish_times: list[str] | None = None,
     now: datetime | None = None,
 ) -> tuple[str, str | None, str, str | None]:
     """
@@ -173,7 +195,7 @@ def resolve_publish_schedule(
 
     Returns (privacy, publish_at_utc, timezone_used, publish_at_local).
     Scheduled uploads force privacy to private (YouTube requirement).
-    ``publish_at="auto"`` uses the next future date at 16:30 in ``timezone``.
+    ``publish_at="auto"`` uses the next future date at 10:00 or 16:30 in ``timezone``.
     """
     local = publish_at or meta.get("publish_at")
     tz = timezone or meta.get("publish_timezone") or DEFAULT_PUBLISH_TZ
@@ -185,7 +207,7 @@ def resolve_publish_schedule(
         return resolve_auto_publish_schedule(
             start_date=start_date,
             occupied_dates=occupied_dates,
-            publish_time=publish_time,
+            publish_times=publish_times or AUTO_PUBLISH_TIMES,
             now=now,
             timezone=tz,
         )

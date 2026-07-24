@@ -9,9 +9,9 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts" / "upload"))
 
-from youtube_schedule import DEFAULT_PUBLISH_TZ, parse_publish_at, resolve_publish_schedule
+from youtube_schedule import AUTO_PUBLISH_TIMES, DEFAULT_PUBLISH_TZ, parse_publish_at, resolve_publish_schedule
 
 
 def test_parse_publish_at_aest_winter() -> None:
@@ -43,7 +43,8 @@ def test_parse_publish_at_invalid_timezone_raises() -> None:
         parse_publish_at("2026-06-12 17:00", "Not/A/Timezone")
 
 
-def test_resolve_publish_schedule_auto_uses_next_future_sydney_afternoon() -> None:
+def test_resolve_publish_schedule_auto_uses_next_future_sydney_morning() -> None:
+    # 10:00 is the first slot, 16:30 second
     privacy, utc, tz, local = resolve_publish_schedule(
         publish_at="auto",
         timezone=DEFAULT_PUBLISH_TZ,
@@ -54,12 +55,49 @@ def test_resolve_publish_schedule_auto_uses_next_future_sydney_afternoon() -> No
     )
 
     assert privacy == "private"
-    assert utc == "2026-06-20T06:30:00.000Z"
+    assert utc == "2026-06-20T00:00:00.000Z"  # 10:00 AEST = 00:00 UTC
     assert tz == DEFAULT_PUBLISH_TZ
-    assert local == "2026-06-20 16:30"
+    assert local == "2026-06-20 10:00"
 
 
 def test_resolve_publish_schedule_auto_skips_today_after_slot_time() -> None:
+    # Before 10:00 today -> should get 10:00 today
+    privacy, utc, tz, local = resolve_publish_schedule(
+        publish_at="auto",
+        timezone=DEFAULT_PUBLISH_TZ,
+        meta={},
+        privacy="public",
+        start_date=date(2026, 6, 19),
+        occupied_dates=set(),
+        now=datetime(2026, 6, 19, 9, 0, tzinfo=ZoneInfo(DEFAULT_PUBLISH_TZ)),
+    )
+
+    assert privacy == "private"
+    assert utc == "2026-06-19T00:00:00.000Z"  # 10:00 AEST = 00:00 UTC
+    assert tz == DEFAULT_PUBLISH_TZ
+    assert local == "2026-06-19 10:00"
+
+
+def test_resolve_publish_schedule_auto_skips_10am_after_10am() -> None:
+    # After 10:00 today but before 16:30 -> should get 16:30 today
+    privacy, utc, tz, local = resolve_publish_schedule(
+        publish_at="auto",
+        timezone=DEFAULT_PUBLISH_TZ,
+        meta={},
+        privacy="public",
+        start_date=date(2026, 6, 19),
+        occupied_dates=set(),
+        now=datetime(2026, 6, 19, 12, 0, tzinfo=ZoneInfo(DEFAULT_PUBLISH_TZ)),
+    )
+
+    assert privacy == "private"
+    assert utc == "2026-06-19T06:30:00.000Z"  # 16:30 AEST = 06:30 UTC
+    assert tz == DEFAULT_PUBLISH_TZ
+    assert local == "2026-06-19 16:30"
+
+
+def test_resolve_publish_schedule_auto_skips_today_after_1630() -> None:
+    # After 16:30 today -> should get 10:00 tomorrow
     privacy, utc, tz, local = resolve_publish_schedule(
         publish_at="auto",
         timezone=DEFAULT_PUBLISH_TZ,
@@ -71,25 +109,26 @@ def test_resolve_publish_schedule_auto_skips_today_after_slot_time() -> None:
     )
 
     assert privacy == "private"
-    assert utc == "2026-06-20T06:30:00.000Z"
+    assert utc == "2026-06-20T00:00:00.000Z"  # 10:00 AEST = 00:00 UTC
     assert tz == DEFAULT_PUBLISH_TZ
-    assert local == "2026-06-20 16:30"
+    assert local == "2026-06-20 10:00"
 
 
-def test_resolve_publish_schedule_auto_skips_consecutive_occupied_dates() -> None:
+def test_resolve_publish_schedule_auto_skips_consecutive_occupied_slots() -> None:
+    # Both 10:00 and 16:30 on 19th occupied -> should get 10:00 on 20th
     privacy, utc, tz, local = resolve_publish_schedule(
         publish_at="auto",
         timezone=DEFAULT_PUBLISH_TZ,
         meta={},
         privacy="public",
         start_date=date(2026, 6, 19),
-        occupied_dates={"2026-06-19", "2026-06-20"},
+        occupied_dates={"2026-06-19 10:00", "2026-06-19 16:30"},
     )
 
     assert privacy == "private"
-    assert utc == "2026-06-21T06:30:00.000Z"
+    assert utc == "2026-06-20T00:00:00.000Z"
     assert tz == DEFAULT_PUBLISH_TZ
-    assert local == "2026-06-21 16:30"
+    assert local == "2026-06-20 10:00"
 
 
 def test_resolve_publish_schedule_forces_private() -> None:

@@ -13,13 +13,9 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
-import os
-import pathlib
 import random
 import ssl
 import sys
-import time
-from contextlib import contextmanager
 from pathlib import Path
 
 import google.auth
@@ -52,8 +48,6 @@ CLIENT_SECRET = "client_secret.json"
 TOKEN_FILE = "token_youtube.json"
 THUMB_TOKEN_FILE = "token_youtube_thumb.json"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SCHEDULE_PATH = PROJECT_ROOT / "youtube" / ".publish_schedule.json"
-SCHEDULE_LOCK_PATH = PROJECT_ROOT / "youtube" / ".publish_schedule.lock"
 
 
 def get_authenticated_service(scopes: list[str] | None = None, token_file: str | None = None) -> googleapiclient.discovery.Resource:
@@ -182,108 +176,6 @@ def _session_path(video_path: str) -> str:
 def _meta_path(video_path: str) -> str:
     """Path to upload_meta.json alongside the video file."""
     return str(Path(video_path).parent / "upload_meta.json")
-
-
-def _load_publish_schedule(path: Path = SCHEDULE_PATH) -> dict:
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _save_publish_schedule(data: dict, path: Path = SCHEDULE_PATH) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    tmp.replace(path)
-
-
-@contextmanager
-def _publish_schedule_lock(path: Path = SCHEDULE_LOCK_PATH, timeout: float = 30.0):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(str(os.getpid()))
-            break
-        except FileExistsError:
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"Timed out waiting for publish schedule lock: {path}")
-            time.sleep(0.1)
-    try:
-        yield
-    finally:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
-
-
-def load_occupied_publish_dates(path: Path = SCHEDULE_PATH) -> set[str]:
-    with _publish_schedule_lock(path.with_name(".publish_schedule.lock")):
-        return set(_load_publish_schedule(path).keys())
-
-
-def _reserve_publish_slot_locked(
-    publish_local: str,
-    publish_at_utc: str,
-    timezone: str,
-    video_path: str,
-    path: Path = SCHEDULE_PATH,
-) -> str:
-    publish_date = publish_local.strip().split()[0]
-    schedule = _load_publish_schedule(path)
-    if publish_date in schedule:
-        raise ValueError(f"Publish slot already reserved for {publish_date}")
-    schedule[publish_date] = {
-        "publish_at": publish_local,
-        "publish_at_utc": publish_at_utc,
-        "publish_timezone": timezone,
-        "video_path": video_path,
-    }
-    _save_publish_schedule(schedule, path)
-    return publish_date
-
-
-def reserve_publish_slot(
-    publish_local: str,
-    publish_at_utc: str,
-    timezone: str,
-    video_path: str,
-    path: Path = SCHEDULE_PATH,
-) -> str:
-    with _publish_schedule_lock(path.with_name(".publish_schedule.lock")):
-        return _reserve_publish_slot_locked(
-            publish_local,
-            publish_at_utc,
-            timezone,
-            video_path,
-            path,
-        )
-
-
-def release_publish_slot(publish_date: str, path: Path = SCHEDULE_PATH) -> None:
-    with _publish_schedule_lock(path.with_name(".publish_schedule.lock")):
-        schedule = _load_publish_schedule(path)
-        schedule.pop(publish_date, None)
-        _save_publish_schedule(schedule, path)
-
-
-def _cleanup_stale_ledger_entries(stale_dates: set[str], path: Path = SCHEDULE_PATH) -> None:
-    """Remove ledger entries for dates already occupied on YouTube."""
-    if not stale_dates:
-        return
-    with _publish_schedule_lock(path.with_name(".publish_schedule.lock")):
-        schedule = _load_publish_schedule(path)
-        removed = {d: schedule.pop(d) for d in stale_dates if d in schedule}
-        if removed:
-            _save_publish_schedule(schedule, path)
-            print(f"  [Schedule] Cleaned {len(removed)} stale ledger entr(y/ies): {', '.join(sorted(removed))}", flush=True)
 
 
 def _record_publish_meta(
@@ -615,88 +507,40 @@ def main() -> None:
             )
         else:
             print("  [Schedule] No existing videos found on channel — no occupied dates to reserve", flush=True)
-    reserved_publish_date: str | None = None
-    # In auto mode, load the ledger-occupied dates BEFORE entering the lock
-    # so the resolver can skip slots already reserved by other pending
-    # uploads. Without this, the resolver can pick a date the YouTube API
-    # says is free, but the ledger has reserved for a future video, and
-    # _reserve_publish_slot_locked below crashes with "Publish slot
-    # already reserved". (load_occupied_publish_dates also takes the lock,
-    # so it must be called outside the with-block below to avoid deadlock.)
     occupied_dates: set[str] = set()
     if args.publish_at == AUTO_PUBLISH_MODE:
         occupied_dates = set(yt_publish_dates)
-        # Load local ledger dates so resolver skips slots reserved by other pending uploads.
-        ledger_dates = load_occupied_publish_dates()
-        # Remove stale ledger entries: dates already occupied on YouTube
-        # (e.g. video was published but ledger entry was never cleaned up).
-        stale = ledger_dates & yt_publish_dates
-        if stale:
-            _cleanup_stale_ledger_entries(stale)
-            ledger_dates -= stale
-        occupied_dates.update(ledger_dates)
-    try:
-        with _publish_schedule_lock():
-            privacy, publish_at_utc, publish_tz, publish_local = resolve_publish_schedule(
-                publish_at=args.publish_at,
-                timezone=args.timezone,
-                meta=meta,
-                privacy=privacy,
-                start_date=start_date,
-                occupied_dates=occupied_dates,
-            )
-            if publish_at_utc:
-                reserved_publish_date = _reserve_publish_slot_locked(
-                    publish_local,
-                    publish_at_utc,
-                    publish_tz,
-                    str(video),
-                )
-    except ValueError as exc:
-        print(f"[ERROR] {exc}", flush=True)
-        sys.exit(1)
+    privacy, publish_at_utc, publish_tz, publish_local = resolve_publish_schedule(
+            publish_at=args.publish_at,
+            timezone=args.timezone,
+            meta=meta,
+            privacy=privacy,
+            start_date=start_date,
+            occupied_dates=occupied_dates,
+            publish_times=["10:00", "16:30"],
+        )
 
-    try:
-        if publish_at_utc:
-            if original_privacy != "private":
-                print(
-                    f"  [WARN] Scheduled publish requires private upload; "
-                    f"overriding privacy {original_privacy!r} -> 'private'",
-                    flush=True,
-                )
+    if publish_at_utc:
+        if original_privacy != "private":
             print(
-                f"  Scheduled publish: {publish_local} ({publish_tz}) -> {publish_at_utc} UTC",
+                f"  [WARN] Scheduled publish requires private upload; "
+                f"overriding privacy {original_privacy!r} -> 'private'",
                 flush=True,
             )
-
-        print("Uploading...", flush=True)
-        upload_video(
-            youtube, str(video), title, description,
-            privacy, thumbnail, tags, meta_path=meta_file_path,
-            publish_at_utc=publish_at_utc,
+        print(
+            f"  Scheduled publish: {publish_local} ({publish_tz}) -> {publish_at_utc} UTC",
+            flush=True,
         )
-        if publish_at_utc:
-            _record_publish_meta(meta_file_path, publish_local, publish_tz, publish_at_utc)
-        print("Done!", flush=True)
-        if reserved_publish_date:
-            try:
-                release_publish_slot(reserved_publish_date)
-            except Exception as release_error:
-                print(f"  [WARN] Could not release reserved publish slot: {release_error}", flush=True)
 
-        if args.also_bilibili:
-            try:
-                _run_bilibili()
-            except Exception as e:
-                print(f"[ERROR] YouTube OK but bilibili failed: {e}", flush=True)
-                sys.exit(1)
-    except BaseException:
-        if reserved_publish_date:
-            try:
-                release_publish_slot(reserved_publish_date)
-            except Exception as release_error:
-                print(f"  [WARN] Could not release reserved publish slot: {release_error}", flush=True)
-        raise
+    print("Uploading...", flush=True)
+    upload_video(
+        youtube, str(video), title, description,
+        privacy, thumbnail, tags, meta_path=meta_file_path,
+        publish_at_utc=publish_at_utc,
+    )
+    if publish_at_utc:
+        _record_publish_meta(meta_file_path, publish_local, publish_tz, publish_at_utc)
+    print("Done!", flush=True)
 
 
 if __name__ == "__main__":
