@@ -415,6 +415,7 @@ def _render_util_cams(
     dry_run: bool,
     debug: bool,
     demo_id: str | None = None,
+    demos_dir: Path | None = None,
 ) -> int:
     """Render util_cam dirs needing render via CS2UtilArchive render_spot_batch.
 
@@ -472,6 +473,7 @@ def _render_util_cams(
 
     options = BatchRenderOptions(
         data_dir=str(data_dir),
+        demos_dir=str(demos_dir),
         cam_offset=380.0,
         cam_height=96.0,
         flight_smooth=0.75,
@@ -609,7 +611,7 @@ def main() -> int:
 
     # Phase 2: RENDER
     return _render_util_cams(
-        util_cams_root, data_dir, args.chunk_size, args.dry_run, args.debug, args.demo_id,
+        util_cams_root, data_dir, args.chunk_size, args.dry_run, args.debug, args.demo_id, demos_dir,
     )
 
 

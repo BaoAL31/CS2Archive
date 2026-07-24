@@ -74,6 +74,7 @@ from overlay.overlay_utilcams import (
     PipClip,
     _find_demo_data_dir,
     _cs2util_results_dir,
+    _ensure_cs2util_data,
     _load_player_throws,
     _build_round_frame_ranges,
     _rm_empty_dir,
@@ -167,6 +168,19 @@ def _probe_video_info(video_path: Path) -> tuple[int, int, float, int]:
     fps = float(num) / float(den)
     fc = int(s.get("nb_frames", 0))
     return w, h, fps, fc
+
+
+def _is_pbdems2(demo_path: Path) -> bool:
+    """Check if a .dem file uses PBDEMS2 format (BLAST/PGL tournaments).
+
+    PBDEMS2 demos lack button/input data — keyboard overlay is impossible.
+    Reads the first 7 bytes of the file to check the header.
+    """
+    try:
+        with open(demo_path, "rb") as f:
+            return f.read(7) == b"PBDEMS2"
+    except OSError:
+        return False
 
 
 # -- CS2UtilArchive data dir lookup --------------------------------------
@@ -778,19 +792,28 @@ def run_overlay(
         round_start_tick, _ = round_tick_ranges[first_round]
         _log(f"First round {first_round} start tick: {round_start_tick}")
 
+    # -- PBDEMS2 detection (BLAST demos lack input data) -----------------------
+    is_pbdems2 = _is_pbdems2(demo_path)
+    if is_pbdems2:
+        _log("[PBDEMS2] Demo uses PBDEMS2 format — no keyboard/input data. "
+             "Skipping keyboard overlay (utility-throw flight PiP will still render).")
+
     # -- Step 1: Keyboard states -------------------------------------------------
-    t1 = time.time()
-    _log(f"Extracting keyboard states via demoparser2 (DEMOPARSER_TICK_FIELDS)...")
-    per_sig = _extract_keyboard_states(
-        demo_path, steam_id, frame_count, fps,
-        round_offsets=round_offsets or None,
-        round_tick_ranges=round_tick_ranges or None,
-        round_video_duration=round_video_duration or None,
-    )
-    if not per_sig or all(len(v) == 0 for v in per_sig.values()):
-        _log("[ERROR] No keyboard states extracted")
-        sys.exit(1)
-    _log(f"Keyboard: {len(next(iter(per_sig.values())))} frames x {len(per_sig)} signals ({time.time()-t1:.1f}s)")
+    if not is_pbdems2:
+        t1 = time.time()
+        _log(f"Extracting keyboard states via demoparser2 (DEMOPARSER_TICK_FIELDS)...")
+        per_sig = _extract_keyboard_states(
+            demo_path, steam_id, frame_count, fps,
+            round_offsets=round_offsets or None,
+            round_tick_ranges=round_tick_ranges or None,
+            round_video_duration=round_video_duration or None,
+        )
+        if not per_sig or all(len(v) == 0 for v in per_sig.values()):
+            _log("[ERROR] No keyboard states extracted")
+            sys.exit(1)
+        _log(f"Keyboard: {len(next(iter(per_sig.values())))} frames x {len(per_sig)} signals ({time.time()-t1:.1f}s)")
+    else:
+        per_sig = {s: [] for s in _OVERLAY_SIGNALS}
 
     # -- Step 2: Generate keyboard sprite PNGs -----------------------------------
     if work_dir is not None:
@@ -805,23 +828,30 @@ def run_overlay(
         # cleanup can relocate it even if an exception fires before line below.
         output_path = video_path.with_suffix(".overlay.mp4")
         t4 = time.time()
-        t2 = time.time()
-        _log(f"Generating key cap sprites...")
-        assets = generate_key_assets(work_dir / "sprites")
-        png_inputs = overlay_png_input_paths(assets)
-        _log(f"{len(png_inputs)} PNGs ({time.time()-t2:.1f}s)")
+        if not is_pbdems2:
+            t2 = time.time()
+            _log(f"Generating key cap sprites...")
+            assets = generate_key_assets(work_dir / "sprites")
+            png_inputs = overlay_png_input_paths(assets)
+            _log(f"{len(png_inputs)} PNGs ({time.time()-t2:.1f}s)")
 
-        keyboard_fc, keyboard_out_label = build_png_overlay_filter(
-            per_sig,
-            assets=assets,
-            placement="bottom-center",
-            video_width=width,
-            video_height=height,
-            pressed_release_fade_frames=0,
-            pressed_release_fade_steps=0,
-            video_label="[0:v]",
-            png_input_offset=1,
-        )
+            keyboard_fc, keyboard_out_label = build_png_overlay_filter(
+                per_sig,
+                assets=assets,
+                placement="bottom-center",
+                video_width=width,
+                video_height=height,
+                pressed_release_fade_frames=0,
+                pressed_release_fade_steps=0,
+                video_label="[0:v]",
+                png_input_offset=1,
+            )
+        else:
+            _log("[PBDEMS2] Skipping keyboard sprite generation")
+            assets = None
+            png_inputs = []
+            keyboard_fc = ""
+            keyboard_out_label = "[0:v]"
         if not keyboard_fc:
             keyboard_fc = ""
             keyboard_out_label = "[0:v]"
@@ -900,17 +930,21 @@ def run_overlay(
                     }
 
                     # Rebuild keyboard filter (smaller graph per batch).
-                    batch_kb_fc, batch_kb_label = build_png_overlay_filter(
-                        batch_per_sig,
-                        assets=assets,
-                        placement="bottom-center",
-                        video_width=width,
-                        video_height=height,
-                        pressed_release_fade_frames=0,
-                        pressed_release_fade_steps=0,
-                        video_label="[0:v]",
-                        png_input_offset=1,
-                    )
+                    if not is_pbdems2:
+                        batch_kb_fc, batch_kb_label = build_png_overlay_filter(
+                            batch_per_sig,
+                            assets=assets,
+                            placement="bottom-center",
+                            video_width=width,
+                            video_height=height,
+                            pressed_release_fade_frames=0,
+                            pressed_release_fade_steps=0,
+                            video_label="[0:v]",
+                            png_input_offset=1,
+                        )
+                    else:
+                        batch_kb_fc = ""
+                        batch_kb_label = "[0:v]"
                     if not batch_kb_fc:
                         batch_kb_fc = ""
                         batch_kb_label = "[0:v]"
@@ -1074,15 +1108,9 @@ def main() -> None:
                         help="Working directory for temp files (default: tempdir)")
     args = parser.parse_args()
 
-    # Early guard: the utility-cam overlay REQUIRES CS2UtilArchive to have
-    # extracted+analyzed this demo (throws.parquet / trajectories.parquet).
-    # Fail fast (before the expensive keyboard extraction) if it's missing,
-    # so we never silently produce an incomplete overlay.
-    if _find_demo_data_dir(Path(args.demo)) is None:
-        _log("[ERROR] CS2UtilArchive data missing for this demo "
-             f"({Path(args.demo).stem}). Cannot render utility-cam overlay. "
-             "Extract+analyze the demo in CS2UtilArchive first.")
-        sys.exit(1)
+    # Ensure CS2UtilArchive has extracted+analyzed this demo (throws.parquet).
+    # Auto-extract if missing so the overlay step works without manual setup.
+    _ensure_cs2util_data(Path(args.demo))
 
     run_overlay(Path(args.video), Path(args.demo), args.steam_id, args.round, args.batches,
                 util_cams_root=args.util_cams_root, work_dir=args.work_dir)

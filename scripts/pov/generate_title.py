@@ -123,6 +123,11 @@ def main() -> None:
         default="raw",
         help="Variant: 'raw' (default) or 'overlay' (suffix title/desc/tags)",
     )
+    parser.add_argument(
+        "--pbdems2",
+        action="store_true",
+        help="PBDEMS2 demo format (no keyboard input data available)",
+    )
     args = parser.parse_args()
 
     path = Path(args.ratings_json)
@@ -227,7 +232,36 @@ def main() -> None:
     ]))
 
     if args.variant == "overlay":
-        suffix = " | W/ Inputs + Util Overlay"
+        if args.pbdems2:
+            suffix = " | W/ Utility Cam Overlay"
+            extra_overlay_tags = [
+                "utility cam",
+                "CS2 overlay",
+                "CS2 utility cam",
+                "smoke lineup",
+            ]
+            description = (
+                f"{description}\n\n"
+                "This version includes utility trajectory clips for smokes, "
+                "flashes, molotovs, and other grenades."
+            )
+        else:
+            suffix = " | W/ Inputs + Util Overlay"
+            extra_overlay_tags = [
+                "input overlay",
+                "utility cam",
+                "CS2 overlay",
+                "keyboard overlay",
+                "mouse input",
+                "CS2 utility cam",
+                "smoke lineup",
+            ]
+            description = (
+                f"{description}\n\n"
+                "This version includes a real-time keyboard & mouse input overlay "
+                "plus utility trajectory clips for smokes, "
+                "flashes, molotovs, and other grenades."
+            )
         # Drop removable sections by priority (rating -> stage) until the
         # full title+suffix fits YouTube's 100-char limit.
         removable = sorted([s for s in sections if s[1] is not None],
@@ -239,21 +273,6 @@ def main() -> None:
         title = title + suffix
         if len(title) > 100:
             title = title[:97].rstrip() + "..."
-        description = (
-            f"{description}\n\n"
-            "This version includes a real-time keyboard & mouse input overlay "
-            "plus utility trajectory clips for smokes, "
-            "flashes, molotovs, and other grenades."
-        )
-        extra_overlay_tags = [
-            "input overlay",
-            "utility cam",
-            "CS2 overlay",
-            "keyboard overlay",
-            "mouse input",
-            "CS2 utility cam",
-            "smoke lineup",
-        ]
         tags = tags + extra_overlay_tags
 
     print(json.dumps({"title": title, "description": description, "tags": tags}))

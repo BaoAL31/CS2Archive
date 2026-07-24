@@ -29,6 +29,7 @@ DEFAULT_SETTINGS = {
     "viewmodel_offset_y": None,
     "viewmodel_offset_z": None,
     "viewmodel_presetpos": None,
+    "hud_scaling": None,
 }
 
 _RES_RE = re.compile(r"^(\d+)\s*[x×]\s*(\d+)$", re.I)
@@ -132,7 +133,7 @@ def scrape_player_viewmodel(
 
 
 def viewmodel_convars(settings: dict) -> list[str]:
-    """CS2 convars for viewmodel fields present in *settings*."""
+    """CS2 convars for viewmodel and HUD fields present in *settings*."""
     lines: list[str] = []
     mapping = (
         ("viewmodel_fov", "viewmodel_fov"),
@@ -140,6 +141,7 @@ def viewmodel_convars(settings: dict) -> list[str]:
         ("viewmodel_offset_y", "viewmodel_offset_y"),
         ("viewmodel_offset_z", "viewmodel_offset_z"),
         ("viewmodel_presetpos", "viewmodel_presetpos"),
+        ("hud_scaling", "hud_scaling"),
     )
     for key, cvar in mapping:
         val = settings.get(key)
@@ -345,6 +347,7 @@ def resolve_video_settings(
         "viewmodel_offset_y": hit.get("viewmodel_offset_y"),
         "viewmodel_offset_z": hit.get("viewmodel_offset_z"),
         "viewmodel_presetpos": hit.get("viewmodel_presetpos"),
+        "hud_scaling": hit.get("hud_scaling"),
         "source": "prosettings",
     }
 
@@ -362,7 +365,7 @@ def backlog_video_fields(nickname: str) -> dict:
     }
     for k in (
         "viewmodel_fov", "viewmodel_offset_x", "viewmodel_offset_y",
-        "viewmodel_offset_z", "viewmodel_presetpos",
+        "viewmodel_offset_z", "viewmodel_presetpos", "hud_scaling",
     ):
         if s.get(k) is not None:
             fields[k] = s[k]
@@ -398,7 +401,7 @@ def sync_player_accounts(*, force_scrape: bool = True) -> dict:
         rec["video_settings_source"] = s.get("source", "default")
         for k in (
             "viewmodel_fov", "viewmodel_offset_x", "viewmodel_offset_y",
-            "viewmodel_offset_z", "viewmodel_presetpos",
+            "viewmodel_offset_z", "viewmodel_presetpos", "hud_scaling",
         ):
             if s.get(k) is not None:
                 rec[k] = s[k]

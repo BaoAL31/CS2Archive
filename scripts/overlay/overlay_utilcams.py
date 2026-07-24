@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 from overlay._common import (
     _CS2UTIL_ROOT,
+    _CS2UTIL_SCRIPTS,
     TICKRATE,
     _log,
     _probe_clip_duration_seconds,
@@ -118,6 +119,40 @@ def _load_player_throws(
         missing = "CT" if ct_count == 0 else "T"
         _log(f"  [throws] NOTE: zero throws on {missing} side — data observation, not pipeline bug")
     return [dict(row) for _, row in player_df.iterrows()]
+
+
+def _ensure_cs2util_data(demo_path: Path) -> None:
+    """Auto-extract CS2UtilArchive data if missing for this demo."""
+    if _find_demo_data_dir(demo_path) is not None:
+        return
+    _log(f"  [extract] CS2UtilArchive data missing for {demo_path.stem} — auto-extracting...")
+
+    # Determine demo_id same way CS2UtilArchive does
+    from scripts.demo_ids import default_demo_id_from_path
+    demo_id = default_demo_id_from_path(demo_path)
+
+    # Ensure .dem is in CS2UtilArchive's demos/extracted/ directory
+    match_dir = demo_path.parent.name
+    extracted_demo_dir = _CS2UTIL_ROOT / "demos" / "extracted" / match_dir
+    extracted_demo_path = extracted_demo_dir / demo_path.name
+    if not extracted_demo_path.is_file():
+        extracted_demo_dir.mkdir(parents=True, exist_ok=True)
+        import shutil
+        shutil.copy2(demo_path, extracted_demo_path)
+        _log(f"  [extract] Copied {demo_path.name} -> {extracted_demo_path}")
+
+    # Add CS2UtilArchive scripts to sys.path for imports
+    cs2_scripts = str(_CS2UTIL_SCRIPTS)
+    if cs2_scripts not in sys.path:
+        sys.path.insert(0, cs2_scripts)
+
+    from scripts.extract_utils import process_demo
+    summary = process_demo(
+        str(extracted_demo_path),
+        output_dir=str(_CS2UTIL_ROOT / "results" / "auto_extracted" / "data"),
+        demo_id=demo_id,
+    )
+    _log(f"  [extract] Done: {summary['n_throws']} throws, {summary['n_trajectories']} trajectory points")
 
 
 def _build_round_frame_ranges(
@@ -234,8 +269,20 @@ def _run_batch_util_cams_subprocess(
         result = subprocess.run(
             cmd, cwd=str(util_cams_root.parent.parent.parent),
             check=False,
+            timeout=3600,
+            capture_output=True,
+            text=True,
         )
+        if result.stdout:
+            _log(f"  [flight] stdout: {result.stdout[-2000:]}")
+        if result.stderr:
+            _log(f"  [flight] stderr: {result.stderr[-2000:]}")
         return result.returncode
+    except subprocess.TimeoutExpired:
+        _log(f"  [flight] TIMEOUT: render_util_cams.py exceeded 3600s — "
+             f"CS2 likely failed to launch (secondary drive?). "
+             f"Open CS2 manually and re-run.")
+        return 124
     except Exception as exc:
         _log(f"  [flight] render_util_cams.py subprocess failed: {exc}")
         return 1
@@ -366,9 +413,12 @@ def _render_throw_flight_clips(
 
     throws = _load_player_throws(demo_path, steam_id, first_round_tick, last_round_tick)
     if throws is None:
-        _log("[ERROR] CS2UtilArchive data missing for this demo — cannot render "
-             "utility-cam overlay. Extract+analyze the demo in CS2UtilArchive first.")
-        sys.exit(1)
+        _log("[extract] CS2UtilArchive data missing — auto-extracting...")
+        _ensure_cs2util_data(demo_path)
+        throws = _load_player_throws(demo_path, steam_id, first_round_tick, last_round_tick)
+        if throws is None:
+            _log("[ERROR] CS2UtilArchive data still missing after auto-extract")
+            sys.exit(1)
     if not throws:
         return []
 

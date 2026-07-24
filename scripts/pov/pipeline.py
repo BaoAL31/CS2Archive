@@ -925,6 +925,14 @@ class Pipeline:
         replaces video.mp4 in that dir. In raw-only mode the original
         (orphaned) behavior is preserved: overlay_pov.py writes a sidecar
         video.overlay.mp4 next to video.mp4 which is otherwise unused."""
+        # Skip if the overlay variant already has a valid video (resume from
+        # a previous successful run where .overlay_work was cleaned).
+        if self.dual_upload and self.overlay_youtube_dir is not None:
+            dst = self.overlay_youtube_dir / "video.mp4"
+            if dst.is_file() and dst.stat().st_size > 100_000:
+                print(f"  [skip] Overlay video already exists in "
+                      f"{self.overlay_youtube_dir.name}/video.mp4")
+                return
         if self.dual_upload and self.overlay_youtube_dir is not None:
             # Work under renders/ so intermediate files (batches, sidecar)
             # don't clutter youtube/. Only copy final result to youtube/.
@@ -1246,6 +1254,11 @@ class Pipeline:
 
     # ── Upload meta writer (runs inside thumbnail step) ────────────────
 
+    def _is_pbdems2(self) -> bool:
+        """Check if demo is PBDEMS2 format (Blast tournament demos)."""
+        from overlay.overlay_pov import _is_pbdems2 as _check_pbdems2
+        return _check_pbdems2(self.demo_path)
+
     def _write_upload_meta(
         self,
         youtube_dir: Path,
@@ -1265,6 +1278,8 @@ class Pipeline:
             "--map", self.map_name,
             "--variant", variant,
         ]
+        if variant == "overlay" and self._is_pbdems2():
+            titlize_args += ["--pbdems2"]
         if self.is_faceit:
             titlize_args = [
                 "scripts/faceit/faceit_title.py", str(self.demo_path),
