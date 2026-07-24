@@ -353,8 +353,9 @@ def main() -> None:
     parser.add_argument("--framerate", type=int, default=60)
     parser.add_argument("--width", type=int, default=2560)
     parser.add_argument("--height", type=int, default=1440)
-    parser.add_argument("--batches", type=int, default=10,
-                        help="Rounds per batch (default: 10). Each batch produces one MP4.")
+    parser.add_argument("--batches", type=int, default=2,
+                        help="Number of render batches (default: 2). Rounds are divided equally across batches. "
+                             "E.g. --batches 3 with 30 rounds produces 3 batches of 10 rounds each.")
     parser.add_argument("--rounds", type=str, default="",
                     help="Comma-separated list of specific rounds to render, e.g. '1,3,5' or '2-4,7'. If omitted, all rounds are rendered.")
 
@@ -424,7 +425,7 @@ def main() -> None:
         print("  [WARN] No crosshair/viewmodel — keeping current autoexec.cfg")
 
     print(f"Output:  {output_dir}")
-    print(f"Batch size: {args.batches} round(s) per batch")
+    print(f"  {args.batches} batch(es) across {len(desired_local)} round(s)")
 
     if args.batches < 1:
         print("[ERROR] --batches must be >= 1")
@@ -439,7 +440,6 @@ def main() -> None:
 
         global_round = 0
         total_rendered = 0
-        expected_batches: list[str] = []
 
         # Parse optional round selection
         if args.rounds:
@@ -485,9 +485,21 @@ def main() -> None:
                 global_round += n_rounds
                 continue
 
-            batch_size = args.batches
-            for i in range(0, len(desired_local), batch_size):
-                batch = desired_local[i:i + batch_size]
+            num_batches = args.batches
+            n_desired = len(desired_local)
+            if num_batches > n_desired:
+                num_batches = n_desired
+
+            # Divide rounds into num_batches roughly equal chunks.
+            base, remainder = divmod(n_desired, num_batches)
+            chunks: list[list[int]] = []
+            offset = 0
+            for b in range(num_batches):
+                size = base + (1 if b < remainder else 0)
+                chunks.append(desired_local[offset:offset + size])
+                offset += size
+
+            for batch in chunks:
                 local_start = batch[0]
                 local_end = batch[-1]
                 global_start = global_round + local_start
@@ -555,17 +567,13 @@ def main() -> None:
             print("[ERROR] No rounds rendered")
             sys.exit(1)
 
-        missing = [n for n in expected_batches if not (output_dir / n).exists()]
-        if missing:
-            print(f"[ERROR] Missing expected batch files: {missing}")
-            sys.exit(1)
-
-        print(f"\nDone. {total_rendered} round(s) in {len(expected_batches)} batch(es) at {output_dir}")
+        print(f"\nDone. {total_rendered} round(s) in {num_batches} batch(es) at {output_dir}")
 
         if args.overlay:
             # Run overlay on the rendered output
-            vid = output_dir / expected_batches[0]
-            if not vid.exists():
+            vid = next((p for p in sorted(output_dir.glob("*.mp4"))
+                        if p.stat().st_size >= 1_048_576), None)
+            if vid is None or not vid.exists():
                 print(f"[WARN] --overlay set but no video found: {vid}")
             else:
                 round_arg = []

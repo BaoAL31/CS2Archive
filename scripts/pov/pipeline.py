@@ -1369,12 +1369,9 @@ def main() -> None:
     parser.add_argument(
         "--batches",
         type=int,
-        default=20,
-        help="Rounds per render batch passed to render_pov.py (default: 20). "
-             "Set to 1 to force one CSDM call per round, which makes CSDM emit "
-             "per-round sequence-*-tick-*.mp4 files (real per-round tick spans) "
-             "so concat_rounds.py can write authoritative per_round_ticks for a "
-             "synced overlay. Higher values batch rounds into one call.",
+        default=2,
+        help="Number of render batches (default: 2). Rounds are divided equally across batches "
+             "and rendered in N separate CSDM calls. Set 1 for a single call.",
     )
     parser.add_argument(
         "--overlay-batches",
