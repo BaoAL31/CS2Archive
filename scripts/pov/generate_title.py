@@ -66,8 +66,8 @@ def shorten_tournament(name: str) -> str:
     """Shorten verbose tournament names for titles."""
     name = name.strip()
     # Explicit abbreviations for verbose tournament names. Keep these tight
-    # so the title stays under YouTube's 100-char limit (and leaves room
-    # for the rating section, which is trimmed first when over budget).
+    # so the title stays under YouTube's 100-char limit (stage is trimmed
+    # first, then map when over budget).
     # Keyed case-insensitively because shorten_tournament receives the raw
     # tournament string (e.g. "XSE Pro League Guangzhou 2026").
     ABBREV = {
@@ -97,9 +97,9 @@ def normalize_stage(stage: str) -> str:
     if "grand final" in stage_lower:
         return "Grand Final"
     if "semi" in stage_lower:
-        return "Semi-final"
+        return "Semi-Final"
     if "quarter" in stage_lower:
-        return "Quarter-final"
+        return "Quarter-Final"
     if "final" in stage_lower:
         return "Final"
     if "playoff" in stage_lower:
@@ -164,16 +164,18 @@ def main() -> None:
     stage = normalize_stage(stage_raw)
 
     # Title sections with removable priority (None = never drop).
-    # Trim priority when over YouTube's 100-char limit: 1=rating, 2=stage.
-    # Player / teams / map / tournament are always kept.
-    sections = [(args.player, None)]
+    # Trim priority when over YouTube's 100-char limit: 1=stage, 2=map.
+    # Player / teams / tournament are always kept.
+    player_parts = [args.player]
+    if kd:
+        player_parts.append(f"({kd})")
     if rating != "?.??":
-        rating_text = f"{rating}" if args.variant == "overlay" else f"{rating} Rating"
-        sections.append((rating_text, 1))
+        player_parts.append(f"{rating} Rating POV")
+    sections = [(" ".join(player_parts), None)]
     sections.append((f"{team_a_short} vs {team_b_short}", None))
-    sections.append((args.map, None))
     if stage:
-        sections.append((stage, 2))
+        sections.append((stage, 1))
+    sections.append((args.map, 2))
     if tournament_short:
         sections.append((tournament_short, None))
 
@@ -262,7 +264,7 @@ def main() -> None:
                 "plus utility trajectory clips for smokes, "
                 "flashes, molotovs, and other grenades."
             )
-        # Drop removable sections by priority (rating -> stage) until the
+        # Drop removable sections by priority (stage -> map) until the
         # full title+suffix fits YouTube's 100-char limit.
         removable = sorted([s for s in sections if s[1] is not None],
                            key=lambda s: s[1])
