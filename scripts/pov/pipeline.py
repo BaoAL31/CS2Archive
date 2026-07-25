@@ -5,13 +5,13 @@ Structured errors for agent parsing.
 Auto-downloads missing demos from HuggingFace if hf_root is set.
 
 Usage:
-    python scripts/pov/pipeline.py --backlog backlog/<match_slug>/<priority>/<slug>.json [--step N] [--dual-upload]
+    python scripts/pov/pipeline.py --backlog backlog/<match_slug>/<priority>/<slug>.json [--step N] [--raw-only]
 
 Steps (use --step N to start at a specific step):
   1 = analyze    csdm analyze the demo
   2 = render     Render all rounds as POV clips
   3 = concat     Concatenate rounds, copy to youtube/
-  4 = overlay    Apply input overlay + util cam (skipped unless --dual-upload)
+  4 = overlay    Apply input overlay + util cam (skipped unless --raw-only)
   5 = outro      Generate 5s silent outro, concat onto video.mp4
   6 = thumbnail  Generate 1280x720 thumbnail + write upload_meta.json
   7 = cleanup    Remove renders folder + pipeline state
@@ -22,9 +22,11 @@ thumbnail_path/youtube_id=None/upload_status="pending"). A separate script,
 scripts/upload/upload_pending.py, scans every upload_meta.json under youtube/ and
 uploads any that are still pending.
 
-Dual-upload (--dual-upload): produces a second, independent variant with
+Dual-upload (default): produces a second, independent variant with
 keyboard/utility overlay. Raw variant -> youtube/{run_id}/
 Overlay variant -> youtube/{run_id}_overlay/   (separate title, thumbnail, meta)
+
+Raw-only (--raw-only): produce only the raw variant, skip overlay entirely.
 """
 
 from __future__ import annotations
@@ -922,23 +924,25 @@ class Pipeline:
     def step_overlay(self) -> None:
         """Apply keyboard + util flight overlay. In dual-upload mode the
         overlay is written into the dedicated overlay variant directory and
-        replaces video.mp4 in that dir. In raw-only mode the original
-        (orphaned) behavior is preserved: overlay_pov.py writes a sidecar
-        video.overlay.mp4 next to video.mp4 which is otherwise unused."""
+        replaces video.mp4 in that dir. In raw-only mode the step is skipped
+        entirely — no overlay work directory or util_cams are created."""
+        # Skip in raw-only mode
+        if not self.dual_upload:
+            print("  [skip] Raw-only mode: overlay step disabled")
+            return
+
         # Skip if the overlay variant already has a valid video (resume from
         # a previous successful run where .overlay_work was cleaned).
-        if self.dual_upload and self.overlay_youtube_dir is not None:
+        if self.overlay_youtube_dir is not None:
             dst = self.overlay_youtube_dir / "video.mp4"
             if dst.is_file() and dst.stat().st_size > 100_000:
                 print(f"  [skip] Overlay video already exists in "
                       f"{self.overlay_youtube_dir.name}/video.mp4")
                 return
-        if self.dual_upload and self.overlay_youtube_dir is not None:
-            # Work under renders/ so intermediate files (batches, sidecar)
-            # don't clutter youtube/. Only copy final result to youtube/.
-            target_dir = self.render_dir / ".overlay_work"
-        else:
-            target_dir = self.youtube_dir
+
+        # Work under renders/ so intermediate files (batches, sidecar)
+        # don't clutter youtube/. Only copy final result to youtube/.
+        target_dir = self.render_dir / ".overlay_work"
 
         video_path = target_dir / "video.mp4"
         if not video_path.exists():
@@ -956,38 +960,29 @@ class Pipeline:
                 self._copy_overlay_result_to_youtube(overlay=video_path)
                 return
             else:
-                if self.dual_upload:
-                    # Copy raw combined.mp4 to renders/.overlay_work/ as working file.
-                    src = self.render_dir / "combined.mp4"
-                    if not src.exists() or src.stat().st_size < 100_000:
-                        fail(4, "OVERLAY_NO_INPUT",
-                             f"combined.mp4 missing/empty in render_dir")
-                    target_dir.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(str(src), str(video_path))
-                    # Copy sidecar (round_offsets.json) alongside video.mp4
-                    # overlay_pov.py looks for <video>.round_offsets.json next to video
-                    sidecar_src = self.render_dir / "combined.round_offsets.json"
-                    if sidecar_src.is_file():
-                        sidecar_dst = target_dir / "video.round_offsets.json"
-                        shutil.copy2(str(sidecar_src), str(sidecar_dst))
-                        print(f"  [setup] copied sidecar to {sidecar_dst.name}")
-                    print(f"  [setup] copied combined.mp4 to renders/.overlay_work/ "
-                          f"for overlay_pov.py")
-                else:
-                    print(f"  [skip] video.mp4 not found in {target_dir.name} "
-                          f"and no pre-rendered combined.overlay.mp4 in renders/")
-                    return
+                # Copy raw combined.mp4 to renders/.overlay_work/ as working file.
+                src = self.render_dir / "combined.mp4"
+                if not src.exists() or src.stat().st_size < 100_000:
+                    fail(4, "OVERLAY_NO_INPUT",
+                         f"combined.mp4 missing/empty in render_dir")
+                target_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(src), str(video_path))
+                # Copy sidecar (round_offsets.json) alongside video.mp4
+                # overlay_pov.py looks for <video>.round_offsets.json next to video
+                sidecar_src = self.render_dir / "combined.round_offsets.json"
+                if sidecar_src.is_file():
+                    sidecar_dst = target_dir / "video.round_offsets.json"
+                    shutil.copy2(str(sidecar_src), str(sidecar_dst))
+                    print(f"  [setup] copied sidecar to {sidecar_dst.name}")
+                print(f"  [setup] copied combined.mp4 to renders/.overlay_work/ "
+                      f"for overlay_pov.py")
         if not self.demo_path or not self.demo_path.exists():
-            if self.dual_upload:
-                fail(4, "OVERLAY_NO_DEMO",
-                     f"demo required for overlay but not found: {self.demo_path}")
-            print("  [skip] demo not found")
+            fail(4, "OVERLAY_NO_DEMO",
+                 f"demo required for overlay but not found: {self.demo_path}")
             return
         steam_id = self.state["data"].get("steam_id", self.meta.get("steam_id", ""))
         if not steam_id:
-            if self.dual_upload:
-                fail(4, "OVERLAY_NO_STEAM_ID", "no steam_id for overlay")
-            print("  [skip] no steam_id")
+            fail(4, "OVERLAY_NO_STEAM_ID", "no steam_id for overlay")
             return
 
         work_dir = self.render_dir / ".overlay_work"
@@ -1010,21 +1005,14 @@ class Pipeline:
 
         overlay_sidecar = video_path.with_suffix(".overlay.mp4")
         if not overlay_sidecar.exists():
-            if self.dual_upload:
-                fail(4, "OVERLAY_NO_OUTPUT",
-                     f"overlay_pov.py succeeded but {overlay_sidecar} not found")
-            print("  [skip] overlay produced no output")
+            fail(4, "OVERLAY_NO_OUTPUT",
+                 f"overlay_pov.py succeeded but {overlay_sidecar} not found")
             return
 
-        if self.dual_upload:
-            # Copy overlay result from renders/ work dir -> youtube/ variant dir
-            self._copy_overlay_result_to_youtube(overlay=overlay_sidecar)
-            # Clean up renders/.overlay_work/
-            shutil.rmtree(target_dir, ignore_errors=True)
-        else:
-            # Legacy: sidecar lives next to raw video.mp4
-            mb = overlay_sidecar.stat().st_size / 1024 / 1024
-            print(f"  [OK] Overlay applied to video.mp4 (sidecar: {overlay_sidecar.name}, {mb:.0f} MB)")
+        # Copy overlay result from renders/ work dir -> youtube/ variant dir
+        self._copy_overlay_result_to_youtube(overlay=overlay_sidecar)
+        # Clean up renders/.overlay_work/
+        shutil.rmtree(target_dir, ignore_errors=True)
 
     def _append_outro(self, youtube_dir: Path, step_num: int = 5) -> None:
         """Generate a 5s silent outro and append it to video.mp4 inside
@@ -1352,10 +1340,10 @@ def main() -> None:
     parser.add_argument("--until", type=int, default=None, choices=range(1, 8),
                         help="Stop after step N (default: 6 = thumbnail, before cleanup)")
     parser.add_argument(
-        "--no-dual-upload",
+        "--raw-only",
         action="store_false",
         dest="dual_upload",
-        help="Disable the second overlay variant (default: dual-upload ON).",
+        help="Produce only the raw variant (no overlay, no second upload).",
     )
     parser.set_defaults(dual_upload=True)
     parser.add_argument(

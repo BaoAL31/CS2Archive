@@ -49,7 +49,7 @@ Reads all POV metadata from the backlog file. Runs steps 1-6 in order (analyze �
 | 6 | thumbnail | `python -m thumbnail <url> --player <nick> --map <map> --demo <dem> --steam-id <id>` |
 | 7 | cleanup | `python scripts/pov/cleanup_renders.py <renders_folder>` |
 
-**Uploading is a separate step.** The pipeline stops at step 6 (thumbnail) and writes `upload_meta.json` (with `youtube_id=null`, `upload_status="pending"`) for every variant. Run `python scripts/upload/upload_pending.py` afterward to upload all pending metas (it scans `youtube/*/upload_meta.json` and uploads any not yet completed). Step 4 (overlay) runs by default because dual-upload is on. To skip overlay entirely, run with `--until 3`. Raw-only mode (`--no-dual-upload`) still executes step 4 but discards the overlay output.
+**Uploading is a separate step.** The pipeline stops at step 6 (thumbnail) and writes `upload_meta.json` (with `youtube_id=null`, `upload_status="pending"`) for every variant. Run `python scripts/upload/upload_pending.py` afterward to upload all pending metas (it scans `youtube/*/upload_meta.json` and uploads any not yet completed). Step 4 (overlay) runs by default because dual-upload is on. To skip overlay entirely, run with `--until 3`. Raw-only mode (`--raw-only`) skips step 4 entirely — no overlay work directory or util_cams are created.
 
 **Overlay step (step 4) does two things:**
 1. Extracts keyboard states via demoparser2 (full round, not sparse parquet)
@@ -90,7 +90,7 @@ python scripts/upload/upload_pending.py
 - **`--resume-from-round N`** — deprecated. Render now uses filesystem-based resume: existing `batch-*.mp4` files ≥1MB are automatically skipped on re-run. To re-render a specific batch, manually delete its file.
 - **`--batches N`** — number of render batches (default: 2). Rounds are divided equally across N batches; the last batch gets fewer rounds if they don't divide evenly. Each batch produces one MP4 named `batch-{start:03d}-{end:03d}.mp4`. `--batches 1` renders all rounds in a single CSDM call.
 - **`--until N`** — stop after step N (e.g. `--until 5` runs through outro, skips thumbnail/cleanup). Default: run through step 6 (thumbnail; upload handled separately by `upload_pending.py`).
-- **`--dual-upload`** — now the **default**: dual-upload is ON unless you pass `--no-dual-upload`. Produces a second independent variant with the keyboard + util-cam overlay. Raw-only mode is the opt-in.
+- **`--dual-upload`** — now the **default**: dual-upload is ON unless you pass `--raw-only`. Produces a second independent variant with the keyboard + util-cam overlay. Raw-only mode is the opt-in.
 - **`--overlay-only`** — render/upload only the overlay variant. Implies `--dual-upload`'s overlay branch but skips raw video copy / raw outro / raw thumbnail. No `youtube/{run_id}/` dir created. Use when you only want the keyboard+util-cam version on the channel. State stored under `overlay_only=True` for resume.
 
 ### Dual-Upload (`--dual-upload`)
@@ -106,7 +106,7 @@ Both variants get independent `upload_meta.json`; `upload_pending.py` records ea
 
 **Data flow:**
 1. Step 3 (concat): `combined.mp4` copied to both `youtube/{run_id}/` and `youtube/{run_id}_overlay/`
-2. Step 4 (overlay): runs `overlay_pov.py` on the overlay dir's `video.mp4`; output replaces `video.mp4` in the overlay dir. Skipped in raw-only mode (`--no-dual-upload`) so cost is zero.
+2. Step 4 (overlay): runs `overlay_pov.py` on the overlay dir's `video.mp4`; output replaces `video.mp4` in the overlay dir. Skipped in raw-only mode (`--raw-only`) so cost is zero.
 3. Step 5 (outro): appended to both `video.mp4` files
 4. Step 6 (thumbnail): two thumbnails generated, each with its own `upload_meta.json`
 5. Upload: handled by a separate `upload_pending.py` pass — both variants uploaded, each from its own `upload_meta.json`, skipped if already completed.
@@ -114,9 +114,9 @@ Both variants get independent `upload_meta.json`; `upload_pending.py` records ea
 
 **Resume:** Upload is resume-safe: `upload_pending.py` skips any `upload_meta.json` whose `upload_status == "completed"` (youtube_id set), so re-running only uploads what's left. Re-running the pipeline with the same `--dual-upload` flag re-runs only the missing render/overlay/thumbnail work.
 
-**Cost:** raw-only mode (`--no-dual-upload`) skips the ~30–60 min overlay render (20+ throws) and the extra upload. Default dual-upload adds both.
+**Cost:** raw-only mode (`--raw-only`) skips the ~30–60 min overlay render (20+ throws) and the extra upload. Default dual-upload adds both.
 
-**Raw-only mode (`--no-dual-upload`):** step 4 still runs `overlay_pov.py` but its output is left as an orphan sidecar next to `video.mp4`; no `youtube/{run_id}_overlay/` directory is created. The only added state key vs raw-only is `dual_upload=False`. Existing `youtube/{run_id}/` and `.pipeline/{run_id}.json` files are otherwise unaffected.
+**Raw-only mode (`--raw-only`):** step 4 is skipped entirely — no overlay work directory or util_cams are created. The only state key is `dual_upload=False`. Existing `youtube/{run_id}/` and `.pipeline/{run_id}.json` files are otherwise unaffected.
 
 **`--overlay-only`** is a strict subset of `--dual-upload` for the overlay branch. Resuming a failed overlay-only run with the same flag re-runs only the missing overlay work; no raw artifacts are ever produced.
 
