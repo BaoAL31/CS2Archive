@@ -45,6 +45,7 @@ from _pathsetup import ensure
 ensure()
 
 from upload_bilibili import is_bilibili_pending  # noqa: E402
+from youtube_schedule import DEFAULT_PUBLISH_TZ, resolve_auto_publish_schedule  # noqa: E402
 
 PY = sys.executable
 UPLOAD_YOUTUBE = SCRIPTS_DIR / "upload" / "upload_youtube.py"
@@ -181,7 +182,26 @@ def main() -> None:
         "--also-bilibili", action="store_true",
         help="Also upload to bilibili.tv (same title/schedule/tags; needs "
              ".bilibili_storage.json). Resume-safe via bilibili_aid in meta.")
+    parser.add_argument(
+        "--check-schedule", action="store_true",
+        help="Show next available YouTube publish slot and exit")
     args = parser.parse_args()
+
+    if args.check_schedule:
+        from upload_youtube import get_authenticated_service, get_youtube_publish_dates
+        print("Querying YouTube schedule...")
+        youtube = get_authenticated_service()
+        occupied = get_youtube_publish_dates(youtube) or set()
+        privacy, utc, tz, local = resolve_auto_publish_schedule(
+            timezone=DEFAULT_PUBLISH_TZ, occupied_dates=occupied,
+        )
+        print(f"Next free slot:")
+        print(f"  Local:  {local} {tz}")
+        print(f"  UTC:    {utc}")
+        print(f"  Status: {privacy}")
+        if occupied:
+            print(f"  Occupied dates: {len(occupied)}")
+        return
 
     youtube_dir = Path(args.dir)
     if not youtube_dir.exists():

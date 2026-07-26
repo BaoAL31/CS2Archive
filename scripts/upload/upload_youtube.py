@@ -13,9 +13,11 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
+import os
 import random
 import ssl
 import sys
+import time
 from pathlib import Path
 
 import google.auth
@@ -151,7 +153,7 @@ def get_youtube_publish_dates(youtube) -> set[str]:
             if not pub:
                 continue
             dt = datetime.fromisoformat(pub.replace("Z", "+00:00"))
-            occupied.add(dt.date().isoformat())
+            occupied.add(dt.strftime("%Y-%m-%dT%H:%M"))
     return occupied
 
 

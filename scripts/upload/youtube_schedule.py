@@ -147,7 +147,9 @@ def resolve_auto_publish_schedule(
 ) -> tuple[str, str, str, str]:
     """Resolve next future daily publish slot at ``publish_times`` in ``timezone``.
 
-    Returns (privacy, publish_at_utc, timezone_used, publish_at_local).
+    Checks slot-by-slot (not whole-day) so a busy 10:00 doesn't block
+    the same day's 16:30. Returns (privacy, publish_at_utc, timezone_used,
+    publish_at_local).
     Scheduled uploads force privacy to private (YouTube requirement).
     """
     tz = timezone or _detect_local_tz()
@@ -160,23 +162,22 @@ def resolve_auto_publish_schedule(
     else:
         now = now.astimezone(tzinfo)
 
+    # occupied_slots has full "YYYY-MM-DDTHH:MM" strings from
+    # get_youtube_publish_dates. Check slot-by-slot so a busy 10:00
+    # doesn't block same day's 16:30.
+    occupied_slots = {(d.split("T")[0], d.split("T")[1][:5]) for d in (occupied_dates or []) if "T" in d}
+
     candidate_date = start_date or now.date()
-
-    for hour, minute in times:
-        slot_time = datetime.combine(candidate_date, time(hour, minute, tzinfo=tzinfo))
-        if now < slot_time:
-            break
-    else:
+    while True:
+        for hour, minute in times:
+            slot_time = datetime.combine(candidate_date, time(hour, minute, tzinfo=tzinfo))
+            if now < slot_time:
+                date_str = candidate_date.isoformat()
+                time_str = f"{hour:02d}:{minute:02d}"
+                if (date_str, time_str) not in occupied_slots:
+                    local = f"{date_str} {time_str}"
+                    return "private", parse_publish_at(local, tz), tz, local
         candidate_date += timedelta(days=1)
-        hour, minute = times[0]
-
-    first_free = next_available_publish_date(
-        candidate_date,
-        occupied_dates or [],
-        tz,
-    )
-    local = f"{first_free.isoformat()} {hour:02d}:{minute:02d}"
-    return "private", parse_publish_at(local, tz), tz, local
 
 
 def resolve_publish_schedule(
