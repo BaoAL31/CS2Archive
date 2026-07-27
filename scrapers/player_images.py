@@ -75,17 +75,7 @@ _PICK_ROSTER_JS = """
 }
 """
 
-_PICK_ROSTER_INDEX_JS = """
-() => {
-    const imgs = document.querySelectorAll('div.players img.player-photo');
-    return Array.from(imgs).map((img, index) => {
-        const alt = img.alt || '';
-        const m = alt.match(/'([^']+)'/);
-        const nick = m ? m[1].toLowerCase() : alt.split(' ').pop().toLowerCase();
-        return { nickname: nick, index };
-    });
-}
-"""
+
 
 
 def _player_id_from_url(url: str | None) -> str | None:
@@ -288,36 +278,7 @@ class CloakAvatarFetcher:
         finally:
             page.close()
 
-    def fetch_match_page_headshot(self, match_url: str, player_key: str) -> bytes | None:
-        """Last resort: screenshot match-page lineup photo for one player."""
-        page = self._new_page()
-        try:
-            page.goto(match_url, timeout=120_000)
-            page.wait_for_timeout(3000)
-
-            entries = page.evaluate(_PICK_ROSTER_INDEX_JS)
-            match = next((e for e in entries if e["nickname"] == player_key), None)
-            if not match:
-                console.print(f"[yellow]   [{player_key}] not found on match page for fallback[/yellow]")
-                return None
-
-            locator = page.locator("div.players img.player-photo").nth(match["index"])
-            shot = locator.screenshot(type="png")
-            if not shot or len(shot) < 1000:
-                return None
-
-            im = Image.open(BytesIO(shot))
-            if _is_acceptable(im):
-                return shot
-            console.print(
-                f"[yellow]   [{player_key}] match-page photo too small ({im.size[0]}x{im.size[1]})[/yellow]"
-            )
-            return None
-        except Exception as e:
-            console.print(f"[yellow]   [{player_key}] match page fallback failed: {type(e).__name__}[/yellow]")
-            return None
-        finally:
-            page.close()
+    
 
 
 def _has_hltv_identity(resolution: dict | None) -> bool:
@@ -375,10 +336,12 @@ def _fetch_avatar_cloak(
 
     ratings = load_ratings_json(ratings_path)
     resolution = resolve_hltv_player(key_norm, accounts, ratings)
+    search_resolution = None
+    match_url = (match_url or "").strip()
 
     own_fetcher = False
     if fetcher is None:
-        fetcher = CloakAvatarFetcher(headless=False)
+        fetcher = CloakAvatarFetcher(headless=True)
         own_fetcher = True
 
     try:
@@ -397,26 +360,57 @@ def _fetch_avatar_cloak(
                 _promote_hltv_identity(account, resolution)
                 console.print(f"[green]   Avatar resolution source: {resolution['source']}[/green]")
                 return png_path
-
-        roster = fetcher.scrape_match_roster(match_url)
-        roster_resolution = resolve_from_roster(roster, key_norm)
-        if _has_hltv_identity(roster_resolution):
-            label = (
-                roster_resolution.get("player_url")
-                or f"player/{roster_resolution.get('player_id')}"
+            raise RuntimeError(
+                f"Failed to fetch bodyshot for {key_norm} (resolved via {resolution['source']}: "
+                f"{player_url or player_id})"
             )
-            console.print(f"[dim]   Resolved HLTV profile via roster: {label}[/dim]")
-            player_url = str(roster_resolution.get("player_url", "") or "").strip()
-            player_id = str(roster_resolution.get("player_id", "") or "").strip() or (
-                hltv_player_id_from_url(player_url) or ""
-            )
-            raw = fetcher.try_profile_and_cdn(player_url, player_id)
-            if raw and _save_avatar_bytes_sync(raw, png_path):
-                _promote_hltv_identity(account, roster_resolution)
-                console.print("[green]   Avatar resolution source: roster[/green]")
-                return png_path
 
-        if not _has_hltv_identity(resolution) and not _has_hltv_identity(roster_resolution):
+        if match_url:
+            roster = fetcher.scrape_match_roster(match_url)
+            roster_resolution = resolve_from_roster(roster, key_norm)
+            if _has_hltv_identity(roster_resolution):
+                label = (
+                    roster_resolution.get("player_url")
+                    or f"player/{roster_resolution.get('player_id')}"
+                )
+                console.print(f"[dim]   Resolved HLTV profile via roster: {label}[/dim]")
+                player_url = str(roster_resolution.get("player_url", "") or "").strip()
+                player_id = str(roster_resolution.get("player_id", "") or "").strip() or (
+                    hltv_player_id_from_url(player_url) or ""
+                )
+                raw = fetcher.try_profile_and_cdn(player_url, player_id)
+                if raw and _save_avatar_bytes_sync(raw, png_path):
+                    _promote_hltv_identity(account, roster_resolution)
+                    console.print("[green]   Avatar resolution source: roster[/green]")
+                    return png_path
+
+            if not _has_hltv_identity(resolution) and not _has_hltv_identity(roster_resolution):
+                search_url = f"{settings.hltv_base_url}/search?query={key_norm}"
+                page = fetcher._new_page()
+                try:
+                    page.goto(search_url, timeout=120_000)
+                    page.wait_for_timeout(3000)
+                    search_html = page.content()
+                finally:
+                    page.close()
+
+                search_resolution = resolve_from_search(search_html, ratings, key_norm)
+                if _has_hltv_identity(search_resolution):
+                    label = (
+                        search_resolution.get("player_url")
+                        or f"player/{search_resolution.get('player_id')}"
+                    )
+                    console.print(f"[dim]   Resolved HLTV profile via search: {label}[/dim]")
+                    player_url = str(search_resolution.get("player_url", "") or "").strip()
+                    player_id = str(search_resolution.get("player_id", "") or "").strip() or (
+                        hltv_player_id_from_url(player_url) or ""
+                    )
+                    raw = fetcher.try_profile_and_cdn(player_url, player_id)
+                    if raw and _save_avatar_bytes_sync(raw, png_path):
+                        _promote_hltv_identity(account, search_resolution)
+                        console.print("[green]   Avatar resolution source: search[/green]")
+                        return png_path
+        else:
             search_url = f"{settings.hltv_base_url}/search?query={key_norm}"
             page = fetcher._new_page()
             try:
@@ -442,15 +436,8 @@ def _fetch_avatar_cloak(
                     _promote_hltv_identity(account, search_resolution)
                     console.print("[green]   Avatar resolution source: search[/green]")
                     return png_path
+            raise RuntimeError(f"no HLTV identity for {key_norm} and search returned no results")
 
-        console.print("[yellow]   Profile bodyshot failed; trying match-page fallback[/yellow]")
-        raw = fetcher.fetch_match_page_headshot(match_url, key_norm)
-        if raw and _save_avatar_bytes_sync(raw, png_path):
-            promote_resolution = search_resolution or roster_resolution or resolution
-            if promote_resolution:
-                _promote_hltv_identity(account, promote_resolution)
-            console.print("[green]   Avatar resolution source: match_fallback[/green]")
-            return png_path
     finally:
         if own_fetcher:
             fetcher.__exit__()

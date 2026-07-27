@@ -95,7 +95,6 @@ def get_avatar_path(nickname: str) -> Path | None:
     Resolution order (per player folder):
       1. demos/avatars/{nick}/hltv/{nick}[_N].<ext>   (HLTV pro bodyshot wins)
       2. demos/avatars/{nick}/faceit/{nick}[_N].<ext>
-      3. legacy flat demos/avatars/{nick}.<ext>   (pre-migration files)
 
     Within a source folder, the largest PNG (by pixel area) is chosen so the
     best-centered / highest-res variant wins.
@@ -121,10 +120,6 @@ def get_avatar_path(nickname: str) -> Path | None:
     for source in AVATAR_SOURCES:
         p = _best_in(AVATAR_DIR / name / source)
         if p:
-            return p
-    for ext in AVATAR_EXTS:
-        p = AVATAR_DIR / f"{name}{ext}"
-        if p.exists():
             return p
     return None
 

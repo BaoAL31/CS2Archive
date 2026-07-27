@@ -176,18 +176,21 @@ def disambiguate_search_candidates(
     player_key: str,
 ) -> SearchPlayerCandidate | None:
     """Filter search hits to roster nicknames; tiebreak on exact player_key match."""
+    key = normalize_pipeline_player_key(player_key)
     roster_set = set(roster_nicknames)
-    on_roster = [
-        candidate
-        for candidate in candidates
-        if normalize_pipeline_player_key(candidate["nickname"]) in roster_set
-    ]
+    if roster_set:
+        on_roster = [
+            candidate
+            for candidate in candidates
+            if normalize_pipeline_player_key(candidate["nickname"]) in roster_set
+        ]
+    else:
+        on_roster = candidates
     if not on_roster:
         return None
     if len(on_roster) == 1:
         return on_roster[0]
 
-    key = normalize_pipeline_player_key(player_key)
     exact = [
         candidate
         for candidate in on_roster

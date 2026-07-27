@@ -92,7 +92,6 @@ def _resolve_steam_id(nickname: str) -> str:
 
 def _existing_avatar_path(nickname: str) -> str:
     name = nickname.strip().lower()
-    # Nested layout: {nick}/hltv or {nick}/faceit, then legacy flat
     for source in ("hltv", "faceit"):
         folder = PROJECT_ROOT / "demos" / "avatars" / name / source
         if folder.is_dir():
@@ -100,10 +99,6 @@ def _existing_avatar_path(nickname: str) -> str:
                 p = folder / f"{name}{ext}"
                 if p.exists():
                     return str(p.relative_to(PROJECT_ROOT)).replace("\\", "/")
-    for ext in (".png", ".jpg", ".jpeg"):
-        p = PROJECT_ROOT / "demos" / "avatars" / f"{name}{ext}"
-        if p.exists():
-            return str(p.relative_to(PROJECT_ROOT)).replace("\\", "/")
     return ""
 
 
@@ -250,13 +245,33 @@ async def main() -> None:
     if existing_demos:
         print(f"[SKIP] Demos already exist in {demo_folder}")
     else:
-        print("[HF] Demos not found locally. Downloading from HuggingFace...")
-        try:
-            demos = _download_match_from_hf(hf_root, slug, demo_folder)
-        except Exception as e:
-            print(f"[ERR] HuggingFace download failed: {e}")
+        if hf_root:
+            print("[HF] Demos not found locally. Downloading from HuggingFace...")
+            try:
+                demos = _download_match_from_hf(hf_root, slug, demo_folder)
+                print(f"[OK] Downloaded {len(demos)} demo(s) to {demo_folder}")
+            except Exception as e:
+                print(f"  [WARN] HuggingFace download failed: {e}")
+                print("  [FALLBACK] Trying CloakBrowser download...")
+                from scrapers.hltv_acquire import acquire_match
+                result = acquire_match(match_url, force=False, headless=True)
+                if result.status.value == "failed":
+                    print(f"[ERR] CloakBrowser download also failed: {result.error}")
+                    sys.exit(1)
+                print(f"[OK] Downloaded via CloakBrowser to {demo_folder}")
+        else:
+            print("[DL] No HF root — downloading via CloakBrowser...")
+            from scrapers.hltv_acquire import acquire_match
+            result = acquire_match(match_url, force=False, headless=True)
+            if result.status.value == "failed":
+                print(f"[ERR] CloakBrowser download failed: {result.error}")
+                sys.exit(1)
+            print(f"[OK] Downloaded via CloakBrowser to {demo_folder}")
+
+        existing_demos = list(demo_folder.glob("*.dem"))
+        if not existing_demos:
+            print("[ERR] No .dem files available after download")
             sys.exit(1)
-        print(f"[OK] Downloaded {len(demos)} demo(s) to {demo_folder}")
 
     unique_players = sorted({
         p["nickname"].strip()
