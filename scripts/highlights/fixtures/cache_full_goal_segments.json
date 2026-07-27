@@ -1,0 +1,575 @@
+{
+  "description": "Golden edit timeline after manual review (Cache FACEIT). Equal/higher streak interrupt, 10s min, death+2s, last-seg round-end expand.",
+  "segments": [
+    {
+      "start_tick": 1280,
+      "end_tick": 3198,
+      "pov_steam_id": "76561198044045107",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ]
+    },
+    {
+      "start_tick": 4895,
+      "end_tick": 6436,
+      "pov_steam_id": "76561198838822582",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        7,
+        8,
+        9
+      ]
+    },
+    {
+      "start_tick": 6340,
+      "end_tick": 7063,
+      "pov_steam_id": "76561198920720017",
+      "segment_type": "default",
+      "kill_indices": [
+        12
+      ]
+    },
+    {
+      "start_tick": 8344,
+      "end_tick": 10143,
+      "pov_steam_id": "76561198920720017",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        13,
+        14
+      ]
+    },
+    {
+      "start_tick": 10015,
+      "end_tick": 10718,
+      "pov_steam_id": "76561198044045107",
+      "segment_type": "default",
+      "kill_indices": [
+        15
+      ]
+    },
+    {
+      "start_tick": 11999,
+      "end_tick": 14401,
+      "pov_steam_id": "76561198044045107",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        16,
+        17
+      ]
+    },
+    {
+      "start_tick": 12932,
+      "end_tick": 18761,
+      "pov_steam_id": "76561197996678278",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        19,
+        22,
+        23
+      ]
+    },
+    {
+      "start_tick": 20042,
+      "end_tick": 22113,
+      "pov_steam_id": "76561198920720017",
+      "segment_type": "default",
+      "kill_indices": [
+        25
+      ]
+    },
+    {
+      "start_tick": 22145,
+      "end_tick": 25568,
+      "pov_steam_id": "76561198838822582",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        26,
+        28,
+        29
+      ]
+    },
+    {
+      "start_tick": 26849,
+      "end_tick": 30273,
+      "pov_steam_id": "76561198920720017",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        30,
+        31
+      ]
+    },
+    {
+      "start_tick": 28362,
+      "end_tick": 30958,
+      "pov_steam_id": "76561198044045107",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        34,
+        35
+      ]
+    },
+    {
+      "start_tick": 32239,
+      "end_tick": 33141,
+      "pov_steam_id": "76561197996678278",
+      "segment_type": "default",
+      "kill_indices": [
+        36
+      ]
+    },
+    {
+      "start_tick": 32757,
+      "end_tick": 33517,
+      "pov_steam_id": "76561198034202275",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        37,
+        38
+      ]
+    },
+    {
+      "start_tick": 33137,
+      "end_tick": 36957,
+      "pov_steam_id": "76561198920720017",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        40,
+        41,
+        42
+      ]
+    },
+    {
+      "start_tick": 38238,
+      "end_tick": 39495,
+      "pov_steam_id": "76561198920720017",
+      "segment_type": "default",
+      "kill_indices": [
+        43
+      ]
+    },
+    {
+      "start_tick": 39384,
+      "end_tick": 40082,
+      "pov_steam_id": "76561198034202275",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        44,
+        45
+      ]
+    },
+    {
+      "start_tick": 40050,
+      "end_tick": 41072,
+      "pov_steam_id": "76561198920720017",
+      "segment_type": "default",
+      "kill_indices": [
+        46
+      ]
+    },
+    {
+      "start_tick": 42353,
+      "end_tick": 43995,
+      "pov_steam_id": "76561198034202275",
+      "segment_type": "default",
+      "kill_indices": [
+        47
+      ]
+    },
+    {
+      "start_tick": 43589,
+      "end_tick": 44692,
+      "pov_steam_id": "76561197980923031",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        49,
+        50
+      ]
+    },
+    {
+      "start_tick": 44660,
+      "end_tick": 47382,
+      "pov_steam_id": "76561198044045107",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        51,
+        52
+      ]
+    },
+    {
+      "start_tick": 48937,
+      "end_tick": 49878,
+      "pov_steam_id": "76561198044045107",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        54,
+        56
+      ]
+    },
+    {
+      "start_tick": 49846,
+      "end_tick": 51233,
+      "pov_steam_id": "76561198920720017",
+      "segment_type": "default",
+      "kill_indices": [
+        59
+      ]
+    },
+    {
+      "start_tick": 52514,
+      "end_tick": 54560,
+      "pov_steam_id": "76561198838822582",
+      "segment_type": "default",
+      "kill_indices": [
+        60
+      ]
+    },
+    {
+      "start_tick": 54144,
+      "end_tick": 54784,
+      "pov_steam_id": "76561198034202275",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        61,
+        63
+      ]
+    },
+    {
+      "start_tick": 54373,
+      "end_tick": 57279,
+      "pov_steam_id": "76561197993230696",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        64,
+        65
+      ]
+    },
+    {
+      "start_tick": 58560,
+      "end_tick": 61983,
+      "pov_steam_id": "76561197996678278",
+      "segment_type": "default",
+      "kill_indices": [
+        67
+      ]
+    },
+    {
+      "start_tick": 60532,
+      "end_tick": 62798,
+      "pov_steam_id": "76561198838822582",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        68,
+        70
+      ]
+    },
+    {
+      "start_tick": 64079,
+      "end_tick": 66578,
+      "pov_steam_id": "76561198920720017",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        72,
+        74
+      ]
+    },
+    {
+      "start_tick": 66546,
+      "end_tick": 68701,
+      "pov_steam_id": "76561198044045107",
+      "segment_type": "default",
+      "kill_indices": [
+        76
+      ]
+    },
+    {
+      "start_tick": 70398,
+      "end_tick": 73249,
+      "pov_steam_id": "76561198044045107",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        78,
+        81,
+        83
+      ]
+    },
+    {
+      "start_tick": 74530,
+      "end_tick": 75273,
+      "pov_steam_id": "76561198034202275",
+      "segment_type": "default",
+      "kill_indices": [
+        84
+      ]
+    },
+    {
+      "start_tick": 75258,
+      "end_tick": 77982,
+      "pov_steam_id": "76561198838822582",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        87,
+        89
+      ]
+    },
+    {
+      "start_tick": 77304,
+      "end_tick": 79261,
+      "pov_steam_id": "76561198044045107",
+      "segment_type": "default",
+      "kill_indices": [
+        91
+      ]
+    },
+    {
+      "start_tick": 80542,
+      "end_tick": 83847,
+      "pov_steam_id": "76561197996678278",
+      "segment_type": "default",
+      "kill_indices": [
+        95
+      ]
+    },
+    {
+      "start_tick": 85128,
+      "end_tick": 89455,
+      "pov_steam_id": "76561198034202275",
+      "segment_type": "default",
+      "kill_indices": [
+        98
+      ]
+    },
+    {
+      "start_tick": 87454,
+      "end_tick": 90811,
+      "pov_steam_id": "76561197996678278",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        100,
+        102
+      ]
+    },
+    {
+      "start_tick": 98544,
+      "end_tick": 102349,
+      "pov_steam_id": "76561198920720017",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        109,
+        112
+      ]
+    },
+    {
+      "start_tick": 103949,
+      "end_tick": 105579,
+      "pov_steam_id": "76561197996678278",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        114,
+        115,
+        116,
+        117
+      ]
+    },
+    {
+      "start_tick": 106860,
+      "end_tick": 108000,
+      "pov_steam_id": "76561198034202275",
+      "segment_type": "default",
+      "kill_indices": [
+        119
+      ]
+    },
+    {
+      "start_tick": 107983,
+      "end_tick": 111163,
+      "pov_steam_id": "76561198044045107",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        122,
+        123,
+        126
+      ]
+    },
+    {
+      "start_tick": 112444,
+      "end_tick": 115146,
+      "pov_steam_id": "76561197996678278",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        128,
+        131
+      ]
+    },
+    {
+      "start_tick": 116427,
+      "end_tick": 121133,
+      "pov_steam_id": "76561198044045107",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        133,
+        136,
+        137
+      ]
+    },
+    {
+      "start_tick": 122437,
+      "end_tick": 126561,
+      "pov_steam_id": "76561198838822582",
+      "segment_type": "default",
+      "kill_indices": [
+        140
+      ]
+    },
+    {
+      "start_tick": 125117,
+      "end_tick": 126561,
+      "pov_steam_id": "76561197996678278",
+      "segment_type": "default",
+      "kill_indices": [
+        141
+      ]
+    },
+    {
+      "start_tick": 126593,
+      "end_tick": 127517,
+      "pov_steam_id": "76561198044045107",
+      "segment_type": "default",
+      "kill_indices": [
+        143
+      ]
+    },
+    {
+      "start_tick": 129117,
+      "end_tick": 130687,
+      "pov_steam_id": "76561198920720017",
+      "segment_type": "default",
+      "kill_indices": [
+        148
+      ]
+    },
+    {
+      "start_tick": 130303,
+      "end_tick": 131187,
+      "pov_steam_id": "76561197980923031",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        149,
+        150
+      ]
+    },
+    {
+      "start_tick": 132884,
+      "end_tick": 134887,
+      "pov_steam_id": "76561198034202275",
+      "segment_type": "default",
+      "kill_indices": [
+        151
+      ]
+    },
+    {
+      "start_tick": 134047,
+      "end_tick": 136233,
+      "pov_steam_id": "76561198838822582",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        153,
+        154,
+        156
+      ]
+    },
+    {
+      "start_tick": 137514,
+      "end_tick": 141456,
+      "pov_steam_id": "76561198044045107",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        158,
+        162
+      ]
+    },
+    {
+      "start_tick": 143283,
+      "end_tick": 144656,
+      "pov_steam_id": "76561198920720017",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        164,
+        165
+      ]
+    },
+    {
+      "start_tick": 144624,
+      "end_tick": 146004,
+      "pov_steam_id": "76561198044045107",
+      "segment_type": "default",
+      "kill_indices": [
+        168
+      ]
+    },
+    {
+      "start_tick": 147701,
+      "end_tick": 149499,
+      "pov_steam_id": "76561198044045107",
+      "segment_type": "default",
+      "kill_indices": [
+        170
+      ]
+    },
+    {
+      "start_tick": 149475,
+      "end_tick": 153412,
+      "pov_steam_id": "76561197990871118",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        172,
+        173
+      ]
+    },
+    {
+      "start_tick": 154693,
+      "end_tick": 158414,
+      "pov_steam_id": "76561197996678278",
+      "segment_type": "default",
+      "kill_indices": [
+        177
+      ]
+    },
+    {
+      "start_tick": 158030,
+      "end_tick": 158974,
+      "pov_steam_id": "76561198838822582",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        179,
+        180
+      ]
+    },
+    {
+      "start_tick": 160574,
+      "end_tick": 161718,
+      "pov_steam_id": "76561198838822582",
+      "segment_type": "default",
+      "kill_indices": [
+        182
+      ]
+    },
+    {
+      "start_tick": 161334,
+      "end_tick": 164103,
+      "pov_steam_id": "76561197996678278",
+      "segment_type": "multi_kill",
+      "kill_indices": [
+        183,
+        186
+      ]
+    }
+  ]
+}

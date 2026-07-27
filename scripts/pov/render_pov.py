@@ -113,26 +113,66 @@ _ROUND_RENDER_RE = re.compile(r"^round-(\d+)-tick-(\d+)-to-(\d+)\.mp4$")
 
 
 def _rename_sequence_files(output_dir: Path, global_rounds: list[int]) -> None:
-    """After csdm renders a batch without --concatenate-sequences, rename the
-    freshly-written sequence-{i}-tick-{A}-to-{B}.mp4 files to
-    round-{global:03d}-tick-{A}-to-{B}.mp4. Sequence index i (1-based) maps to
-    global_rounds[i-1] because csdm renders --rounds in order. Renaming makes
-    each round's file unique + addressable for concat + resume."""
+    """After csdm renders a batch, rename per-round outputs to
+    round-{global:03d}-tick-{A}-to-{B}.mp4. Handles two CSDM output formats:
+
+    Old (pre-3.20): sequence-{i}-tick-{A}-to-{B}.mp4 files in output_dir root.
+    New (3.20+):    N-sequence/video.mp4 directories (tick info from analysis JSON).
+
+    Renaming makes each round's file unique + addressable for concat + resume."""
+    # Try old format first
     seqs = sorted(
         (p for p in output_dir.rglob("sequence-*-tick-*-to-*.mp4")),
         key=lambda p: int(_SEQ_RENDER_RE.match(p.name).group(1)),
     )
-    if len(seqs) != len(global_rounds):
+    if len(seqs) == len(global_rounds):
+        for i, p in enumerate(seqs):
+            m = _SEQ_RENDER_RE.match(p.name)
+            a, b = m.group(2), m.group(3)
+            gr = global_rounds[i]
+            p.rename(output_dir / f"round-{gr:03d}-tick-{a}-to-{b}.mp4")
+        return
+
+    # New format (CSDM 3.20+): N-sequence/video.mp4 per round
+    seq_dirs = sorted(
+        (p for p in output_dir.glob("*-sequence") if p.is_dir()),
+        key=lambda p: int(p.name.split("-")[0]),
+    )
+    if not seq_dirs:
         print(
             f"  [ERROR] sequence file count ({len(seqs)}) != rounds "
+            f"({len(global_rounds)}) and no sequence dirs found"
+        )
+        sys.exit(1)
+    if len(seq_dirs) != len(global_rounds):
+        print(
+            f"  [ERROR] sequence directory count ({len(seq_dirs)}) != rounds "
             f"({len(global_rounds)}); csdm dropped round(s)"
         )
         sys.exit(1)
-    for i, p in enumerate(seqs):
-        m = _SEQ_RENDER_RE.match(p.name)
-        a, b = m.group(2), m.group(3)
-        gr = global_rounds[i] if i < len(global_rounds) else global_rounds[-1]
-        p.rename(output_dir / f"round-{gr:03d}-tick-{a}-to-{b}.mp4")
+
+    # Load round tick info from analysis JSON saved by pipeline step 1
+    analysis_path = output_dir / "csdm_analysis.json"
+    tick_map: dict[int, tuple[int, int]] = {}
+    if analysis_path.exists():
+        try:
+            data = json.loads(analysis_path.read_text(encoding="utf-8"))
+            for r in data.get("rounds", []):
+                rn = r.get("number")
+                if rn is not None:
+                    tick_map[rn] = (r.get("startTick", 0), r.get("endTick", 0))
+        except Exception:
+            pass
+
+    for i, seq_dir in enumerate(seq_dirs):
+        gr = global_rounds[i]
+        video = seq_dir / "video.mp4"
+        if not video.exists():
+            print(f"  [ERROR] {video} not found in {seq_dir.name}")
+            sys.exit(1)
+        a, b = tick_map.get(gr, (0, 0))
+        video.rename(output_dir / f"round-{gr:03d}-tick-{a}-to-{b}.mp4")
+        shutil.rmtree(seq_dir, ignore_errors=True)
 
 
 def resolve_output_dir(output: str | None, first_demo_path: str, steam_id: str) -> Path:
@@ -380,6 +420,14 @@ def main() -> None:
     parser.add_argument("--viewmodel-offset-y", type=float, default=None)
     parser.add_argument("--viewmodel-offset-z", type=float, default=None)
     parser.add_argument("--viewmodel-presetpos", type=int, default=None)
+    parser.add_argument("--skip-failed-rounds", action="store_true", default=False,
+                        help="[DANGER] Skip round batches that fail instead of aborting the entire "
+                             "render. Only use when a specific demo file is broken and you want to "
+                             "render whatever rounds survive. NEVER enable by default. "
+                             "Documented in AGENTS.md: this flag exists for corrupted/incompatible demos "
+                             "where CS2 crashes on specific rounds. It silently drops failures, which "
+                             "can produce incomplete POV videos. Only turn on per-invocation for "
+                             "specifically problematic demos.")
     args = parser.parse_args()
 
     # Resolve capture resolution from player_accounts.json if available.
@@ -460,6 +508,19 @@ def main() -> None:
     if args.batches < 1:
         print("[ERROR] --batches must be >= 1")
         sys.exit(1)
+
+    # Persistent skip list: rounds that failed with --skip-failed-rounds
+    # so resume doesn't re-attempt them forever.
+    SKIP_FILE = output_dir / ".skip_failed_rounds.json"
+    skipped_rounds: set[int] = set()
+    if args.skip_failed_rounds and SKIP_FILE.exists():
+        try:
+            skipped_rounds = set(json.loads(SKIP_FILE.read_text(encoding="utf-8")))
+            if skipped_rounds:
+                print(f"  [SKIP-FAILED] Loaded {len(skipped_rounds)} previously skipped round(s): "
+                      f"{sorted(skipped_rounds)}")
+        except Exception:
+            pass
 
     try:
         minimizer = None
@@ -546,6 +607,8 @@ def main() -> None:
                     for p in output_dir.glob("round-*-tick-*-to-*.mp4")
                     if p.stat().st_size >= 1_048_576
                 }
+                # --skip-failed-rounds: treat previously failed rounds as "done"
+                already |= skipped_rounds
                 missing_global = [gr for gr in global_rounds if gr not in already]
                 if not missing_global:
                     existing = [
@@ -574,19 +637,55 @@ def main() -> None:
                 # csdm writes per-round sequence files; do NOT expect a single
                 # batch file. run_csdm returns the newest mp4 (a sequence file)
                 # which we ignore — we rename the new sequence files below.
-                run_csdm(cmd, f"rounds {missing_global[0]}-{missing_global[-1]}", expected=None)
-                _rename_sequence_files(output_dir, missing_global)
-                still = [
-                    gr for gr in missing_global
-                    if not any(
-                        p.stat().st_size >= 1_048_576
-                        for p in output_dir.glob(f"round-{gr:03d}-tick-*-to-*.mp4")
-                    )
-                ]
-                if still:
-                    print(f"[ERROR] After render, still missing rounds: {still}")
-                    sys.exit(1)
-                total_rendered += len(batch)
+                batch_ok = True
+                failed_this_batch: list[int] = []
+                try:
+                    run_csdm(cmd, f"rounds {missing_global[0]}-{missing_global[-1]}", expected=None)
+                except SystemExit:
+                    if args.skip_failed_rounds:
+                        print(f"  [WARN] Batch rounds {missing_global} failed. Skipping.")
+                        failed_this_batch = list(missing_global)
+                        batch_ok = False
+                    else:
+                        raise
+                if batch_ok:
+                    try:
+                        _rename_sequence_files(output_dir, missing_global)
+                    except SystemExit:
+                        if args.skip_failed_rounds:
+                            print(f"  [WARN] Rename failed for batch rounds {missing_global}. Skipping.")
+                            failed_this_batch = list(missing_global)
+                            batch_ok = False
+                        else:
+                            raise
+                if batch_ok:
+                    still = [
+                        gr for gr in missing_global
+                        if not any(
+                            p.stat().st_size >= 1_048_576
+                            for p in output_dir.glob(f"round-{gr:03d}-tick-*-to-*.mp4")
+                        )
+                    ]
+                    if still:
+                        msg = f"[ERROR] After render, still missing rounds: {still}"
+                        print(msg)
+                        if not args.skip_failed_rounds:
+                            sys.exit(1)
+                        failed_this_batch = still
+                        batch_ok = False
+                if batch_ok:
+                    total_rendered += len(batch)
+                elif args.skip_failed_rounds and failed_this_batch:
+                    print(f"  [SKIP-FAILED] Dropped {len(failed_this_batch)} failed round(s): "
+                          f"{failed_this_batch}")
+                    skipped_rounds.update(failed_this_batch)
+                    try:
+                        SKIP_FILE.write_text(
+                            json.dumps(sorted(skipped_rounds)),
+                            encoding="utf-8",
+                        )
+                    except Exception:
+                        pass
 
             global_round += n_rounds
 

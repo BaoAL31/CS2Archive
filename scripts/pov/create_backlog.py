@@ -73,12 +73,19 @@ def _resolve_demo_for_map(match_slug: str, map_name: str) -> Path:
 
 
 def _resolve_steam_id(nickname: str) -> str:
-    from player_accounts import _load_accounts, PlayerAccount
+    from player_accounts import _load_accounts, PlayerAccount, extract_steam_id
 
     lower = nickname.lower()
     for rec in _load_accounts():
         if rec["nickname"].lower() == lower:
             acct = PlayerAccount(**rec)
+            # Prefer re-resolving from steam_url (canonical when it's a
+            # 17-digit numeric ID). acct.steam_id can be stale if the Steam
+            # profile URL redirect changed over time — using it would lock
+            # CSDM to the wrong player and silently render enemy POV.
+            resolved = extract_steam_id(acct.steam_url)
+            if resolved:
+                return resolved
             return acct.steam_id or acct.steam_url or ""
     return ""
 

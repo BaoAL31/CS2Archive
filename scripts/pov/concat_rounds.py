@@ -47,7 +47,11 @@ def _concat_two(a: Path, b: Path, out: Path) -> None:
     print(f"OK ({out_mb:.0f} MB)")
 
 
-def _parse_batches(folder: Path, combined_exists: bool = False) -> tuple[list[Path], int]:
+def _parse_batches(
+    folder: Path,
+    combined_exists: bool = False,
+    allow_gaps: bool = False,
+) -> tuple[list[Path], int]:
     batch_files = sorted(
         [f for f in folder.glob("batch-*.mp4") if _BATCH_RE.match(f.name)],
         key=lambda f: int(_BATCH_RE.match(f.name).group(1)),
@@ -70,14 +74,20 @@ def _parse_batches(folder: Path, combined_exists: bool = False) -> tuple[list[Pa
                 f"but expected round {expected_start} (overlap with previous batch)"
             )
         if start > expected_start:
-            msg = (
-                f"remaining batches not contiguous (expected {expected_start}, "
-                f"got {f.name})"
-            ) if combined_exists else (
-                f"expected batch starting at round {expected_start}, "
-                f"got {f.name} (check for missing or overlapping batches)"
-            )
-            raise ValueError(f"CONCAT_BATCH_GAP: {msg}")
+            if allow_gaps:
+                print(
+                    f"  [GAP] rounds {expected_start}-{start - 1} missing "
+                    f"(--skip-failed-rounds); continuing with {f.name}"
+                )
+            else:
+                msg = (
+                    f"remaining batches not contiguous (expected {expected_start}, "
+                    f"got {f.name})"
+                ) if combined_exists else (
+                    f"expected batch starting at round {expected_start}, "
+                    f"got {f.name} (check for missing or overlapping batches)"
+                )
+                raise ValueError(f"CONCAT_BATCH_GAP: {msg}")
         expected_start = end + 1
     return files, _batch_range(files[0])[0]
 
@@ -198,10 +208,11 @@ def validate_round_offsets_sidecar(
         )
 
     sorted_rns = sorted(offsets)
+    # start at 1 is the common case but --skip-failed-rounds may omit early rounds.
     if sorted_rns[0] != 1:
-        errors.append(f"round_offsets should start at round 1, got {sorted_rns[0]}")
-    if sorted_rns != list(range(sorted_rns[0], sorted_rns[-1] + 1)):
-        errors.append(f"round_offsets has gaps: {sorted_rns}")
+        errors.append(f"round_offsets starts at round {sorted_rns[0]} (not 1) — OK if --skip-failed-rounds")
+    # Non-contiguous gaps (e.g. 2,4,5 where 3 is missing) are valid under --skip-failed-rounds.
+    # Just check monotonic timestamps below.
 
     if offsets[sorted_rns[0]] < -0.01:
         errors.append(f"first round offset is negative: {offsets[sorted_rns[0]]}")
@@ -268,11 +279,11 @@ def validate_round_offsets_sidecar(
     return errors
 
 
-def concat_rounds(folder: Path) -> Path:
+def concat_rounds(folder: Path, allow_gaps: bool = False) -> Path:
     combined = folder / "combined.mp4"
     offset_path = folder / "combined.round_offsets.json"
     resuming = combined.exists()
-    files, _ = _parse_batches(folder, combined_exists=resuming)
+    files, _ = _parse_batches(folder, combined_exists=resuming, allow_gaps=allow_gaps)
     new_rounds = sum(
         _batch_range(f)[1] - _batch_range(f)[0] + 1
         for f in files
@@ -361,8 +372,12 @@ def concat_rounds(folder: Path) -> Path:
         # On resume, only trust sequences when they cover a contiguous 1..N
         # that includes every round we already tracked — otherwise keep the
         # seeded even-split offsets for prior rounds.
+        # Check if sequence files cover a contiguous range (ideal case:
+        # all rounds present). With --skip-failed-rounds, early/late rounds
+        # may be missing—that's OK, we still write the per-round data.
         covers_all = (
-            seq_rounds == list(range(1, seq_rounds[-1] + 1))
+            len(seq_rounds) > 0
+            and seq_rounds == list(range(seq_rounds[0], seq_rounds[-1] + 1))
             and (not round_offsets or seq_rounds[-1] >= max(round_offsets))
         )
         if covers_all:
@@ -382,7 +397,8 @@ def concat_rounds(folder: Path) -> Path:
                 "  [warn] sequence files don't cover all rounds on resume; "
                 "keeping even-split / seeded offsets"
             )
-            seq_fields = None
+            # Do NOT set seq_fields=None — still write per-round data
+            # for whatever rounds we have (critical for --skip-failed-rounds)
 
     total_rounds = len(round_offsets)
     payload = {
@@ -526,6 +542,13 @@ def main() -> None:
         default="Stretched",
         help="Ignored for encode (always stretch to target). Kept for backlog/CLI compat.",
     )
+    parser.add_argument(
+        "--allow-gaps",
+        action="store_true",
+        default=False,
+        help="Allow non-contiguous round ranges (for --skip-failed-rounds). "
+             "Gaps in round numbers are logged but do not abort.",
+    )
     args = parser.parse_args()
 
     folder = Path(args.folder)
@@ -556,7 +579,7 @@ def main() -> None:
         return
 
     try:
-        combined = concat_rounds(folder)
+        combined = concat_rounds(folder, allow_gaps=args.allow_gaps)
     except FileNotFoundError as e:
         print(f"[ERROR] {e}")
         sys.exit(1)

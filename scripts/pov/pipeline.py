@@ -476,11 +476,14 @@ class Pipeline:
         if "steam.exe" not in steam_check.stdout:
             fail(2, "RENDER_STEAM_NOT_RUNNING", "Steam must be running before rendering")
 
+        skip_failed = getattr(self.args, "skip_failed_rounds", False)
         render_args = [
             "scripts/pov/render_pov.py", str(self.demo_path), self.steam_id,
             "--output", str(self.render_dir),
             "--batches", str(getattr(self.args, "batches", 20)),
         ]
+        if skip_failed:
+            render_args += ["--skip-failed-rounds"]
         cap_w = int(self.meta.get("capture_width") or 0)
         cap_h = int(self.meta.get("capture_height") or 0)
         if cap_w >= 800 and cap_h >= 600:
@@ -526,11 +529,17 @@ class Pipeline:
         if round_files:
             nums = [int(round_re.match(f.name).group(1)) for f in round_files]
             missing = [n for n in range(1, (round_count or max(nums)) + 1) if n not in set(nums)]
-            if missing:
-                fail(2, "RENDER_INCOMPLETE",
-                     f"missing round clips: {missing[:20]}{'...' if len(missing) > 20 else ''}")
             total_mb = sum(f.stat().st_size for f in round_files) / 1024 / 1024
-            print(f"  [OK] {len(round_files)} round clip(s) ({total_mb:.0f} MB)")
+            if missing:
+                if skip_failed:
+                    print(f"  [OK] {len(round_files)} of {round_count} round clip(s) "
+                          f"({total_mb:.0f} MB) — {len(missing)} failed/skipped rounds: "
+                          f"{missing[:20]}")
+                else:
+                    fail(2, "RENDER_INCOMPLETE",
+                         f"missing round clips: {missing[:20]}{'...' if len(missing) > 20 else ''}")
+            else:
+                print(f"  [OK] {len(round_files)} round clip(s) ({total_mb:.0f} MB)")
         elif batch_files:
             # Legacy batch-*.mp4 layout
             if round_count > 0:
@@ -629,7 +638,7 @@ class Pipeline:
         data = json.loads(r.stdout)
         return float(data.get("format", {}).get("duration", 0) or 0)
 
-    def _validate_concat(self, combined: Path) -> None:
+    def _validate_concat(self, combined: Path, skip_failed: bool = False) -> None:
         """Cross-check the finished concatenated video against the csdm
         analysis. Two independent checks:
 
@@ -678,9 +687,13 @@ class Pipeline:
                 for f in batch_files
             )
         if actual_rounds and actual_rounds != expected_rounds:
-            fail(3, "CONCAT_ROUND_COUNT_MISMATCH",
-                 f"concat has {actual_rounds} rounds but csdm analysis has "
-                 f"{expected_rounds} rounds (missing/extra round clips?)")
+            if skip_failed:
+                print(f"  [OK] {actual_rounds} of {expected_rounds} rounds "
+                      f"concat'd ({expected_rounds - actual_rounds} skipped via --skip-failed-rounds)")
+            else:
+                fail(3, "CONCAT_ROUND_COUNT_MISMATCH",
+                     f"concat has {actual_rounds} rounds but csdm analysis has "
+                     f"{expected_rounds} rounds (missing/extra round clips?)")
         else:
             print(f"  [OK] round count: {actual_rounds} rounds match "
                   f"analysis ({expected_rounds})")
@@ -695,9 +708,14 @@ class Pipeline:
                 off, video_duration_seconds=actual_sec if actual_sec > 0 else None,
             )
             if sidecar_errs:
-                fail(3, "CONCAT_SIDECAR_INVALID", "; ".join(sidecar_errs))
-            print(f"  [OK] sidecar validated against combined.mp4 "
-                  f"({actual_sec:.1f}s)")
+                if skip_failed:
+                    for e in sidecar_errs:
+                        print(f"  [warn] sidecar: {e}")
+                else:
+                    fail(3, "CONCAT_SIDECAR_INVALID", "; ".join(sidecar_errs))
+            if not sidecar_errs:
+                print(f"  [OK] sidecar validated against combined.mp4 "
+                      f"({actual_sec:.1f}s)")
 
         # Duration check — only against ACTUAL rendered tick spans. These are
         #         # Duration estimate from CSDM's own analysis JSON (per-round
@@ -887,11 +905,14 @@ class Pipeline:
     def step_concat(self) -> None:
         if not self.render_dir.exists():
             fail(3, "CONCAT_RENDER_DIR_MISSING", f"render dir not found: {self.render_dir}")
+        skip_failed = getattr(self.args, "skip_failed_rounds", False)
 
         concat_args = ["scripts/pov/concat_rounds.py", str(self.render_dir)]
         scaling = (self.meta.get("scaling_mode") or "").strip()
         if scaling:
             concat_args += ["--scaling-mode", scaling]
+        if skip_failed:
+            concat_args += ["--allow-gaps"]
         r = self._run_py(concat_args, timeout=7200)
         if r.returncode != 0:
             fail(3, "CONCAT_FAILED", f"concat_rounds.py exited {r.returncode}")
@@ -902,7 +923,7 @@ class Pipeline:
         if combined.stat().st_size < 100000:
             fail(3, "CONCAT_OUTPUT_TOO_SMALL", f"combined.mp4 suspiciously small: {combined.stat().st_size} bytes")
 
-        self._validate_concat(combined)
+        self._validate_concat(combined, skip_failed=skip_failed)
 
         # overlay-only: skip raw youtube dir entirely. The overlay variant
         # becomes the only output. (Raw combined.mp4 is still produced by
@@ -1368,6 +1389,16 @@ def main() -> None:
         help="Rounds per overlay batch (default: 10). Splits overlay ffmpeg "
              "composite into per-batch segments for ~2-3x speedup and crash "
              "resume. Set 0 for single-pass (original behavior).",
+    )
+    parser.add_argument(
+        "--skip-failed-rounds",
+        action="store_true",
+        default=False,
+        help="[DANGER] Skip round batches that fail during rendering instead of aborting. "
+             "NEVER set by default. Only use when a specific demo file is corrupted/incompatible "
+             "and CS2 crashes on certain rounds. Silently drops failed batches, producing "
+             "incomplete POV videos. Set per-invocation for problematic demos only. "
+             "See AGENTS.md for details.",
     )
     parser.add_argument(
         "--cleanup",

@@ -501,7 +501,9 @@ def main() -> None:
         if yt_publish_dates:
             latest_yt = max(yt_publish_dates)
             from datetime import date as _date, timedelta as _td
-            start_date = _date.fromisoformat(latest_yt) + _td(days=1)
+            # Strip time part if present (e.g. '2026-07-27T00:00Z' -> '2026-07-27')
+            clean = latest_yt.split("T")[0].split(" ")[0]
+            start_date = _date.fromisoformat(clean) + _td(days=1)
             print(
                 f"  [Schedule] YouTube: {len(yt_publish_dates)} occupied dates, "
                 f"latest={latest_yt}, next free from {start_date.isoformat()}",
