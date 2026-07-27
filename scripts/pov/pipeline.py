@@ -706,6 +706,7 @@ class Pipeline:
             actual_sec = self._probe_duration(combined)
             sidecar_errs = validate_round_offsets_sidecar(
                 off, video_duration_seconds=actual_sec if actual_sec > 0 else None,
+                allow_gaps=skip_failed,
             )
             if sidecar_errs:
                 if skip_failed:

@@ -173,12 +173,13 @@ def validate_round_offsets_sidecar(
     data: dict,
     *,
     video_duration_seconds: float | None = None,
+    allow_gaps: bool = False,
 ) -> list[str]:
     """Validate a ``*.round_offsets.json`` payload.
 
-    Returns a list of error strings (empty = OK). Catches the class of bugs
+    Returns a list of error strings (empty = PASS). Catches the class of bugs
     where batch durations were probed from cumulative ``combined.mp4`` after
-    append — sidecar claimed ~2× the real video length and late round
+    append — sidecar claimed ~1× the real video duration and late round
     offsets landed past EOF (e.g. total 4195s / round 22 at 3093s on a
     2202s POV).
     """
@@ -208,9 +209,11 @@ def validate_round_offsets_sidecar(
         )
 
     sorted_rns = sorted(offsets)
-    # start at 1 is the common case but --skip-failed-rounds may omit early rounds.
     if sorted_rns[0] != 1:
-        errors.append(f"round_offsets starts at round {sorted_rns[0]} (not 1) — OK if --skip-failed-rounds")
+        msg = f"round_offsets starts at round {sorted_rns[0]} (not 1)"
+        if allow_gaps:
+            return errors  # expected with --skip-failed-rounds, not an error
+        errors.append(msg)
     # Non-contiguous gaps (e.g. 2,4,5 where 3 is missing) are valid under --skip-failed-rounds.
     # Just check monotonic timestamps below.
 
@@ -420,7 +423,7 @@ def concat_rounds(folder: Path, allow_gaps: bool = False) -> Path:
 
     video_dur = _probe_duration(combined)
     sidecar_errs = validate_round_offsets_sidecar(
-        payload, video_duration_seconds=video_dur,
+        payload, video_duration_seconds=video_dur, allow_gaps=allow_gaps,
     )
     if sidecar_errs:
         for err in sidecar_errs:

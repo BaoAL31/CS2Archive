@@ -112,46 +112,21 @@ _SEQ_RENDER_RE = re.compile(r"^sequence-(\d+)-tick-(\d+)-to-(\d+)\.mp4$")
 _ROUND_RENDER_RE = re.compile(r"^round-(\d+)-tick-(\d+)-to-(\d+)\.mp4$")
 
 
-def _rename_sequence_files(output_dir: Path, global_rounds: list[int]) -> None:
-    """After csdm renders a batch, rename per-round outputs to
-    round-{global:03d}-tick-{A}-to-{B}.mp4. Handles two CSDM output formats:
+def _rename_sequence_files(output_dir: Path, global_rounds: list[int]) -> set[int]:
+    """Rename per-round CSDM outputs to round-{global:03d}-tick-{A}-to-{B}.mp4.
 
-    Old (pre-3.20): sequence-{i}-tick-{A}-to-{B}.mp4 files in output_dir root.
-    New (3.20+):    N-sequence/video.mp4 directories (tick info from analysis JSON).
+    Handles two CSDM output formats:
+      Old (pre-3.20): sequence-{i}-tick-{A}-to-{B}.mp4 files in output_dir root.
+      New (3.20+):    N-sequence/video.mp4 directories (tick info from analysis JSON).
 
-    Renaming makes each round's file unique + addressable for concat + resume."""
-    # Try old format first
-    seqs = sorted(
-        (p for p in output_dir.rglob("sequence-*-tick-*-to-*.mp4")),
-        key=lambda p: int(_SEQ_RENDER_RE.match(p.name).group(1)),
-    )
-    if len(seqs) == len(global_rounds):
-        for i, p in enumerate(seqs):
-            m = _SEQ_RENDER_RE.match(p.name)
-            a, b = m.group(2), m.group(3)
-            gr = global_rounds[i]
-            p.rename(output_dir / f"round-{gr:03d}-tick-{a}-to-{b}.mp4")
-        return
+    Returns the set of global round numbers successfully renamed. Best-effort
+    salvage on partial success — when csdm emitted fewer outputs than requested
+    (e.g. round 1 crashed but 2-7 rendered), surviving outputs are matched to
+    rounds via tick spans in csdm_analysis.json (positional fallback if no
+    analysis), and only unmapped rounds are left un-renamed. Won't sys.exit."""
+    salvaged: set[int] = set()
 
-    # New format (CSDM 3.20+): N-sequence/video.mp4 per round
-    seq_dirs = sorted(
-        (p for p in output_dir.glob("*-sequence") if p.is_dir()),
-        key=lambda p: int(p.name.split("-")[0]),
-    )
-    if not seq_dirs:
-        print(
-            f"  [ERROR] sequence file count ({len(seqs)}) != rounds "
-            f"({len(global_rounds)}) and no sequence dirs found"
-        )
-        sys.exit(1)
-    if len(seq_dirs) != len(global_rounds):
-        print(
-            f"  [ERROR] sequence directory count ({len(seq_dirs)}) != rounds "
-            f"({len(global_rounds)}); csdm dropped round(s)"
-        )
-        sys.exit(1)
-
-    # Load round tick info from analysis JSON saved by pipeline step 1
+    # Load tick map from analysis JSON
     analysis_path = output_dir / "csdm_analysis.json"
     tick_map: dict[int, tuple[int, int]] = {}
     if analysis_path.exists():
@@ -164,15 +139,87 @@ def _rename_sequence_files(output_dir: Path, global_rounds: list[int]) -> None:
         except Exception:
             pass
 
-    for i, seq_dir in enumerate(seq_dirs):
-        gr = global_rounds[i]
+    # --- Old format: sequence-{i}-tick-{A}-to-{B}.mp4 ---
+    seqs = sorted(
+        (p for p in output_dir.glob("sequence-*-tick-*-to-*.mp4")),
+        key=lambda p: int(_SEQ_RENDER_RE.match(p.name).group(1)),
+    )
+    if seqs:
+        if len(seqs) == len(global_rounds):
+            for i, p in enumerate(seqs):
+                m = _SEQ_RENDER_RE.match(p.name)
+                gr = global_rounds[i]
+                p.rename(output_dir / f"round-{gr:03d}-tick-{m.group(2)}-to-{m.group(3)}.mp4")
+                salvaged.add(gr)
+            return salvaged
+
+        # Partial match: fewer seq files than rounds. Map by tick start.
+        tick_start_to_rn: dict[int, int] = {a: rn for rn, (a, _b) in tick_map.items()}
+        for seq in seqs:
+            m = _SEQ_RENDER_RE.match(seq.name)
+            tick_s = int(m.group(2))
+            rn = tick_start_to_rn.get(tick_s)
+            if rn is not None and rn in set(global_rounds):
+                seq.rename(output_dir / f"round-{rn:03d}-tick-{m.group(2)}-to-{m.group(3)}.mp4")
+                salvaged.add(rn)
+            else:
+                # Fallback: sequential pairing with rescued rounds only
+                pass
+        # Fallback: any seqs we couldn't tick-map, pair sequentially with
+        # remaining unmapped global_rounds
+        unmapped_gr = [gr for gr in global_rounds if gr not in salvaged]
+        unmapped_seqs = [
+            s for s in seqs
+            if s.parent == output_dir and s.name.startswith("sequence-")
+        ]
+        for seq, gr in zip(sorted(unmapped_seqs), unmapped_gr):
+            m = _SEQ_RENDER_RE.match(seq.name)
+            a, b = m.group(2), m.group(3)
+            seq.rename(output_dir / f"round-{gr:03d}-tick-{a}-to-{b}.mp4")
+            salvaged.add(gr)
+        return salvaged
+
+    # --- New format (CSDM 3.20+): N-sequence/video.mp4 ---
+    seq_dirs = sorted(
+        (p for p in output_dir.glob("*-sequence") if p.is_dir()),
+        key=lambda p: int(p.name.split("-")[0]),
+    )
+    if not seq_dirs:
+        print(f"  [WARN] No sequence outputs found for batch {global_rounds}")
+        return salvaged
+
+    # Build index: seq index → tick start from analysis (sorted)
+    sorted_ticks = sorted(tick_map)
+    seq_to_tick: dict[int, int] = {}
+    for i, tick_a in enumerate(sorted_ticks):
+        seq_to_tick[i] = tick_a
+
+    tick_to_rn: dict[int, int] = {}
+    for rn, (a, _b) in tick_map.items():
+        tick_to_rn[a] = rn
+
+    for seq_dir in seq_dirs:
         video = seq_dir / "video.mp4"
         if not video.exists():
-            print(f"  [ERROR] {video} not found in {seq_dir.name}")
-            sys.exit(1)
-        a, b = tick_map.get(gr, (0, 0))
-        video.rename(output_dir / f"round-{gr:03d}-tick-{a}-to-{b}.mp4")
-        shutil.rmtree(seq_dir, ignore_errors=True)
+            print(f"  [WARN] {video} not found in {seq_dir.name}")
+            continue
+        seq_num = int(seq_dir.name.split("-")[0])
+        tick_a = seq_to_tick.get(seq_num - 1)
+        rn = tick_to_rn.get(tick_a) if tick_a is not None else None
+        if rn is not None and rn in set(global_rounds):
+            a, b = tick_map.get(rn, (0, 0))
+            video.rename(output_dir / f"round-{rn:03d}-tick-{a}-to-{b}.mp4")
+            shutil.rmtree(seq_dir, ignore_errors=True)
+            salvaged.add(rn)
+        else:
+            if seq_num <= len(global_rounds):
+                gr = global_rounds[seq_num - 1]
+                a, b = tick_map.get(gr, (0, 0))
+                video.rename(output_dir / f"round-{gr:03d}-tick-{a}-to-{b}.mp4")
+                shutil.rmtree(seq_dir, ignore_errors=True)
+                salvaged.add(gr)
+
+    return salvaged
 
 
 def resolve_output_dir(output: str | None, first_demo_path: str, steam_id: str) -> Path:
@@ -616,9 +663,27 @@ def main() -> None:
                         if int(_ROUND_RENDER_RE.match(p.name).group(1)) in set(global_rounds)
                     ]
                     mb_total = sum(p.stat().st_size for p in existing) / 1024 / 1024
-                    print(f"  [SKIP] rounds {global_rounds} already rendered ({mb_total:.0f} MB)")
-                    total_rendered += len(batch)
+                    all_via_skip = set(global_rounds) <= skipped_rounds and not existing
+                    if all_via_skip:
+                        print(f"  [SKIP] rounds {global_rounds} previously failed (skip file)")
+                    else:
+                        print(f"  [SKIP] rounds {global_rounds} already rendered ({mb_total:.0f} MB)")
+                        total_rendered += len(batch)
                     continue
+
+                # Clean stale sequence dirs from previous batches before
+                # rendering this batch. CSDM reuses N-sequence/ naming each
+                # call, so leftover dirs from failed batches would cause
+                # _rename_sequence_files' count check to fail.
+                for stale_seq in output_dir.glob("*-sequence"):
+                    if stale_seq.is_dir():
+                        shutil.rmtree(stale_seq, ignore_errors=True)
+                # Also clean legacy per-round files that may be stale
+                for stale_seq in output_dir.glob("sequence-*-tick-*-to-*.mp4"):
+                    try:
+                        stale_seq.unlink()
+                    except OSError:
+                        pass
 
                 # Resume: only ask csdm for the missing local rounds in this batch.
                 missing_local = [gr - global_round for gr in missing_global]
@@ -634,48 +699,45 @@ def main() -> None:
                     "--cfg", str(abs_cfg_path()),
                 ] + BASE_FLAGS
 
-                # csdm writes per-round sequence files; do NOT expect a single
-                # batch file. run_csdm returns the newest mp4 (a sequence file)
-                # which we ignore — we rename the new sequence files below.
-                batch_ok = True
+                # csdm writes per-round sequence files; we rename them below.
                 failed_this_batch: list[int] = []
+                csdm_crashed = False
                 try:
                     run_csdm(cmd, f"rounds {missing_global[0]}-{missing_global[-1]}", expected=None)
                 except SystemExit:
-                    if args.skip_failed_rounds:
-                        print(f"  [WARN] Batch rounds {missing_global} failed. Skipping.")
-                        failed_this_batch = list(missing_global)
-                        batch_ok = False
-                    else:
+                    csdm_crashed = True
+                    if not args.skip_failed_rounds:
                         raise
-                if batch_ok:
-                    try:
-                        _rename_sequence_files(output_dir, missing_global)
-                    except SystemExit:
-                        if args.skip_failed_rounds:
-                            print(f"  [WARN] Rename failed for batch rounds {missing_global}. Skipping.")
-                            failed_this_batch = list(missing_global)
-                            batch_ok = False
-                        else:
-                            raise
-                if batch_ok:
-                    still = [
-                        gr for gr in missing_global
-                        if not any(
-                            p.stat().st_size >= 1_048_576
-                            for p in output_dir.glob(f"round-{gr:03d}-tick-*-to-*.mp4")
-                        )
-                    ]
-                    if still:
+
+                # Always attempt salvage: even after a csdm crash, partial
+                # sequence outputs may exist. Best-effort rename by tick span;
+                # any round with no >=1 MB round-*.mp4 goes to the skip list.
+                salvaged = _rename_sequence_files(output_dir, missing_global)
+                if csdm_crashed:
+                    print(f"  [WARN] csdm crashed (rounds {missing_global}); "
+                          f"salvaged {len(salvaged)} rounds after crash")
+
+                still = [
+                    gr for gr in missing_global
+                    if not any(
+                        p.stat().st_size >= 1_048_576
+                        for p in output_dir.glob(f"round-{gr:03d}-tick-*-to-*.mp4")
+                    )
+                ]
+                if still:
+                    if not args.skip_failed_rounds:
                         msg = f"[ERROR] After render, still missing rounds: {still}"
                         print(msg)
-                        if not args.skip_failed_rounds:
-                            sys.exit(1)
-                        failed_this_batch = still
-                        batch_ok = False
-                if batch_ok:
-                    total_rendered += len(batch)
-                elif args.skip_failed_rounds and failed_this_batch:
+                        sys.exit(1)
+                    failed_this_batch = still
+
+                rendered_count = len(missing_global) - len(failed_this_batch)
+                if rendered_count > 0:
+                    total_rendered += rendered_count
+                    print(f"  [OK] {rendered_count}/{len(missing_global)} rounds rendered "
+                          f"for this batch")
+
+                if args.skip_failed_rounds and failed_this_batch:
                     print(f"  [SKIP-FAILED] Dropped {len(failed_this_batch)} failed round(s): "
                           f"{failed_this_batch}")
                     skipped_rounds.update(failed_this_batch)
@@ -686,6 +748,9 @@ def main() -> None:
                         )
                     except Exception:
                         pass
+                    # Kill stale CS2/HLAE processes after a failed batch to
+                    # prevent cascade failures on subsequent batches.
+                    _kill_stale_processes()
 
             global_round += n_rounds
 
