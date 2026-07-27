@@ -213,8 +213,8 @@ def _player_slug_from_url(url: str) -> str:
     return m.group(1).lower() if m else ""
 
 
-def _strip_matches(slug: str, peer_key: str) -> bool:
-    return peer_key == slug
+def _slug_matches(slug: str, player_key: str) -> bool:
+    return player_key == slug
 
 
 def resolve_from_search(

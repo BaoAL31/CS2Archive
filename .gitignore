@@ -84,3 +84,4 @@ backlog/
 logs/
 *.log
 .upload_*.shtoken_youtube_readonly.json
+token_youtube_readonly.json
