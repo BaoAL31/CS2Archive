@@ -1213,6 +1213,8 @@ class Pipeline:
             cmd += ["--steam-id", self.steam_id]
         if self.tournament:
             cmd += ["--tournament", self.tournament]
+        if variant == "overlay" and self._is_pbdems2():
+            cmd += ["--pbdems2"]
         cmd += ["--output", str(youtube_dir)]
 
         r = self._run_py(cmd, timeout=300)

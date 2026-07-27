@@ -167,6 +167,10 @@ def main() -> None:
         default="raw",
         help="Variant: 'raw' (default) or 'overlay' (adds W/ INPUT OVERLAY and + UTIL CAMS badges)",
     )
+    parser.add_argument(
+        "--pbdems2", action="store_true",
+        help="Demo is PBDEMS2 format (Blast); overlay badge shows W/ UTILITY CAMS only (no input overlay)",
+    )
     parser.add_argument("--output", "-o", help="Output path (defaults to youtube/...)")
     args = parser.parse_args()
 
@@ -229,6 +233,7 @@ def main() -> None:
         tournament=args.tournament or "",
         stage=stage,
         variant=args.variant,
+        pbdems2=args.pbdems2,
     )
     img = img.convert("RGB")
     img.save(output_path.with_suffix(".jpg"), "JPEG", quality=95, subsampling=0)
