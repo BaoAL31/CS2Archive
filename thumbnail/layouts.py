@@ -60,11 +60,13 @@ def _draw_pill(
     return y1
 
 
-def _draw_overlay_badge(img: Image.Image) -> None:
+def _draw_overlay_badge(img: Image.Image, *, pbdems2: bool = False) -> None:
     """Draw stacked pills in top-left corner for the overlay variant.
 
-    Primary: ``W/ INPUT OVERLAY`` (always-on keyboard state).
-    Secondary: ``+ UTIL CAMS`` (sparse PiP utility throw flights).
+    When *pbdems2* is True, the primary pill reads ``W/ UTILITY CAMS``
+    (PBDEMS2 demos lack keyboard input data — only utility throw PiP is present).
+    Otherwise the primary pill reads ``W/ INPUT OVERLAY`` (always-on keyboard
+    state) and a secondary ``+ UTIL CAMS`` pill is stacked below.
     """
     from PIL import ImageDraw, ImageFont
 
@@ -81,34 +83,42 @@ def _draw_overlay_badge(img: Image.Image) -> None:
         font_main = ImageFont.load_default()
         font_sub = font_main
 
-    # Measure first to anchor stack to bottom edge.
+    if pbdems2:
+        # PBDEMS2 → single pill, no keyboard overlay section.
+        bbox = draw.textbbox((0, 0), "W/ UTILITY CAMS", font=font_main)
+        main_h = (bbox[3] - bbox[1]) + 7 * 2
+        _draw_pill(
+            draw,
+            "W/ UTILITY CAMS",
+            font_main,
+            left=margin,
+            top=margin,
+        )
+        img.paste(overlay, (0, 0), overlay)
+        return
+
+    # Standard: two stacked pills.
     bbox1 = draw.textbbox((0, 0), "W/ INPUT OVERLAY", font=font_main)
     bbox2 = draw.textbbox((0, 0), "+ UTIL CAMS", font=font_sub)
     main_h = (bbox1[3] - bbox1[1]) + 7 * 2
     sub_h = (bbox2[3] - bbox2[1]) + 7 * 2
 
-    left_edge = margin
-    top_edge = margin
+    main_top = margin
+    sub_top = margin + main_h + pill_gap
 
-    # Stack from top: main (bigger) on top, sub (smaller) on bottom, with gap.
-    main_top = top_edge
-    sub_top = top_edge + main_h + pill_gap
-
-    # Primary pill on top
     _draw_pill(
         draw,
         "W/ INPUT OVERLAY",
         font_main,
-        left=left_edge,
+        left=margin,
         top=main_top,
     )
 
-    # Secondary pill on bottom
     _draw_pill(
         draw,
         "+ UTIL CAMS",
         font_sub,
-        left=left_edge,
+        left=margin,
         top=sub_top,
         padding_x=14,
         padding_y=7,
@@ -129,6 +139,8 @@ def generate(
     tournament: str = "",
     stage: str = "",
     variant: str = "raw",
+    *,
+    pbdems2: bool = False,
 ) -> Image.Image:
     bg = load_background(bg_path)
 
@@ -166,7 +178,7 @@ def generate(
         current_y += _line_height(size)
 
     if variant == "overlay":
-        _draw_overlay_badge(bg)
+        _draw_overlay_badge(bg, pbdems2=pbdems2)
 
     return bg
 
@@ -178,6 +190,8 @@ def generate_faceit(
     match_detail: str,
     tournament: str = "",
     variant: str = "raw",
+    *,
+    pbdems2: bool = False,
     avatar_path: Path | None = None,
 ) -> Image.Image:
     """FACEIT thumbnail: blurred kill-frame background + text overlay.
@@ -225,6 +239,6 @@ def generate_faceit(
         current_y += _line_height(size)
 
     if variant == "overlay":
-        _draw_overlay_badge(bg)
+        _draw_overlay_badge(bg, pbdems2=pbdems2)
 
     return bg

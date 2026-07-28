@@ -669,12 +669,17 @@ def run_overlay(
             )
             if sidecar_errs:
                 for err in sidecar_errs:
-                    _log(f"[ERROR] sidecar invalid: {err}")
-                _log(
-                    f"[ERROR] Refusing to overlay with corrupt "
-                    f"{offset_path.name} (would desync keyboard/util cams)"
-                )
-                sys.exit(1)
+                    _log(f"[WARN] sidecar: {err}")
+                # Only hard-fail on truly corrupt data (negative durations,
+                # non-monotonic timestamps). Gaps/skip-first-round from
+                # --skip-failed-rounds are intentional.
+                critical = [e for e in sidecar_errs if "negative" in e.lower()
+                            or "not monotonic" in e.lower()
+                            or "duration" in e.lower() and "round_offsets" not in e.lower()]
+                if critical:
+                    _log(f"[ERROR] Refusing to overlay: {offset_path.name} has critical errors")
+                    sys.exit(1)
+                _log(f"  [WARN] Proceeding with sidecar despite non-critical warnings")
             round_offsets = {int(k): v for k, v in off_data.get("round_offsets", {}).items()}
             video_total_seconds = float(off_data.get("total_duration_seconds", 0))
             # Compute per-round video duration from batches

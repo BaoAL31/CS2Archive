@@ -185,7 +185,7 @@ def main() -> None:
         f"{args.player}'s POV on {args.map}",
     ]
     if stage_raw:
-        desc_lines.append(f"{tournament} — {stage_raw}" if tournament else stage_raw)
+        desc_lines.append(f"{tournament} - {stage_raw}" if tournament else stage_raw)
     elif tournament:
         desc_lines.append(tournament)
     if team_a and team_b:

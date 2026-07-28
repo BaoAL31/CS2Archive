@@ -153,7 +153,12 @@ def get_youtube_publish_dates(youtube) -> set[str]:
             if not pub:
                 continue
             dt = datetime.fromisoformat(pub.replace("Z", "+00:00"))
-            occupied.add(dt.strftime("%Y-%m-%dT%H:%M"))
+            try:
+                from zoneinfo import ZoneInfo
+                local_dt = dt.astimezone(ZoneInfo(DEFAULT_PUBLISH_TZ))
+                occupied.add(local_dt.strftime("%Y-%m-%dT%H:%M"))
+            except Exception:
+                occupied.add(dt.strftime("%Y-%m-%dT%H:%M"))
     return occupied
 
 
@@ -499,12 +504,8 @@ def main() -> None:
     if args.publish_at == AUTO_PUBLISH_MODE:
         yt_publish_dates = get_youtube_publish_dates(youtube) or set()
         if yt_publish_dates:
-            latest_yt = max(yt_publish_dates)
-            from datetime import date as _date, timedelta as _td
-            start_date = _date.fromisoformat(latest_yt) + _td(days=1)
             print(
-                f"  [Schedule] YouTube: {len(yt_publish_dates)} occupied dates, "
-                f"latest={latest_yt}, next free from {start_date.isoformat()}",
+                f"  [Schedule] YouTube: {len(yt_publish_dates)} occupied slots",
                 flush=True,
             )
         else:

@@ -176,26 +176,45 @@ def disambiguate_search_candidates(
     player_key: str,
 ) -> SearchPlayerCandidate | None:
     """Filter search hits to roster nicknames; tiebreak on exact player_key match."""
-    roster_set = set(roster_nicknames)
-    on_roster = [
-        candidate
-        for candidate in candidates
-        if normalize_pipeline_player_key(candidate["nickname"]) in roster_set
-    ]
-    if not on_roster:
-        return None
-    if len(on_roster) == 1:
-        return on_roster[0]
-
     key = normalize_pipeline_player_key(player_key)
-    exact = [
-        candidate
-        for candidate in on_roster
-        if normalize_pipeline_player_key(candidate["nickname"]) == key
-    ]
-    if len(exact) == 1:
-        return exact[0]
+    roster_set = set(roster_nicknames)
+    if roster_set:
+        on_roster = [
+            candidate
+            for candidate in candidates
+            if normalize_pipeline_player_key(candidate["nickname"]) in roster_set
+        ]
+        if not on_roster:
+            return None
+        if len(on_roster) == 1:
+            return on_roster[0]
+
+        exact = [
+            candidate
+            for candidate in on_roster
+            if normalize_pipeline_player_key(candidate["nickname"]) == key
+        ]
+        if len(exact) == 1:
+            return exact[0]
+        return None
+
+    for candidate in candidates:
+        slug = _player_slug_from_url(candidate["player_url"])
+        if slug and _slug_matches(slug, key):
+            return candidate
     return None
+
+
+_HLTV_PLAYER_SLUG_RE = re.compile(r"/player/\d+/([^/?#]+)", re.IGNORECASE)
+
+
+def _player_slug_from_url(url: str) -> str:
+    m = _HLTV_PLAYER_SLUG_RE.search(url)
+    return m.group(1).lower() if m else ""
+
+
+def _slug_matches(slug: str, player_key: str) -> bool:
+    return player_key == slug
 
 
 def resolve_from_search(
