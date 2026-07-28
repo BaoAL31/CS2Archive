@@ -112,6 +112,33 @@ _SEQ_RENDER_RE = re.compile(r"^sequence-(\d+)-tick-(\d+)-to-(\d+)\.mp4$")
 _ROUND_RENDER_RE = re.compile(r"^round-(\d+)-tick-(\d+)-to-(\d+)\.mp4$")
 
 
+def _copy_and_verify(src: Path, dst: Path) -> bool:
+    """Copy src -> dst, then delete src only if dst exists and size matches."""
+    if not src.exists():
+        return False
+    src_size = src.stat().st_size
+    try:
+        shutil.copy2(str(src), str(dst))
+    except OSError:
+        return False
+    if not dst.exists():
+        return False
+    if dst.stat().st_size != src_size:
+        try:
+            dst.unlink()
+        except OSError:
+            pass
+        return False
+    try:
+        if src.is_dir():
+            shutil.rmtree(src, ignore_errors=True)
+        else:
+            src.unlink()
+    except OSError:
+        pass
+    return True
+
+
 def _rename_sequence_files(output_dir: Path, global_rounds: list[int]) -> set[int]:
     """Rename per-round CSDM outputs to round-{global:03d}-tick-{A}-to-{B}.mp4.
 
@@ -149,8 +176,9 @@ def _rename_sequence_files(output_dir: Path, global_rounds: list[int]) -> set[in
             for i, p in enumerate(seqs):
                 m = _SEQ_RENDER_RE.match(p.name)
                 gr = global_rounds[i]
-                p.rename(output_dir / f"round-{gr:03d}-tick-{m.group(2)}-to-{m.group(3)}.mp4")
-                salvaged.add(gr)
+                dst = output_dir / f"round-{gr:03d}-tick-{m.group(2)}-to-{m.group(3)}.mp4"
+                if _copy_and_verify(p, dst):
+                    salvaged.add(gr)
             return salvaged
 
         # Partial match: fewer seq files than rounds. Map by tick start.
@@ -160,8 +188,9 @@ def _rename_sequence_files(output_dir: Path, global_rounds: list[int]) -> set[in
             tick_s = int(m.group(2))
             rn = tick_start_to_rn.get(tick_s)
             if rn is not None and rn in set(global_rounds):
-                seq.rename(output_dir / f"round-{rn:03d}-tick-{m.group(2)}-to-{m.group(3)}.mp4")
-                salvaged.add(rn)
+                dst = output_dir / f"round-{rn:03d}-tick-{m.group(2)}-to-{m.group(3)}.mp4"
+                if _copy_and_verify(seq, dst):
+                    salvaged.add(rn)
             else:
                 # Fallback: sequential pairing with rescued rounds only
                 pass
@@ -175,8 +204,9 @@ def _rename_sequence_files(output_dir: Path, global_rounds: list[int]) -> set[in
         for seq, gr in zip(sorted(unmapped_seqs), unmapped_gr):
             m = _SEQ_RENDER_RE.match(seq.name)
             a, b = m.group(2), m.group(3)
-            seq.rename(output_dir / f"round-{gr:03d}-tick-{a}-to-{b}.mp4")
-            salvaged.add(gr)
+            dst = output_dir / f"round-{gr:03d}-tick-{a}-to-{b}.mp4"
+            if _copy_and_verify(seq, dst):
+                salvaged.add(gr)
         return salvaged
 
     # --- New format (CSDM 3.20+): N-sequence/video.mp4 ---
@@ -188,15 +218,8 @@ def _rename_sequence_files(output_dir: Path, global_rounds: list[int]) -> set[in
         print(f"  [WARN] No sequence outputs found for batch {global_rounds}")
         return salvaged
 
-    # Build index: seq index → tick start from analysis (sorted)
-    sorted_ticks = sorted(tick_map)
-    seq_to_tick: dict[int, int] = {}
-    for i, tick_a in enumerate(sorted_ticks):
-        seq_to_tick[i] = tick_a
-
-    tick_to_rn: dict[int, int] = {}
-    for rn, (a, _b) in tick_map.items():
-        tick_to_rn[a] = rn
+    # CSDM numbers sequence dirs from 1 within each batch, starting at the first
+    # round it was asked to render. seq_num → global_rounds[seq_num - 1].
 
     for seq_dir in seq_dirs:
         video = seq_dir / "video.mp4"
@@ -204,20 +227,13 @@ def _rename_sequence_files(output_dir: Path, global_rounds: list[int]) -> set[in
             print(f"  [WARN] {video} not found in {seq_dir.name}")
             continue
         seq_num = int(seq_dir.name.split("-")[0])
-        tick_a = seq_to_tick.get(seq_num - 1)
-        rn = tick_to_rn.get(tick_a) if tick_a is not None else None
-        if rn is not None and rn in set(global_rounds):
-            a, b = tick_map.get(rn, (0, 0))
-            video.rename(output_dir / f"round-{rn:03d}-tick-{a}-to-{b}.mp4")
-            shutil.rmtree(seq_dir, ignore_errors=True)
-            salvaged.add(rn)
-        else:
-            if seq_num <= len(global_rounds):
-                gr = global_rounds[seq_num - 1]
-                a, b = tick_map.get(gr, (0, 0))
-                video.rename(output_dir / f"round-{gr:03d}-tick-{a}-to-{b}.mp4")
-                shutil.rmtree(seq_dir, ignore_errors=True)
-                salvaged.add(gr)
+        gr = global_rounds[seq_num - 1] if seq_num - 1 < len(global_rounds) else None
+        if gr is None:
+            continue
+        a, b = tick_map.get(gr, (0, 0))
+        dst = output_dir / f"round-{gr:03d}-tick-{a}-to-{b}.mp4"
+        if _copy_and_verify(video, dst):
+            salvaged.add(gr)
 
     return salvaged
 
@@ -670,20 +686,6 @@ def main() -> None:
                         print(f"  [SKIP] rounds {global_rounds} already rendered ({mb_total:.0f} MB)")
                         total_rendered += len(batch)
                     continue
-
-                # Clean stale sequence dirs from previous batches before
-                # rendering this batch. CSDM reuses N-sequence/ naming each
-                # call, so leftover dirs from failed batches would cause
-                # _rename_sequence_files' count check to fail.
-                for stale_seq in output_dir.glob("*-sequence"):
-                    if stale_seq.is_dir():
-                        shutil.rmtree(stale_seq, ignore_errors=True)
-                # Also clean legacy per-round files that may be stale
-                for stale_seq in output_dir.glob("sequence-*-tick-*-to-*.mp4"):
-                    try:
-                        stale_seq.unlink()
-                    except OSError:
-                        pass
 
                 # Resume: only ask csdm for the missing local rounds in this batch.
                 missing_local = [gr - global_round for gr in missing_global]
