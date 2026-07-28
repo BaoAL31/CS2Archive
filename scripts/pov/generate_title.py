@@ -164,7 +164,8 @@ def main() -> None:
     stage = normalize_stage(stage_raw)
 
     # Title sections with removable priority (None = never drop).
-    # Trim priority when over YouTube's 100-char limit: 1=stage, 2=map.
+    # Trim priority when over YouTube's 100-char limit:
+    # 1=stage, 2=overlay-suffix, 3=map.
     # Player / teams / tournament are always kept.
     player_parts = [args.player]
     if kd:
@@ -175,7 +176,7 @@ def main() -> None:
     sections.append((f"{team_a_short} vs {team_b_short}", None))
     if stage:
         sections.append((stage, 1))
-    sections.append((args.map, 2))
+    sections.append((args.map, 3))
     if tournament_short:
         sections.append((tournament_short, None))
 
@@ -235,7 +236,7 @@ def main() -> None:
 
     if args.variant == "overlay":
         if args.pbdems2:
-            suffix = " | W/ Utility Cam Overlay"
+            overlay_label = "W/ Utility Cams"
             extra_overlay_tags = [
                 "utility cam",
                 "CS2 overlay",
@@ -248,7 +249,7 @@ def main() -> None:
                 "flashes, molotovs, and other grenades."
             )
         else:
-            suffix = " | W/ Inputs + Util Overlay"
+            overlay_label = "W/ Inputs + Utility Cams"
             extra_overlay_tags = [
                 "input overlay",
                 "utility cam",
@@ -264,17 +265,26 @@ def main() -> None:
                 "plus utility trajectory clips for smokes, "
                 "flashes, molotovs, and other grenades."
             )
-        # Drop removable sections by priority (stage -> map) until the
-        # full title+suffix fits YouTube's 100-char limit.
+        # Insert overlay label before map in sections (priority 2 —
+        # dropped after stage, before map).
+        map_section = next((s for s in sections if s[1] == 3), None)
+        if map_section:
+            idx = sections.index(map_section)
+            sections.insert(idx, (overlay_label, 2))
+        else:
+            sections.append((overlay_label, 2))
+        # Rebuild title with the new section
+        title = " | ".join(t for t, _ in sections)
+        # Drop removable sections by priority (stage -> overlay -> map)
+        # until title fits YouTube's 100-char limit.
         removable = sorted([s for s in sections if s[1] is not None],
                            key=lambda s: s[1])
-        while len(title + suffix) > 100 and removable:
+        while len(title) > 100 and removable:
             victim = removable.pop(0)
             sections = [s for s in sections if s != victim]
             title = " | ".join(t for t, _ in sections)
-        title = title + suffix
         if len(title) > 100:
-            title = title[:97].rstrip() + "..."
+            title = title[:100]
         tags = tags + extra_overlay_tags
 
     print(json.dumps({"title": title, "description": description, "tags": tags}))
