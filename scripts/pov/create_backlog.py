@@ -72,7 +72,7 @@ def _resolve_demo_for_map(match_slug: str, map_name: str) -> Path:
 
 
 
-def _resolve_steam_id(nickname: str) -> str:
+def _resolve_steam_id(nickname: str, demo_steamids: dict[str, str] | None = None) -> str:
     from player_accounts import _load_accounts, PlayerAccount, extract_steam_id
 
     lower = nickname.lower()
@@ -81,12 +81,20 @@ def _resolve_steam_id(nickname: str) -> str:
             acct = PlayerAccount(**rec)
             # Prefer re-resolving from steam_url (canonical when it's a
             # 17-digit numeric ID). acct.steam_id can be stale if the Steam
-            # profile URL redirect changed over time — using it would lock
+            # profile URL redirect changed over — using it over the
             # CSDM to the wrong player and silently render enemy POV.
             resolved = extract_steam_id(acct.steam_url)
             if resolved:
                 return resolved
             return acct.steam_id or acct.steam_url or ""
+
+    # Fallback: extract from the demo itself
+    if demo_steamids:
+        for player_name, sid in demo_steamids.items():
+            if player_name.lower() == lower:
+                print(f"  [STEAM] resolved {nickname} from demo: {sid}")
+                return sid
+
     return ""
 
 
@@ -102,6 +110,57 @@ def _existing_avatar_path(nickname: str) -> str:
     return ""
 
 
+def _ensure_player_account(nickname: str, steam_id: str) -> None:
+    """Add player to player_accounts.json if not already present."""
+    from player_accounts import _load_accounts, _save_accounts
+    import datetime as _dt
+
+    records = _load_accounts()
+    for r in records:
+        if r["nickname"].lower() == nickname.lower():
+            return
+
+    now = _dt.datetime.now().isoformat()
+    records.append({
+        "nickname": nickname,
+        "steam_id": steam_id,
+        "steam_url": f"https://steamcommunity.com/profiles/{steam_id}",
+        "created_at": now,
+        "updated_at": now,
+    })
+    _save_accounts(records)
+    print(f"  [ACCT] Added {nickname} ({steam_id}) to player_accounts.json")
+
+
+def _ensure_video_settings(nickname: str) -> None:
+    """Sync video settings from prosettings.net onto the player account."""
+    from scrapers.prosettings import resolve_video_settings
+    from player_accounts import _load_accounts, _save_accounts
+    import datetime as _loc_dt
+
+    settings = resolve_video_settings(nickname)
+    records = _load_accounts()
+    now = _loc_dt.datetime.now()
+    for r in records:
+        if r["nickname"].lower() == nickname.lower():
+            r["resolution"] = settings["resolution"]
+            r["aspect_ratio"] = settings["aspect_ratio"]
+            r["scaling_mode"] = settings["scaling_mode"]
+            r["capture_width"] = settings["width"]
+            r["capture_height"] = settings["height"]
+            r["video_settings_source"] = settings.get("source", "default")
+            for k in ("viewmodel_fov", "viewmodel_offset_x", "viewmodel_offset_y",
+                      "viewmodel_offset_z", "viewmodel_presetpos", "hud_scaling"):
+                if settings.get(k) is not None:
+                    r[k] = settings[k]
+                elif k not in r:
+                    r[k] = None
+            r["updated_at"] = str(now)
+            _save_accounts(records)
+            print(f"  [CFG] Synced video settings for {nickname} (source: {settings.get('source', '?')})")
+            return
+
+
 async def create_backlog_entry(
     match_url: str,
     match_slug: str,
@@ -115,21 +174,29 @@ async def create_backlog_entry(
     tournament: str,
     *,
     avatar_rel: str = "",
+    demo_steamids: dict[str, str] | None = None,
 ) -> None:
     player_clean = player.strip()
     priority = get_priority(rating)
-    steam_id = _resolve_steam_id(player_clean)
+    steam_id = _resolve_steam_id(player_clean, demo_steamids)
 
     demo_for_map = _resolve_demo_for_map(match_slug, map_name)
     demo_rel = str(demo_for_map.relative_to(PROJECT_ROOT)).replace("\\", "/")
 
     if not avatar_rel:
         avatar_rel = _existing_avatar_path(player_clean)
-        if not avatar_rel:
-            try:
-                avatar_rel = await _fetch_avatar(player_clean, match_url, ratings_path)
-            except Exception as e:
-                print(f"  [WARN] Avatar fetch failed for {player_clean}: {e}")
+
+    missing: list[str] = []
+    if not steam_id:
+        missing.append("steam_id")
+    if not avatar_rel:
+        missing.append("avatar_path")
+    if missing:
+        print(f"[ERR] Missing required fields for {player_clean} on {map_name}: {missing}")
+        sys.exit(1)
+
+    _ensure_player_account(player_clean, steam_id)
+    _ensure_video_settings(player_clean)
 
     slug = f"{player_clean.lower()}-{map_name.lower()}-{match_slug}"
     backlog_dir = BACKLOG_DIR / match_slug / priority
@@ -214,6 +281,56 @@ def _download_match_from_hf(hf_root: str, slug: str, demo_folder: Path) -> list[
     return out
 
 
+def _write_avatar_worker(players: list[str], match_url: str, ratings_path: str) -> Path:
+    """Write a self-contained Python script that fetches avatars via CloakBrowser
+    in its own process (avoids Plapyright-async-inside-asyncio deadlock)."""
+    script = PROJECT_ROOT / "tmp" / "_avatar_worker.py"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    PROJECT_ROOT_ABS = str(PROJECT_ROOT).replace("\\", "/")
+    script.write_text(f'''
+import json, os, sys, time
+from pathlib import Path
+
+PROJECT_ROOT = Path(r"{PROJECT_ROOT_ABS}")
+os.chdir(str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT))
+
+players = {json.dumps(players)}
+match_url = {json.dumps(match_url)}
+ratings_path = {json.dumps(ratings_path)}
+
+from scrapers.player_images import CloakAvatarFetcher, _fetch_avatar_cloak
+
+def _existing(nick):
+    name = nick.strip().lower()
+    for source in ("hltv", "faceit"):
+        folder = PROJECT_ROOT / "demos" / "avatars" / name / source
+        if folder.is_dir():
+            for ext in (".png", ".jpg", ".jpeg"):
+                p = folder / f"{{name}}{{ext}}"
+                if p.exists():
+                    return str(p.relative_to(PROJECT_ROOT)).replace("\\\\", "/")
+    return ""
+
+with CloakAvatarFetcher(headless=False) as fetcher:
+    for i, nick in enumerate(players):
+        cached = _existing(nick)
+        if cached:
+            print(f"AVATAR_OK:{{nick}}:{{cached}}")
+            continue
+        try:
+            path = _fetch_avatar_cloak(nick, match_url, str(ratings_path), fetcher=fetcher)
+            abs_path = PROJECT_ROOT.joinpath(path) if not path.is_absolute() else path
+            rel = str(abs_path.relative_to(PROJECT_ROOT)).replace("\\\\", "/")
+            print(f"AVATAR_OK:{{nick}}:{{rel}}")
+        except Exception as e:
+            print(f"AVATAR_FAIL:{{nick}}:{{e}}")
+        if i < len(players) - 1:
+            time.sleep(2)
+'''.strip(), encoding="utf-8")
+    return script
+
+
 async def main() -> None:
     if len(sys.argv) < 2:
         print(f"Usage: python {sys.argv[0]} <hltv_url>")
@@ -241,7 +358,7 @@ async def main() -> None:
     print(f"[OK] Tournament: {tournament}")
     hf_root = re.sub(r"[^\w]", "_", tournament.lower()).strip("_") if tournament else ""
     print(f"[OK] HF root: {hf_root}")
-
+    
     if existing_demos:
         print(f"[SKIP] Demos already exist in {demo_folder}")
     else:
@@ -254,7 +371,7 @@ async def main() -> None:
                 print(f"  [WARN] HuggingFace download failed: {e}")
                 print("  [FALLBACK] Trying CloakBrowser download...")
                 from scrapers.hltv_acquire import acquire_match
-                result = acquire_match(match_url, force=False, headless=True)
+                result = await asyncio.to_thread(acquire_match, match_url, force=False, headless=True)
                 if result.status.value == "failed":
                     print(f"[ERR] CloakBrowser download also failed: {result.error}")
                     sys.exit(1)
@@ -262,7 +379,7 @@ async def main() -> None:
         else:
             print("[DL] No HF root — downloading via CloakBrowser...")
             from scrapers.hltv_acquire import acquire_match
-            result = acquire_match(match_url, force=False, headless=True)
+            result = await asyncio.to_thread(acquire_match, match_url, force=False, headless=True)
             if result.status.value == "failed":
                 print(f"[ERR] CloakBrowser download failed: {result.error}")
                 sys.exit(1)
@@ -278,35 +395,40 @@ async def main() -> None:
         for t in ratings["tables"]
         for p in t["players"]
     })
+    print(f"[STEAM] Extracting Steam IDs from demos...")
+    demo_steamids = {}
+    for dem in existing_demos:
+        try:
+            from scripts.pov.extract_steamids import extract_steamids
+            demo_steamids.update(extract_steamids(str(dem)))
+        except Exception as e:
+            print(f"  [WARN] Failed to extract steam IDs from {dem.name}: {e}")
+    print(f"  [OK] Resolved {len(demo_steamids)} players from demos")
+
     print(f"[AVATAR] Fetching {len(unique_players)} unique players (CloakBrowser)...")
     avatar_cache: dict[str, str] = {}
-
-    def _fetch_avatars_sync():
-        from scrapers.player_images import CloakAvatarFetcher, _fetch_avatar_cloak
-        import time as _time
-
-        cache: dict[str, str] = {}
-        with CloakAvatarFetcher(headless=False) as fetcher:
-            for i, nick in enumerate(unique_players):
-                cached = _existing_avatar_path(nick)
-                if cached:
-                    cache[nick] = cached
-                    continue
-                try:
-                    path = _fetch_avatar_cloak(nick, match_url, str(ratings_path), fetcher=fetcher)
-                    abs_path = PROJECT_ROOT.joinpath(path) if not path.is_absolute() else path
-                    cache[nick] = str(abs_path.relative_to(PROJECT_ROOT)).replace("\\", "/")
-                except Exception as e:
-                    print(f"  [WARN] Avatar failed for {nick}: {e}")
-                if i < len(unique_players) - 1:
-                    _time.sleep(2)
-        return cache
-
+    avatar_script = _write_avatar_worker(unique_players, match_url, str(ratings_path))
     try:
-        loop = asyncio.get_event_loop()
-        avatar_cache = await loop.run_in_executor(None, _fetch_avatars_sync)
+        import subprocess as _subprocess
+        print(f"  [AVATAR] Launching isolated subprocess for {len(unique_players)} players...")
+        _result = _subprocess.run(
+            [sys.executable, str(avatar_script)],
+            capture_output=True, text=True, timeout=600, cwd=str(PROJECT_ROOT),
+        )
+        print(_result.stdout)
+        if _result.stderr:
+            print(_result.stderr, file=sys.stderr)
+        for line in _result.stdout.splitlines():
+            if line.startswith("AVATAR_OK:"):
+                _, nick, path = line.split(":", 2)
+                avatar_cache[nick] = path
+            elif line.startswith("AVATAR_FAIL:"):
+                _, nick, msg = line.split(":", 2)
+                print(f"  [WARN] Avatar failed for {nick}: {msg}")
+        if _result.returncode != 0:
+            print(f"  [WARN] Avatar worker exited {_result.returncode}")
     except Exception as e:
-        print(f"  [WARN] Avatar browser unavailable, skipping avatars: {e}")
+        print(f"  [WARN] Avatar worker failed: {e}")
 
     for table in ratings["tables"]:
         if table["map"] == "Series Overall":
@@ -327,6 +449,7 @@ async def main() -> None:
                 ratings_path=ratings_path,
                 tournament=tournament,
                 avatar_rel=avatar_cache.get(nick, ""),
+                demo_steamids=demo_steamids,
             )
 
     print("[OK] Backlog created")

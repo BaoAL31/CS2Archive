@@ -133,9 +133,9 @@ These tools sit outside the core `pipeline.py` → `upload_pending.py` flow but 
 
 ### Chaining pipelines (upload overlap)
 
-Use `scripts/pov/pipeline_chain.py` to start the **next** POV when the **previous** reaches **thumbnail/upload-ready** (state `step >= 6`). Only one render (step 2) should run at a time; the actual YouTube upload runs separately via `upload_pending.py` and can overlap with the next POV’s acquire→render.
+Use `scripts/pov/pipeline_chain.py` to start the **next** POV when the **previous** reaches **thumbnail/upload-ready** (state `step >= 6`). Only one render (step 2) should run at a time.
 
-**How it works:** polls `.pipeline/{run_id}.json` every 30s (`--poll`). When `"step" >= 6`, spawns `pipeline.py` with the args you pass after `--`. Does **not** read terminal output — only the state file.
+**How it works:** polls `.pipeline/{run_id}.json` every 30s (`--poll`). When `"step" >= 6`, spawns `pipeline.py` with the args you pass after `--`. Does **not** read terminal output — only the state file. The pipeline stops at step 6 (thumbnail) with `upload_status="pending"`; uploading is a separate `upload_pending.py` pass that can overlap with the next POV's render.
 
 **`run_id`** = `{match_id}_{demo_stem}_{player}_{map}` (e.g. `2394174_falcons-vs-mouz-m3-nuke_NiKo_Nuke`). Includes HLTV match ID to prevent collision when the same teams/map/player appear in different tournaments. Use `match_id_from_url()` from `scrapers/hltv_acquire.py` to extract the ID. Same args as the watched pipeline must be used when resuming.
 
@@ -151,7 +151,7 @@ python scripts/pov/pipeline_chain.py --watch falcons-vs-mouz-m2-dust2_kyousuke_D
 
 - **`--no-wait`** — start the next pipeline and exit (recommended; each POV runs in its own process/terminal).
 - Omit `--no-wait` to block until the spawned pipeline finishes.
-- Start POV A’s pipeline first, then start chain watcher(s) in separate background terminals.
+- Start POV A's pipeline first, then start chain watcher(s) in separate background terminals.
 
 ## Individual Step Scripts (Debugging / Manual Use)
 
