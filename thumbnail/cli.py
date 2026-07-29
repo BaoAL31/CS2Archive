@@ -190,7 +190,7 @@ def main() -> None:
     avatar_path = get_avatar_path(args.player)
     if not avatar_path:
         console.print(f"[red]  No avatar found for '{args.player}' in demos/avatars/[/red]")
-        return
+        sys.exit(1)
 
     if args.background:
         bg_path = Path(args.background)
