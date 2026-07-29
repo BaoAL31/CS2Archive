@@ -11,7 +11,7 @@ from pathlib import Path
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _SCRIPTS_DIR.parent
-_BUCKETS = ("pov", "overlay", "faceit", "highlights", "upload", "hf", "misc")
+_BUCKETS = ("pov", "overlay", "faceit", "highlights", "upload", "hf", "misc", "shorts")
 
 
 def ensure() -> Path:
