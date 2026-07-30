@@ -145,7 +145,12 @@ def build_action_timeline(demo_path: Path) -> dict:
                 _fe_by_round[rn] = tick
     round_freeze_ends = [{"round": rn, "tick": t} for rn, t in sorted(_fe_by_round.items())]
 
-    # Round ends — keep one per round (earliest tick wins)
+    # Round ends — CS2 emits round_officially_ended for round N at the same
+    # tick as round_start for round N+1. Bump those back by one round.
+    _rs_ticks: set[int] = set()
+    for st_tick, _ in round_starts:
+        if first_freeze is None or st_tick >= first_freeze:
+            _rs_ticks.add(st_tick)
     _re_by_round: dict[int, int] = {}
     if not round_end.empty:
         for _, row in round_end.sort_values("tick").iterrows():
@@ -153,6 +158,8 @@ def build_action_timeline(demo_path: Path) -> dict:
             if first_freeze is not None and tick < first_freeze:
                 continue
             rn = _round_for_tick(tick, round_starts, first_freeze)
+            if tick in _rs_ticks and rn > 0:
+                rn -= 1
             if rn > 0 and rn not in _re_by_round:
                 _re_by_round[rn] = tick
     round_ends = [{"round": rn, "tick": t} for rn, t in sorted(_re_by_round.items())]

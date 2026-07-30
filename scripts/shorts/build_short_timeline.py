@@ -307,9 +307,15 @@ def detect_shorts(
     _all_rounds = sorted(set(kills_by_round.keys()) | set(round_win_events.keys()))
     all_rounds = [r for r in _all_rounds if r > 0]
 
+    # Derive actual team numbers from player data (CS2 uses 2/3, not 1/2)
+    _team_nums = sorted({t for t in team_by_sid.values() if t > 1})
+    if len(_team_nums) < 2:
+        _team_nums = [2, 3]
+    _team_a, _team_b = _team_nums[:2]
+
     for roundn in all_rounds:
         round_kills = kills_by_round.get(roundn, [])
-        alive: dict[int, int] = {1: 5, 2: 5}
+        alive: dict[int, int] = {_team_a: 5, _team_b: 5}
         victim_teams = {}
         for k in round_kills:
             vt = team_by_sid.get(k["victim_sid"], 0)
@@ -323,10 +329,10 @@ def detect_shorts(
             if vt > 0 and vt in alive:
                 alive[vt] = max(0, alive[vt] - 1)
 
-            for team in (1, 2):
+            for team in (_team_a, _team_b):
                 if team not in alive or team in clutch_triggered:
                     continue
-                enemy = 1 if team == 2 else 2
+                enemy = _team_b if team == _team_a else _team_a
                 if team in alive and enemy in alive:
                     if alive[team] <= 2 and alive[enemy] >= 4:
                         at_size = alive[team]
