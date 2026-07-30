@@ -244,6 +244,40 @@ def build_action_timeline(demo_path: Path) -> dict:
                 "site": str(row.get("site", "") or ""),
             })
 
+    # --- Winner per round ---
+    # Compute which team won each round from kills + bomb events + team assignments.
+    winner_by_round: dict[int, int] = {}
+    # Gather all round numbers that have data
+    kill_rounds = {k["round"] for k in kills}
+    bomb_rounds = {b["round"] for b in bomb_actions}
+    for rn in sorted(kill_rounds | bomb_rounds):
+        _rkills = sorted([k for k in kills if k["round"] == rn], key=lambda k: k["tick"])
+        _rbombs = [b for b in bomb_actions if b["round"] == rn]
+
+        # Bomb win
+        for b in _rbombs:
+            if b["type"] == "explode":
+                sid = b["player_steam_id"]
+                if sid in team_by_sid:
+                    winner_by_round[rn] = team_by_sid[sid]
+            elif b["type"] == "defuse":
+                sid = b["player_steam_id"]
+                if sid in team_by_sid:
+                    winner_by_round[rn] = team_by_sid[sid]
+
+        # If no bomb win, winner = team of last surviving killer
+        if rn not in winner_by_round and _rkills:
+            dead: set[str] = set()
+            for k in _rkills:
+                if k["victim_steam_id"]:
+                    dead.add(k["victim_steam_id"])
+            # Last killer not in dead → their team wins
+            for k in reversed(_rkills):
+                aid = k["attacker_steam_id"]
+                if aid and aid not in dead and aid in team_by_sid:
+                    winner_by_round[rn] = team_by_sid[aid]
+                    break
+
     try:
         demo_rel = str(demo_path.resolve().relative_to(PROJECT_ROOT)).replace("\\", "/")
     except ValueError:
@@ -261,6 +295,7 @@ def build_action_timeline(demo_path: Path) -> dict:
         "round_starts": [{"round": rn, "tick": t} for t, rn in round_starts],
         "round_freeze_ends": round_freeze_ends,
         "round_ends": round_ends,
+        "winner_by_round": {str(rn): t for rn, t in winner_by_round.items()},
     }
 
 

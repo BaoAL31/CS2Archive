@@ -111,6 +111,7 @@ def detect_shorts(
     bomb_explode: "pd.DataFrame | None" = None,
     team_by_sid: dict[str, int] | None = None,
     nickname_by_sid: dict[str, str] | None = None,
+    winner_by_round: dict[int, int] | None = None,
     kill_events: list[dict] | None = None,
     round_starts: list[tuple[int, int]] | None = None,
     first_freeze: int | None = None,
@@ -355,14 +356,18 @@ def detect_shorts(
             for we in rw_events:
                 if we["tick"] < trigger["start_tick"]:
                     continue
+                if we["event"] not in ("defuse", "explode"):
+                    continue  # plant is not a win
                 psid = we["player_sid"]
                 if psid and psid in team_by_sid and team_by_sid[psid] == team:
                     win_tick = we["tick"]
                     win_event = we["event"]
                     win_player = psid
 
-            if win_tick is None and roundn in round_ends:
-                win_tick = round_ends[roundn]
+            if win_tick is None and winner_by_round and roundn in winner_by_round:
+                if winner_by_round[roundn] != team:
+                    continue  # clutch team did NOT win => skip
+                win_tick = round_ends.get(roundn, 0)
                 win_event = "team_win"
 
             win_player = _last_surviving_killer(round_kills, team, team_by_sid, win_player_hint=win_player)
@@ -469,6 +474,14 @@ def build_short_timeline_from_action(action_timeline_path: Path, demo_path: Path
     for re_item in at.get("round_ends", []):
         round_ends[re_item["round"]] = re_item["tick"]
 
+    # Winner per round from action timeline
+    winner_by_round: dict[int, int] = {}
+    for rn_str, team in at.get("winner_by_round", {}).items():
+        try:
+            winner_by_round[int(rn_str)] = int(team)
+        except (ValueError, TypeError):
+            pass
+
     # Team assignments + nicknames from demo (cheap: player_info only)
     parser = dp.DemoParser(str(demo_path))
     info = parser.parse_player_info()
@@ -497,6 +510,7 @@ def build_short_timeline_from_action(action_timeline_path: Path, demo_path: Path
         header_map=at.get("map", ""),
         team_by_sid=team_by_sid,
         nickname_by_sid=nickname_by_sid,
+        winner_by_round=winner_by_round,
         kill_events=kill_events,
         round_starts=round_starts,
         round_ends=round_ends,
