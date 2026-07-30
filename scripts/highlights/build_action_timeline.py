@@ -302,8 +302,9 @@ def build_action_timeline(demo_path: Path) -> dict:
 
     # --- Bomb events (by anyone — context for the round) ---
     bomb_actions: list[dict] = []
+    import pandas as _pd
     for label, df in [("plant", bomb_plant), ("defuse", bomb_defuse), ("explode", bomb_explode)]:
-        if df.empty:
+        if not isinstance(df, _pd.DataFrame) or df.empty:
             continue
         for _, row in df.sort_values("tick").iterrows():
             tick = int(row["tick"])

@@ -193,41 +193,23 @@ def test_scale_is_accepted_kwarg():
 
 
 def test_scale_scales_foreground_wider():
-    """scale=1.5 should produce a wider intermediate (1296px wide) than scale=1.0 (1080px)."""
+    """scale>1.0 should produce a wider foreground in the ffmpeg filter chain."""
     from unittest.mock import patch, MagicMock
-    with patch("moviepy.VideoFileClip") as mock_clip_cls:
-        mock_clip = MagicMock()
-        mock_clip.w = 1920
-        mock_clip.h = 1080
-        mock_clip.duration = 5.0
-        mock_clip.fps = 60
-        mock_clip_cls.return_value = mock_clip
+    captured: list[list[str]] = []
+    def fake_run(cmd, *args, **kwargs):
+        captured.append(cmd)
+        m = MagicMock(returncode=0, stderr="", stdout="")
+        return m
 
-        mock_clip.resized.return_value = mock_clip
-        mock_clip.cropped.return_value = mock_clip
-        mock_clip.with_position.return_value = mock_clip
-        mock_clip.with_duration.return_value = mock_clip
-        mock_clip.image_transform.return_value = mock_clip
+    fake_stat = MagicMock(st_size=2000000)
+    with patch("subprocess.run", side_effect=fake_run), \
+         patch.object(Path, "stat", return_value=fake_stat):
+        _composite_9x16(Path("src.mp4"), Path("dst.mp4"), scale=1.0)
+        _composite_9x16(Path("src.mp4"), Path("dst.mp4"), scale=1.5)
 
-        # track resize calls
-        resize_widths = []
-        def fake_resized(*args, **kwargs):
-            if kwargs.get("width"):
-                resize_widths.append(kwargs["width"])
-            elif args and isinstance(args[0], int):
-                resize_widths.append(args[0])
-            return mock_clip
-
-        mock_clip.resized.side_effect = fake_resized
-
-        with patch("moviepy.CompositeVideoClip", return_value=mock_clip), \
-             patch.object(Path, "stat", return_value=MagicMock(st_size=2000000)):
-            _composite_9x16(Path("src.mp4"), Path("dst.mp4"), scale=1.0)
-            _composite_9x16(Path("src.mp4"), Path("dst.mp4"), scale=1.5)
-
-        # Default 1.0: fg = 1080px wide; 1.5: fg = 1620px wide
-        assert 1080 in resize_widths
-        assert 1620 in resize_widths
+    fcs = [c[7] for c in captured]  # -filter_complex arg
+    assert any("force_original_aspect_ratio=decrease" in f for f in fcs)
+    assert any("scale=1620:-1" in f for f in fcs)
 
 
 def test_output_file_naming(monkeypatch):

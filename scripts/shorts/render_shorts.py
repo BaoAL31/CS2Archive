@@ -229,52 +229,68 @@ def _composite_9x16(
     src: Path,
     dst: Path,
     scale: float = 2.0,
-    blur_radius: int = 35,
-    darken_factor: float = 0.6,
+    blur_radius: int = 50,
+    darken_factor: float = 1.0,
 ) -> None:
-    """Composite a 1920x1080 source into 1080x1920 with echo-letterbox.
+    """Composite a 1920x1080 source into 1080x1920 via ffmpeg filter chain.
 
-    Background: source scaled to fill canvas height, cropped to width,
-    Gaussian-blurred via Pillow, darkened.
+    Background: source scaled to fill canvas (force_original_aspect_ratio=increase,
+    crop to 1080x1920), Gaussian-blurred.
 
-    Foreground: source scaled to ``OUT_WIDTH * scale``, then centre-cropped
-    to 1080px wide.     ``scale=2.0`` zooms 2x. ``scale=1.0`` fits full width (no crop).
-    zooms in 20%, losing 10% off each side but enlarging the footage.
+    Foreground: source scaled to fit canvas (force_original_aspect_ratio=decrease).
+    ``scale=1.0`` fits the source inside without cropping.
+    ``scale>1.0`` zooms in (e.g. 1.5 = source scaled to 1.5x, cropped centre to 1080).
+
+    Encode: NVIDIA NVENC (h264_nvenc) for GPU-accelerated H.264.
+    Decode: cuda hwaccel for GPU-accelerated source decode.
+    Audio: passthrough copy.
     """
-    import numpy as np
-    from PIL import Image, ImageFilter
-    from moviepy import VideoFileClip, CompositeVideoClip
+    gblur_sigma = max(1, blur_radius // 2)
 
-    fg_scaled_w = round(OUT_WIDTH * scale)
+    _dbg("9x16", f"{src.name}: 1080x1920 canvas, scale={scale}x, blur_sigma={gblur_sigma}")
 
-    _dbg("9x16", f"{src.name}: 1080x1920 canvas, scale={scale}x -> fg {fg_scaled_w}px, blur={blur_radius} darken={darken_factor:.0%}")
+    if scale == 1.0:
+        fg_chain = (
+            f"[fg_src]scale={OUT_WIDTH}:{OUT_HEIGHT}:"
+            f"force_original_aspect_ratio=decrease[fg]"
+        )
+    else:
+        fg_chain = (
+            f"[fg_src]scale={round(OUT_WIDTH * scale)}:-1,"
+            f"crop={OUT_WIDTH}:ih[fg]"
+        )
 
-    main = VideoFileClip(str(src), audio=True)
-
-    bg = main.resized(height=OUT_HEIGHT)
-    bg = bg.cropped(x_center=bg.w / 2, y_center=bg.h / 2, width=OUT_WIDTH, height=OUT_HEIGHT)
-
-    def _blur_frame(frame):
-        img = Image.fromarray(frame)
-        blurred = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-        return (np.array(blurred) * darken_factor).astype(np.uint8)
-
-    bg = bg.image_transform(_blur_frame)
-
-    fg = main.resized(width=fg_scaled_w)
-    fg = fg.cropped(x_center=fg.w / 2, y_center=fg.h / 2, width=OUT_WIDTH, height=fg.h)
-    fg = fg.with_position("center")
-
-    final = CompositeVideoClip([bg, fg], size=(OUT_WIDTH, OUT_HEIGHT))
-    final = final.with_duration(main.duration).with_audio(main.audio)
-
-    final.write_videofile(
-        str(dst),
-        fps=main.fps,
-        codec="libx264",
-        audio_codec="aac",
-        audio=True,
+    bg_chain = (
+        f"[bg_src]scale={OUT_WIDTH}:{OUT_HEIGHT}:force_original_aspect_ratio=increase,"
+        f"crop={OUT_WIDTH}:{OUT_HEIGHT},"
+        f"gblur=sigma={gblur_sigma}[bg]"
     )
+    if darken_factor < 1.0:
+        bg_chain += f",eq=brightness={round(darken_factor - 1.0, 3)}"
+
+    vf = (
+        f"[0:v]split=2[bg_src][fg_src];"
+        f"{bg_chain};"
+        f"{fg_chain};"
+        f"[bg][fg]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2[out]"
+    )
+
+    cmd = [
+        FFMPEG, "-y", "-hwaccel", "cuda", "-i", str(src),
+        "-filter_complex", vf,
+        "-map", "[out]", "-map", "0:a?",
+        "-c:v", "h264_nvenc", "-preset", "p4", "-b:v", "25M",
+        "-profile:v", "high", "-pix_fmt", "yuv420p",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        str(dst),
+    ]
+
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg composite failed (rc={r.returncode}): {r.stderr[-2000:]}"
+        )
 
     mb = dst.stat().st_size / 1e6
     _dbg("composite", f"OK ({mb:.1f} MB)")
@@ -398,7 +414,7 @@ def main() -> int:
     ap.add_argument("--batches", type=int, default=0,
                    help="Shorts per batch (0 = all in one)")
     ap.add_argument("--scale", type=float, default=2.0,
-                   help="Foreground scale multiplier (2.0 = 2x zoom, 1.0 = fit width, crop sides)")
+                   help="Foreground scale multiplier (1.0 = fit canvas, 2.0 = 2x zoom with centre crop)")
     ap.add_argument("--composite-only", action="store_true",
                    help="Skip CSDM render; re-composite existing segments with new editing params")
     ap.add_argument("--name", type=str, default=None,
