@@ -43,8 +43,8 @@ def test_4k_detected():
     assert s["short_type"] == "4k"
     assert s["pov_steam_id"] == "A"
     assert s["pov_nick"] == "Unknown"
-    assert s["start_tick"] == 872  # 2s padding (128 ticks) before first kill
-    assert s["end_tick"] == 4128  # 2s padding after last kill
+    assert s["start_tick"] == 680  # 5s padding (320 ticks) before first kill
+    assert s["end_tick"] == 4128  # 2s padding (128 ticks) after last kill
     assert s["kill_ticks"] == [1000, 2000, 3000, 4000]
 
 

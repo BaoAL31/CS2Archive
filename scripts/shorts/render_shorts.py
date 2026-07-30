@@ -228,7 +228,7 @@ def _find_sequence_files(search_dir: Path, num_expected: int, shorts: list[dict]
 def _composite_9x16(
     src: Path,
     dst: Path,
-    scale: float = 1.0,
+    scale: float = 2.0,
     blur_radius: int = 35,
     darken_factor: float = 0.6,
 ) -> None:
@@ -238,7 +238,7 @@ def _composite_9x16(
     Gaussian-blurred via Pillow, darkened.
 
     Foreground: source scaled to ``OUT_WIDTH * scale``, then centre-cropped
-    to 1080px wide. ``scale=1.0`` fits full width (no crop). ``scale=1.2``
+    to 1080px wide.     ``scale=2.0`` zooms 2x. ``scale=1.0`` fits full width (no crop).
     zooms in 20%, losing 10% off each side but enlarging the footage.
     """
     import numpy as np
@@ -249,7 +249,7 @@ def _composite_9x16(
 
     _dbg("9x16", f"{src.name}: 1080x1920 canvas, scale={scale}x -> fg {fg_scaled_w}px, blur={blur_radius} darken={darken_factor:.0%}")
 
-    main = VideoFileClip(str(src), audio=False)
+    main = VideoFileClip(str(src), audio=True)
 
     bg = main.resized(height=OUT_HEIGHT)
     bg = bg.cropped(x_center=bg.w / 2, y_center=bg.h / 2, width=OUT_WIDTH, height=OUT_HEIGHT)
@@ -266,14 +266,14 @@ def _composite_9x16(
     fg = fg.with_position("center")
 
     final = CompositeVideoClip([bg, fg], size=(OUT_WIDTH, OUT_HEIGHT))
-    final = final.with_duration(main.duration)
+    final = final.with_duration(main.duration).with_audio(main.audio)
 
     final.write_videofile(
         str(dst),
         fps=main.fps,
         codec="libx264",
         audio_codec="aac",
-        audio=False,
+        audio=True,
     )
 
     mb = dst.stat().st_size / 1e6
@@ -284,9 +284,14 @@ def render_shorts(
     timeline_path: Path,
     player: str | None = None,
     batch_size: int = 0,
-    scale: float = 1.0,
+    scale: float = 2.0,
+    composite_only: bool = False,
+    name: str | None = None,
 ) -> Path:
     """Render all shorts from a timeline JSON.
+    
+    When *composite_only* is True, skip CSDM and re-composite existing
+    segments with new editing parameters (e.g. scale).
     
     Returns the output directory path.
     """
@@ -309,12 +314,6 @@ def render_shorts(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     segments_dir = out_dir / "segments"
-    # Clear any previous render's segments so we don't pick up stale
-    # sequence-* files / dirs from a prior run.
-    if segments_dir.exists():
-        import shutil
-        shutil.rmtree(segments_dir)
-    segments_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Shorts: {len(shorts)} clips, map={tl.get('map', 'Unknown')}")
     print(f"Demo: {demo_path}")
@@ -328,26 +327,37 @@ def render_shorts(
 
     print(f"  Batches: {len(batches)} (batch size: {batch_size if batch_size > 0 else 'all'})")
 
-    for batch_idx, batch in enumerate(batches):
-        batch_start = sum(len(b) for b in batches[:batch_idx])
-        batch_end = batch_start + len(batch) - 1
-        _dbg("batch", f"batch {batch_idx + 1}/{len(batches)}: shorts {batch_start + 1}-{batch_end + 1}")
+    if not composite_only:
+        # Fresh render: clear stale segments, then run CSDM for each batch
+        if segments_dir.exists():
+            import shutil
+            shutil.rmtree(segments_dir)
+        segments_dir.mkdir(parents=True, exist_ok=True)
 
-        config = _build_csdm_config(batch, demo_path, segments_dir)
-        conf_path = out_dir / f"batch_{batch_idx + 1}_config.json"
-        conf_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        for batch_idx, batch in enumerate(batches):
+            batch_start = sum(len(b) for b in batches[:batch_idx])
+            batch_end = batch_start + len(batch) - 1
+            _dbg("batch", f"batch {batch_idx + 1}/{len(batches)}: shorts {batch_start + 1}-{batch_end + 1}")
 
-        t0 = time.time()
-        ret = _run_csdm(conf_path)
-        elapsed = time.time() - t0
-        if ret != 0:
-            raise RuntimeError(f"CSDM batch {batch_idx + 1} failed (exit {ret}, {elapsed:.0f}s)")
+            config = _build_csdm_config(batch, demo_path, segments_dir)
+            conf_path = out_dir / f"batch_{batch_idx + 1}_config.json"
+            conf_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
-        _dbg("csdm", f"batch {batch_idx + 1} rendered in {elapsed:.0f}s")
+            t0 = time.time()
+            ret = _run_csdm(conf_path)
+            elapsed = time.time() - t0
+            if ret != 0:
+                raise RuntimeError(f"CSDM batch {batch_idx + 1} failed (exit {ret}, {elapsed:.0f}s)")
 
-        seq_files = _find_sequence_files(segments_dir, len(batch), batch)
-        if len(seq_files) != len(batch):
-            _dbg("render", f"[WARN] Expected {len(batch)} sequence files, found {len(seq_files)}")
+            _dbg("csdm", f"batch {batch_idx + 1} rendered in {elapsed:.0f}s")
+
+            seq_files = _find_sequence_files(segments_dir, len(batch), batch)
+            if len(seq_files) != len(batch):
+                _dbg("render", f"[WARN] Expected {len(batch)} sequence files, found {len(seq_files)}")
+    else:
+        if not segments_dir.exists():
+            raise FileNotFoundError(f"No existing segments dir for --composite-only: {segments_dir}")
+        _dbg("composite", f"composite-only: reusing {len(shorts)} source clips from {segments_dir}")
 
     # Composite each segment into 9:16
     seq_files = _find_sequence_files(segments_dir, len(shorts), shorts)
@@ -357,7 +367,14 @@ def render_shorts(
             raise RuntimeError(f"No rendered sequence files found in {segments_dir}")
 
     for i, (seg_file, short) in enumerate(zip(seq_files, shorts)):
-        out_name = f"short_{i + 1:03d}.mp4"
+        if name:
+            base = name
+        else:
+            st = short["short_type"]
+            nick = short.get("pov_nick", "unknown")
+            tick = short.get("start_tick", 0)
+            base = f"{st}-{nick}-t{tick}"
+        out_name = f"{base}.mp4"
         dst = out_dir / out_name
         if dst.exists() and dst.stat().st_size >= 1_048_576:
             w, h = _probe_resolution(dst)
@@ -380,13 +397,18 @@ def main() -> int:
     ap.add_argument("--output", "-o", type=Path, default=None, help="Override output directory")
     ap.add_argument("--batches", type=int, default=0,
                    help="Shorts per batch (0 = all in one)")
-    ap.add_argument("--scale", type=float, default=1.0,
-                   help="Foreground scale multiplier (1.0 = fit width, 1.2 = 20%% zoom, crop sides)")
+    ap.add_argument("--scale", type=float, default=2.0,
+                   help="Foreground scale multiplier (2.0 = 2x zoom, 1.0 = fit width, crop sides)")
+    ap.add_argument("--composite-only", action="store_true",
+                   help="Skip CSDM render; re-composite existing segments with new editing params")
+    ap.add_argument("--name", type=str, default=None,
+                   help="Output filename (without .mp4). Default: {short_type}-{pov_nick}")
     args = ap.parse_args()
 
     try:
         render_shorts(args.timeline, player=args.player, batch_size=args.batches,
-                       scale=args.scale)
+                       scale=args.scale, composite_only=args.composite_only,
+                       name=args.name)
         return 0
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)

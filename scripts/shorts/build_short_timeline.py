@@ -31,7 +31,77 @@ ensure()
 
 from shorts import resolve_output_dir  # noqa: E402
 
-_DEFAULT_TICK_MARGIN = 128  # 2s at 64 tick
+_PRE_KILL_TICK_MARGIN = 320  # 5s before first kill (at 64 tick)
+_POST_KILL_TICK_MARGIN = 128  # 2s after last kill (at 64 tick)
+
+# Weapon tiers for multikill filtering: at least one victim must have a tier >= attacker's tier.
+# Handles both player_death short names (e.g. "m4a1") and display names (e.g. "M4A4").
+_WEAPON_TIER: dict[str, int] = {
+    # Tier 0: Melee / eco items
+    "knife": 0, "world": 0, "zeus": 0, "zeus x27": 0,
+    "c4": 0, "planted_c4": 0,
+    "bayonet": 0, "karambit": 0, "flip knife": 0, "gut knife": 0,
+    "m9 bayonet": 0, "huntsman knife": 0, "falchion knife": 0,
+    "bowie knife": 0, "butterfly knife": 0, "shadow daggers": 0,
+    "paracord knife": 0, "survival knife": 0, "ursus knife": 0,
+    "navaja knife": 0, "nomad knife": 0, "stiletto knife": 0,
+    "talon knife": 0, "classic knife": 0, "skeleton knife": 0,
+    "axe": 0, "hammer": 0, "wrench": 0, "spanner": 0, "tablet": 0,
+    # Tier 1: Pistols
+    "glock": 1, "glock-18": 1, "usp_silencer": 1, "usp-s": 1,
+    "p2000": 1, "p250": 1, "deagle": 1, "desert eagle": 1,
+    "elite": 1, "dual berettas": 1, "fiveseven": 1, "five-seveN": 1,
+    "tec9": 1, "tec-9": 1, "cz75": 1, "cz75-auto": 1,
+    "r8revolver": 1, "r8 revolver": 1,
+    # Tier 2: Shotguns
+    "nova": 2, "xm1014": 2, "mag7": 2, "mag-7": 2,
+    "sawedoff": 2, "sawed-off": 2,
+    # Tier 3: SMGs
+    "mac10": 3, "mac-10": 3, "mp5sd": 3, "mp5-sd": 3,
+    "mp7": 3, "mp9": 3, "p90": 3, "ump45": 3, "ump-45": 3,
+    "bizon": 3, "pp-bizon": 3, "m249": 3, "negev": 3,
+    # Tier 4: Rifles & Snipers
+    "ak47": 4, "ak-47": 4, "m4a4": 4, "m4a1": 4,
+    "m4a1_silencer": 4, "m4a1-s": 4, "famas": 4, "galilar": 4,
+    "galil ar": 4, "aug": 4, "sg553": 4, "sg 553": 4,
+    "awp": 4, "g3sg1": 4, "scar20": 4, "scar-20": 4,
+    "ssg08": 4, "ssg 08": 4,
+    # Tier 5: Special (always count — grenades, fire, bomb)
+    "inferno": 5, "hegrenade": 5, "he grenade": 5,
+    "flashbang": 5, "smokegrenade": 5, "smoke grenade": 5,
+    "decoy": 5, "decoy grenade": 5, "incendiary": 5,
+    "molotov": 5, "tagrenade": 5, "ta grenade": 5,
+    "fraggrenade": 5, "frag grenade": 5,
+}
+
+
+def _weapon_tier(weapon: str) -> int:
+    return _WEAPON_TIER.get(weapon.strip().lower(), -1)
+
+
+def _meets_tier_criterion(kills: list[dict]) -> bool:
+    """At least one victim has weapon tier >= attacker's primary weapon tier.
+    
+    Primary weapon = most common weapon across all kills (tie → highest tier).
+    Tier 5 (inferno, nades, etc.) always passes.
+    """
+    if not kills:
+        return False
+    from collections import Counter
+    counts = Counter(k.get("weapon", "") for k in kills)
+    if not counts:
+        return False
+    primary = counts.most_common(1)[0][0]
+    attacker_tier = _weapon_tier(primary)
+    if attacker_tier >= 5:
+        return True
+    for k in kills:
+        vw = k.get("victim_weapon", "")
+        if not vw:
+            return True
+        if _weapon_tier(vw) >= attacker_tier:
+            return True
+    return False
 
 
 def _sid(val) -> str:
@@ -228,6 +298,7 @@ def detect_shorts(
                 "attacker_sid": str(ev.get("attacker_sid", "")),
                 "victim_sid": str(ev.get("victim_sid", "")),
                 "weapon": str(ev.get("weapon", "")),
+                "victim_weapon": str(ev.get("victim_weapon", "")),
             })
     elif deaths is not None and not deaths.empty:
         kills_by_round = {}
@@ -251,6 +322,7 @@ def detect_shorts(
                 "attacker_sid": attacker_sid,
                 "victim_sid": victim_sid,
                 "weapon": weapon,
+                "victim_weapon": "",
             })
     else:
         kills_by_round = {}
@@ -292,13 +364,15 @@ def detect_shorts(
         for aid, kills in by_attacker.items():
             if len(kills) < 4:
                 continue
+            if not _meets_tier_criterion(kills):
+                continue
             ticks = sorted(k["tick"] for k in kills)
             shorts.append({
                 "short_type": "4k",
                 "pov_steam_id": aid,
                 "pov_nick": nickname_by_sid.get(aid, "Unknown"),
-                "start_tick": ticks[0] - _DEFAULT_TICK_MARGIN,
-                "end_tick": ticks[-1] + _DEFAULT_TICK_MARGIN,
+                "start_tick": ticks[0] - _PRE_KILL_TICK_MARGIN,
+                "end_tick": ticks[-1] + _POST_KILL_TICK_MARGIN,
                 "kill_ticks": ticks,
             })
 
@@ -453,6 +527,7 @@ def build_short_timeline_from_action(action_timeline_path: Path, demo_path: Path
             "attacker_sid": str(k.get("attacker_steam_id", "")),
             "victim_sid": str(k.get("victim_steam_id", "")),
             "weapon": str(k.get("weapon", "")),
+            "victim_weapon": str(k.get("victim_weapon", "")),
         })
 
     # Convert bomb actions -> round_win_events format
@@ -523,12 +598,13 @@ def _build_short_slug(short: dict) -> str:
     st = short["short_type"]
     nick = short.get("pov_nick", "Unknown")
     safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in nick)
+    tick = short.get("start_tick", 0)
     if st == "4k":
-        return f"4k-{safe}"
+        return f"4k-{safe}-t{tick}"
     elif st == "clutch":
         cnt = short.get("clutch_initial_count", "XvX")
-        return f"clutch-{safe}-{cnt}"
-    return f"{st}-{safe}"
+        return f"clutch-{safe}-{cnt}-t{tick}"
+    return f"{st}-{safe}-t{tick}"
 
 
 def main() -> int:

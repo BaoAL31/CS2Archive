@@ -187,7 +187,7 @@ def test_scale_is_accepted_kwarg():
     import inspect
     sig = inspect.signature(_composite_9x16)
     assert "scale" in sig.parameters
-    assert sig.parameters["scale"].default == 1.0
+    assert sig.parameters["scale"].default == 2.0
     anno = sig.parameters["scale"].annotation
     assert anno in (float, "float")
 

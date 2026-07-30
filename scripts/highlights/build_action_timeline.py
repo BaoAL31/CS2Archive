@@ -29,6 +29,47 @@ from faceit_names import canonical_nick, known_pro_steam_ids  # noqa: E402
 
 BOMB_WEAPONS = frozenset({"c4", "planted_c4"})
 
+_CS2_WEAPON_IDS: dict[int, str] = {
+    # Pistols
+    1: "Desert Eagle", 2: "Dual Berettas", 3: "Five-SeveN", 4: "Glock-18",
+    30: "Tec-9", 32: "P2000", 36: "P250", 61: "USP-S",
+    63: "CZ75-Auto", 64: "R8 Revolver",
+    # Rifles
+    7: "AK-47", 8: "AUG", 10: "FAMAS", 13: "Galil AR",
+    16: "M4A4", 39: "SG 553", 60: "M4A1-S",
+    # Snipers
+    9: "AWP", 11: "G3SG1", 38: "SCAR-20", 40: "SSG 08",
+    # SMGs
+    17: "MAC-10", 19: "P90", 23: "MP5-SD", 24: "UMP-45",
+    26: "PP-Bizon", 33: "MP7", 34: "MP9",
+    # Heavy
+    14: "M249", 25: "XM1014", 27: "MAG-7", 28: "Negev",
+    29: "Sawed-Off", 35: "Nova",
+    # Equipment
+    31: "Zeus x27", 42: "Knife", 49: "C4",
+    50: "Kevlar Vest", 51: "Kevlar + Helmet", 52: "Defuse Kit",
+    54: "Rescue Kit", 55: "Medi-Shot", 57: "Healthshot", 59: "Knife",
+    80: "Shield",
+    # Grenades
+    43: "Flashbang", 44: "HE Grenade", 45: "Smoke Grenade",
+    46: "Molotov", 47: "Decoy Grenade", 48: "Incendiary",
+    68: "TA Grenade", 81: "Frag Grenade",
+    # Knives
+    500: "Bayonet", 503: "Karambit", 505: "Flip Knife",
+    506: "Gut Knife", 507: "M9 Bayonet", 508: "Huntsman Knife",
+    509: "Falchion Knife", 512: "Bowie Knife", 514: "Butterfly Knife",
+    515: "Shadow Daggers", 516: "Paracord Knife", 517: "Survival Knife",
+    518: "Ursus Knife", 519: "Navaja Knife", 520: "Nomad Knife",
+    521: "Stiletto Knife", 522: "Talon Knife", 523: "Classic Knife",
+    525: "Skeleton Knife",
+    # Danger Zone tools
+    85: "Tablet", 86: "Axe", 87: "Hammer", 88: "Wrench", 89: "Spanner",
+}
+
+
+def _resolve_weapon_id(def_idx: int) -> str:
+    return _CS2_WEAPON_IDS.get(def_idx, f"item_{def_idx}")
+
 
 def _is_faceit_demo(path: Path) -> bool:
     try:
@@ -164,6 +205,38 @@ def build_action_timeline(demo_path: Path) -> dict:
                 _re_by_round[rn] = tick
     round_ends = [{"round": rn, "tick": t} for rn, t in sorted(_re_by_round.items())]
 
+    # --- Victim weapon lookup via tick-level active weapon snapshot ---
+    import numpy as np
+
+    _death_ticks_raw = sorted(set(
+        int(r["tick"]) for _, r in deaths.iterrows()
+        if first_freeze is None or int(r["tick"]) >= first_freeze
+    ))
+    _weapon_query_ticks: list[int] = []
+    for t in _death_ticks_raw:
+        _weapon_query_ticks.append(t)
+        if t > 1:
+            _weapon_query_ticks.append(t - 1)
+    _weapon_snapshot = parser.parse_ticks(
+        ["m_iItemDefinitionIndex"], ticks=_weapon_query_ticks,
+    )
+    _victim_weapon_map: dict[tuple[int, str], int] = {}
+    for _, row in _weapon_snapshot.iterrows():
+        sid = _sid(row.get("steamid"))
+        t = int(row["tick"])
+        val = row.get("m_iItemDefinitionIndex")
+        if sid and not (isinstance(val, float) and np.isnan(val)):
+            key = (t, sid)
+            if key not in _victim_weapon_map:
+                _victim_weapon_map[key] = int(val)
+
+    def _victim_weapon(death_tick: int, victim_sid: str) -> str:
+        for offset in [death_tick, death_tick - 1, death_tick - 2]:
+            key = (offset, victim_sid)
+            if key in _victim_weapon_map:
+                return _resolve_weapon_id(_victim_weapon_map[key])
+        return ""
+
     # --- Kills ---
     kills: list[dict] = []
     for _, row in deaths.sort_values("tick").iterrows():
@@ -212,6 +285,8 @@ def build_action_timeline(demo_path: Path) -> dict:
             or str(row.get("user_name", "") or "")
         )
 
+        victim_weapon = _victim_weapon(tick, victim_sid) if victim_sid else ""
+
         kills.append({
             "tick": tick,
             "round": _round_for_tick(tick, round_starts, first_freeze),
@@ -220,6 +295,7 @@ def build_action_timeline(demo_path: Path) -> dict:
             "victim": victim_name,
             "victim_steam_id": victim_sid,
             "weapon": weapon,
+            "victim_weapon": victim_weapon,
             "is_bomb": is_bomb,
             "headshot": bool(row.get("headshot", False)),
         })
