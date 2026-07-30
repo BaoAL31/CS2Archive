@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -118,13 +120,6 @@ def test_1v2_not_clutch():
         {"tick": 2500, "round": 1, "attacker_sid": "B2", "victim_sid": "A2", "weapon": "ak47"},
         # B team is alive=2: B1, B2. A team is alive=3: A1, A2 was killed, actually 2. Wait, let's redo.
     ]
-    # Simp: A team: A1, A2, A3, A4, A5. B team: B1, B2, B3, B4, B5.
-    # Kills:
-    # B1 kills A1 (B1 out)
-    # A2 kills B2 (B loses one)
-    # A3 kills B3 (B down to 2)
-    #  — but A still has 5 alive. That's 2v5.
-    # We want 1v2 — not a clutch. Let me restructure
     pass  # This test needs a more precise scenario; see next test
 
 
@@ -183,23 +178,19 @@ def test_zero_kill_defuse_clutch():
     assert c["clutch_initial_count"] == "2v5"
     assert c["pov_steam_id"] == "B2"
     assert c["win_event"] == "defuse"
-    # Span: from outnumbered moment to defuse
     assert c["start_tick"] == 1200
     assert c["end_tick"] == 5000
 
 
 def test_mixed_timeline_coexists():
     kill_events = [
-        # Round 1: 4K by A1
         {"tick": 1000, "round": 1, "attacker_sid": "A1", "victim_sid": "B5", "weapon": "ak47"},
         {"tick": 2000, "round": 1, "attacker_sid": "A1", "victim_sid": "B4", "weapon": "ak47"},
         {"tick": 3000, "round": 1, "attacker_sid": "A1", "victim_sid": "B3", "weapon": "ak47"},
         {"tick": 4000, "round": 1, "attacker_sid": "A1", "victim_sid": "B2", "weapon": "ak47"},
-        # Round 2: Clutch by C2
         {"tick": 5000, "round": 2, "attacker_sid": "C1", "victim_sid": "D5", "weapon": "ak47"},
         {"tick": 5100, "round": 2, "attacker_sid": "C2_opp", "victim_sid": "D4", "weapon": "ak47"},
         {"tick": 5200, "round": 2, "attacker_sid": "C3", "victim_sid": "D3", "weapon": "ak47"},
-        # D team now: D1, D2 alive (2v5)
     ]
     team_by_sid_m = {
         "A1": 1, "A2": 1, "A3": 1, "A4": 1, "A5": 1,
@@ -220,3 +211,92 @@ def test_mixed_timeline_coexists():
     types = {s["short_type"] for s in result["shorts"]}
     assert "4k" in types
     assert "clutch" in types
+
+
+# ------------------ Action Timeline conversion ------------------
+
+
+def test_build_from_action_timeline_detects_4k(tmp_path):
+    """build_short_timeline_from_action converts an action_timeline.json and detects a 4K."""
+    from scripts.shorts.build_short_timeline import build_short_timeline_from_action
+
+    at = {
+        "demo_path": "demos/faceit/test.dem",
+        "map": "Nuke",
+        "source": "faceit",
+        "kill_count": 4,
+        "kills": [
+            {"tick": 1000, "round": 1, "attacker": "NiKo", "attacker_steam_id": "A",
+             "victim": "s1mple", "victim_steam_id": "B", "weapon": "ak47",
+             "is_bomb": False, "headshot": False},
+            {"tick": 2000, "round": 1, "attacker": "NiKo", "attacker_steam_id": "A",
+             "victim": "b1t", "victim_steam_id": "C", "weapon": "ak47",
+             "is_bomb": False, "headshot": False},
+            {"tick": 3000, "round": 1, "attacker": "NiKo", "attacker_steam_id": "A",
+             "victim": "jL", "victim_steam_id": "D", "weapon": "ak47",
+             "is_bomb": False, "headshot": False},
+            {"tick": 4000, "round": 1, "attacker": "NiKo", "attacker_steam_id": "A",
+             "victim": "w0nderful", "victim_steam_id": "E", "weapon": "ak47",
+             "is_bomb": False, "headshot": False},
+        ],
+        "bomb_actions": [],
+        "round_starts": [{"round": 1, "tick": 900}],
+        "round_freeze_ends": [{"round": 1, "tick": 1000}],
+        "round_ends": [{"round": 1, "tick": 5000}],
+    }
+
+    at_path = tmp_path / "action_timeline.json"
+    at_path.write_text(json.dumps(at), encoding="utf-8")
+    demo_path = tmp_path / "test.dem"
+
+    mock_info = MagicMock()
+    mock_info.iterrows.return_value = iter([
+        (0, {"steamid": "A", "team_number": 2, "name": "NiKo"}),
+        (1, {"steamid": "B", "team_number": 3, "name": "s1mple"}),
+        (2, {"steamid": "C", "team_number": 3, "name": "b1t"}),
+        (3, {"steamid": "D", "team_number": 3, "name": "jL"}),
+        (4, {"steamid": "E", "team_number": 3, "name": "w0nderful"}),
+    ])
+    mock_parser = MagicMock()
+    mock_parser.return_value.parse_player_info.return_value = mock_info
+
+    with patch("demoparser2.DemoParser", mock_parser):
+        result = build_short_timeline_from_action(at_path, demo_path)
+
+    assert result["short_count"] >= 1
+    types = {s["short_type"] for s in result["shorts"]}
+    assert "4k" in types
+    assert result["map"] == "Nuke"
+
+
+def test_build_from_action_preserves_demo_path(tmp_path):
+    """Action timeline conversion preserves the demo_path in the output."""
+    from scripts.shorts.build_short_timeline import build_short_timeline_from_action
+
+    at = {
+        "demo_path": "demos/faceit/my-match.dem",
+        "map": "Inferno",
+        "source": "faceit",
+        "kill_count": 0,
+        "kills": [],
+        "bomb_actions": [],
+        "round_starts": [],
+        "round_freeze_ends": [],
+        "round_ends": [],
+    }
+
+    at_path = tmp_path / "at.json"
+    at_path.write_text(json.dumps(at), encoding="utf-8")
+    demo_path = tmp_path / "cache_test.dem"
+
+    mock_info = MagicMock()
+    mock_info.iterrows.return_value = iter([])
+    mock_parser = MagicMock()
+    mock_parser.return_value.parse_player_info.return_value = mock_info
+
+    with patch("demoparser2.DemoParser", mock_parser):
+        result = build_short_timeline_from_action(at_path, demo_path)
+
+    assert result["demo_path"] == str(demo_path)
+    assert result["map"] == "Inferno"
+    assert result["short_count"] == 0

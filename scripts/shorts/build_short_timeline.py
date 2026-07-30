@@ -1,11 +1,20 @@
 """Build a Short Timeline from any CS2 demo (HLTV or FACEIT).
 
 Detects two Short types:
-  - 4K : 4+ kills by same attacker in a single round (incl. 5-kill aces).
-  - Clutch : team wins from 2v4 or worse (1v3, 1v4, 1v5, 2v4, 2v5).
+  - **4K** : 4+ kills by same attacker in a single round (incl. 5-kill aces).
+  - **Clutch** : team wins from 2v4 or worse (1v3, 1v4, 1v5, 2v4, 2v5).
+
+Two input modes:
+  1. **Direct demo parse** (default): parses the full demo via demoparser2.
+  2. **From Action Timeline** (``--from-action-timeline``): reads an existing
+     ``action_timeline.json`` (Recognised Pro-gated, FACEIT-only), extracts
+     kill events + team assignments, and runs the same 4K/Clutch detection.
+     This reuses the highlights pipeline's Recognised Pro filtering without
+     re-parsing the demo.
 
 Usage:
     python scripts/shorts/build_short_timeline.py <demo_path> [--player <steam_id>]
+    python scripts/shorts/build_short_timeline.py <demo_path> --from-action-timeline renders/hl-<stem>/action_timeline.json [--player <steam_id>]
 """
 
 from __future__ import annotations
@@ -155,6 +164,15 @@ def detect_shorts(
         round_freeze_ends = {}
 
     # --- Round ends ---
+    # CS2 emits `round_officially_ended` for round N at the same tick as
+    # `round_start` for round N+1. _round_for_tick() then assigns the end
+    # to round N+1 (since start_tick <= tick), but it really belongs to
+    # round N. Fix: build a set of round_start ticks and bump those ends
+    # back by one round.
+    _rs_ticks: set[int] = set()
+    for st_tick, _ in round_starts:
+        if first_freeze is None or st_tick >= first_freeze:
+            _rs_ticks.add(st_tick)
     if round_ends is None and round_end is not None and not round_end.empty:
         _re: dict[int, int] = {}
         for _, row in round_end.sort_values("tick").iterrows():
@@ -162,6 +180,8 @@ def detect_shorts(
             if first_freeze is not None and tick < first_freeze:
                 continue
             rn = _round_for_tick(tick, round_starts, first_freeze)
+            if tick in _rs_ticks and rn > 0:
+                rn -= 1
             if rn > 0 and rn not in _re:
                 _re[rn] = tick
         round_ends = _re
@@ -220,6 +240,8 @@ def detect_shorts(
                 if first_freeze is not None and tick < first_freeze:
                     continue
                 rn = _round_for_tick(tick, round_starts, first_freeze)
+                if tick in _rs_ticks and rn > 0:
+                    rn -= 1
                 _rwe.setdefault(rn, []).append({
                     "tick": tick,
                     "event": label,
@@ -293,26 +315,23 @@ def detect_shorts(
             win_event = None
             win_player = None
 
+            # Pick the LAST win event for this team at or after the clutch
+            # trigger. Plant/explode can fire mid-round, before the team is
+            # actually outnumbered.
             for we in rw_events:
+                if we["tick"] < trigger["start_tick"]:
+                    continue
                 psid = we["player_sid"]
                 if psid and psid in team_by_sid and team_by_sid[psid] == team:
                     win_tick = we["tick"]
                     win_event = we["event"]
                     win_player = psid
-                    break
 
             if win_tick is None and roundn in round_ends:
                 win_tick = round_ends[roundn]
                 win_event = "team_win"
-                for sid, t in team_by_sid.items():
-                    if t == team and sid not in [k["victim_sid"] for k in round_kills]:
-                        win_player = sid
-                        break
-                if win_player is None:
-                    for k in reversed(round_kills):
-                        if k["attacker_sid"] and team_by_sid.get(k["attacker_sid"], 0) == team:
-                            win_player = k["attacker_sid"]
-                            break
+
+            win_player = _last_surviving_killer(round_kills, team, team_by_sid, win_player_hint=win_player)
 
             if win_tick is not None and win_player is not None:
                 shorts.append({
@@ -348,11 +367,121 @@ def _round_for_tick(
     return rn
 
 
+def _last_surviving_killer(
+    round_kills: list[dict],
+    team: int,
+    team_by_sid: dict[str, int],
+    win_player_hint: str | None = None,
+) -> str | None:
+    """Pick the POV for a team clutch: the last attacker on this team in
+    the round who isn't themselves a victim (i.e. survived). Falls back
+    to the win event actor (e.g. defuser), then any surviving teammate."""
+    dead: set[str] = {k["victim_sid"] for k in round_kills if k["victim_sid"]}
+    killers_team = [
+        k for k in round_kills
+        if k["attacker_sid"]
+        and team_by_sid.get(k["attacker_sid"], 0) == team
+        and k["attacker_sid"] not in dead
+    ]
+    if killers_team:
+        return killers_team[-1]["attacker_sid"]
+    if win_player_hint and team_by_sid.get(win_player_hint) == team and win_player_hint not in dead:
+        return win_player_hint
+    for sid, t in team_by_sid.items():
+        if t == team and sid not in dead:
+            return sid
+    return None
+
+
+def build_short_timeline_from_action(action_timeline_path: Path, demo_path: Path) -> dict:
+    """Build a Short Timeline from an existing action_timeline.json.
+
+    Reads Recognised Pro-gated kills + bomb events from the Action Timeline,
+    infers team assignments from the same source demo (player_info only), then
+    runs the standard 4K/Clutch detection via ``detect_shorts()``.
+    """
+    import demoparser2 as dp
+
+    at = json.loads(action_timeline_path.read_text(encoding="utf-8"))
+
+    # Convert action timeline kills -> kill_events format for detect_shorts()
+    kill_events: list[dict] = []
+    for k in at.get("kills", []):
+        kill_events.append({
+            "tick": k["tick"],
+            "round": k["round"],
+            "attacker_sid": str(k.get("attacker_steam_id", "")),
+            "victim_sid": str(k.get("victim_steam_id", "")),
+            "weapon": str(k.get("weapon", "")),
+        })
+
+    # Convert bomb actions -> round_win_events format
+    round_win_events: dict[int, list[dict]] = {}
+    for b in at.get("bomb_actions", []):
+        rn = b["round"]
+        round_win_events.setdefault(rn, []).append({
+            "tick": b["tick"],
+            "event": b["type"],
+            "player_sid": str(b.get("player_steam_id", "")),
+        })
+
+    # Convert round metadata
+    round_starts = [(rs["tick"], rs["round"]) for rs in at.get("round_starts", [])]
+    round_freeze_ends: dict[int, int] = {}
+    for re_item in at.get("round_freeze_ends", []):
+        round_freeze_ends[re_item["round"]] = re_item["tick"]
+    round_ends: dict[int, int] = {}
+    for re_item in at.get("round_ends", []):
+        round_ends[re_item["round"]] = re_item["tick"]
+
+    # Team assignments from demo (cheap: player_info only)
+    parser = dp.DemoParser(str(demo_path))
+    info = parser.parse_player_info()
+    team_by_sid: dict[str, int] = {}
+    for _, row in info.iterrows():
+        sid = _sid(row.get("steamid"))
+        if not sid:
+            continue
+        team_by_sid[sid] = int(row.get("team_number", 0) or 0)
+
+    return detect_shorts(
+        demo_path=str(demo_path),
+        header_map=at.get("map", ""),
+        team_by_sid=team_by_sid,
+        kill_events=kill_events,
+        round_starts=round_starts,
+        round_ends=round_ends,
+        round_freeze_ends=round_freeze_ends,
+        round_win_events=round_win_events,
+    )
+
+
+def _resolve_output_dir_for_action_timeline(at_path: Path, demo_path: Path, player: str | None = None) -> Path:
+    """Determine shorts output dir when using --from-action-timeline.
+
+    Action timelines live in ``renders/hl-{stem}/``. Per ADR 0004, shorts are
+    colocated: ``renders/hl-{stem}/shorts/``.
+    """
+    # For FACEIT demos referenced by an action_timeline in hl-X/ context,
+    # colocate under that highlights run dir.
+    hl_dir = at_path.parent
+    shorts_dir = hl_dir / "shorts"
+    shorts_dir.mkdir(parents=True, exist_ok=True)
+    return shorts_dir
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build Short Timeline JSON from a demo")
     ap.add_argument("demo_path", type=Path, help="Path to .dem file")
     ap.add_argument("--player", type=str, default=None, help="Steam ID for HLTV demo output dir")
     ap.add_argument("--output", "-o", type=Path, default=None, help="Override output path")
+    ap.add_argument(
+        "--from-action-timeline", "-A",
+        type=Path,
+        default=None,
+        help="Build shorts from an existing action_timeline.json (Recognised Pro-gated). "
+             "Demo used only for player_info (team assignments).",
+    )
     args = ap.parse_args()
 
     demo = args.demo_path
@@ -360,12 +489,23 @@ def main() -> int:
         print(f"[ERR] demo not found: {demo}", file=sys.stderr)
         return 1
 
-    timeline = build_short_timeline(demo, player=args.player)
-
-    if args.output:
-        out = args.output
+    if args.from_action_timeline:
+        at_path = args.from_action_timeline
+        if not at_path.is_file():
+            print(f"[ERR] action_timeline.json not found: {at_path}", file=sys.stderr)
+            return 1
+        timeline = build_short_timeline_from_action(at_path, demo)
+        if args.output:
+            out = args.output
+        else:
+            out = _resolve_output_dir_for_action_timeline(at_path, demo, player=args.player) / "short_timeline.json"
     else:
-        out = resolve_output_dir(demo, player=args.player) / "short_timeline.json"
+        timeline = build_short_timeline(demo, player=args.player)
+        if args.output:
+            out = args.output
+        else:
+            out = resolve_output_dir(demo, player=args.player) / "short_timeline.json"
+
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(timeline, indent=2), encoding="utf-8")
     print(f"[OK] {timeline['short_count']} shorts -> {out}")

@@ -12,26 +12,29 @@ RENDERS_DIR = _PROJECT_ROOT / "renders"
 
 
 def resolve_output_dir(demo_path: str | Path, player: str | None = None) -> Path:
-    """Return the shorts output directory for a demo.
+    """Return the shorts output directory for a demo (per ADR 0004 + pollution guard).
+
+    Shorts are folded into a single per-match folder, not per-player — otherwise
+    a 10-player match would create 10 near-empty ``renders/`` siblings. The
+    player's identity travels inside each rendered short (POV steam_id), not in
+    the directory layout.
 
     For HLTV demos (under ``demos/hltv/``) returns
-    ``renders/pov-{demo_stem}_{player}/shorts/``.
+    ``renders/pov-{demo_stem}/shorts/`` (sibling to all per-player POV dirs).
 
     For FACEIT demos (under ``demos/faceit/``) returns
     ``renders/hl-{demo_stem}/shorts/``.
 
-    Creates the ``shorts/`` subfolder if it does not already exist.
+    The ``player`` argument is accepted for backwards compatibility but ignored.
+
+    Creates the directory if it does not already exist.
     """
     demo = Path(demo_path).resolve()
     normalized = str(demo).replace("\\", "/")
     demo_stem = demo.stem
 
     if "demos/hltv" in normalized:
-        if not player:
-            raise ValueError(
-                f"resolve_output_dir: player required for HLTV demo {demo}"
-            )
-        output_dir = RENDERS_DIR / f"pov-{demo_stem}_{player}" / "shorts"
+        output_dir = RENDERS_DIR / f"pov-{demo_stem}" / "shorts"
     elif "demos/faceit" in normalized:
         output_dir = RENDERS_DIR / f"hl-{demo_stem}" / "shorts"
     else:

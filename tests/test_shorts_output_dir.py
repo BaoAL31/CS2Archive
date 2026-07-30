@@ -35,7 +35,7 @@ def test_hltv_with_player(monkeypatch, tmp_path):
     monkeypatch.setattr("shorts.RENDERS_DIR", tmp_path / "renders")
 
     out = resolve_output_dir(demo, player="76561198000000000")
-    assert out == tmp_path / "renders" / "pov-spirit-vs-falcons-m3-nuke_76561198000000000" / "shorts"
+    assert out == tmp_path / "renders" / "pov-spirit-vs-falcons-m3-nuke" / "shorts"
     assert out.is_dir()
 
 
@@ -64,10 +64,11 @@ def test_hltv_absolute_path(monkeypatch, tmp_path):
 
     out = resolve_output_dir(demo, player="123456789")
     assert out.name == "shorts"
-    assert "pov-match-slug-map_123456789" in out.parent.name
+    assert "pov-match-slug-map" in out.parent.name
 
 
-def test_hltv_missing_player_raises(monkeypatch, tmp_path):
+def test_hltv_player_ignored(monkeypatch, tmp_path):
+    """Player is accepted but ignored — single per-match shorts folder."""
     fake_project = tmp_path / "project"
     fake_project.mkdir()
     abs_demo_root = fake_project / "demos" / "hltv" / "some-match"
@@ -76,8 +77,9 @@ def test_hltv_missing_player_raises(monkeypatch, tmp_path):
     demo.write_text("")
     monkeypatch.setattr("shorts.RENDERS_DIR", tmp_path / "renders")
 
-    with pytest.raises(ValueError, match="player required"):
-        resolve_output_dir(demo)
+    out = resolve_output_dir(demo)  # no player needed
+    assert out.name == "shorts"
+    assert out.parent.name == "pov-some-map"
 
 
 def test_unknown_path_raises(monkeypatch, tmp_path):

@@ -229,77 +229,103 @@ def _composite_9x16(
     src: Path,
     dst: Path,
     footage_ratio: int = 10,
+    blur_sigma: int = 40,
+    bg_scale: float = 1.5,
+    side_crop: float = 0.10,
 ) -> None:
-    """Composite a 2560x1440 source into 1080x1920 with edge mirror blur.
+    """Composite a 2560x1440 source into 1080x1920 with a blurred-background fill.
 
-    *footage_ratio* controls how much of the 16-unit vertical height is
-    allocated to the central footage region.  Header/footer = (16-N)/2 each.
+    Layout (Premiere/Reels convention):
+      1. Canvas = 1080x1920.
+      2. Background layer: same source scaled by ``bg_scale`` (default 1.5x)
+         to fill the canvas, heavily Gaussian-blurred (default sigma=40) so
+         all detail washes out — just colour and motion.
+      3. Foreground: 16:9 source scaled to fit width (1080px) with
+         ``side_crop`` fraction trimmed off each side (default 10%), centred
+         vertically. Black bars are masked by the blurred background
+         showing through.
 
-    Default ratio=10 → footage=1200px, header=360px, footer=360px.
+    *footage_ratio* is preserved for callers but is no longer used; the
+    foreground sits centred in the canvas and the background fills the rest.
     """
-    footage_h = int(OUT_HEIGHT * footage_ratio / 16)
-    edge_h = (OUT_HEIGHT - footage_h) // 2
+    fg_w = OUT_WIDTH
+    fg_h = round(SRC_HEIGHT * fg_w / SRC_WIDTH)
+    if fg_h > OUT_HEIGHT:
+        fg_h = OUT_HEIGHT
 
-    # Ensure precise sum
-    if edge_h * 2 + footage_h != OUT_HEIGHT:
-        edge_h = (OUT_HEIGHT - footage_h) // 2
-        footage_h = OUT_HEIGHT - edge_h * 2
+    # Trim side_crop fraction off each side of the foreground by scaling up
+    # to (1/(1 - 2*side_crop)) and cropping back to fg_w.
+    fg_scale = 1.0 / max(1.0 - 2.0 * side_crop, 0.1)
+    fg_scaled_w = round(SRC_WIDTH * fg_scale)
+    fg_scaled_h = round(SRC_HEIGHT * fg_scale)
+    fg_y = (OUT_HEIGHT - fg_h) // 2
+    crop_x = (fg_scaled_w - fg_w) // 2
 
-    _dbg("9x16", f"{src.name}: {SRC_WIDTH}x{SRC_HEIGHT} -> {OUT_WIDTH}x{OUT_HEIGHT} (footage={footage_h}px, edges={edge_h}px)")
+    bg_w = round(OUT_WIDTH * bg_scale)
+    bg_h = round(OUT_HEIGHT * bg_scale)
 
+    _dbg("9x16", f"{src.name}: {SRC_WIDTH}x{SRC_HEIGHT} -> {OUT_WIDTH}x{OUT_HEIGHT} (fg {fg_w}x{fg_h}@y={fg_y} side-crop={side_crop:.0%}, bg {bg_w}x{bg_h} blur={blur_sigma})")
+
+    # NVENC path
     cmd = [
         "ffmpeg", "-y", "-i", str(src),
         "-filter_complex",
         (
-            # Scale to 1080x1920 (fill: scale to width, then crop height)
-            f"[0:v]scale={OUT_WIDTH}:{OUT_HEIGHT}:force_original_aspect_ratio=increase,crop={OUT_WIDTH}:{OUT_HEIGHT}[scaled];"
-            f"[scaled]split=3[s1][s2][s3];"
-            # Blur top edge: crop top portion, scale to fill edge, blur
-            f"[s1]crop={OUT_WIDTH}:{edge_h}:0:0,scale={OUT_WIDTH}:{edge_h}:flags=lanczos,gblur=20[mirror_top];"
-            # Central footage
-            f"[s2]crop={OUT_WIDTH}:{footage_h}:0:{edge_h}[fg];"
-            # Blur bottom edge: crop bottom portion, scale to fill edge, blur
-            f"[s3]crop={OUT_WIDTH}:{edge_h}:0:{OUT_HEIGHT - edge_h}:exact=1,scale={OUT_WIDTH}:{edge_h}:flags=lanczos,gblur=20[mirror_bot];"
-            # Stack: mirror_top | fg | mirror_bot
-            f"[mirror_top][fg][mirror_bot]vstack=inputs=3[out]"
+            # Background: scale source up to bg_scale * canvas, crop centre
+            f"[0:v]scale={bg_w}:{bg_h}:force_original_aspect_ratio=increase,"
+            f"crop={OUT_WIDTH}:{OUT_HEIGHT}:(iw-{OUT_WIDTH})/2:(ih-{OUT_HEIGHT})/2,"
+            f"gblur=sigma={blur_sigma}:steps=3,format=yuv420p[bg];"
+            # Foreground: scale to fill width+side_crop, crop centre, then pad
+            # to canvas.
+            f"[0:v]scale={fg_scaled_w}:{fg_scaled_h}:force_original_aspect_ratio=decrease,"
+            f"crop={fg_w}:{fg_scaled_h}:{crop_x}:0,format=yuv420p[fg_raw];"
+            f"color=black:s={OUT_WIDTH}x{OUT_HEIGHT}:d=1[blank];"
+            f"[blank][fg_raw]overlay=x=0:y={fg_y}[fg];"
+            # Composite fg over bg
+            f"[bg][fg]overlay=0:0:format=auto[out]"
         ),
         "-map", "[out]",
-        "-c:v", "h264_nvenc", "-preset", "p7", "-b:v", "0", "-cq", "20",
+        "-r", "64",
+        "-fps_mode", "cfr",
+        "-c:v", "h264_nvenc", "-preset", "p4", "-b:v", "0", "-cq", "20",
         "-profile:v", "high", "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
         "-an",
         str(dst),
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-    if r.returncode != 0:
-        _dbg("composite", f"[ERROR] {r.stderr[-500:]}")
-        # CPU fallback
-        cmd = [
-            "ffmpeg", "-y", "-i", str(src),
-            "-filter_complex",
-            (
-                f"[0:v]split[raw1][raw2];"
-                f"[raw1]scale={OUT_WIDTH}:-1:flags=spline,format=yuv420p[scaled];"
-                f"[raw2]scale={OUT_WIDTH}:-1:flags=spline,format=yuv420p[scaled_r2];"
-                f"[scaled]crop={OUT_WIDTH}:{footage_h}[fg];"
-                f"[scaled_r2]crop={OUT_WIDTH}:{edge_h}:0:0:exact=1[top_raw];"
-                f"[scaled_r2]crop={OUT_WIDTH}:{edge_h}:0:{OUT_HEIGHT - edge_h}:exact=1[bot_raw];"
-                f"[top_raw]scale={OUT_WIDTH}:{edge_h}:flags=lanczos,gblur=20[edge_top];"
-                f"[bot_raw]scale={OUT_WIDTH}:{edge_h}:flags=lanczos,gblur=20[edge_bot];"
-                f"[edge_top][fg][edge_bot]vstack=inputs=3[out]"
-            ),
-            "-map", "[out]",
-            "-c:v", "libx264", "-crf", "18", "-preset", "slow",
-            "-profile:v", "high", "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            "-an",
-            str(dst),
-        ]
-        r2 = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-        if r2.returncode != 0:
-            raise RuntimeError(f"Composite failed (NVENC + libx264): {r2.stderr[-500:]}")
+    if r.returncode == 0:
+        mb = dst.stat().st_size / 1e6
+        _dbg("composite", f"OK ({mb:.1f} MB)")
+        return
+        return
+
+    _dbg("composite", f"[WARN] NVENC failed: {r.stderr[-300:]}")
+    # CPU fallback (libx264)
+    cmd = [
+        "ffmpeg", "-y", "-i", str(src),
+        "-filter_complex",
+        (
+            f"[0:v]scale={bg_w}:{bg_h}:force_original_aspect_ratio=increase,"
+            f"crop={OUT_WIDTH}:{OUT_HEIGHT}:(iw-{OUT_WIDTH})/2:(ih-{OUT_HEIGHT})/2,"
+            f"gblur=sigma={blur_sigma}:steps=4,format=yuv420p[bg];"
+            f"[0:v]scale={fg_w}:-1,format=yuv420p[fg_raw];"
+            f"color=black:s={OUT_WIDTH}x{OUT_HEIGHT}:d=1[blank];"
+            f"[blank][fg_raw]overlay=x=0:y={fg_y}[fg];"
+            f"[bg][fg]overlay=0:0:format=auto[out]"
+        ),
+        "-map", "[out]",
+        "-c:v", "libx264", "-crf", "18", "-preset", "slow",
+        "-profile:v", "high", "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-an",
+        str(dst),
+    ]
+    r2 = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    if r2.returncode != 0:
+        raise RuntimeError(f"Composite failed (NVENC + libx264): {r2.stderr[-500:]}")
     mb = dst.stat().st_size / 1e6
-    _dbg("composite", f"OK ({mb:.1f} MB)")
+    _dbg("composite", f"OK CPU ({mb:.1f} MB)")
 
 
 def render_shorts(
@@ -325,6 +351,11 @@ def render_shorts(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     segments_dir = out_dir / "segments"
+    # Clear any previous render's segments so we don't pick up stale
+    # sequence-* files / dirs from a prior run.
+    if segments_dir.exists():
+        import shutil
+        shutil.rmtree(segments_dir)
     segments_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Shorts: {len(shorts)} clips, map={tl.get('map', 'Unknown')}")

@@ -183,20 +183,27 @@ def test_output_has_duration(tmp_path, monkeypatch):
 
 
 def test_footage_ratio_changes_composite():
-    """footage_ratio 10 vs 8 build different filter strings."""
+    """footage_ratio is preserved as a kwarg but the filter is bg-scale + blur."""
     with patch("subprocess.run") as mock_run:
         mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
 
         with patch.object(Path, "stat", return_value=MagicMock(st_size=2000000)):
-            _composite_9x16(Path("10_src.mp4"), Path("10_dst.mp4"), footage_ratio=10)
-        args_10_str = " ".join(str(a) for a in mock_run.call_args_list[-1][0][0])
+            _composite_9x16(Path("src.mp4"), Path("dst.mp4"), footage_ratio=10)
+        args_str = " ".join(str(a) for a in mock_run.call_args_list[-1][0][0])
 
-        with patch.object(Path, "stat", return_value=MagicMock(st_size=2000000)):
-            _composite_9x16(Path("8_src.mp4"), Path("8_dst.mp4"), footage_ratio=8)
-        args_8_str = " ".join(str(a) for a in mock_run.call_args_list[-1][0][0])
-
-        assert "crop=1080:1200" in args_10_str
-        assert "crop=1080:960" in args_8_str
+        # Background layer: scale up 1.5x + heavy Gaussian blur (default)
+        assert "gblur=sigma=40" in args_str
+        # 1.5x of 1080x1920 = 1620x2880 — much smaller than 3x, avoids
+        # frame drops during the composite encode.
+        assert "scale=1620:2880" in args_str
+        # Foreground is overlaid centred on the blurred bg
+        assert "[bg][fg]overlay" in args_str
+        # Foreground is cropped 10% off each side: scale up by 1/0.8 = 1.25
+        assert "scale=3200:1800" in args_str
+        # CFR 64fps output prevents frame-rate drift
+        assert '"64"' in args_str or "64" in args_str
+        # NVENC preset p4 (was p7 — p7 drops frames on heavy filter)
+        assert "-preset p4" in args_str
 
 
 def test_output_file_naming(monkeypatch):
