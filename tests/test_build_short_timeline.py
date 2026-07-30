@@ -42,6 +42,7 @@ def test_4k_detected():
     s = timeline["shorts"][0]
     assert s["short_type"] == "4k"
     assert s["pov_steam_id"] == "A"
+    assert s["pov_nick"] == "Unknown"
     assert s["start_tick"] == 1000
     assert s["end_tick"] == 4000
     assert s["kill_ticks"] == [1000, 2000, 3000, 4000]
@@ -110,6 +111,7 @@ def test_clutch_detected():
     c = clutches[0]
     assert c["clutch_initial_count"] == "2v5"
     assert c["pov_steam_id"] == "t2_Z"
+    assert c["pov_nick"] == "Unknown"
     assert c["win_event"] == "defuse"
 
 
@@ -267,6 +269,10 @@ def test_build_from_action_timeline_detects_4k(tmp_path):
     types = {s["short_type"] for s in result["shorts"]}
     assert "4k" in types
     assert result["map"] == "Nuke"
+    # pov_nick should be resolved from player_info or action timeline kills
+    fourk = [s for s in result["shorts"] if s["short_type"] == "4k"]
+    if fourk:
+        assert fourk[0].get("pov_nick") == "NiKo"
 
 
 def test_build_from_action_preserves_demo_path(tmp_path):

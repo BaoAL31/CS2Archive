@@ -1,4 +1,4 @@
-"""Build an Action Timeline from a FACEIT demo (data only).
+"""Build an Action Timeline from a demo (HLTV or FACEIT, data only).
 
 Parses demoparser2 events — kills, bomb events, utility usage, round lifecycle —
 keeps actions **by** a Recognised Pro (``.data/player_accounts.json``), and writes:
@@ -8,6 +8,7 @@ keeps actions **by** a Recognised Pro (``.data/player_accounts.json``), and writ
 Usage:
     python scripts/highlights/build_action_timeline.py <demo_path>
     python scripts/highlights/build_action_timeline.py demos/faceit/some-match.dem
+    python scripts/highlights/build_action_timeline.py demos/hltv/some-match/some-map.dem
 """
 
 from __future__ import annotations
@@ -241,10 +242,12 @@ def build_action_timeline(demo_path: Path) -> dict:
     except ValueError:
         demo_rel = str(demo_path)
 
+    source = "hltv" if "demos/hltv" in demo_rel else "faceit"
+
     return {
         "demo_path": demo_rel,
         "map": _map_name(demo_path, header_map),
-        "source": "faceit",
+        "source": source,
         "kill_count": len(kills),
         "kills": kills,
         "bomb_actions": bomb_actions,
@@ -259,8 +262,8 @@ def highlights_run_dir(demo_path: Path) -> Path:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Build FACEIT Action Timeline JSON")
-    ap.add_argument("demo_path", type=Path, help="Path to FACEIT .dem under demos/faceit/")
+    ap = argparse.ArgumentParser(description="Build Action Timeline JSON (HLTV or FACEIT)")
+    ap.add_argument("demo_path", type=Path, help="Path to .dem file")
     ap.add_argument(
         "--output",
         type=Path,
@@ -272,12 +275,6 @@ def main() -> int:
     demo = args.demo_path
     if not demo.is_file():
         print(f"[ERR] demo not found: {demo}", file=sys.stderr)
-        return 1
-    if not _is_faceit_demo(demo):
-        print(
-            f"[ERR] FACEIT-only: demo must live under demos/faceit/ (got {demo})",
-            file=sys.stderr,
-        )
         return 1
 
     timeline = build_action_timeline(demo)

@@ -47,6 +47,18 @@ def _sid(val) -> str:
     return s
 
 
+def _build_nickname_map(info) -> dict[str, str]:
+    nid: dict[str, str] = {}
+    for _, row in info.iterrows():
+        sid = _sid(row.get("steamid"))
+        if not sid:
+            continue
+        name = str(row.get("name", "") or "").strip()
+        if name:
+            nid[sid] = name
+    return nid
+
+
 def build_short_timeline(demo_path: Path, player: str | None = None) -> dict:
     """Parse demo via demoparser2 and extract 4K/Clutch Shorts."""
     import demoparser2 as dp
@@ -68,6 +80,8 @@ def build_short_timeline(demo_path: Path, player: str | None = None) -> dict:
     except Exception:
         header_map = ""
 
+    nickname_by_sid = _build_nickname_map(info)
+
     return detect_shorts(
         demo_path=str(demo_path),
         header_map=header_map,
@@ -76,6 +90,7 @@ def build_short_timeline(demo_path: Path, player: str | None = None) -> dict:
         freeze_end=freeze_end,
         round_end=round_end,
         info=info,
+        nickname_by_sid=nickname_by_sid,
         bomb_plant=bomb_plant,
         bomb_defuse=bomb_defuse,
         bomb_explode=bomb_explode,
@@ -95,6 +110,7 @@ def detect_shorts(
     bomb_defuse: "pd.DataFrame | None" = None,
     bomb_explode: "pd.DataFrame | None" = None,
     team_by_sid: dict[str, int] | None = None,
+    nickname_by_sid: dict[str, str] | None = None,
     kill_events: list[dict] | None = None,
     round_starts: list[tuple[int, int]] | None = None,
     first_freeze: int | None = None,
@@ -111,6 +127,7 @@ def detect_shorts(
 
     # --- Team + name lookup from player_info ---
     _tid: dict[str, int] = {}
+    _nid: dict[str, str] = {}
     if team_by_sid is not None:
         _tid = dict(team_by_sid)
     elif info is not None and not info.empty:
@@ -119,7 +136,17 @@ def detect_shorts(
             if not sid:
                 continue
             _tid[sid] = int(row.get("team_number", 0) or 0)
+            name = str(row.get("name", "") or "").strip()
+            if name:
+                _nid[sid] = name
     team_by_sid = _tid
+    if nickname_by_sid is None:
+        nickname_by_sid = _nid
+    else:
+        nickname_by_sid = dict(nickname_by_sid)
+        # fill missing from info
+        for sid, name in _nid.items():
+            nickname_by_sid.setdefault(sid, name)
 
     # --- Round starts ---
     if round_starts is not None:
@@ -268,6 +295,7 @@ def detect_shorts(
             shorts.append({
                 "short_type": "4k",
                 "pov_steam_id": aid,
+                "pov_nick": nickname_by_sid.get(aid, "Unknown"),
                 "start_tick": ticks[0] - _DEFAULT_TICK_MARGIN,
                 "end_tick": ticks[-1] + _DEFAULT_TICK_MARGIN,
                 "kill_ticks": ticks,
@@ -337,6 +365,7 @@ def detect_shorts(
                 shorts.append({
                     "short_type": "clutch",
                     "pov_steam_id": win_player,
+                    "pov_nick": nickname_by_sid.get(win_player, "Unknown"),
                     "start_tick": trigger["start_tick"],
                     "end_tick": win_tick,
                     "clutch_initial_count": trigger["type"],
@@ -434,20 +463,34 @@ def build_short_timeline_from_action(action_timeline_path: Path, demo_path: Path
     for re_item in at.get("round_ends", []):
         round_ends[re_item["round"]] = re_item["tick"]
 
-    # Team assignments from demo (cheap: player_info only)
+    # Team assignments + nicknames from demo (cheap: player_info only)
     parser = dp.DemoParser(str(demo_path))
     info = parser.parse_player_info()
     team_by_sid: dict[str, int] = {}
+    nickname_by_sid: dict[str, str] = {}
     for _, row in info.iterrows():
         sid = _sid(row.get("steamid"))
         if not sid:
             continue
         team_by_sid[sid] = int(row.get("team_number", 0) or 0)
+        name = str(row.get("name", "") or "").strip()
+        if name:
+            nickname_by_sid[sid] = name
+
+    # Also pull nicknames from action timeline kills (some players may not appear in info)
+    for k in at.get("kills", []):
+        sid = str(k.get("attacker_steam_id", ""))
+        if sid and sid not in nickname_by_sid:
+            nickname_by_sid[sid] = str(k.get("attacker", ""))
+        sid = str(k.get("victim_steam_id", ""))
+        if sid and sid not in nickname_by_sid:
+            nickname_by_sid[sid] = str(k.get("victim", ""))
 
     return detect_shorts(
         demo_path=str(demo_path),
         header_map=at.get("map", ""),
         team_by_sid=team_by_sid,
+        nickname_by_sid=nickname_by_sid,
         kill_events=kill_events,
         round_starts=round_starts,
         round_ends=round_ends,
@@ -456,25 +499,23 @@ def build_short_timeline_from_action(action_timeline_path: Path, demo_path: Path
     )
 
 
-def _resolve_output_dir_for_action_timeline(at_path: Path, demo_path: Path, player: str | None = None) -> Path:
-    """Determine shorts output dir when using --from-action-timeline.
-
-    Action timelines live in ``renders/hl-{stem}/``. Per ADR 0004, shorts are
-    colocated: ``renders/hl-{stem}/shorts/``.
-    """
-    # For FACEIT demos referenced by an action_timeline in hl-X/ context,
-    # colocate under that highlights run dir.
-    hl_dir = at_path.parent
-    shorts_dir = hl_dir / "shorts"
-    shorts_dir.mkdir(parents=True, exist_ok=True)
-    return shorts_dir
+def _build_short_slug(short: dict) -> str:
+    st = short["short_type"]
+    nick = short.get("pov_nick", "Unknown")
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in nick)
+    if st == "4k":
+        return f"4k-{safe}"
+    elif st == "clutch":
+        cnt = short.get("clutch_initial_count", "XvX")
+        return f"clutch-{safe}-{cnt}"
+    return f"{st}-{safe}"
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build Short Timeline JSON from a demo")
     ap.add_argument("demo_path", type=Path, help="Path to .dem file")
     ap.add_argument("--player", type=str, default=None, help="Steam ID for HLTV demo output dir")
-    ap.add_argument("--output", "-o", type=Path, default=None, help="Override output path")
+    ap.add_argument("--output", "-o", type=Path, default=None, help="Override output base directory")
     ap.add_argument(
         "--from-action-timeline", "-A",
         type=Path,
@@ -495,20 +536,27 @@ def main() -> int:
             print(f"[ERR] action_timeline.json not found: {at_path}", file=sys.stderr)
             return 1
         timeline = build_short_timeline_from_action(at_path, demo)
-        if args.output:
-            out = args.output
-        else:
-            out = _resolve_output_dir_for_action_timeline(at_path, demo, player=args.player) / "short_timeline.json"
+        base_dir = args.output or at_path.parent
     else:
         timeline = build_short_timeline(demo, player=args.player)
-        if args.output:
-            out = args.output
-        else:
-            out = resolve_output_dir(demo, player=args.player) / "short_timeline.json"
+        base_dir = args.output or resolve_output_dir(demo, player=args.player)
 
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(timeline, indent=2), encoding="utf-8")
-    print(f"[OK] {timeline['short_count']} shorts -> {out}")
+    shorts_list = timeline.get("shorts", [])
+    if not shorts_list:
+        print("[OK] 0 shorts detected (no output written)")
+        return 0
+
+    written = 0
+    for short in shorts_list:
+        slug = _build_short_slug(short)
+        short_dir = base_dir / f"shorts-{slug}"
+        short_dir.mkdir(parents=True, exist_ok=True)
+        single_tl = {**timeline, "short_count": 1, "shorts": [short]}
+        out = short_dir / "short_timeline.json"
+        out.write_text(json.dumps(single_tl, indent=2), encoding="utf-8")
+        written += 1
+
+    print(f"[OK] {len(shorts_list)} shorts -> {written} files under {base_dir}")
     return 0
 
 

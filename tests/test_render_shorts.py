@@ -216,7 +216,7 @@ def test_output_file_naming(monkeypatch):
 
 def test_skip_already_rendered(tmp_path):
     """If short_001.mp4 already exists with 1080x1920, skip re-render."""
-    out_dir = tmp_path / "renders" / "pov-test_shorts" / "shorts"
+    out_dir = tmp_path / "renders" / "hl-test_shorts"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Pre-place a fake file
