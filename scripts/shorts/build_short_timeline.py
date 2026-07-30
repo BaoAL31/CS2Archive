@@ -31,7 +31,7 @@ ensure()
 
 from shorts import resolve_output_dir  # noqa: E402
 
-_DEFAULT_TICK_MARGIN = 0
+_DEFAULT_TICK_MARGIN = 128  # 2s at 64 tick
 
 
 def _sid(val) -> str:
@@ -335,7 +335,7 @@ def detect_shorts(
                     continue
                 enemy = _team_b if team == _team_a else _team_a
                 if team in alive and enemy in alive:
-                    if alive[team] <= 2 and alive[enemy] >= 4:
+                    if (alive[team] == 2 and alive[enemy] == 5) or (alive[team] == 1 and alive[enemy] >= 3):
                         at_size = alive[team]
                         enemy_size = alive[enemy]
                         clutch_type = f"{at_size}v{enemy_size}"

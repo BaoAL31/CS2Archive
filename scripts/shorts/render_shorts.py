@@ -30,11 +30,11 @@ FFMPEG = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
 FFPROBE = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffprobe.exe"
 CFG_PATH = (_PROJECT_ROOT / "assets" / "cs2_pov.cfg").resolve()
 
-SRC_WIDTH = 2560
-SRC_HEIGHT = 1440
+SRC_WIDTH = 1920
+SRC_HEIGHT = 1080
 OUT_WIDTH = 1080
 OUT_HEIGHT = 1920
-CSDM_RECORD_FRAMERATE = 64
+CSDM_RECORD_FRAMERATE = 60
 
 
 def _dbg(label: str, msg: str) -> None:
@@ -229,103 +229,50 @@ def _composite_9x16(
     src: Path,
     dst: Path,
     footage_ratio: int = 10,
-    blur_sigma: int = 40,
-    bg_scale: float = 1.5,
-    side_crop: float = 0.10,
+    blur_radius: int = 35,
+    darken_factor: float = 0.6,
+    side_crop: float = 0.0,
 ) -> None:
-    """Composite a 2560x1440 source into 1080x1920 with a blurred-background fill.
+    """Composite a 1920x1080 source into 1080x1920 with echo-letterbox.
 
-    Layout (Premiere/Reels convention):
-      1. Canvas = 1080x1920.
-      2. Background layer: same source scaled by ``bg_scale`` (default 1.5x)
-         to fill the canvas, heavily Gaussian-blurred (default sigma=40) so
-         all detail washes out — just colour and motion.
-      3. Foreground: 16:9 source scaled to fit width (1080px) with
-         ``side_crop`` fraction trimmed off each side (default 10%), centred
-         vertically. Black bars are masked by the blurred background
-         showing through.
-
-    *footage_ratio* is preserved for callers but is no longer used; the
-    foreground sits centred in the canvas and the background fills the rest.
+    Background: source scaled to fill canvas height, cropped to width,
+    Gaussian-blurred via Pillow, darkened. Foreground: source scaled to
+    fit canvas width, centred vertically.
     """
-    fg_w = OUT_WIDTH
-    fg_h = round(SRC_HEIGHT * fg_w / SRC_WIDTH)
-    if fg_h > OUT_HEIGHT:
-        fg_h = OUT_HEIGHT
+    import numpy as np
+    from PIL import Image, ImageFilter
+    from moviepy import VideoFileClip, CompositeVideoClip
 
-    # Trim side_crop fraction off each side of the foreground by scaling up
-    # to (1/(1 - 2*side_crop)) and cropping back to fg_w.
-    fg_scale = 1.0 / max(1.0 - 2.0 * side_crop, 0.1)
-    fg_scaled_w = round(SRC_WIDTH * fg_scale)
-    fg_scaled_h = round(SRC_HEIGHT * fg_scale)
-    fg_y = (OUT_HEIGHT - fg_h) // 2
-    crop_x = (fg_scaled_w - fg_w) // 2
+    _dbg("9x16", f"{src.name}: 1080x1920 canvas, blur={blur_radius} darken={darken_factor:.0%}")
 
-    bg_w = round(OUT_WIDTH * bg_scale)
-    bg_h = round(OUT_HEIGHT * bg_scale)
+    main = VideoFileClip(str(src), audio=False)
 
-    _dbg("9x16", f"{src.name}: {SRC_WIDTH}x{SRC_HEIGHT} -> {OUT_WIDTH}x{OUT_HEIGHT} (fg {fg_w}x{fg_h}@y={fg_y} side-crop={side_crop:.0%}, bg {bg_w}x{bg_h} blur={blur_sigma})")
+    bg = main.resized(height=OUT_HEIGHT)
+    bg = bg.cropped(x_center=bg.w / 2, y_center=bg.h / 2, width=OUT_WIDTH, height=OUT_HEIGHT)
 
-    # NVENC path
-    cmd = [
-        "ffmpeg", "-y", "-i", str(src),
-        "-filter_complex",
-        (
-            # Background: scale source up to bg_scale * canvas, crop centre
-            f"[0:v]scale={bg_w}:{bg_h}:force_original_aspect_ratio=increase,"
-            f"crop={OUT_WIDTH}:{OUT_HEIGHT}:(iw-{OUT_WIDTH})/2:(ih-{OUT_HEIGHT})/2,"
-            f"gblur=sigma={blur_sigma}:steps=3,format=yuv420p[bg];"
-            # Foreground: scale to fill width+side_crop, crop centre, then pad
-            # to canvas.
-            f"[0:v]scale={fg_scaled_w}:{fg_scaled_h}:force_original_aspect_ratio=decrease,"
-            f"crop={fg_w}:{fg_scaled_h}:{crop_x}:0,format=yuv420p[fg_raw];"
-            f"color=black:s={OUT_WIDTH}x{OUT_HEIGHT}:d=1[blank];"
-            f"[blank][fg_raw]overlay=x=0:y={fg_y}[fg];"
-            # Composite fg over bg
-            f"[bg][fg]overlay=0:0:format=auto[out]"
-        ),
-        "-map", "[out]",
-        "-r", "64",
-        "-fps_mode", "cfr",
-        "-c:v", "h264_nvenc", "-preset", "p4", "-b:v", "0", "-cq", "20",
-        "-profile:v", "high", "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        "-an",
+    def _blur_frame(frame):
+        img = Image.fromarray(frame)
+        blurred = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+        return (np.array(blurred) * darken_factor).astype(np.uint8)
+
+    bg = bg.image_transform(_blur_frame)
+
+    fg = main.resized(width=OUT_WIDTH)
+    fg = fg.with_position("center")
+
+    final = CompositeVideoClip([bg, fg], size=(OUT_WIDTH, OUT_HEIGHT))
+    final = final.with_duration(main.duration)
+
+    final.write_videofile(
         str(dst),
-    ]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-    if r.returncode == 0:
-        mb = dst.stat().st_size / 1e6
-        _dbg("composite", f"OK ({mb:.1f} MB)")
-        return
-        return
+        fps=main.fps,
+        codec="libx264",
+        audio_codec="aac",
+        audio=False,
+    )
 
-    _dbg("composite", f"[WARN] NVENC failed: {r.stderr[-300:]}")
-    # CPU fallback (libx264)
-    cmd = [
-        "ffmpeg", "-y", "-i", str(src),
-        "-filter_complex",
-        (
-            f"[0:v]scale={bg_w}:{bg_h}:force_original_aspect_ratio=increase,"
-            f"crop={OUT_WIDTH}:{OUT_HEIGHT}:(iw-{OUT_WIDTH})/2:(ih-{OUT_HEIGHT})/2,"
-            f"gblur=sigma={blur_sigma}:steps=4,format=yuv420p[bg];"
-            f"[0:v]scale={fg_w}:-1,format=yuv420p[fg_raw];"
-            f"color=black:s={OUT_WIDTH}x{OUT_HEIGHT}:d=1[blank];"
-            f"[blank][fg_raw]overlay=x=0:y={fg_y}[fg];"
-            f"[bg][fg]overlay=0:0:format=auto[out]"
-        ),
-        "-map", "[out]",
-        "-c:v", "libx264", "-crf", "18", "-preset", "slow",
-        "-profile:v", "high", "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        "-an",
-        str(dst),
-    ]
-    r2 = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-    if r2.returncode != 0:
-        raise RuntimeError(f"Composite failed (NVENC + libx264): {r2.stderr[-500:]}")
     mb = dst.stat().st_size / 1e6
-    _dbg("composite", f"OK CPU ({mb:.1f} MB)")
+    _dbg("composite", f"OK ({mb:.1f} MB)")
 
 
 def render_shorts(
@@ -347,7 +294,13 @@ def render_shorts(
     if not demo_path.exists():
         raise FileNotFoundError(f"Demo not found: {demo_path}")
 
-    out_dir = resolve_output_dir(demo_path, player=player)
+    # If the timeline is in a per-short folder (shorts-{slug}/), output there.
+    # Otherwise fall back to resolve_output_dir base.
+    parent = timeline_path.resolve().parent
+    if parent.name.startswith("shorts-"):
+        out_dir = parent
+    else:
+        out_dir = resolve_output_dir(demo_path, player=player)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     segments_dir = out_dir / "segments"
