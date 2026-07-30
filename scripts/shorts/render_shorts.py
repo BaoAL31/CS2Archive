@@ -228,22 +228,26 @@ def _find_sequence_files(search_dir: Path, num_expected: int, shorts: list[dict]
 def _composite_9x16(
     src: Path,
     dst: Path,
-    footage_ratio: int = 10,
+    scale: float = 1.0,
     blur_radius: int = 35,
     darken_factor: float = 0.6,
-    side_crop: float = 0.0,
 ) -> None:
     """Composite a 1920x1080 source into 1080x1920 with echo-letterbox.
 
     Background: source scaled to fill canvas height, cropped to width,
-    Gaussian-blurred via Pillow, darkened. Foreground: source scaled to
-    fit canvas width, centred vertically.
+    Gaussian-blurred via Pillow, darkened.
+
+    Foreground: source scaled to ``OUT_WIDTH * scale``, then centre-cropped
+    to 1080px wide. ``scale=1.0`` fits full width (no crop). ``scale=1.2``
+    zooms in 20%, losing 10% off each side but enlarging the footage.
     """
     import numpy as np
     from PIL import Image, ImageFilter
     from moviepy import VideoFileClip, CompositeVideoClip
 
-    _dbg("9x16", f"{src.name}: 1080x1920 canvas, blur={blur_radius} darken={darken_factor:.0%}")
+    fg_scaled_w = round(OUT_WIDTH * scale)
+
+    _dbg("9x16", f"{src.name}: 1080x1920 canvas, scale={scale}x -> fg {fg_scaled_w}px, blur={blur_radius} darken={darken_factor:.0%}")
 
     main = VideoFileClip(str(src), audio=False)
 
@@ -257,7 +261,8 @@ def _composite_9x16(
 
     bg = bg.image_transform(_blur_frame)
 
-    fg = main.resized(width=OUT_WIDTH)
+    fg = main.resized(width=fg_scaled_w)
+    fg = fg.cropped(x_center=fg.w / 2, y_center=fg.h / 2, width=OUT_WIDTH, height=fg.h)
     fg = fg.with_position("center")
 
     final = CompositeVideoClip([bg, fg], size=(OUT_WIDTH, OUT_HEIGHT))
@@ -279,7 +284,7 @@ def render_shorts(
     timeline_path: Path,
     player: str | None = None,
     batch_size: int = 0,
-    footage_ratio: int = 10,
+    scale: float = 1.0,
 ) -> Path:
     """Render all shorts from a timeline JSON.
     
@@ -359,7 +364,7 @@ def render_shorts(
             if w == OUT_WIDTH and h == OUT_HEIGHT:
                 _dbg("composite", f"[SKIP] {out_name} already rendered at {OUT_WIDTH}x{OUT_HEIGHT}")
                 continue
-        _composite_9x16(seg_file, dst, footage_ratio=footage_ratio)
+        _composite_9x16(seg_file, dst, scale=scale)
         w, h = _probe_resolution(dst)
         dur = _probe_duration(dst)
         _dbg("done", f"{out_name}: {w}x{h} {dur:.1f}s (pov: {short['pov_steam_id']}, type: {short['short_type']})")
@@ -375,13 +380,13 @@ def main() -> int:
     ap.add_argument("--output", "-o", type=Path, default=None, help="Override output directory")
     ap.add_argument("--batches", type=int, default=0,
                    help="Shorts per batch (0 = all in one)")
-    ap.add_argument("--footage-ratio", type=int, default=10,
-                   help="Footage proportion in 16-unit height (default 10 → 1200px)")
+    ap.add_argument("--scale", type=float, default=1.0,
+                   help="Foreground scale multiplier (1.0 = fit width, 1.2 = 20%% zoom, crop sides)")
     args = ap.parse_args()
 
     try:
         render_shorts(args.timeline, player=args.player, batch_size=args.batches,
-                       footage_ratio=args.footage_ratio)
+                       scale=args.scale)
         return 0
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)

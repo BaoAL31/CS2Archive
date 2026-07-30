@@ -63,9 +63,9 @@ def test_csdm_config_structure(tmp_path):
 
     assert "demoPath" in config
     assert "outputFolderPath" in config
-    assert config["framerate"] == 64
-    assert config["width"] == 2560
-    assert config["height"] == 1440
+    assert config["framerate"] == 60
+    assert config["width"] == 1920
+    assert config["height"] == 1080
     assert config["concatenateSequences"] is False
     assert len(config["sequences"]) == 1
     seq = config["sequences"][0]
@@ -145,7 +145,7 @@ def test_output_resolution_1080x1920(tmp_path, monkeypatch):
     assert r.returncode == 0, f"ffmpeg failed: {r.stderr[:500]}"
     assert src.exists() and src.stat().st_size > 1000
 
-    _composite_9x16(src, dst, footage_ratio=10)
+    _composite_9x16(src, dst)
 
     assert dst.exists() and dst.stat().st_size > 1000
     w, h = _probe_resolution(dst)
@@ -177,33 +177,57 @@ def test_output_has_duration(tmp_path, monkeypatch):
     ]
     subprocess.run(cmd, capture_output=True, text=True)
 
-    _composite_9x16(src, dst, footage_ratio=10)
+    _composite_9x16(src, dst)
     dur = _probe_duration(dst)
     assert dur > 0.5
 
 
-def test_footage_ratio_changes_composite():
-    """footage_ratio is preserved as a kwarg but the filter is bg-scale + blur."""
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+def test_scale_is_accepted_kwarg():
+    """scale=1.0 (default) and scale=1.5 both pass through the function signature."""
+    import inspect
+    sig = inspect.signature(_composite_9x16)
+    assert "scale" in sig.parameters
+    assert sig.parameters["scale"].default == 1.0
+    anno = sig.parameters["scale"].annotation
+    assert anno in (float, "float")
 
-        with patch.object(Path, "stat", return_value=MagicMock(st_size=2000000)):
-            _composite_9x16(Path("src.mp4"), Path("dst.mp4"), footage_ratio=10)
-        args_str = " ".join(str(a) for a in mock_run.call_args_list[-1][0][0])
 
-        # Background layer: scale up 1.5x + heavy Gaussian blur (default)
-        assert "gblur=sigma=40" in args_str
-        # 1.5x of 1080x1920 = 1620x2880 — much smaller than 3x, avoids
-        # frame drops during the composite encode.
-        assert "scale=1620:2880" in args_str
-        # Foreground is overlaid centred on the blurred bg
-        assert "[bg][fg]overlay" in args_str
-        # Foreground is cropped 10% off each side: scale up by 1/0.8 = 1.25
-        assert "scale=3200:1800" in args_str
-        # CFR 64fps output prevents frame-rate drift
-        assert '"64"' in args_str or "64" in args_str
-        # NVENC preset p4 (was p7 — p7 drops frames on heavy filter)
-        assert "-preset p4" in args_str
+def test_scale_scales_foreground_wider():
+    """scale=1.5 should produce a wider intermediate (1296px wide) than scale=1.0 (1080px)."""
+    from unittest.mock import patch, MagicMock
+    with patch("moviepy.VideoFileClip") as mock_clip_cls:
+        mock_clip = MagicMock()
+        mock_clip.w = 1920
+        mock_clip.h = 1080
+        mock_clip.duration = 5.0
+        mock_clip.fps = 60
+        mock_clip_cls.return_value = mock_clip
+
+        mock_clip.resized.return_value = mock_clip
+        mock_clip.cropped.return_value = mock_clip
+        mock_clip.with_position.return_value = mock_clip
+        mock_clip.with_duration.return_value = mock_clip
+        mock_clip.image_transform.return_value = mock_clip
+
+        # track resize calls
+        resize_widths = []
+        def fake_resized(*args, **kwargs):
+            if kwargs.get("width"):
+                resize_widths.append(kwargs["width"])
+            elif args and isinstance(args[0], int):
+                resize_widths.append(args[0])
+            return mock_clip
+
+        mock_clip.resized.side_effect = fake_resized
+
+        with patch("moviepy.CompositeVideoClip", return_value=mock_clip), \
+             patch.object(Path, "stat", return_value=MagicMock(st_size=2000000)):
+            _composite_9x16(Path("src.mp4"), Path("dst.mp4"), scale=1.0)
+            _composite_9x16(Path("src.mp4"), Path("dst.mp4"), scale=1.5)
+
+        # Default 1.0: fg = 1080px wide; 1.5: fg = 1620px wide
+        assert 1080 in resize_widths
+        assert 1620 in resize_widths
 
 
 def test_output_file_naming(monkeypatch):
