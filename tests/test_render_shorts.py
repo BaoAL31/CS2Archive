@@ -20,6 +20,7 @@ from shorts.render_shorts import (
     _probe_resolution,
     OUT_WIDTH,
     OUT_HEIGHT,
+    SRC_WIDTH,
 )
 
 
@@ -118,9 +119,8 @@ def test_csdm_subprocess_called(tmp_path):
 
 def test_output_resolution_1080x1920(tmp_path, monkeypatch):
     """Given a source, composite produces 1080x1920 output."""
-    import shutil
+    from shorts.render_shorts import _render_kill_feed_pip
 
-    # Find ffmpeg first
     ffmpeg = None
     for p in [
         r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe",
@@ -132,12 +132,12 @@ def test_output_resolution_1080x1920(tmp_path, monkeypatch):
     if not ffmpeg:
         pytest.skip("ffmpeg not found")
 
-    # Generate a synthetic 2560x1440 test video (1 second of color bars)
     src = tmp_path / "src.mp4"
     dst = tmp_path / "short_test.mp4"
+    kf = tmp_path / "kf.mp4"
     cmd = [
         ffmpeg, "-y", "-f", "lavfi", "-i",
-        f"testsrc=size={2560}x{1440}:rate=60:duration=1",
+        f"testsrc=size={SRC_WIDTH}x{1080}:rate=60:duration=1",
         "-c:v", "libx264", "-preset", "ultrafast", "-frames:v", "60",
         "-pix_fmt", "yuv420p", str(src),
     ]
@@ -145,7 +145,8 @@ def test_output_resolution_1080x1920(tmp_path, monkeypatch):
     assert r.returncode == 0, f"ffmpeg failed: {r.stderr[:500]}"
     assert src.exists() and src.stat().st_size > 1000
 
-    _composite_9x16(src, dst)
+    _render_kill_feed_pip(src, kf)
+    _composite_9x16(src, dst, kill_feed_path=kf)
 
     assert dst.exists() and dst.stat().st_size > 1000
     w, h = _probe_resolution(dst)
@@ -155,7 +156,7 @@ def test_output_resolution_1080x1920(tmp_path, monkeypatch):
 
 def test_output_has_duration(tmp_path, monkeypatch):
     """Output has non-zero duration."""
-    import shutil
+    from shorts.render_shorts import _render_kill_feed_pip
 
     ffmpeg = None
     for p in [
@@ -169,15 +170,17 @@ def test_output_has_duration(tmp_path, monkeypatch):
 
     src = tmp_path / "src_colorbars.mp4"
     dst = tmp_path / "short_dur.mp4"
+    kf = tmp_path / "kf_dur.mp4"
     cmd = [
         ffmpeg, "-y", "-f", "lavfi", "-i",
-        f"testsrc=size=2560x1440:rate=60:duration=1",
+        f"testsrc=size={SRC_WIDTH}x{1080}:rate=60:duration=1",
         "-c:v", "libx264", "-preset", "ultrafast",
         "-t", "1", "-pix_fmt", "yuv420p", str(src),
     ]
     subprocess.run(cmd, capture_output=True, text=True)
 
-    _composite_9x16(src, dst)
+    _render_kill_feed_pip(src, kf)
+    _composite_9x16(src, dst, kill_feed_path=kf)
     dur = _probe_duration(dst)
     assert dur > 0.5
 
@@ -204,12 +207,177 @@ def test_scale_scales_foreground_wider():
     fake_stat = MagicMock(st_size=2000000)
     with patch("subprocess.run", side_effect=fake_run), \
          patch.object(Path, "stat", return_value=fake_stat):
-        _composite_9x16(Path("src.mp4"), Path("dst.mp4"), scale=1.0)
-        _composite_9x16(Path("src.mp4"), Path("dst.mp4"), scale=1.5)
+        _composite_9x16(
+            Path("src.mp4"), Path("dst.mp4"),
+            scale=1.0, kill_feed_path=Path("kf.mp4"),
+        )
+        _composite_9x16(
+            Path("src.mp4"), Path("dst.mp4"),
+            scale=1.5, kill_feed_path=Path("kf.mp4"),
+        )
 
-    fcs = [c[7] for c in captured]  # -filter_complex arg
+    fcs = [c[c.index("-filter_complex") + 1] for c in captured]
     assert any("force_original_aspect_ratio=decrease" in f for f in fcs)
     assert any("scale=1620:-1" in f for f in fcs)
+
+
+def _capture_filter_complex(scale: float = 2.0, kill_feed_path=None, **kwargs) -> list[str]:
+    """Run _composite_9x16 with subprocess mocked; return the full ffmpeg cmd."""
+    captured: list[list[str]] = []
+
+    def fake_run(cmd, *args, **kwargs_run):
+        captured.append(cmd)
+        m = MagicMock(returncode=0, stderr="", stdout="")
+        return m
+
+    fake_stat = MagicMock(st_size=2_000_000)
+    if kill_feed_path is None:
+        kill_feed_path = Path("default_kill_feed.mp4")
+    with patch("subprocess.run", side_effect=fake_run), \
+         patch.object(Path, "stat", return_value=fake_stat):
+        _composite_9x16(
+            Path("src.mp4"),
+            Path("dst.mp4"),
+            scale=scale,
+            kill_feed_path=kill_feed_path,
+            **kwargs,
+        )
+
+    return captured[0]
+
+
+def _capture_filter_str(scale: float = 2.0, kill_feed_path=None, **kwargs) -> str:
+    """Run _composite_9x16 with subprocess mocked; return the filter_complex string."""
+    cmd = _capture_filter_complex(scale=scale, kill_feed_path=kill_feed_path, **kwargs)
+    return cmd[cmd.index("-filter_complex") + 1]
+
+
+def test_kill_feed_overlay_present_by_default():
+    """Default compositing includes a kill-feed PiP overlay in the filter chain."""
+    fc = _capture_filter_str()
+    # Kill feed PiP must be in the filter chain — distinct from background/foreground
+    assert "[kf]" in fc, "kill feed label [kf] missing from filter chain"
+    # The kill feed must be overlaid onto the foreground (not just background)
+    assert fc.count("overlay=") >= 2, "expected bg/fg overlay + kill feed overlay"
+
+
+def test_kill_feed_overlay_positioned_top_right_of_canvas():
+    """Kill feed overlay must be placed at the top-right of the 1080x1920 canvas."""
+    from shorts import render_shorts as rmod
+    fc = _capture_filter_str()
+    import re
+    m = re.search(r"\[tmp\]\[kf\]overlay=(\d+):(\d+)", fc)
+    assert m is not None, f"kill-feed overlay step not found:\n{fc}"
+    ox, oy = (int(v) for v in m.groups())
+    expected_x = OUT_WIDTH - rmod.KILLFEED_PIP_W
+    assert ox == expected_x, f"kill feed overlay x={ox}, expected {expected_x}"
+    assert oy == 0, f"kill feed overlay y={oy}, expected 0"
+
+
+def test_kill_feed_can_be_disabled():
+    """Kill feed overlay can be turned off via kill_feed=False."""
+    fc = _capture_filter_str(kill_feed=False)
+    assert "[kf]" not in fc, "kill feed present when disabled"
+
+
+def test_kill_feed_crop_constants_within_source():
+    """Kill feed crop stays within the 1920x1080 source and at top edge (y=0)."""
+    from shorts import render_shorts as rmod
+    assert 0 < rmod.KILLFEED_CROP_X
+    assert rmod.KILLFEED_CROP_X + rmod.KILLFEED_CROP_W <= 1920
+    assert rmod.KILLFEED_CROP_Y == 0
+    assert rmod.KILLFEED_CROP_H <= 200
+
+
+def test_kill_feed_signature_kwarg():
+    """_composite_9x16 accepts kill_feed and kill_feed_path keyword arguments."""
+    import inspect
+    sig = inspect.signature(_composite_9x16)
+    assert "kill_feed" in sig.parameters
+    assert sig.parameters["kill_feed"].default is True
+    assert "kill_feed_path" in sig.parameters
+    assert sig.parameters["kill_feed_path"].default is None
+
+
+def test_kill_feed_uses_external_input_when_provided():
+    """The kill feed is taken from input [1:v] (pre-rendered PiP), no inline crop."""
+    from shorts import render_shorts as rmod
+    fc = _capture_filter_str(kill_feed_path=Path("kill_feed.mp4"))
+    assert "[1:v]" in fc, "kill feed must reference external input [1:v]"
+    assert "[kf_src]" not in fc, "kill feed must not be cropped inline when external PiP provided"
+    assert f"scale={rmod.KILLFEED_PIP_W}:{rmod.KILLFEED_PIP_H}" not in fc, "PiP must not be rescaled in composite"
+
+
+def test_kill_feed_external_input_command_uses_two_inputs():
+    """With kill_feed_path, ffmpeg receives two -i inputs (src + kill_feed)."""
+    cmd = _capture_filter_complex(kill_feed_path=Path("kf.mp4"))
+    input_count = sum(1 for arg in cmd if arg == "-i")
+    assert input_count == 2, f"expected 2 -i inputs, got {input_count}: {cmd}"
+
+
+def test_render_kill_feed_pip_creates_file():
+    """_render_kill_feed_pip calls ffmpeg and writes the kill-feed PiP file."""
+    from shorts.render_shorts import _render_kill_feed_pip
+    captured: list[list[str]] = []
+    def fake_run(cmd, *a, **k):
+        captured.append(cmd)
+        m = MagicMock(returncode=0, stderr="", stdout="")
+        return m
+
+    fake_stat = MagicMock(st_size=2_000_000)
+    dst = Path("dst_kf.mp4")
+    with patch("subprocess.run", side_effect=fake_run), \
+         patch.object(Path, "stat", return_value=fake_stat):
+        _render_kill_feed_pip(Path("src.mp4"), dst)
+
+    assert len(captured) == 1
+    cmd = captured[0]
+    assert Path(cmd[-1]) == dst
+    assert "-i" in cmd
+    src_idx = cmd.index("-i") + 1
+    assert cmd[src_idx] == "src.mp4"
+    fc = cmd[cmd.index("-vf") + 1]
+    import re
+    crop_match = re.search(r"crop=(\d+):(\d+):(\d+):(\d+)", fc)
+    assert crop_match is not None
+    w, h, x, y = (int(v) for v in crop_match.groups())
+    assert y == 0
+    assert x > 0
+
+
+def test_render_kill_feed_pip_uses_pre_renderer_constants():
+    """The pre-renderer uses KILLFEED_CROP_* and KILLFEED_PIP_* module constants."""
+    from shorts import render_shorts as rmod
+    from shorts.render_shorts import _render_kill_feed_pip
+    captured: list[list[str]] = []
+    def fake_run(cmd, *a, **k):
+        captured.append(cmd)
+        m = MagicMock(returncode=0)
+        return m
+
+    fake_stat = MagicMock(st_size=2_000_000)
+    with patch("subprocess.run", side_effect=fake_run), \
+         patch.object(Path, "stat", return_value=fake_stat):
+        _render_kill_feed_pip(Path("src.mp4"), Path("kf.mp4"))
+
+    fc = captured[0][captured[0].index("-vf") + 1]
+    assert f"crop={rmod.KILLFEED_CROP_W}:{rmod.KILLFEED_CROP_H}:{rmod.KILLFEED_CROP_X}:{rmod.KILLFEED_CROP_Y}" in fc
+    assert f"scale={rmod.KILLFEED_PIP_W}:{rmod.KILLFEED_PIP_H}" in fc
+
+
+def test_render_kill_feed_pip_runtime_failure_raises():
+    """ffmpeg failure surfaces as RuntimeError with stderr excerpt."""
+    from shorts.render_shorts import _render_kill_feed_pip
+    fake_stat = MagicMock(st_size=2_000_000)
+    fail_run = MagicMock(
+        returncode=1,
+        stderr="some ffmpeg error",
+        stdout="",
+    )
+    with patch("subprocess.run", return_value=fail_run), \
+         patch.object(Path, "stat", return_value=fake_stat):
+        with pytest.raises(RuntimeError, match="kill feed pre-render failed"):
+            _render_kill_feed_pip(Path("src.mp4"), Path("kf.mp4"))
 
 
 def test_output_file_naming(monkeypatch):

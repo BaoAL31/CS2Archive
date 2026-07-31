@@ -36,6 +36,13 @@ OUT_WIDTH = 1080
 OUT_HEIGHT = 1920
 CSDM_RECORD_FRAMERATE = 60
 
+KILLFEED_CROP_W = 720
+KILLFEED_CROP_H = 180
+KILLFEED_CROP_X = SRC_WIDTH - KILLFEED_CROP_W
+KILLFEED_CROP_Y = 0
+KILLFEED_PIP_W = 540
+KILLFEED_PIP_H = round(KILLFEED_CROP_H * KILLFEED_PIP_W / KILLFEED_CROP_W)
+
 
 def _dbg(label: str, msg: str) -> None:
     ts = time.strftime("%H:%M:%S")
@@ -225,12 +232,46 @@ def _find_sequence_files(search_dir: Path, num_expected: int, shorts: list[dict]
     return []
 
 
+def _render_kill_feed_pip(src: Path, dst: Path) -> None:
+    """Pre-render the kill-feed PiP from the source segment.
+
+    Extracts the top band of the source (KILLFEED_CROP_W x KILLFEED_CROP_H at
+    y=0) and upscales to KILLFEED_PIP_W wide. Single ffmpeg call; the result
+    is fed into ``_composite_9x16`` as input [1:v] so the final composite
+    remains a single encode pass.
+    """
+    vf = (
+        f"crop={KILLFEED_CROP_W}:{KILLFEED_CROP_H}:{KILLFEED_CROP_X}:{KILLFEED_CROP_Y},"
+        f"scale={KILLFEED_PIP_W}:{KILLFEED_PIP_H}"
+    )
+    cmd = [
+        FFMPEG, "-y", "-hwaccel", "cuda", "-i", str(src),
+        "-vf", vf,
+        "-c:v", "h264_nvenc", "-preset", "p4", "-cq", "14",
+        "-profile:v", "high", "-pix_fmt", "yuv420p",
+        "-an",
+        "-movflags", "+faststart",
+        str(dst),
+    ]
+
+    _dbg("kf", f"{src.name}: crop {KILLFEED_CROP_W}x{KILLFEED_CROP_H}@{KILLFEED_CROP_X},{KILLFEED_CROP_Y} -> {KILLFEED_PIP_W}x{KILLFEED_PIP_H}")
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"kill feed pre-render failed (rc={r.returncode}): {r.stderr[-2000:]}"
+        )
+    mb = dst.stat().st_size / 1e6
+    _dbg("kf", f"OK ({mb:.2f} MB) -> {dst.name}")
+
+
 def _composite_9x16(
     src: Path,
     dst: Path,
     scale: float = 2.0,
     blur_radius: int = 50,
     darken_factor: float = 1.0,
+    kill_feed: bool = True,
+    kill_feed_path: Path | None = None,
 ) -> None:
     """Composite a 1920x1080 source into 1080x1920 via ffmpeg filter chain.
 
@@ -241,9 +282,14 @@ def _composite_9x16(
     ``scale=1.0`` fits the source inside without cropping.
     ``scale>1.0`` zooms in (e.g. 1.5 = source scaled to 1.5x, cropped centre to 1080).
 
+    Kill-feed PiP (when ``kill_feed=True``, default): overlaid at the top-right
+    of the 9:16 canvas (KILLFEED_PIP_W wide). ``kill_feed_path`` is the
+    pre-rendered PiP file produced by ``_render_kill_feed_pip``; the composite
+    feeds it in as input [1:v] without rescaling (PiP already at target size).
+
     Encode: NVIDIA NVENC (h264_nvenc) for GPU-accelerated H.264.
     Decode: cuda hwaccel for GPU-accelerated source decode.
-    Audio: passthrough copy.
+    Audio: passthrough copy from the source.
     """
     gblur_sigma = max(1, blur_radius // 2)
 
@@ -268,23 +314,46 @@ def _composite_9x16(
     if darken_factor < 1.0:
         bg_chain += f",eq=brightness={round(darken_factor - 1.0, 3)}"
 
-    vf = (
-        f"[0:v]split=2[bg_src][fg_src];"
-        f"{bg_chain};"
-        f"{fg_chain};"
-        f"[bg][fg]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2[out]"
-    )
-
-    cmd = [
-        FFMPEG, "-y", "-hwaccel", "cuda", "-i", str(src),
-        "-filter_complex", vf,
-        "-map", "[out]", "-map", "0:a?",
-        "-c:v", "h264_nvenc", "-preset", "p4", "-b:v", "25M",
-        "-profile:v", "high", "-pix_fmt", "yuv420p",
-        "-c:a", "copy",
-        "-movflags", "+faststart",
-        str(dst),
-    ]
+    if kill_feed:
+        cmd = [
+            FFMPEG, "-y", "-hwaccel", "cuda",
+            "-i", str(src),
+            "-i", str(kill_feed_path),
+            "-filter_complex",
+            (
+                f"[0:v]split=2[bg_src][fg_src];"
+                f"{bg_chain};"
+                f"{fg_chain};"
+                f"[1:v]null[kf];"
+                f"[bg][fg]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2[tmp];"
+                f"[tmp][kf]overlay={OUT_WIDTH - KILLFEED_PIP_W}:0[out]"
+            ),
+            "-map", "[out]", "-map", "0:a?",
+            "-c:v", "h264_nvenc", "-preset", "p4", "-b:v", "25M",
+            "-profile:v", "high", "-pix_fmt", "yuv420p",
+            "-level", "4.2",
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            str(dst),
+        ]
+    else:
+        vf = (
+            f"[0:v]split=2[bg_src][fg_src];"
+            f"{bg_chain};"
+            f"{fg_chain};"
+            f"[bg][fg]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2[out]"
+        )
+        cmd = [
+            FFMPEG, "-y", "-hwaccel", "cuda", "-i", str(src),
+            "-filter_complex", vf,
+            "-map", "[out]", "-map", "0:a?",
+            "-c:v", "h264_nvenc", "-preset", "p4", "-b:v", "25M",
+            "-profile:v", "high", "-pix_fmt", "yuv420p",
+            "-level", "4.2",
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            str(dst),
+        ]
 
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if r.returncode != 0:
@@ -397,7 +466,10 @@ def render_shorts(
             if w == OUT_WIDTH and h == OUT_HEIGHT:
                 _dbg("composite", f"[SKIP] {out_name} already rendered at {OUT_WIDTH}x{OUT_HEIGHT}")
                 continue
-        _composite_9x16(seg_file, dst, scale=scale)
+        kf_path = segments_dir / f"{seg_file.stem}-kill_feed.mp4"
+        if not kf_path.exists() or kf_path.stat().st_size < 1_048_576:
+            _render_kill_feed_pip(seg_file, kf_path)
+        _composite_9x16(seg_file, dst, scale=scale, kill_feed_path=kf_path)
         w, h = _probe_resolution(dst)
         dur = _probe_duration(dst)
         _dbg("done", f"{out_name}: {w}x{h} {dur:.1f}s (pov: {short['pov_steam_id']}, type: {short['short_type']})")
