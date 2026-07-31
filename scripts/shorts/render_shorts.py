@@ -36,12 +36,10 @@ OUT_WIDTH = 1080
 OUT_HEIGHT = 1920
 CSDM_RECORD_FRAMERATE = 60
 
-KILLFEED_CROP_W = 720
-KILLFEED_CROP_H = 180
+KILLFEED_CROP_W = 300
+KILLFEED_CROP_H = 170
 KILLFEED_CROP_X = SRC_WIDTH - KILLFEED_CROP_W
-KILLFEED_CROP_Y = 0
-KILLFEED_PIP_W = 540
-KILLFEED_PIP_H = round(KILLFEED_CROP_H * KILLFEED_PIP_W / KILLFEED_CROP_W)
+KILLFEED_CROP_Y = 10
 
 
 def _dbg(label: str, msg: str) -> None:
@@ -235,26 +233,24 @@ def _find_sequence_files(search_dir: Path, num_expected: int, shorts: list[dict]
 def _render_kill_feed_pip(src: Path, dst: Path) -> None:
     """Pre-render the kill-feed PiP from the source segment.
 
-    Extracts the top band of the source (KILLFEED_CROP_W x KILLFEED_CROP_H at
-    y=0) and upscales to KILLFEED_PIP_W wide. Single ffmpeg call; the result
-    is fed into ``_composite_9x16`` as input [1:v] so the final composite
-    remains a single encode pass.
+    Crops the top band of the source (KILLFEED_CROP_W x KILLFEED_CROP_H at
+    y=0) at native resolution — no rescaling, so no resampling artifacts.
+    Encode is GPU (h264_nvenc). Single ffmpeg call; the result is fed into
+    ``_composite_9x16`` as input [1:v] so the final composite remains a
+    single encode pass.
     """
-    vf = (
-        f"crop={KILLFEED_CROP_W}:{KILLFEED_CROP_H}:{KILLFEED_CROP_X}:{KILLFEED_CROP_Y},"
-        f"scale={KILLFEED_PIP_W}:{KILLFEED_PIP_H}"
-    )
+    vf = f"crop={KILLFEED_CROP_W}:{KILLFEED_CROP_H}:{KILLFEED_CROP_X}:{KILLFEED_CROP_Y}"
     cmd = [
-        FFMPEG, "-y", "-hwaccel", "cuda", "-i", str(src),
+        FFMPEG, "-y", "-i", str(src),
         "-vf", vf,
-        "-c:v", "h264_nvenc", "-preset", "p4", "-cq", "14",
+        "-c:v", "h264_nvenc", "-preset", "p7", "-cq", "14",
         "-profile:v", "high", "-pix_fmt", "yuv420p",
         "-an",
         "-movflags", "+faststart",
         str(dst),
     ]
 
-    _dbg("kf", f"{src.name}: crop {KILLFEED_CROP_W}x{KILLFEED_CROP_H}@{KILLFEED_CROP_X},{KILLFEED_CROP_Y} -> {KILLFEED_PIP_W}x{KILLFEED_PIP_H}")
+    _dbg("kf", f"{src.name}: crop {KILLFEED_CROP_W}x{KILLFEED_CROP_H}@{KILLFEED_CROP_X},{KILLFEED_CROP_Y} (native, no scale)")
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     if r.returncode != 0:
         raise RuntimeError(
@@ -272,6 +268,7 @@ def _composite_9x16(
     darken_factor: float = 1.0,
     kill_feed: bool = True,
     kill_feed_path: Path | None = None,
+    pip_scale: float = 1.0,
 ) -> None:
     """Composite a 1920x1080 source into 1080x1920 via ffmpeg filter chain.
 
@@ -282,10 +279,10 @@ def _composite_9x16(
     ``scale=1.0`` fits the source inside without cropping.
     ``scale>1.0`` zooms in (e.g. 1.5 = source scaled to 1.5x, cropped centre to 1080).
 
-    Kill-feed PiP (when ``kill_feed=True``, default): overlaid at the top-right
-    of the 9:16 canvas (KILLFEED_PIP_W wide). ``kill_feed_path`` is the
-    pre-rendered PiP file produced by ``_render_kill_feed_pip``; the composite
-    feeds it in as input [1:v] without rescaling (PiP already at target size).
+    Kill-feed PiP (when ``kill_feed=True``, default): direct native crop from
+    the source (no per‑PiP scaling) overlaid at top‑right of the foreground
+    footage. Carved from [0:v] so it sits on the same source timeline as
+    bg/fg — downstream overlays are on the final 1080×1920 canvas.
 
     Encode: NVIDIA NVENC (h264_nvenc) for GPU-accelerated H.264.
     Decode: cuda hwaccel for GPU-accelerated source decode.
@@ -300,42 +297,92 @@ def _composite_9x16(
             f"[fg_src]scale={OUT_WIDTH}:{OUT_HEIGHT}:"
             f"force_original_aspect_ratio=decrease[fg]"
         )
+        fg_top = 0
     else:
         fg_chain = (
             f"[fg_src]scale={round(OUT_WIDTH * scale)}:-1,"
             f"crop={OUT_WIDTH}:ih[fg]"
         )
+        fg_w = round(OUT_WIDTH * scale)
+        fg_h = round(fg_w * SRC_HEIGHT / SRC_WIDTH)
+        fg_top = (OUT_HEIGHT - fg_h) // 2
 
     bg_chain = (
         f"[bg_src]scale={OUT_WIDTH}:{OUT_HEIGHT}:force_original_aspect_ratio=increase,"
         f"crop={OUT_WIDTH}:{OUT_HEIGHT},"
-        f"gblur=sigma={gblur_sigma}[bg]"
+        f"gblur=sigma={gblur_sigma}:steps=2[bg]"
     )
     if darken_factor < 1.0:
         bg_chain += f",eq=brightness={round(darken_factor - 1.0, 3)}"
 
     if kill_feed:
+        pip_w = KILLFEED_CROP_W
+        pip_h = KILLFEED_CROP_H
+        
+        actual_pip_scale = pip_scale
+        if actual_pip_scale <= 0.0 and scale != 1.0 and fg_top > 0:
+            # Default: fill the full canvas width, capped at the header band height.
+            width_limit = OUT_WIDTH / pip_w
+            height_limit = fg_top / pip_h
+            actual_pip_scale = min(width_limit, height_limit)
+        elif actual_pip_scale <= 0.0:
+            actual_pip_scale = 1.0
+            
+        scaled_pip_w = int(pip_w * actual_pip_scale)
+        scaled_pip_h = int(pip_h * actual_pip_scale)
+        pip_x = OUT_WIDTH - scaled_pip_w
+        
+        # Place it vertically centered inside the top blurred banner
+        if scale != 1.0 and fg_top > scaled_pip_h:
+            pip_y = (fg_top - scaled_pip_h) // 2
+        else:
+            pip_y = 0
+
         cmd = [
             FFMPEG, "-y", "-hwaccel", "cuda",
-            "-i", str(src),
-            "-i", str(kill_feed_path),
-            "-filter_complex",
-            (
+            "-i", str(src)
+        ]
+
+        if kill_feed_path:
+            cmd.extend(["-i", str(kill_feed_path)])
+            pip_scale_chain = f"[1:v]scale={scaled_pip_w}:{scaled_pip_h}[scaled_pip];" if actual_pip_scale != 1.0 else ""
+            pip_in = "[scaled_pip]" if actual_pip_scale != 1.0 else "[1:v]"
+            filter_str = (
                 f"[0:v]split=2[bg_src][fg_src];"
                 f"{bg_chain};"
                 f"{fg_chain};"
-                f"[1:v]null[kf];"
+                f"{pip_scale_chain}"
                 f"[bg][fg]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2[tmp];"
-                f"[tmp][kf]overlay={OUT_WIDTH - KILLFEED_PIP_W}:0[out]"
-            ),
+                f"[tmp]{pip_in}overlay={pip_x}:{pip_y}[out]"
+            )
+        else:
+            pip_chain = (
+                f"[pip_src]crop={pip_w}:{pip_h}:"
+                f"{KILLFEED_CROP_X}:{KILLFEED_CROP_Y}"
+            )
+            if actual_pip_scale != 1.0:
+                pip_chain += f",scale={scaled_pip_w}:{scaled_pip_h}"
+            pip_chain += "[pip];"
+            
+            filter_str = (
+                f"[0:v]split=3[bg_src][fg_src][pip_src];"
+                f"{bg_chain};"
+                f"{fg_chain};"
+                f"{pip_chain}"
+                f"[bg][fg]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2[tmp];"
+                f"[tmp][pip]overlay={pip_x}:{pip_y}[out]"
+            )
+
+        cmd.extend([
+            "-filter_complex", filter_str,
             "-map", "[out]", "-map", "0:a?",
-            "-c:v", "h264_nvenc", "-preset", "p4", "-b:v", "25M",
+            "-c:v", "h264_nvenc", "-preset", "p7", "-cq", "14", "-b:v", "0",
             "-profile:v", "high", "-pix_fmt", "yuv420p",
             "-level", "4.2",
             "-c:a", "copy",
             "-movflags", "+faststart",
             str(dst),
-        ]
+        ])
     else:
         vf = (
             f"[0:v]split=2[bg_src][fg_src];"
@@ -347,7 +394,7 @@ def _composite_9x16(
             FFMPEG, "-y", "-hwaccel", "cuda", "-i", str(src),
             "-filter_complex", vf,
             "-map", "[out]", "-map", "0:a?",
-            "-c:v", "h264_nvenc", "-preset", "p4", "-b:v", "25M",
+            "-c:v", "h264_nvenc", "-preset", "p7", "-cq", "14", "-b:v", "0",
             "-profile:v", "high", "-pix_fmt", "yuv420p",
             "-level", "4.2",
             "-c:a", "copy",
@@ -370,6 +417,7 @@ def render_shorts(
     player: str | None = None,
     batch_size: int = 0,
     scale: float = 2.0,
+    pip_scale: float = 1.0,
     composite_only: bool = False,
     name: str | None = None,
 ) -> Path:
@@ -469,7 +517,7 @@ def render_shorts(
         kf_path = segments_dir / f"{seg_file.stem}-kill_feed.mp4"
         if not kf_path.exists() or kf_path.stat().st_size < 1_048_576:
             _render_kill_feed_pip(seg_file, kf_path)
-        _composite_9x16(seg_file, dst, scale=scale, kill_feed_path=kf_path)
+        _composite_9x16(seg_file, dst, scale=scale, kill_feed_path=kf_path, pip_scale=pip_scale)
         w, h = _probe_resolution(dst)
         dur = _probe_duration(dst)
         _dbg("done", f"{out_name}: {w}x{h} {dur:.1f}s (pov: {short['pov_steam_id']}, type: {short['short_type']})")
@@ -487,6 +535,8 @@ def main() -> int:
                    help="Shorts per batch (0 = all in one)")
     ap.add_argument("--scale", type=float, default=2.0,
                    help="Foreground scale multiplier (1.0 = fit canvas, 2.0 = 2x zoom with centre crop)")
+    ap.add_argument("--pip-scale", type=float, default=0.0,
+                   help="Kill feed scale multiplier (0.0 = auto-fill top banner height)")
     ap.add_argument("--composite-only", action="store_true",
                    help="Skip CSDM render; re-composite existing segments with new editing params")
     ap.add_argument("--name", type=str, default=None,
@@ -495,7 +545,7 @@ def main() -> int:
 
     try:
         render_shorts(args.timeline, player=args.player, batch_size=args.batches,
-                       scale=args.scale, composite_only=args.composite_only,
+                       scale=args.scale, pip_scale=args.pip_scale, composite_only=args.composite_only,
                        name=args.name)
         return 0
     except Exception as e:

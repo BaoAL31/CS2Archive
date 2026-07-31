@@ -231,8 +231,7 @@ def _capture_filter_complex(scale: float = 2.0, kill_feed_path=None, **kwargs) -
         return m
 
     fake_stat = MagicMock(st_size=2_000_000)
-    if kill_feed_path is None:
-        kill_feed_path = Path("default_kill_feed.mp4")
+    # Don't default kill_feed_path, pass it exactly as received.
     with patch("subprocess.run", side_effect=fake_run), \
          patch.object(Path, "stat", return_value=fake_stat):
         _composite_9x16(
@@ -255,29 +254,30 @@ def _capture_filter_str(scale: float = 2.0, kill_feed_path=None, **kwargs) -> st
 def test_kill_feed_overlay_present_by_default():
     """Default compositing includes a kill-feed PiP overlay in the filter chain."""
     fc = _capture_filter_str()
-    # Kill feed PiP must be in the filter chain — distinct from background/foreground
-    assert "[kf]" in fc, "kill feed label [kf] missing from filter chain"
-    # The kill feed must be overlaid onto the foreground (not just background)
+    assert "[pip]" in fc, "kill feed label [pip] missing from filter chain"
     assert fc.count("overlay=") >= 2, "expected bg/fg overlay + kill feed overlay"
 
 
 def test_kill_feed_overlay_positioned_top_right_of_canvas():
-    """Kill feed overlay must be placed at the top-right of the 1080x1920 canvas."""
+    """Kill feed overlay must be at the top-right of the foreground footage."""
     from shorts import render_shorts as rmod
     fc = _capture_filter_str()
     import re
-    m = re.search(r"\[tmp\]\[kf\]overlay=(\d+):(\d+)", fc)
+    m = re.search(r"\[tmp\]\[pip\]overlay=(\d+):(\d+)", fc)
     assert m is not None, f"kill-feed overlay step not found:\n{fc}"
     ox, oy = (int(v) for v in m.groups())
-    expected_x = OUT_WIDTH - rmod.KILLFEED_PIP_W
+    expected_x = OUT_WIDTH - rmod.KILLFEED_CROP_W
     assert ox == expected_x, f"kill feed overlay x={ox}, expected {expected_x}"
-    assert oy == 0, f"kill feed overlay y={oy}, expected 0"
+    # scale=2.0 default -> fg is 1080x1215, centred -> top at y=352
+    fg_h = round(round(OUT_WIDTH * 2.0) * rmod.SRC_HEIGHT / rmod.SRC_WIDTH)
+    expected_y = (OUT_HEIGHT - fg_h) // 2
+    assert oy == expected_y, f"kill feed overlay y={oy}, expected {expected_y}"
 
 
 def test_kill_feed_can_be_disabled():
     """Kill feed overlay can be turned off via kill_feed=False."""
     fc = _capture_filter_str(kill_feed=False)
-    assert "[kf]" not in fc, "kill feed present when disabled"
+    assert "[pip]" not in fc, "kill feed present when disabled"
 
 
 def test_kill_feed_crop_constants_within_source():
@@ -285,7 +285,7 @@ def test_kill_feed_crop_constants_within_source():
     from shorts import render_shorts as rmod
     assert 0 < rmod.KILLFEED_CROP_X
     assert rmod.KILLFEED_CROP_X + rmod.KILLFEED_CROP_W <= 1920
-    assert rmod.KILLFEED_CROP_Y == 0
+    assert 0 <= rmod.KILLFEED_CROP_Y < 50
     assert rmod.KILLFEED_CROP_H <= 200
 
 
@@ -299,20 +299,27 @@ def test_kill_feed_signature_kwarg():
     assert sig.parameters["kill_feed_path"].default is None
 
 
-def test_kill_feed_uses_external_input_when_provided():
-    """The kill feed is taken from input [1:v] (pre-rendered PiP), no inline crop."""
-    from shorts import render_shorts as rmod
-    fc = _capture_filter_str(kill_feed_path=Path("kill_feed.mp4"))
-    assert "[1:v]" in fc, "kill feed must reference external input [1:v]"
-    assert "[kf_src]" not in fc, "kill feed must not be cropped inline when external PiP provided"
-    assert f"scale={rmod.KILLFEED_PIP_W}:{rmod.KILLFEED_PIP_H}" not in fc, "PiP must not be rescaled in composite"
+def test_kill_feed_uses_external_file_if_provided():
+    """If kill_feed_path is provided, it must be used as [1:v] (second input)."""
+    fc = _capture_filter_str(kill_feed_path=Path("some_kf.mp4"))
+    assert "[1:v]" in fc, "pip must use external input [1:v]"
+    assert "[pip_src]" not in fc, "pip must not use inline source when path provided"
 
 
-def test_kill_feed_external_input_command_uses_two_inputs():
-    """With kill_feed_path, ffmpeg receives two -i inputs (src + kill_feed)."""
-    cmd = _capture_filter_complex(kill_feed_path=Path("kf.mp4"))
-    input_count = sum(1 for arg in cmd if arg == "-i")
-    assert input_count == 2, f"expected 2 -i inputs, got {input_count}: {cmd}"
+def test_kill_feed_is_inline_crop_if_no_path():
+    """If no kill_feed_path is provided, it crops inline from [0:v]."""
+    fc = _capture_filter_str(kill_feed_path=None)
+    assert "[pip_src]" in fc, "pip must use inline source from pip_src"
+    assert "[1:v]" not in fc, "pip must not use external input [1:v]"
+
+
+def test_kill_feed_input_count():
+    """Two -i inputs if kill_feed_path provided, else one."""
+    cmd_two = _capture_filter_complex(kill_feed_path=Path("some_kf.mp4"))
+    assert sum(1 for arg in cmd_two if arg == "-i") == 2, "expected 2 -i inputs"
+    
+    cmd_one = _capture_filter_complex(kill_feed_path=None)
+    assert sum(1 for arg in cmd_one if arg == "-i") == 1, "expected 1 -i input"
 
 
 def test_render_kill_feed_pip_creates_file():
@@ -341,12 +348,12 @@ def test_render_kill_feed_pip_creates_file():
     crop_match = re.search(r"crop=(\d+):(\d+):(\d+):(\d+)", fc)
     assert crop_match is not None
     w, h, x, y = (int(v) for v in crop_match.groups())
-    assert y == 0
+    assert y >= 0
     assert x > 0
 
 
 def test_render_kill_feed_pip_uses_pre_renderer_constants():
-    """The pre-renderer uses KILLFEED_CROP_* and KILLFEED_PIP_* module constants."""
+    """The pre-renderer uses KILLFEED_CROP_* module constants."""
     from shorts import render_shorts as rmod
     from shorts.render_shorts import _render_kill_feed_pip
     captured: list[list[str]] = []
@@ -362,7 +369,7 @@ def test_render_kill_feed_pip_uses_pre_renderer_constants():
 
     fc = captured[0][captured[0].index("-vf") + 1]
     assert f"crop={rmod.KILLFEED_CROP_W}:{rmod.KILLFEED_CROP_H}:{rmod.KILLFEED_CROP_X}:{rmod.KILLFEED_CROP_Y}" in fc
-    assert f"scale={rmod.KILLFEED_PIP_W}:{rmod.KILLFEED_PIP_H}" in fc
+    assert "scale_cuda=" not in fc, "no rescaling in the pre-renderer"
 
 
 def test_render_kill_feed_pip_runtime_failure_raises():

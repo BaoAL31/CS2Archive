@@ -2,7 +2,7 @@
 E2E pipeline: backlog metadata -> analyze -> render -> concat -> overlay -> outro -> thumbnail.
 Reads all POV metadata from a backlog file.
 Structured errors for agent parsing.
-Auto-downloads missing demos from HuggingFace if hf_root is set.
+Auto-downloads missing demos from HuggingFace (if hf_root set) or falls back to CloakBrowser (if hltv_url set).
 
 Usage:
     python scripts/pov/pipeline.py --backlog backlog/<match_slug>/<priority>/<slug>.json [--step N] [--raw-only]
@@ -270,30 +270,55 @@ class Pipeline:
     def _ensure_demo(self) -> None:
         if self.demo_path and self.demo_path.exists():
             return
+        if not self.demo_path:
+            return
+
+        from scrapers.hltv_acquire import acquire_match
+        from models import DownloadStatus
+
         hf_root = self.meta.get("hf_root", "").strip()
         hf_repo = self.meta.get("hf_repo", "cs2povarchive/cs2-demos")
-        if not hf_root or not self.demo_path:
-            return
-        match_slug = self.demo_path.parent.name
-        dem_filename = self.demo_path.name
-        hf_folder = f"{self.match_id}-{match_slug}" if self.match_id else match_slug
-        hf_remote = f"{hf_root}/{hf_folder}/{dem_filename}"
-        self.demo_path.parent.mkdir(parents=True, exist_ok=True)
-        print(f"  [HF] Demo not found locally. Downloading from {hf_repo}...")
-        print(f"       hf://{hf_repo}/{hf_remote}")
+
+        if hf_root:
+            match_slug = self.demo_path.parent.name
+            dem_filename = self.demo_path.name
+            hf_folder = f"{self.match_id}-{match_slug}" if self.match_id else match_slug
+            hf_remote = f"{hf_root}/{hf_folder}/{dem_filename}"
+            self.demo_path.parent.mkdir(parents=True, exist_ok=True)
+            print(f"  [HF] Demo not found locally. Downloading from {hf_repo}...")
+            print(f"       hf://{hf_repo}/{hf_remote}")
+            try:
+                cached = hf_hub_download(
+                    repo_id=hf_repo,
+                    filename=hf_remote,
+                    repo_type="dataset",
+                )
+                shutil.copy2(cached, self.demo_path)
+                if self.demo_path.exists():
+                    mb = self.demo_path.stat().st_size / 1024 / 1024
+                    rel = self.demo_path.relative_to(PROJECT_ROOT) if self.demo_path.is_absolute() else self.demo_path
+                    print(f"  [OK] Demo downloaded ({mb:.0f} MB): {rel}")
+                    return
+            except Exception as e:
+                print(f"  [WARN] HF download failed: {e}")
+
+        if not self.hltv_url:
+            fail(0, "DEMO_NOT_FOUND",
+                 f"Demo not found ({self.demo_path}) and no hltv_url or hf_root to download from")
+
+        print(f"  [DL] Falling back to CloakBrowser: {self.hltv_url}")
         try:
-            cached = hf_hub_download(
-                repo_id=hf_repo,
-                filename=hf_remote,
-                repo_type="dataset",
-            )
-            shutil.copy2(cached, self.demo_path)
+            result = acquire_match(self.hltv_url)
+            if result.status != DownloadStatus.COMPLETED:
+                fail(0, "DEMO_DOWNLOAD_CLOAK_FAILED",
+                     f"CloakBrowser download failed: {result.error or 'unknown'}")
         except Exception as e:
-            fail(0, "HF_DOWNLOAD_FAILED",
-                 f"Failed to download {hf_remote} from {hf_repo}: {e}")
+            fail(0, "DEMO_DOWNLOAD_CLOAK_ERROR",
+                 f"CloakBrowser error: {e}")
+
         if not self.demo_path.exists():
-            fail(0, "HF_DOWNLOAD_MISSING",
-                 f"Download said success but file not found: {self.demo_path}")
+            fail(0, "DEMO_NOT_FOUND",
+                 f"Download complete but demo still not found: {self.demo_path}")
         mb = self.demo_path.stat().st_size / 1024 / 1024
         rel = self.demo_path.relative_to(PROJECT_ROOT) if self.demo_path.is_absolute() else self.demo_path
         print(f"  [OK] Demo downloaded ({mb:.0f} MB): {rel}")

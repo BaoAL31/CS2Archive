@@ -275,17 +275,19 @@ def main() -> None:
             sections.append((overlay_label, 2))
         # Rebuild title with the new section
         title = " | ".join(t for t, _ in sections)
-        # Drop removable sections by priority (stage -> overlay -> map)
-        # until title fits YouTube's 100-char limit.
-        removable = sorted([s for s in sections if s[1] is not None],
-                           key=lambda s: s[1])
-        while len(title) > 100 and removable:
-            victim = removable.pop(0)
-            sections = [s for s in sections if s != victim]
-            title = " | ".join(t for t, _ in sections)
-        if len(title) > 100:
-            title = title[:100]
         tags = tags + extra_overlay_tags
+
+    # Enforce YouTube's 100-char title limit for ALL variants: drop
+    # removable sections by priority (stage -> overlay-suffix -> map),
+    # then hard-truncate as a last resort. Player/teams/tournament kept.
+    removable = sorted([s for s in sections if s[1] is not None],
+                       key=lambda s: s[1])
+    while len(title) > 100 and removable:
+        victim = removable.pop(0)
+        sections = [s for s in sections if s != victim]
+        title = " | ".join(t for t, _ in sections)
+    if len(title) > 100:
+        title = title[:100]
 
     print(json.dumps({"title": title, "description": description, "tags": tags}))
 
