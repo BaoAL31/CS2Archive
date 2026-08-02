@@ -137,11 +137,40 @@ def resolve_publish(meta: dict) -> datetime | None:
     return None
 
 
-def dismiss_cover_editor(page) -> None:
-    """Cover editor requires Crop before Confirm. Never click Cancel (resets form)."""
+def dismiss_cover_editor(page, close_selector: bool = False) -> None:
+    """Confirm the cover editor (Crop then Confirm). Never click Cancel (resets form)."""
+    t0 = time.time()
+    while time.time() - t0 < 15:
+        if page.get_by_text("Cover editor", exact=False).count():
+            break
+        page.wait_for_timeout(500)
     if not page.get_by_text("Cover editor", exact=False).count():
+        log("cover editor did not open")
         return
     shot(page, "cover_before")
+
+    # Cover uploads to bilibili async — wait until the image renders + Confirm enables
+    t0 = time.time()
+    while time.time() - t0 < 30:
+        st = page.evaluate(
+            """() => {
+          const dlg = [...document.querySelectorAll('.el-dialog')]
+            .find(d => /Cover editor/i.test(d.innerText || ''));
+          if (!dlg) return {editor: false};
+          const imgs = [...dlg.querySelectorAll('img')].filter(i => i.naturalWidth >= 500);
+          const btn = [...dlg.querySelectorAll('button')]
+            .find(b => /^\\s*Confirm\\s*$/i.test((b.innerText || '').trim()));
+          return {
+            editor: true,
+            imgLoaded: imgs.length > 0,
+            confirmDisabled: btn ? !!(btn.disabled || btn.classList.contains('is-disabled')) : null,
+          };
+        }"""
+        )
+        if st.get("editor") and st.get("imgLoaded") and st.get("confirmDisabled") is False:
+            break
+        page.wait_for_timeout(1000)
+
     page.evaluate(
         """() => {
       const nodes = [...document.querySelectorAll('div,span,button,a,p')];
@@ -154,36 +183,20 @@ def dismiss_cover_editor(page) -> None:
     )
     page.wait_for_timeout(2500)
 
-    for _ in range(20):
-        st = page.evaluate(
-            """() => {
-          const btn = [...document.querySelectorAll('button')]
-            .find(b => /^\\s*Confirm\\s*$/i.test((b.innerText||'').trim()));
-          if (!btn) return {found:false};
-          const disabled = !!(btn.disabled || btn.getAttribute('disabled') !== null
-            || btn.classList.contains('is-disabled'));
-          return {found:true, disabled};
-        }"""
-        )
-        if st.get("found") and not st.get("disabled"):
-            break
-        page.wait_for_timeout(500)
-
     page.evaluate(
         """() => {
-      const btn = [...document.querySelectorAll('button')]
-        .find(b => /^\\s*Confirm\\s*$/i.test((b.innerText||'').trim()))
-        || document.querySelector('.cover-local__btn.primary-btn');
-      if (btn) btn.click();
+      const btn = [...document.querySelectorAll('.el-dialog button')]
+        .find(b => /^\\s*Confirm\\s*$/i.test((b.innerText || '').trim()));
+      if (btn && !btn.disabled) btn.click();
     }"""
     )
-    page.wait_for_timeout(2000)
+    page.wait_for_timeout(3000)
 
-    if page.get_by_text("Cover editor", exact=False).count():
+    if close_selector:
         page.evaluate(
             """() => {
               const dlg = [...document.querySelectorAll('.el-dialog')]
-                .find(d => /Cover editor/i.test(d.innerText||''));
+                .find(d => /Cover editor|From local/i.test(d.innerText || ''));
               const x = dlg && dlg.querySelector('.el-dialog__headerbtn, .el-dialog__close');
               if (x) x.click();
             }"""
@@ -197,27 +210,34 @@ def set_cover(page, thumb: Path | None) -> None:
         log("no thumbnail — skipping cover set")
         return
     loc = page.get_by_text("Upload a cover", exact=False)
-    if loc.count():
-        try:
-            with page.expect_file_chooser(timeout=5000) as fc:
-                loc.first.click()
-            fc.value.set_files(str(thumb))
-            log(f"cover attached: {thumb.name}")
-        except Exception as e:
-            log(f"cover chooser miss: {type(e).__name__}")
-            inputs = page.locator('input[type="file"]')
-            attached = False
-            for i in range(inputs.count()):
-                acc = (inputs.nth(i).get_attribute("accept") or "").lower()
-                if any(x in acc for x in ("jpg", "png", "jpeg", "image")):
-                    inputs.nth(i).set_input_files(str(thumb))
-                    log(f"cover via file input #{i} accept={acc!r}")
-                    attached = True
-                    break
-            if not attached:
-                log("WARN: no image file input found for cover")
+    if not loc.count():
+        log("WARN: no 'Upload a cover' button found")
+        return
+    try:
+        loc.first.click()
+    except Exception as e:
+        log(f"cover open miss: {type(e).__name__}")
     page.wait_for_timeout(2000)
-    dismiss_cover_editor(page)
+
+    cover_input = page.locator("#cover-upload-btn")
+    if not cover_input.count():
+        inputs = page.locator('input[type="file"]')
+        for i in range(inputs.count()):
+            acc = (inputs.nth(i).get_attribute("accept") or "").lower()
+            if any(x in acc for x in ("jpg", "png", "jpeg", "image")):
+                cover_input = inputs.nth(i)
+                break
+    if not cover_input.count():
+        log("WARN: no cover file input found")
+        return
+    try:
+        cover_input.first.set_input_files(str(thumb))
+        log(f"cover attached: {thumb.name}")
+    except Exception as e:
+        log(f"cover set miss: {type(e).__name__}")
+        return
+    page.wait_for_timeout(2000)
+    dismiss_cover_editor(page, close_selector=True)
 
 
 def fill_tags(page, tags: list[str]) -> None:

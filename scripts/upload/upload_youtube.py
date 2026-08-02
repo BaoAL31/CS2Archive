@@ -72,13 +72,13 @@ def get_authenticated_service(scopes: list[str] | None = None, token_file: str |
     return build("youtube", "v3", credentials=creds)
 
 
-def get_youtube_publish_dates(youtube) -> set[str]:
+def get_youtube_publish_dates(youtube, *, exclude_shorts: bool = True) -> set[str]:
     """Return set of YYYY-MM-DD dates with scheduled or published long-form vids.
 
     Queries channel uploads playlist (paginated), then ``videos().list`` in
     batches of 50 to fetch ``status.publishAt`` (actual public date for
-    scheduled vids) and ``status.privacyStatus``. Skips Shorts and unlisted.
-    Raises on API error — no silent fallback.
+    scheduled vids) and ``status.privacyStatus``. Skips Shorts and unlisted
+    when *exclude_shorts* is True (default). Raises on API error — no silent fallback.
     """
     from datetime import datetime
     channels = youtube.channels().list(part="contentDetails", mine=True).execute()
@@ -143,7 +143,7 @@ def get_youtube_publish_dates(youtube) -> set[str]:
             id=",".join(batch),
         ).execute()
         for v in resp.get("items", []):
-            if _is_short(v):
+            if exclude_shorts and _is_short(v):
                 continue
             st = v.get("status", {})
             privacy = st.get("privacyStatus", "public")
@@ -187,18 +187,28 @@ def _meta_path(video_path: str) -> str:
 
 def _record_publish_meta(
     meta_file_path: str,
-    publish_local: str,
     publish_tz: str,
-    publish_at_utc: str,
+    publish_at_utc_fallback: str,
 ) -> None:
+    """Write publish fields from ground truth (response publishAt) if present,
+    else the freshly resolved fallback. Local wall-clock is derived from UTC
+    so meta never contradicts what YouTube actually scheduled."""
     path = Path(meta_file_path)
     if not path.exists():
         return
     try:
         meta = json.loads(path.read_text(encoding="utf-8"))
-        meta["publish_at"] = publish_local
-        meta["publish_timezone"] = publish_tz
-        meta["publish_at_utc"] = publish_at_utc
+        actual = meta.get("publish_at_utc") or publish_at_utc_fallback
+        meta["publish_at_utc"] = actual
+        try:
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+            dt = datetime.fromisoformat(actual.replace("Z", "+00:00"))
+            local = dt.astimezone(ZoneInfo(publish_tz))
+            meta["publish_at"] = local.strftime("%Y-%m-%d %H:%M")
+            meta["publish_timezone"] = publish_tz
+        except Exception:
+            pass
         path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     except Exception:
         pass
@@ -317,7 +327,14 @@ def upload_video(
         meta.pop("video_size", None)
         meta["youtube_id"] = response.get("id")
         meta["upload_status"] = "completed"
-        if publish_at_utc:
+        # Record the ACTUAL scheduled publish time from the upload response.
+        # A resumed session keeps the publishAt committed at session creation,
+        # which may differ from a freshly resolved slot — the response is the
+        # only ground truth (the freshly resolved value can be a lie).
+        actual_pub = (response.get("status") or {}).get("publishAt")
+        if actual_pub:
+            meta["publish_at_utc"] = actual_pub
+        elif publish_at_utc and not meta.get("publish_at_utc"):
             meta["publish_at_utc"] = publish_at_utc
         with open(mp, "w") as f:
             json.dump(meta, f, indent=2)
@@ -415,6 +432,8 @@ def main() -> None:
             sys.exit(1)
         meta = json.loads(meta_path_obj.read_text())
 
+    resuming = bool(meta.get("resumable_uri"))
+
     video = Path(args.video or meta.get("video_path", ""))
     if not video.exists():
         print(f"[ERROR] Video not found: {video}")
@@ -494,7 +513,13 @@ def main() -> None:
     print("Authenticating with Google...", flush=True)
     youtube = get_authenticated_service()
 
-    if args.publish_at is None and "publish_at" not in meta:
+    if resuming:
+        # Resumed session already has its status/publishAt metadata committed
+        # at session creation. Re-resolving would both print a misleading
+        # schedule and occupy a slot that the video will never use — the
+        # response's actual publishAt is recorded instead.
+        args.publish_at = meta.get("publish_at")
+    elif args.publish_at is None and "publish_at" not in meta:
         args.publish_at = AUTO_PUBLISH_MODE
 
     original_privacy = privacy
@@ -542,7 +567,10 @@ def main() -> None:
         publish_at_utc=publish_at_utc,
     )
     if publish_at_utc:
-        _record_publish_meta(meta_file_path, publish_local, publish_tz, publish_at_utc)
+        # Fresh upload: derive display fields from the response's actual
+        # publishAt (already in meta via upload_video). Resume case needs no
+        # call — upload_video recorded the session-committed time directly.
+        _record_publish_meta(meta_file_path, publish_tz, publish_at_utc)
     print("Done!", flush=True)
 
 

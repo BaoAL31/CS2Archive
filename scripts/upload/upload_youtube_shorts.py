@@ -17,7 +17,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from upload_youtube import get_authenticated_service, upload_video
+from upload_youtube import get_authenticated_service, get_youtube_publish_dates, upload_video
 from youtube_schedule import DEFAULT_PUBLISH_TZ, resolve_publish_schedule
 
 SHORTS_META_NAME = "upload_meta_shorts.json"
@@ -87,12 +87,38 @@ def main() -> None:
 
     privacy = args.privacy or meta.get("privacy", "unlisted")
     original_privacy = privacy
+    occupied_dates: set[str] | None = None
+    publish_setting = args.publish_at or meta.get("publish_at", "")
+    if publish_setting == "auto":
+        print("Authenticating with Google...", flush=True)
+        youtube_pre = get_authenticated_service()
+        occupied_dates = get_youtube_publish_dates(youtube_pre, exclude_shorts=False) or None
+        occupied_tuples = (
+            {(d.split("T")[0], d.split("T")[1][:5]) for d in occupied_dates if "T" in d}
+            if occupied_dates
+            else set()
+        )
+        # Reuse CS2UtilArchive's shared shorts schedule (SLOT_TIMES +
+        # find_next_upload_slot) so CS2Archive and CS2UtilArchive shorts
+        # reserve from the same slot pool and never double-book a slot.
+        _UTIL_SCRIPTS = Path(r"D:\Projects\CS2UtilArchive\scripts")
+        if str(_UTIL_SCRIPTS) not in sys.path:
+            sys.path.append(str(_UTIL_SCRIPTS))
+        from publish_schedule import find_next_upload_slot
+        date_str, time_str = find_next_upload_slot(occupied=occupied_tuples)
+        publish_setting = f"{date_str} {time_str}"
+        print(
+            f"  Auto Shorts slot (shared CS2UtilArchive schedule): "
+            f"{date_str} {time_str} ({args.timezone})",
+            flush=True,
+        )
     try:
         privacy, publish_at_utc, publish_tz, publish_local = resolve_publish_schedule(
-            publish_at=args.publish_at,
+            publish_at=publish_setting,
             timezone=args.timezone,
             meta=meta,
             privacy=privacy,
+            occupied_dates=occupied_dates,
         )
     except ValueError as exc:
         print(f"[ERROR] {exc}", flush=True)
