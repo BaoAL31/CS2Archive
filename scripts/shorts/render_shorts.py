@@ -1,6 +1,7 @@
 """Render Short Timeline segments via CSDM and composite to 9:16 vertical.
 
-Reads ``short_timeline.json``, renders tick-range source clips (2560×1440),
+Reads ``short_timeline.json``, renders tick-range source clips at the player's
+native capture resolution (from player_accounts.json, e.g. 1280×960 for donk),
 then composites each into 1080×1920 with edge mirror blur header/footer.
 
 Usage:
@@ -17,6 +18,8 @@ import sys
 import time
 from pathlib import Path
 
+from PIL import Image
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_PROJECT_ROOT / "scripts"))
 from _pathsetup import ensure
@@ -30,16 +33,22 @@ FFMPEG = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
 FFPROBE = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffprobe.exe"
 CFG_PATH = (_PROJECT_ROOT / "assets" / "cs2_pov.cfg").resolve()
 
-SRC_WIDTH = 1920
-SRC_HEIGHT = 1080
+_DEFAULT_SRC_WIDTH = 1920
+_DEFAULT_SRC_HEIGHT = 1080
 OUT_WIDTH = 1080
 OUT_HEIGHT = 1920
 CSDM_RECORD_FRAMERATE = 60
 
 KILLFEED_CROP_W = 300
 KILLFEED_CROP_H = 170
-KILLFEED_CROP_X = SRC_WIDTH - KILLFEED_CROP_W
-KILLFEED_CROP_Y = 10
+KILLFEED_CROP_Y = 50
+
+AVATAR_DIR = _PROJECT_ROOT / "demos" / "avatars"
+AVATAR_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+AVATAR_SOURCES = ("hltv", "faceit")
+AVATAR_DEFAULT_HEIGHT = 600
+AVATAR_BOTTOM_MARGIN = 0
+AVATAR_OUTLINE_WIDTH = 3
 
 
 def _dbg(label: str, msg: str) -> None:
@@ -84,6 +93,109 @@ def _ffmpeg_settings() -> dict:
     }
 
 
+def _resolve_avatar_path(nickname: str) -> Path | None:
+    """Return best transparent avatar cutout for a nickname.
+
+    Mirrors thumbnail.utils.get_avatar_path: prefers the HLTV source folder,
+    then FACEIT; within a folder picks the largest PNG by pixel area.
+    """
+    name = nickname.strip().lower()
+
+    def _best_in(folder: Path) -> Path | None:
+        if not folder.is_dir():
+            return None
+        cands: list[Path] = []
+        for ext in AVATAR_EXTS:
+            cands.extend(folder.glob(f"{name}*.{ext.lstrip('.')}"))
+        if not cands:
+            return None
+        best = max(
+            cands,
+            key=lambda p: (Image.open(p).size[0] * Image.open(p).size[1])
+            if _safe_size(p)
+            else 0,
+        )
+        return best
+
+    for source in AVATAR_SOURCES:
+        p = _best_in(AVATAR_DIR / name / source)
+        if p:
+            return p
+    return None
+
+
+def _safe_size(p: Path) -> bool:
+    try:
+        Image.open(p).size
+        return True
+    except Exception:
+        return False
+
+
+def _prepare_avatar_overlay(
+    avatar_path: Path,
+    target_height: int,
+    outline_width: int = AVATAR_OUTLINE_WIDTH,
+    dst: Path | None = None,
+) -> Path:
+    """Scale a transparent avatar to *target_height* and bake a white outline.
+
+    The cutout is resized (LANCZOS) and a solid-white rim ``outline_width`` px
+    thick is grown around the alpha edge using a maximum filter. The result is
+    saved to *dst* (or a sibling of *avatar_path*) as PNG and returned.
+    """
+    import numpy as np
+    from PIL import Image, ImageFilter
+
+    img = Image.open(avatar_path).convert("RGBA")
+    w, h = img.size
+    ratio = target_height / h
+    img = img.resize((max(1, round(w * ratio)), target_height), Image.LANCZOS)
+
+    if outline_width > 0:
+        alpha = np.array(img.getchannel("A"), dtype=np.int32)
+        kernel = outline_width * 2 + 1
+        grown = np.array(img.getchannel("A").filter(ImageFilter.MaxFilter(kernel)), dtype=np.int32)
+        # Ring = pixels the max-filter added (grown > original). Interior stays intact.
+        ring = np.clip(grown - alpha, 0, 255).astype(np.uint8)
+        white = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        white.putalpha(Image.fromarray(ring))
+        img = Image.alpha_composite(white, img)
+
+    out = dst or avatar_path.with_name(f"{avatar_path.stem}_{target_height}px.png")
+    img.save(out)
+    return out
+
+
+def _resolve_player_resolution(steam_id: str) -> tuple[int, int, str]:
+    """Look up capture_width/capture_height + scaling_mode from player_accounts.json.
+    
+    Falls back to _DEFAULT_SRC_WIDTH × _DEFAULT_SRC_HEIGHT (1920×1080) + "Native"
+    when the player is not found or has no capture dimensions.
+    
+    Returns: (width, height, scaling_mode) where scaling_mode is one of
+    "Stretched", "Black Bars", "Native" (per prosettings/launch options).
+    """
+    accounts_path = _PROJECT_ROOT / ".data" / "player_accounts.json"
+    if not accounts_path.exists():
+        return (_DEFAULT_SRC_WIDTH, _DEFAULT_SRC_HEIGHT, "Native")
+    try:
+        accounts = json.loads(accounts_path.read_text(encoding="utf-8"))
+        match = next(
+            (a for a in accounts if a.get("steam_id") == steam_id),
+            None,
+        )
+        if match:
+            w = match.get("capture_width")
+            h = match.get("capture_height")
+            scaling_mode = match.get("scaling_mode") or "Native"
+            if w and w >= 800 and h and h >= 600:
+                return (int(w), int(h), str(scaling_mode))
+    except Exception:
+        pass
+    return (_DEFAULT_SRC_WIDTH, _DEFAULT_SRC_HEIGHT, "Native")
+
+
 def _get_player_crosshair_cvars(steam_id: str, demo_path: Path) -> list[str]:
     cvars = []
     import tempfile
@@ -110,6 +222,8 @@ def _build_csdm_config(
     shorts: list[dict],
     demo_path: Path,
     output_dir: Path,
+    src_width: int = _DEFAULT_SRC_WIDTH,
+    src_height: int = _DEFAULT_SRC_HEIGHT,
 ) -> dict:
     pov_sids = {s["pov_steam_id"] for s in shorts}
     crosshair_cache = {}
@@ -134,11 +248,10 @@ def _build_csdm_config(
         cvars = crosshair_cache.get(pov_sid, [])
 
         cfg_lines = [
+            "cl_draw_only_deathnotices 1",
             "crosshair 1",
             "cl_chatfilters 63",
             "snd_mvp_volume 0",
-            "cl_draw_only_deathnotices 0",
-            "cl_drawhud 1",
             "cl_showfps 0",
             "net_graph 0",
         ] + cvars
@@ -171,8 +284,8 @@ def _build_csdm_config(
         "recordingOutput": "video",
         "encoderSoftware": "FFmpeg",
         "framerate": CSDM_RECORD_FRAMERATE,
-        "width": SRC_WIDTH,
-        "height": SRC_HEIGHT,
+        "width": src_width,
+        "height": src_height,
         "closeGameAfterRecording": True,
         "concatenateSequences": False,
         "trueView": False,
@@ -204,7 +317,8 @@ def _find_sequence_files(search_dir: Path, num_expected: int, shorts: list[dict]
         _dbg("find", f"found {len(files)} sequence dirs")
         return files
 
-    flat = list(search_dir.glob("sequence-*-tick-*-to-*.mp4"))
+    flat = [p for p in search_dir.glob("sequence-*-tick-*-to-*.mp4")
+            if not p.name.endswith("-kill_feed.mp4")]
     if flat and shorts:
         by_ticks: dict[tuple[int, int], Path] = {}
         for p in flat:
@@ -230,7 +344,7 @@ def _find_sequence_files(search_dir: Path, num_expected: int, shorts: list[dict]
     return []
 
 
-def _render_kill_feed_pip(src: Path, dst: Path) -> None:
+def _render_kill_feed_pip(src: Path, dst: Path, src_width: int = _DEFAULT_SRC_WIDTH) -> None:
     """Pre-render the kill-feed PiP from the source segment.
 
     Crops the top band of the source (KILLFEED_CROP_W x KILLFEED_CROP_H at
@@ -239,7 +353,8 @@ def _render_kill_feed_pip(src: Path, dst: Path) -> None:
     ``_composite_9x16`` as input [1:v] so the final composite remains a
     single encode pass.
     """
-    vf = f"crop={KILLFEED_CROP_W}:{KILLFEED_CROP_H}:{KILLFEED_CROP_X}:{KILLFEED_CROP_Y}"
+    kf_x = src_width - KILLFEED_CROP_W
+    vf = f"crop={KILLFEED_CROP_W}:{KILLFEED_CROP_H}:{kf_x}:{KILLFEED_CROP_Y}"
     cmd = [
         FFMPEG, "-y", "-i", str(src),
         "-vf", vf,
@@ -250,7 +365,7 @@ def _render_kill_feed_pip(src: Path, dst: Path) -> None:
         str(dst),
     ]
 
-    _dbg("kf", f"{src.name}: crop {KILLFEED_CROP_W}x{KILLFEED_CROP_H}@{KILLFEED_CROP_X},{KILLFEED_CROP_Y} (native, no scale)")
+    _dbg("kf", f"{src.name}: crop {KILLFEED_CROP_W}x{KILLFEED_CROP_H}@{kf_x},{KILLFEED_CROP_Y} (native, no scale)")
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     if r.returncode != 0:
         raise RuntimeError(
@@ -263,14 +378,20 @@ def _render_kill_feed_pip(src: Path, dst: Path) -> None:
 def _composite_9x16(
     src: Path,
     dst: Path,
+    src_width: int = _DEFAULT_SRC_WIDTH,
+    src_height: int = _DEFAULT_SRC_HEIGHT,
     scale: float = 2.0,
     blur_radius: int = 50,
     darken_factor: float = 1.0,
     kill_feed: bool = True,
     kill_feed_path: Path | None = None,
     pip_scale: float = 1.0,
+    scaling_mode: str = "Native",
+    avatar_path: Path | None = None,
+    avatar_height: int = AVATAR_DEFAULT_HEIGHT,
+    avatar_bottom_margin: int = AVATAR_BOTTOM_MARGIN,
 ) -> None:
-    """Composite a 1920x1080 source into 1080x1920 via ffmpeg filter chain.
+    """Composite a source clip into 1080x1920 via ffmpeg filter chain.
 
     Background: source scaled to fill canvas (force_original_aspect_ratio=increase,
     crop to 1080x1920), Gaussian-blurred.
@@ -279,10 +400,21 @@ def _composite_9x16(
     ``scale=1.0`` fits the source inside without cropping.
     ``scale>1.0`` zooms in (e.g. 1.5 = source scaled to 1.5x, cropped centre to 1080).
 
+    4:3 stretched players (e.g. donk, s1mple): the source is captured at the
+    4:3 capture resolution but the player's view is *horizontally stretched*
+    to fill 16:9 (scaling_mode=Stretched). Pre-scale the source horizontally
+    to 16:9 before compositing — ``setsar=1`` ensures the DAR is square so
+    ffmpeg doesn't pillarbox/unsquish downstream.
+
     Kill-feed PiP (when ``kill_feed=True``, default): direct native crop from
     the source (no per‑PiP scaling) overlaid at top‑right of the foreground
     footage. Carved from [0:v] so it sits on the same source timeline as
     bg/fg — downstream overlays are on the final 1080×1920 canvas.
+
+    Player avatar (when ``avatar_path`` is given): the transparent cutout is
+    overlaid at the bottom-centre of the 1080×1920 canvas, scaled to a target
+    height (``avatar_height``) with ``avatar_bottom_margin`` px of clearance
+    from the bottom edge.
 
     Encode: NVIDIA NVENC (h264_nvenc) for GPU-accelerated H.264.
     Decode: cuda hwaccel for GPU-accelerated source decode.
@@ -290,7 +422,28 @@ def _composite_9x16(
     """
     gblur_sigma = max(1, blur_radius // 2)
 
-    _dbg("9x16", f"{src.name}: 1080x1920 canvas, scale={scale}x, blur_sigma={gblur_sigma}")
+    # 4:3 stretched players: pre-stretch source to 16:9 horizontally so
+    # bg/fg/pip all see a 16:9 source. Stretch target height = round(W_src * 9/16)
+    # only when source is 4:3 (or 5:4) AND scaling_mode=Stretched.
+    src_aspect = src_width / src_height if src_height else 16 / 9
+    is_4_3_like = 1.20 <= src_aspect <= 1.40
+    stretch = (scaling_mode or "Native").lower() == "stretched" and is_4_3_like
+    if stretch:
+        stretched_w = src_width
+        stretched_h = round(src_width * 9 / 16)
+        _dbg("9x16", f"{src.name}: 1080x1920 canvas, src={src_width}x{src_height} ({scaling_mode} -> stretch to {stretched_w}x{stretched_h}), scale={scale}x, blur_sigma={gblur_sigma}")
+    else:
+        stretched_w, stretched_h = src_width, src_height
+        _dbg("9x16", f"{src.name}: 1080x1920 canvas, src={src_width}x{src_height} ({scaling_mode}), scale={scale}x, blur_sigma={gblur_sigma}")
+
+    # Optional stretch pre-filter applied to [0:v] before split into bg/fg/pip_src.
+    # Two-stage: scale+stretch first (output=[base]), then split from [base].
+    if stretch:
+        pre_stretch = f"[0:v]scale={stretched_w}:{stretched_h}:flags=spline,setsar=1[base];"
+        split_pre = "[base]split="
+    else:
+        pre_stretch = ""
+        split_pre = "[0:v]split="
 
     if scale == 1.0:
         fg_chain = (
@@ -304,7 +457,7 @@ def _composite_9x16(
             f"crop={OUT_WIDTH}:ih[fg]"
         )
         fg_w = round(OUT_WIDTH * scale)
-        fg_h = round(fg_w * SRC_HEIGHT / SRC_WIDTH)
+        fg_h = round(fg_w * stretched_h / stretched_w)
         fg_top = (OUT_HEIGHT - fg_h) // 2
 
     bg_chain = (
@@ -347,8 +500,12 @@ def _composite_9x16(
             cmd.extend(["-i", str(kill_feed_path)])
             pip_scale_chain = f"[1:v]scale={scaled_pip_w}:{scaled_pip_h}[scaled_pip];" if actual_pip_scale != 1.0 else ""
             pip_in = "[scaled_pip]" if actual_pip_scale != 1.0 else "[1:v]"
+            if stretch:
+                split_part = f"{pre_stretch}{split_pre}2[bg_src][fg_src];"
+            else:
+                split_part = "[0:v]split=2[bg_src][fg_src];"
             filter_str = (
-                f"[0:v]split=2[bg_src][fg_src];"
+                f"{split_part}"
                 f"{bg_chain};"
                 f"{fg_chain};"
                 f"{pip_scale_chain}"
@@ -358,19 +515,32 @@ def _composite_9x16(
         else:
             pip_chain = (
                 f"[pip_src]crop={pip_w}:{pip_h}:"
-                f"{KILLFEED_CROP_X}:{KILLFEED_CROP_Y}"
+                f"{stretched_w - pip_w}:{KILLFEED_CROP_Y}"
             )
             if actual_pip_scale != 1.0:
                 pip_chain += f",scale={scaled_pip_w}:{scaled_pip_h}"
             pip_chain += "[pip];"
             
+            if stretch:
+                split_part = f"{pre_stretch}{split_pre}3[bg_src][fg_src][pip_src];"
+            else:
+                split_part = "[0:v]split=3[bg_src][fg_src][pip_src];"
             filter_str = (
-                f"[0:v]split=3[bg_src][fg_src][pip_src];"
+                f"{split_part}"
                 f"{bg_chain};"
                 f"{fg_chain};"
                 f"{pip_chain}"
                 f"[bg][fg]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2[tmp];"
                 f"[tmp][pip]overlay={pip_x}:{pip_y}[out]"
+            )
+
+        if avatar_path:
+            av_idx = 2 if kill_feed_path else 1
+            cmd.extend(["-i", str(avatar_path)])
+            filter_str += (
+                f";[{av_idx}:v]scale=-1:{avatar_height}[av];"
+                f"[out][av]overlay=(main_w-overlay_w)/2:"
+                f"(main_h-overlay_h-{avatar_bottom_margin})[out]"
             )
 
         cmd.extend([
@@ -384,8 +554,12 @@ def _composite_9x16(
             str(dst),
         ])
     else:
+        if stretch:
+            split_part = f"{pre_stretch}{split_pre}2[bg_src][fg_src];"
+        else:
+            split_part = "[0:v]split=2[bg_src][fg_src];"
         vf = (
-            f"[0:v]split=2[bg_src][fg_src];"
+            f"{split_part}"
             f"{bg_chain};"
             f"{fg_chain};"
             f"[bg][fg]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2[out]"
@@ -401,6 +575,14 @@ def _composite_9x16(
             "-movflags", "+faststart",
             str(dst),
         ]
+        if avatar_path:
+            cmd[6:6] = ["-i", str(avatar_path)]
+            vf += (
+                f";[1:v]scale=-1:{avatar_height}[av];"
+                f"[out][av]overlay=(main_w-overlay_w)/2:"
+                f"(main_h-overlay_h-{avatar_bottom_margin})[out]"
+            )
+            cmd[cmd.index("-filter_complex") + 1] = vf
 
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if r.returncode != 0:
@@ -420,11 +602,19 @@ def render_shorts(
     pip_scale: float = 1.0,
     composite_only: bool = False,
     name: str | None = None,
+    avatar: bool = True,
+    avatar_height: int = AVATAR_DEFAULT_HEIGHT,
+    avatar_bottom_margin: int = AVATAR_BOTTOM_MARGIN,
+    avatar_outline_width: int = AVATAR_OUTLINE_WIDTH,
 ) -> Path:
     """Render all shorts from a timeline JSON.
     
     When *composite_only* is True, skip CSDM and re-composite existing
     segments with new editing parameters (e.g. scale).
+    
+    When *avatar* is True, each short's player avatar (transparent cutout,
+    resolved from ``pov_nick``) is overlaid at the bottom-centre of the
+    9:16 canvas.
     
     Returns the output directory path.
     """
@@ -436,6 +626,12 @@ def render_shorts(
     demo_path = Path(tl["demo_path"])
     if not demo_path.exists():
         raise FileNotFoundError(f"Demo not found: {demo_path}")
+
+    # Resolve player capture resolution from player_accounts.json.
+    # Use the first short's POV to determine render resolution.
+    pov_sid = shorts[0].get("pov_steam_id", "")
+    src_w, src_h, scaling_mode = _resolve_player_resolution(pov_sid)
+    _dbg("res", f"Player resolution: {src_w}x{src_h} ({scaling_mode}, pov_steam_id={pov_sid})")
 
     # If the timeline is in a per-short folder (shorts-{slug}/), output there.
     # Otherwise fall back to resolve_output_dir base.
@@ -451,6 +647,7 @@ def render_shorts(
     print(f"Shorts: {len(shorts)} clips, map={tl.get('map', 'Unknown')}")
     print(f"Demo: {demo_path}")
     print(f"Output: {out_dir}")
+    print(f"Render resolution: {src_w}x{src_h}")
 
     # Split into batches
     if batch_size > 0:
@@ -472,7 +669,7 @@ def render_shorts(
             batch_end = batch_start + len(batch) - 1
             _dbg("batch", f"batch {batch_idx + 1}/{len(batches)}: shorts {batch_start + 1}-{batch_end + 1}")
 
-            config = _build_csdm_config(batch, demo_path, segments_dir)
+            config = _build_csdm_config(batch, demo_path, segments_dir, src_w, src_h)
             conf_path = out_dir / f"batch_{batch_idx + 1}_config.json"
             conf_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
@@ -506,7 +703,14 @@ def render_shorts(
             st = short["short_type"]
             nick = short.get("pov_nick", "unknown")
             tick = short.get("start_tick", 0)
-            base = f"{st}-{nick}-t{tick}"
+            if st == "4k":
+                kills = len(short.get("kill_ticks", []))
+                base = f"{kills}k_multikill-{nick}-t{tick}"
+            elif st == "clutch":
+                cnt = short.get("clutch_initial_count", "XvX")
+                base = f"{cnt}_clutch-{nick}-t{tick}"
+            else:
+                base = f"{st}-{nick}-t{tick}"
         out_name = f"{base}.mp4"
         dst = out_dir / out_name
         if dst.exists() and dst.stat().st_size >= 1_048_576:
@@ -516,8 +720,28 @@ def render_shorts(
                 continue
         kf_path = segments_dir / f"{seg_file.stem}-kill_feed.mp4"
         if not kf_path.exists() or kf_path.stat().st_size < 1_048_576:
-            _render_kill_feed_pip(seg_file, kf_path)
-        _composite_9x16(seg_file, dst, scale=scale, kill_feed_path=kf_path, pip_scale=pip_scale)
+            _render_kill_feed_pip(seg_file, kf_path, src_w)
+
+        avatar_path = None
+        if avatar:
+            nick = short.get("pov_nick", "")
+            avatar_path = _resolve_avatar_path(nick) if nick else None
+            if avatar_path:
+                _dbg("avatar", f"{out_name}: avatar {avatar_path.name}")
+                overlay_path = out_dir / f"_avatar_{nick}.png"
+                avatar_path = _prepare_avatar_overlay(
+                    avatar_path, avatar_height,
+                    outline_width=avatar_outline_width, dst=overlay_path,
+                )
+            else:
+                _dbg("avatar", f"{out_name}: no avatar for '{nick}' — skipping overlay")
+
+        _composite_9x16(
+            seg_file, dst, src_w, src_h,
+            scale=scale, kill_feed_path=kf_path, pip_scale=pip_scale,
+            scaling_mode=scaling_mode, avatar_path=avatar_path,
+            avatar_height=avatar_height, avatar_bottom_margin=avatar_bottom_margin,
+        )
         w, h = _probe_resolution(dst)
         dur = _probe_duration(dst)
         _dbg("done", f"{out_name}: {w}x{h} {dur:.1f}s (pov: {short['pov_steam_id']}, type: {short['short_type']})")
@@ -541,12 +765,23 @@ def main() -> int:
                    help="Skip CSDM render; re-composite existing segments with new editing params")
     ap.add_argument("--name", type=str, default=None,
                    help="Output filename (without .mp4). Default: {short_type}-{pov_nick}")
+    ap.add_argument("--no-avatar", action="store_true",
+                   help="Skip the player avatar overlay (bottom-centre)")
+    ap.add_argument("--avatar-height", type=int, default=AVATAR_DEFAULT_HEIGHT,
+                   help=f"Avatar target height in px on the 1080x1920 canvas (default: {AVATAR_DEFAULT_HEIGHT})")
+    ap.add_argument("--avatar-bottom-margin", type=int, default=AVATAR_BOTTOM_MARGIN,
+                   help=f"Clearance from the bottom edge in px (default: {AVATAR_BOTTOM_MARGIN})")
+    ap.add_argument("--avatar-outline-width", type=int, default=AVATAR_OUTLINE_WIDTH,
+                   help=f"White outline width around the avatar in px (default: {AVATAR_OUTLINE_WIDTH}; 0 = none)")
     args = ap.parse_args()
 
     try:
         render_shorts(args.timeline, player=args.player, batch_size=args.batches,
                        scale=args.scale, pip_scale=args.pip_scale, composite_only=args.composite_only,
-                       name=args.name)
+                       name=args.name, avatar=not args.no_avatar,
+                       avatar_height=args.avatar_height,
+                       avatar_bottom_margin=args.avatar_bottom_margin,
+                       avatar_outline_width=args.avatar_outline_width)
         return 0
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)

@@ -31,10 +31,13 @@ ensure()
 
 from shorts import resolve_output_dir  # noqa: E402
 
-_PRE_KILL_TICK_MARGIN = 320  # 5s before first kill (at 64 tick)
-_POST_KILL_TICK_MARGIN = 128  # 2s after last kill (at 64 tick)
+_PRE_KILL_TICK_MARGIN = 320  # 5s floor before first kill (at 64 tick)
+_POST_KILL_TICK_MARGIN = 320  # 5s after last kill (at 64 tick)
+_SHORT_TICK_DURATION = 1920  # 30s target total short length (30 * 64 tick)
+_CLUTCH_MIN_DURATION_TICKS = 1920  # 30s of playing at a disadvantage for a clutch
 
-# Weapon tiers for multikill filtering: at least one victim must have a tier >= attacker's tier.
+# Weapon tiers for multikill filtering: at least two victims must hold a
+# weapon of tier >= attacker's primary tier (filters anti-eco farm multikills).
 # Handles both player_death short names (e.g. "m4a1") and display names (e.g. "M4A4").
 _WEAPON_TIER: dict[str, int] = {
     # Tier 0: Melee / eco items
@@ -80,8 +83,8 @@ def _weapon_tier(weapon: str) -> int:
 
 
 def _meets_tier_criterion(kills: list[dict]) -> bool:
-    """At least one victim has weapon tier >= attacker's primary weapon tier.
-    
+    """At least two victims held a weapon of tier >= attacker's primary weapon tier.
+
     Primary weapon = most common weapon across all kills (tie → highest tier).
     Tier 5 (inferno, nades, etc.) always passes.
     """
@@ -95,13 +98,12 @@ def _meets_tier_criterion(kills: list[dict]) -> bool:
     attacker_tier = _weapon_tier(primary)
     if attacker_tier >= 5:
         return True
+    eligible = 0
     for k in kills:
         vw = k.get("victim_weapon", "")
-        if not vw:
-            return True
-        if _weapon_tier(vw) >= attacker_tier:
-            return True
-    return False
+        if vw and _weapon_tier(vw) >= attacker_tier:
+            eligible += 1
+    return eligible >= 2
 
 
 def _sid(val) -> str:
@@ -152,6 +154,36 @@ def build_short_timeline(demo_path: Path, player: str | None = None) -> dict:
 
     nickname_by_sid = _build_nickname_map(info)
 
+    # --- Victim weapon lookup via tick-level active weapon snapshot ---
+    victim_weapon_map: dict[tuple[int, str], str] = {}
+    try:
+        import numpy as np
+        from highlights.build_action_timeline import _resolve_weapon_id
+
+        first_freeze = int(freeze_end["tick"].min()) if freeze_end is not None and not freeze_end.empty else None
+        _death_ticks_raw = sorted(set(
+            int(r["tick"]) for _, r in deaths.iterrows()
+            if first_freeze is None or int(r["tick"]) >= first_freeze
+        ))
+        _weapon_query_ticks: list[int] = []
+        for t in _death_ticks_raw:
+            _weapon_query_ticks.append(t)
+            if t > 1:
+                _weapon_query_ticks.append(t - 1)
+        _weapon_snapshot = parser.parse_ticks(
+            ["m_iItemDefinitionIndex"], ticks=_weapon_query_ticks,
+        )
+        for _, row in _weapon_snapshot.iterrows():
+            sid = _sid(row.get("steamid"))
+            t = int(row["tick"])
+            val = row.get("m_iItemDefinitionIndex")
+            if sid and not (isinstance(val, float) and np.isnan(val)):
+                key = (t, sid)
+                if key not in victim_weapon_map:
+                    victim_weapon_map[key] = _resolve_weapon_id(int(val))
+    except Exception:
+        victim_weapon_map = {}
+
     return detect_shorts(
         demo_path=str(demo_path),
         header_map=header_map,
@@ -160,10 +192,10 @@ def build_short_timeline(demo_path: Path, player: str | None = None) -> dict:
         freeze_end=freeze_end,
         round_end=round_end,
         info=info,
-        nickname_by_sid=nickname_by_sid,
         bomb_plant=bomb_plant,
         bomb_defuse=bomb_defuse,
         bomb_explode=bomb_explode,
+        victim_weapon_map=victim_weapon_map,
     )
 
 
@@ -188,6 +220,7 @@ def detect_shorts(
     round_freeze_ends: dict[int, int] | None = None,
     round_ends: dict[int, int] | None = None,
     round_win_events: dict[int, list[dict]] | None = None,
+    victim_weapon_map: dict[tuple[int, str], str] | None = None,
 ) -> dict:
     """Detect 4K and Clutch Shorts from parsed or synthetic events.
 
@@ -315,6 +348,13 @@ def detect_shorts(
                 continue
             if attacker_sid and attacker_sid == victim_sid and weapon not in ("c4", "planted_c4"):
                 continue
+            victim_weapon = ""
+            if victim_weapon_map:
+                for offset in (tick, tick - 1, tick - 2):
+                    vw = victim_weapon_map.get((offset, victim_sid), "")
+                    if vw:
+                        victim_weapon = vw
+                        break
             rn = _round_for_tick(tick, round_starts, first_freeze)
             kills_by_round.setdefault(rn, []).append({
                 "tick": tick,
@@ -322,7 +362,7 @@ def detect_shorts(
                 "attacker_sid": attacker_sid,
                 "victim_sid": victim_sid,
                 "weapon": weapon,
-                "victim_weapon": "",
+                "victim_weapon": victim_weapon,
             })
     else:
         kills_by_round = {}
@@ -354,7 +394,31 @@ def detect_shorts(
     # ================================================================
     shorts: list[dict] = []
 
+    def _round_winner(rn: int) -> int | None:
+        """Team number of the round winner, inferred from bomb events + kills.
+
+        Mirrors build_action_timeline: a defuse/explode names the winning player's
+        team; otherwise the last surviving killer's team wins.
+        """
+        for we in round_win_events.get(rn, []):
+            if we["event"] in ("defuse", "explode"):
+                sid = we["player_sid"]
+                if sid and sid in team_by_sid:
+                    return team_by_sid[sid]
+        dead: set[str] = set()
+        for k in kills_by_round.get(rn, []):
+            if k["victim_sid"]:
+                dead.add(k["victim_sid"])
+        for k in reversed(kills_by_round.get(rn, [])):
+            aid = k["attacker_sid"]
+            if aid and aid not in dead and aid in team_by_sid:
+                return team_by_sid[aid]
+        return None
+
     for _rn, rkills in sorted(kills_by_round.items()):
+        if _rn <= 0:
+            continue  # round 0 = warmup / knife (side-choice) round — not a real round
+        _winner = _round_winner(_rn)
         by_attacker: dict[str, list[dict]] = {}
         for k in rkills:
             aid = k["attacker_sid"]
@@ -364,15 +428,22 @@ def detect_shorts(
         for aid, kills in by_attacker.items():
             if len(kills) < 4:
                 continue
+            if _winner is not None and team_by_sid.get(aid) != _winner:
+                continue  # multikill team must win the round
             if not _meets_tier_criterion(kills):
                 continue
             ticks = sorted(k["tick"] for k in kills)
+            end_tick = ticks[-1] + _POST_KILL_TICK_MARGIN
+            start_tick = min(
+                end_tick - _SHORT_TICK_DURATION,
+                ticks[0] - _PRE_KILL_TICK_MARGIN,
+            )
             shorts.append({
                 "short_type": "4k",
                 "pov_steam_id": aid,
                 "pov_nick": nickname_by_sid.get(aid, "Unknown"),
-                "start_tick": ticks[0] - _PRE_KILL_TICK_MARGIN,
-                "end_tick": ticks[-1] + _POST_KILL_TICK_MARGIN,
+                "start_tick": start_tick,
+                "end_tick": end_tick,
                 "kill_ticks": ticks,
             })
 
@@ -446,7 +517,11 @@ def detect_shorts(
 
             win_player = _last_surviving_killer(round_kills, team, team_by_sid, win_player_hint=win_player)
 
-            if win_tick is not None and win_player is not None:
+            if (
+                win_tick is not None
+                and win_player is not None
+                and win_tick - trigger["start_tick"] >= _CLUTCH_MIN_DURATION_TICKS
+            ):
                 shorts.append({
                     "short_type": "clutch",
                     "pov_steam_id": win_player,
@@ -457,6 +532,19 @@ def detect_shorts(
                     "round_win_tick": win_tick,
                     "win_event": win_event,
                 })
+
+    # Prioritise clutches over overlapping multikills: when a clutch short's
+    # [trigger, win] window overlaps a 4K short, keep the clutch, drop the 4K.
+    clutches = [s for s in shorts if s["short_type"] == "clutch"]
+    if clutches:
+        shorts = [
+            s for s in shorts
+            if s["short_type"] == "clutch"
+            or not any(
+                s["start_tick"] <= c["end_tick"] and c["start_tick"] <= s["end_tick"]
+                for c in clutches
+            )
+        ]
 
     return {
         "short_type": "short_timeline",
@@ -600,10 +688,11 @@ def _build_short_slug(short: dict) -> str:
     safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in nick)
     tick = short.get("start_tick", 0)
     if st == "4k":
-        return f"4k-{safe}-t{tick}"
+        kills = len(short.get("kill_ticks", []))
+        return f"{kills}k_multikill-{safe}-t{tick}"
     elif st == "clutch":
         cnt = short.get("clutch_initial_count", "XvX")
-        return f"clutch-{safe}-{cnt}-t{tick}"
+        return f"{cnt}_clutch-{safe}-t{tick}"
     return f"{st}-{safe}-t{tick}"
 
 
