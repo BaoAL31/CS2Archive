@@ -32,7 +32,7 @@ ensure()
 from shorts import resolve_output_dir  # noqa: E402
 
 _PRE_KILL_TICK_MARGIN = 320  # 5s floor before first kill (at 64 tick)
-_POST_KILL_TICK_MARGIN = 320  # 5s after last kill (at 64 tick)
+_POST_KILL_TICK_MARGIN = 128  # 2s after last kill (at 64 tick)
 _SHORT_TICK_DURATION = 1920  # 30s target total short length (30 * 64 tick)
 _CLUTCH_MIN_DURATION_TICKS = 1920  # 30s of playing at a disadvantage for a clutch
 
@@ -721,15 +721,18 @@ def main() -> int:
             print(f"[ERR] action_timeline.json not found: {at_path}", file=sys.stderr)
             return 1
         timeline = build_short_timeline_from_action(at_path, demo)
-        base_dir = args.output or at_path.parent
     else:
         timeline = build_short_timeline(demo, player=args.player)
-        base_dir = args.output or resolve_output_dir(demo, player=args.player)
 
     shorts_list = timeline.get("shorts", [])
     if not shorts_list:
         print("[OK] 0 shorts detected (no output written)")
         return 0
+
+    if args.from_action_timeline:
+        base_dir = args.output or at_path.parent
+    else:
+        base_dir = args.output or resolve_output_dir(demo, player=args.player)
 
     written = 0
     for short in shorts_list:

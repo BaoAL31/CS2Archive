@@ -44,7 +44,7 @@ def test_4k_detected():
     assert s["pov_steam_id"] == "A"
     assert s["pov_nick"] == "Unknown"
     assert s["start_tick"] == 680  # 5s floor (320 ticks) before first kill
-    assert s["end_tick"] == 4320  # 5s padding (320 ticks) after last kill
+    assert s["end_tick"] == 4128  # 2s padding (128 ticks) after last kill
     assert s["kill_ticks"] == [1000, 2000, 3000, 4000]
 
 
@@ -62,8 +62,8 @@ def test_4k_dynamic_prekill_caps_at_30s():
         round_starts=[(500, 1)],
     )
     s = result["shorts"][0]
-    assert s["end_tick"] == 1300 + 320 == 1620
-    assert s["start_tick"] == s["end_tick"] - 1920 == -300
+    assert s["end_tick"] == 1300 + 128 == 1428
+    assert s["start_tick"] == s["end_tick"] - 1920 == -492
     assert s["start_tick"] < 1000  # pre-kill is dynamic, much longer than 5s floor
 
 
