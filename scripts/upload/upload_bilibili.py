@@ -380,7 +380,7 @@ def lookup_aid_by_title(page, title: str) -> str | None:
     """Resolve aid from studio archives API when submit doesn't navigate to edit URL."""
     needle = (title or "")[:40]
     try:
-        aid = page.evaluate(
+        return page.evaluate(
             """async (needle) => {
               const r = await fetch(
                 'https://api.bilibili.tv/intl/videoup/web2/archives?state=&pn=1&ps=20&lang_id=3&platform=web&lang=en_US&s_locale=en_US',
@@ -393,10 +393,36 @@ def lookup_aid_by_title(page, title: str) -> str | None:
             }""",
             needle,
         )
-        return aid
     except Exception as e:
         log(f"aid lookup failed: {e}")
         return None
+
+
+def poll_aid_after_submit(page, title: str, tries: int = 6, wait_s: int = 10) -> str | None:
+    """Poll archives API for the just-submitted video (processing can lag)."""
+    needle = (title or "")[:40]
+    for i in range(tries):
+        try:
+            aid = page.evaluate(
+                """async (needle) => {
+                  const r = await fetch(
+                    'https://api.bilibili.tv/intl/videoup/web2/archives?state=&pn=1&ps=20&lang_id=3&platform=web&lang=en_US&s_locale=en_US',
+                    {credentials:'include'}
+                  );
+                  const j = await r.json();
+                  const archives = j?.data?.archives || [];
+                  const hit = archives.find(a => (a.title || '').includes(needle));
+                  return hit ? String(hit.aid) : null;
+                }""",
+                needle,
+            )
+            if aid:
+                log(f"resolved aid via archives API (poll {i + 1}): {aid}")
+                return aid
+        except Exception as e:
+            log(f"aid poll warn ({i + 1}): {e}")
+        page.wait_for_timeout(wait_s * 1000)
+    return None
 
 
 def _write_meta(meta_path: Path | None, **fields) -> None:
@@ -532,7 +558,7 @@ def upload_to_bilibili(
             # Submit often returns to archive-list while Processing (no edit URL).
             page.goto("https://studio.bilibili.tv/archive-list", wait_until="domcontentloaded")
             page.wait_for_timeout(3000)
-            aid = lookup_aid_by_title(page, title)
+            aid = poll_aid_after_submit(page, title)
             if aid:
                 log(f"resolved aid via archives API: {aid}")
         ctx.storage_state(path=str(STORAGE))
