@@ -362,6 +362,16 @@ def build_action_timeline(demo_path: Path) -> dict:
 
     source = "hltv" if "demos/hltv" in demo_rel else "faceit"
 
+    # Team membership {team_number_str: [steam_id, ...]} — used by the edit
+    # timeline to pick a closer POV from the round's winning team. Only real
+    # teams (2 = T, 3 = CT); 1 = unassigned/spectators.
+    teams: dict[str, list[str]] = {}
+    for sid, team_no in team_by_sid.items():
+        if team_no > 1:
+            teams.setdefault(str(team_no), []).append(sid)
+    for team_no in teams:
+        teams[team_no].sort()
+
     return {
         "demo_path": demo_rel,
         "map": _map_name(demo_path, header_map),
@@ -373,6 +383,7 @@ def build_action_timeline(demo_path: Path) -> dict:
         "round_freeze_ends": round_freeze_ends,
         "round_ends": round_ends,
         "winner_by_round": {str(rn): t for rn, t in winner_by_round.items()},
+        "teams": teams,
     }
 
 

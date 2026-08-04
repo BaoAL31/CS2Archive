@@ -244,7 +244,12 @@ Example 3 — One round per segment (do NOT put r1 and r2 kills in one segment):
 """
 
 
-def _build_batch_prompt(batch: dict, action_timeline: dict, players: dict) -> str:
+def _build_batch_prompt(
+    batch: dict,
+    action_timeline: dict,
+    players: dict,
+    hints: list[str] | None = None,
+) -> str:
     pro_sids = _get_pro_sids()
     pro_marks = {sid: " (PRO)" for sid in pro_sids if sid in players}
 
@@ -265,6 +270,14 @@ def _build_batch_prompt(batch: dict, action_timeline: dict, players: dict) -> st
 
     round_end_summary = [f"r{re['round']} t{re['tick']}" for re in batch["round_ends"]]
     player_list = "\n".join(f"  {sid}: {name}{pro_marks.get(sid, '')}" for sid, name in players.items())
+
+    hints_text = ""
+    if hints:
+        hints_text = (
+            "PREVIOUS VALIDATION ISSUES TO AVOID (from an earlier attempt):\n"
+            + "\n".join(f"- {h}" for h in hints)
+            + "\n\n"
+        )
 
     prompt = f"""Create edit segments for a CS2 highlight reel.
 
@@ -314,7 +327,7 @@ RULES:
   2. (end_tick - start_tick) >= 384
   3. All kill_indices must be valid local indices from the KILLS list
 
-{_edit_timeline_few_shot_examples()}
+{hints_text}{_edit_timeline_few_shot_examples()}
 NOW EDIT THE REAL BATCH BELOW (use the KILLS list local indices, not the synthetic examples above).
 
 OUTPUT JSON:
@@ -395,9 +408,15 @@ def _call_llm(prompt: str, model: str = DEFAULT_MODEL, retries: int = 3) -> str:
 # Validate + fix (operates on combined output)
 # ──────────────────────────────────────────────────────────────────────
 
-MIN_DURATION_TICKS = 384  # 6 seconds at 64 tick
+MIN_DURATION_TICKS = 384  # 6 seconds at 64 tick (anchor expansion floor)
+MIN_SEGMENT_TICKS = 768  # 12 seconds at 64 tick — minimum segment duration (merge shorts into neighbours)
 MULTI_KILL_WINDOW_TICKS = 192  # 3s at 64 tick — quick succession / streak merge
 WARMUP_ROUND = 0  # knife / warmup: no buy phase (round index in action_timeline)
+
+BOMB_LIFETIME_TICKS = 2624  # measured plant->explode = 41.00s @64 tick (CS2 C4 timer)
+DEFUSE_PRE_TAIL_TICKS = 192  # comfortable CT-defuse closers end 3s before the defuse completes
+DEFUSE_KEEP_MAX_LEFT_TICKS = 128  # keep the whole defusal if the bomb had <2s left
+ROUND_END_TRIM_TICKS = 128  # trim 2s off every round-end tail (unless a post-round kill happens there)
 
 
 def _segment_kill_ticks(seg: dict, kills: list[dict], max_idx: int) -> list[int]:
@@ -619,6 +638,338 @@ def _normalize_segment_types(segments: list[dict], kills: list[dict], max_idx: i
             seg["segment_type"] = "multi_kill"
 
 
+def _apply_death_cap(seg: dict, kills: list[dict], max_idx: int, death_tail_ticks: int) -> None:
+    """Cap a segment's end at 2s after its POV player's death (see _anchor_window)."""
+    pov = seg.get("pov_steam_id", "")
+    last_kill = max(
+        (kills[ki]["tick"] for ki in seg.get("kill_indices", []) if 0 <= ki <= max_idx),
+        default=-1,
+    )
+    if pov and last_kill >= 0:
+        death = max(
+            (k["tick"] for k in kills
+             if k.get("victim_steam_id") == pov
+             and k["tick"] >= last_kill
+             and k["tick"] <= seg["end_tick"]),
+            default=None,
+        )
+        if death is not None:
+            seg["end_tick"] = min(seg["end_tick"], death + death_tail_ticks)
+
+
+def _merge_segment_pair(a: dict, b: dict) -> dict:
+    """Combine two adjacent segments into one (union range + merged kills)."""
+    merged = dict(a)
+    merged["start_tick"] = min(a["start_tick"], b["start_tick"])
+    merged["end_tick"] = max(a["end_tick"], b["end_tick"])
+    merged["kill_indices"] = sorted(set(a.get("kill_indices", []) + b.get("kill_indices", [])))
+    if len(merged["kill_indices"]) >= 2:
+        merged["segment_type"] = "multi_kill"
+    merged["rationale"] = (
+        f"{a.get('rationale', '')} | merged with short segment "
+        f"({b.get('start_tick')}-{b.get('end_tick')})"
+    ).strip(" |")
+    return merged
+
+
+def _merge_short_segments(
+    segments: list[dict],
+    min_ticks: int,
+    kills: list[dict],
+    max_idx: int,
+    death_tail_ticks: int,
+) -> list[dict]:
+    """Merge any segment shorter than ``min_ticks`` into a neighbour.
+
+    A run of consecutive short segments is consolidated: the first short merges
+    into the preceding (fine) segment, and the rest of the run merge together.
+    This produces fewer, longer segments — no segment below ``min_ticks``. POV is
+    re-set to the top attacker and the death cap is re-applied afterwards.
+    """
+    def dur(s):
+        return s["end_tick"] - s["start_tick"]
+
+    out: list[dict] = []
+    i = 0
+    n = len(segments)
+    while i < n:
+        if dur(segments[i]) >= min_ticks:
+            out.append(dict(segments[i]))
+            i += 1
+            continue
+        run = [dict(segments[i])]
+        j = i + 1
+        while j < n and dur(segments[j]) < min_ticks:
+            run.append(dict(segments[j]))
+            j += 1
+        if out:
+            # First short merges into the preceding fine segment.
+            out.append(_merge_segment_pair(out.pop(), run[0]))
+            run = run[1:]
+        if run:
+            # Merge the rest of the run into one segment.
+            acc = run[0]
+            for s in run[1:]:
+                acc = _merge_segment_pair(acc, s)
+            # If the leftover is still short, absorb the following segment (if
+            # any); otherwise fold it into the last emitted segment so nothing
+            # stays below the minimum.
+            if dur(acc) < min_ticks and j < n:
+                acc = _merge_segment_pair(acc, dict(segments[j]))
+                j += 1
+            if dur(acc) < min_ticks and out:
+                out[-1] = _merge_segment_pair(out[-1], acc)
+            else:
+                out.append(acc)
+        i = j
+
+    # Re-set POV to the majority killer and re-apply the death cap after merging.
+    for seg in out:
+        attacker_counts: dict[str, int] = {}
+        for ki in seg.get("kill_indices", []):
+            if 0 <= ki <= max_idx:
+                sid = kills[ki]["attacker_steam_id"]
+                attacker_counts[sid] = attacker_counts.get(sid, 0) + 1
+        if attacker_counts:
+            seg["pov_steam_id"] = max(attacker_counts, key=attacker_counts.get)
+        _apply_death_cap(seg, kills, max_idx, death_tail_ticks)
+    return out
+
+
+def _ensure_round_closers(
+    segments: list[dict],
+    action_timeline: dict,
+    kills: list[dict],
+    max_idx: int,
+) -> list[dict]:
+    """Guarantee every live round shows its winner.
+
+    Each round must end with a segment whose end_tick reaches that round's end
+    tick, so a viewer always sees who won (round-end screen / closing frags).
+    Two behaviours:
+      1. For a round that already has segments, extend the round's latest
+         segment to the round end tick.
+      2. For a round with no segment at all (previously skipped), synthesize a
+         closing segment running to the round end tick.
+
+    Warmup/knife (round 0) and the match's final round (no round_ends/next
+    round) are left to the normal anchor logic.
+    """
+    round_start_by_round = {
+        rs["round"]: int(rs["tick"]) for rs in action_timeline.get("round_starts", [])
+    }
+    round_end_by_round = {
+        re["round"]: int(re["tick"]) for re in action_timeline.get("round_ends", [])
+    }
+    live_rounds = sorted(
+        r for r in round_start_by_round
+        if r != WARMUP_ROUND and (r in round_end_by_round or r < max(round_start_by_round))
+    )
+    if not segments and not live_rounds:
+        return segments
+
+    def round_of_tick(tick: int) -> int | None:
+        candidates = [r for r, t in round_start_by_round.items() if t <= tick]
+        return max(candidates) if candidates else None
+
+    # Closers must show a player ALIVE through the round end. A dead POV makes
+    # CS2 flip to a random surviving player mid-segment, so the baked avatar
+    # cutout stops matching. Preference when re-pointing: alive pro on the
+    # winning team -> any alive pro -> rando on the winning team (no cutout is
+    # baked for randos) -> any alive player. Degrades gracefully when the
+    # action timeline lacks winner_by_round/teams (e.g. older fixtures).
+    pro_sids = set(known_pro_steam_ids().keys())
+    players = set(_extract_players_from_action_timeline(action_timeline))
+    winner_by_round = {int(r): t for r, t in action_timeline.get("winner_by_round", {}).items()}
+    teams = action_timeline.get("teams", {})  # {team_number_str: [steam_id, ...]}
+
+    def _alive_sids_at(round_start: int, end: int) -> set[str]:
+        dead = {
+            k.get("victim_steam_id") for k in kills
+            if k.get("victim_steam_id") and round_start < k["tick"] <= end
+        }
+        return {sid for sid in players if sid not in dead}
+
+    def _repoint_to_alive(seg: dict, r: int) -> None:
+        """Ensure the closer POV is alive at the round end; switch it if not."""
+        pov = seg.get("pov_steam_id")
+        if not pov:
+            return
+        start = round_start_by_round.get(r, 0)
+        end = int(seg.get("end_tick", 0))
+        alive = _alive_sids_at(start, end)
+        if pov in alive or not alive:
+            return  # POV survives through the round end (or can't determine) — keep it
+        win_team = winner_by_round.get(r)
+        win_sids = set(teams.get(str(win_team), [])) if win_team is not None else set()
+        cand_pros = sorted(alive & pro_sids, key=lambda sid: (sid not in win_sids, sid))
+        if cand_pros:
+            new_pov = cand_pros[0]
+        elif win_sids:
+            rando = sorted(alive & win_sids)
+            new_pov = rando[0] if rando else sorted(alive)[0]
+        else:
+            new_pov = sorted(alive)[0]
+        seg["pov_steam_id"] = new_pov
+        seg["rationale"] = (
+            f"{seg.get('rationale', '')} | POV switched to "
+            f"{'a pro' if new_pov in pro_sids else 'a rando (no cutout)'} alive at round end."
+        ).strip(" |")
+
+    def _trim_defuse_tail(seg: dict, r: int) -> None:
+        """Shave ~4s off a closer when its round ended in a comfortable CT defuse.
+
+        If a planted bomb is defused with >=2s still on the clock, the tail of the
+        round is dead time (just watching the defuse) — cut it to keep the reel
+        tight. A last-second defusal (<2s left on the bomb) is dramatic and kept in
+        full. Only rounds the defusing (CT) team actually won are touched.
+        """
+        events = [
+            b for b in action_timeline.get("bomb_actions", [])
+            if b.get("round") == r
+        ]
+        plant = next((b for b in events if b.get("type") == "plant"), None)
+        defuse = next((b for b in events if b.get("type") == "defuse"), None)
+        if plant is None or defuse is None:
+            return
+        defuser_team = next(
+            (t for t, sids in teams.items() if defuse.get("player_steam_id") in sids),
+            None,
+        )
+        if defuser_team is None or winner_by_round.get(r) != int(defuser_team):
+            return  # not a CT-defuse win
+        time_left = BOMB_LIFETIME_TICKS - (int(defuse["tick"]) - int(plant["tick"]))
+        if time_left < DEFUSE_KEEP_MAX_LEFT_TICKS:
+            return  # last-second defusal — keep the whole thing
+        end = int(seg.get("end_tick", 0))
+        # Comfortable defusal: the defuse process isn't worth showing, so the
+        # closer ends 3s BEFORE the bomb is defused.
+        new_end = int(defuse["tick"]) - DEFUSE_PRE_TAIL_TICKS
+        # Never cut before the segment start, nor before its last kill.
+        kills_here = _segment_kill_ticks(seg, kills, max_idx)
+        last_kill = max(kills_here) if kills_here else int(seg.get("start_tick", 0))
+        new_end = max(new_end, last_kill + 64, int(seg.get("start_tick", 0)) + 1)
+        if new_end < end:
+            seg["end_tick"] = new_end
+            seg["rationale"] = (
+                f"{seg.get('rationale', '')} | Comfortable defuse (bomb had "
+                f"{time_left / 64:.1f}s left): trimmed to 3s before defuse."
+            ).strip(" |")
+
+    def _trim_round_end_tail(seg: dict, r: int, end_tick: int) -> None:
+        """Trim 2s off a round-end tail unless a kill happens in those 2s.
+
+        Called after ``_trim_defuse_tail``; it does NOT stack with the
+        comfortable-defuse trim — if the defuse trim already shortened the closer
+        (end < round end), we leave it alone.
+        """
+        if int(seg.get("end_tick", 0)) < int(end_tick):
+            return  # defuse trim already applied — don't double-trim
+        post_kill = any(
+            k.get("round") == r and end_tick - ROUND_END_TRIM_TICKS < k["tick"] <= end_tick
+            for k in kills
+        )
+        if post_kill:
+            return  # action happening in the last 2s — keep it
+        new_end = end_tick - ROUND_END_TRIM_TICKS
+        new_end = max(new_end, int(seg.get("start_tick", 0)) + 1)
+        if new_end < int(seg.get("end_tick", 0)):
+            seg["end_tick"] = new_end
+            seg["rationale"] = (
+                f"{seg.get('rationale', '')} | trimmed 2s round-end tail"
+            ).strip(" |")
+
+    # Group segments by the round of their first kill.
+    by_round: dict[int, list[dict]] = {}
+    for seg in segments:
+        ticks = _segment_kill_ticks(seg, kills, max_idx)
+        r = None
+        if ticks:
+            r = round_of_tick(min(ticks))
+        if r is None:
+            r = round_of_tick(int(seg.get("start_tick", 0)))
+        if r is not None:
+            by_round.setdefault(r, []).append(seg)
+
+    for r in live_rounds:
+        end_tick = round_end_by_round.get(r)
+        if end_tick is None:
+            later = [t for rr, t in round_start_by_round.items() if rr > r]
+            end_tick = min(later) - 1 if later else None
+        if end_tick is None:
+            continue
+
+        segs_in_round = by_round.get(r, [])
+        if segs_in_round:
+            # Extend the round's latest-closing segment to the round end tick.
+            closer = max(
+                segs_in_round,
+                key=lambda s: _segment_kill_ticks(s, kills, max_idx)[-1]
+                if _segment_kill_ticks(s, kills, max_idx) else int(s.get("end_tick", 0)),
+            )
+            closer["end_tick"] = max(int(closer.get("end_tick", 0)), end_tick)
+            closer["rationale"] = (
+                f"{closer.get('rationale', '')} | Extended to round end (winner visible)."
+            ).strip(" |")
+            _repoint_to_alive(closer, r)
+            _trim_defuse_tail(closer, r)
+            _trim_round_end_tail(closer, r, end_tick)
+        else:
+            # Skipped round: synthesize a closing segment to the round end.
+            round_kills = [ki for ki in range(max_idx + 1) if kills[ki].get("round") == r]
+            ref = max(round_kills, key=lambda ki: kills[ki]["tick"]) if round_kills else None
+            # POV: prefer a pro involved in the round's kills (attacker or victim),
+            # else the last kill's attacker.
+            pov = None
+            if ref is not None:
+                for ki in sorted(round_kills, key=lambda ki: kills[ki]["tick"]):
+                    for sid in (kills[ki].get("attacker_steam_id"), kills[ki].get("victim_steam_id")):
+                        if sid in pro_sids:
+                            pov = sid
+                            break
+                    if pov:
+                        break
+            if pov is None and ref is not None:
+                pov = kills[ref].get("attacker_steam_id")
+            if pov is None:
+                pov = (kills[0].get("attacker_steam_id") or list(
+                    _extract_players_from_action_timeline(action_timeline)
+                ).keys())[0] if kills else ""
+
+            if ref is not None:
+                # Lead into the round's final killing, then run through the end screen.
+                start = kills[ref]["tick"] - 192  # ~3s before the round's last kill
+                start = max(start, round_start_by_round[r])
+            else:
+                start = round_start_by_round[r]
+            closer = {
+                "start_tick": start,
+                "end_tick": end_tick,
+                "pov_steam_id": pov,
+                "segment_type": "default",
+                "kill_indices": [ref] if ref is not None else [],
+                "rationale": (f"Round {r} closer: {kills[ref]['attacker']} final kill — "
+                              f"show round end / winner." if ref is not None
+                              else f"Round {r} closer: show round end / winner."),
+            }
+            _repoint_to_alive(closer, r)
+            _trim_defuse_tail(closer, r)
+            _trim_round_end_tail(closer, r, end_tick)
+            by_round.setdefault(r, []).append(closer)
+
+    # Rebuild segment list, keeping original order then appending synthesized closers.
+    out = list(segments)
+    seen_r = {_segment_round(s, kills, max_idx) for s in segments}
+    appended = [s for r in by_round for s in by_round[r]
+                if s["kill_indices"] and s not in out]
+    out.extend(appended)
+    out.sort(key=lambda s: _segment_first_kill_tick(s, kills, max_idx))
+    return out
+
+
+
+
+
 def _validate_edit_timeline(edit_tl: dict, action_timeline: dict, players: dict) -> list[str]:
     errors = []
     segments = edit_tl.get("segments", [])
@@ -631,8 +982,8 @@ def _validate_edit_timeline(edit_tl: dict, action_timeline: dict, players: dict)
         if seg["start_tick"] >= seg["end_tick"]:
             errors.append(f"Segment {i}: start_tick ({seg['start_tick']}) >= end_tick ({seg['end_tick']}) — must be strictly less")
         duration = seg["end_tick"] - seg["start_tick"]
-        if duration < MIN_DURATION_TICKS:
-            errors.append(f"Segment {i}: duration {duration} ticks < {MIN_DURATION_TICKS} (6s minimum)")
+        if duration < MIN_SEGMENT_TICKS:
+            errors.append(f"Segment {i}: duration {duration} ticks < {MIN_SEGMENT_TICKS} (12s minimum)")
         if i > 0 and seg["start_tick"] < segments[i - 1]["start_tick"]:
             errors.append(f"Segment {i}: not sorted by start_tick")
 
@@ -788,6 +1139,7 @@ def _fix_edit_timeline(edit_tl: dict, action_timeline: dict, players: dict) -> d
     LEAD_TICKS = 256
     TAIL_TICKS = 128
     MULTI_TAIL_PER_KILL = 64
+    DEATH_TAIL_TICKS = 128  # 2s at 64 tick: hard cap on how long a segment may run after the POV player dies
     BUY_TIME_TICKS = 1536  # 24s at 64 tick fallback when freeze_end is unavailable
     HANDOFF_TICKS = 160  # ~2.5s after prior POV's last kill
 
@@ -799,6 +1151,24 @@ def _fix_edit_timeline(edit_tl: dict, action_timeline: dict, players: dict) -> d
         rf["round"]: int(rf["tick"])
         for rf in action_timeline.get("round_freeze_ends", [])
     }
+    round_end_by_round: dict[int, int] = {
+        re["round"]: int(re["tick"])
+        for re in action_timeline.get("round_ends", [])
+    }
+
+    def _round_end_tick(seg_round: int | None) -> int | None:
+        """Return the round's end tick (the boundary before the next round).
+
+        Uses the explicit round_ends entry when present; otherwise falls back to
+        next_round_start - 1. None when the round is the match's final round and
+        has no recorded round_ends (no next round to bound against).
+        """
+        if seg_round is None:
+            return None
+        if seg_round in round_end_by_round:
+            return round_end_by_round[seg_round]
+        later = [t for r, t in round_start_by_round.items() if r > seg_round]
+        return min(later) - 1 if later else None
 
     def _seg_round(seg) -> int | None:
         return _segment_round(seg, kills, max_idx)
@@ -862,6 +1232,25 @@ def _fix_edit_timeline(edit_tl: dict, action_timeline: dict, players: dict) -> d
                 desired_end = desired_start + MIN_DURATION
             if desired_end - desired_start < MIN_DURATION:
                 desired_start = max(floor, desired_end - MIN_DURATION)
+
+        # Hard death cap: if the POV player dies inside this segment, end at
+        # most DEATH_TAIL_TICKS (2s) after that death. Past that, CS2 spectating
+        # auto-switches to a random surviving player, which breaks the
+        # per-segment avatar cutout baked into the reel. Only the death at/after
+        # the segment's last kill counts (a dead player can't kill afterwards);
+        # round closers whose POV is re-pointed to an alive player are exempt
+        # because their POV survives through the round end.
+        pov = seg.get("pov_steam_id", "")
+        if pov and last_kill >= 0:
+            death = max(
+                (k["tick"] for k in kills
+                 if k.get("victim_steam_id") == pov
+                 and k["tick"] >= last_kill
+                 and k["tick"] <= desired_end),
+                default=None,
+            )
+            if death is not None:
+                desired_end = min(desired_end, death + DEATH_TAIL_TICKS)
 
         return desired_start, desired_end
 
@@ -995,6 +1384,24 @@ def _fix_edit_timeline(edit_tl: dict, action_timeline: dict, players: dict) -> d
     _normalize_segment_types(segments, kills, max_idx)
     _anchor_all(segments)
 
+    # Guarantee each round closes with a segment reaching its end tick so the
+    # winner is visible; synthesize closers for rounds that were skipped.
+    # NOTE: no _anchor_all after this — _anchor_window would clamp closers back
+    # to `last_kill + tail`, undoing the round-end extension.
+    segments = _ensure_round_closers(segments, action_timeline, kills, max_idx)
+    segments = _sort_and_dedupe_segments(segments)
+
+    # Enforce the 12s minimum segment duration by merging short segments into
+    # neighbours (produces fewer, longer segments — e.g. two 10s highlights
+    # become one ~20s clip instead of awkwardly short pieces).
+    merged = _merge_short_segments(segments, MIN_SEGMENT_TICKS, kills, max_idx, DEATH_TAIL_TICKS)
+    if len(merged) != len(segments):
+        print(
+            f"  [FIX] Merged {len(segments) - len(merged)} short segments (12s minimum)",
+            file=sys.stderr,
+        )
+        segments = merged
+
     edit_tl["segments"] = segments
     return edit_tl
 
@@ -1008,6 +1415,7 @@ def build_edit_timeline(
     action_timeline_path: Path | None = None,
     model: str = DEFAULT_MODEL,
     batch_size: int = 5,
+    max_attempts: int = 3,
 ) -> dict:
     at_path = action_timeline_path
     if at_path is None:
@@ -1027,55 +1435,71 @@ def build_edit_timeline(
     total_rounds = max(r["round"] for r in action_timeline.get("round_starts", [])) if action_timeline.get("round_starts") else 0
     print(f"[INFO] {total_rounds} rounds -> {len(batches)} batches (batch_size={batch_size})", file=sys.stderr)
 
-    all_segments = []
-    for bi, batch in enumerate(batches):
-        round_range = f"r{batch['min_round']}-r{batch['max_round']}"
-        print(f"[BATCH {bi+1}/{len(batches)}] {round_range} ({batch['kill_count']} kills)...", file=sys.stderr)
+    edit_tl = None
+    last_errors: list[str] = []
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            print(
+                f"[RETRY] {len(last_errors)} validation issue(s); "
+                f"regenerating edit timeline (attempt {attempt}/{max_attempts})",
+                file=sys.stderr,
+            )
+        all_segments = []
+        for bi, batch in enumerate(batches):
+            round_range = f"r{batch['min_round']}-r{batch['max_round']}"
+            print(f"[BATCH {bi+1}/{len(batches)}] {round_range} ({batch['kill_count']} kills)...", file=sys.stderr)
 
-        prompt = _build_batch_prompt(batch, action_timeline, players)
+            prompt = _build_batch_prompt(batch, action_timeline, players, hints=last_errors)
 
-        try:
-            llm_output = _call_llm(prompt, model=model, retries=2)
-            batch_result = json.loads(llm_output)
-        except (json.JSONDecodeError, RuntimeError) as e:
-            print(f"[WARN] Batch {bi+1} failed ({e}), skipping", file=sys.stderr)
-            continue
+            try:
+                llm_output = _call_llm(prompt, model=model, retries=2)
+                batch_result = json.loads(llm_output)
+            except (json.JSONDecodeError, RuntimeError) as e:
+                print(f"[WARN] Batch {bi+1} failed ({e}), skipping", file=sys.stderr)
+                continue
 
-        batch_segments = batch_result.get("segments", [])
+            batch_segments = batch_result.get("segments", [])
 
-        # Remap local kill indices -> global indices
-        global_indices = batch["global_kill_indices"]
-        for seg in batch_segments:
-            seg["kill_indices"] = [
-                global_indices[li] for li in seg["kill_indices"]
-                if li < len(global_indices)
-            ]
+            # Remap local kill indices -> global indices
+            global_indices = batch["global_kill_indices"]
+            for seg in batch_segments:
+                seg["kill_indices"] = [
+                    global_indices[li] for li in seg["kill_indices"]
+                    if li < len(global_indices)
+                ]
 
-        all_segments.extend(batch_segments)
-        print(f"  -> {len(batch_segments)} segments", file=sys.stderr)
+            all_segments.extend(batch_segments)
+            print(f"  -> {len(batch_segments)} segments", file=sys.stderr)
 
-    # Sort combined segments by start_tick
-    all_segments.sort(key=lambda s: s["start_tick"])
+        # Sort combined segments by start_tick
+        all_segments.sort(key=lambda s: s["start_tick"])
 
-    edit_tl = {
-        "demo_path": action_timeline["demo_path"],
-        "map": action_timeline["map"],
-        "segments": all_segments,
-    }
+        edit_tl = {
+            "demo_path": action_timeline["demo_path"],
+            "map": action_timeline["map"],
+            "segments": all_segments,
+        }
 
-    # Always run post-LLM fixes (anchoring, merges, POV correction, buy-time).
-    # Validation alone misses cases like round-0 truthiness (start too late but "valid").
-    errors = _validate_edit_timeline(edit_tl, action_timeline, players)
-    if errors:
-        print(f"[INFO] Fixing {len(errors)} validation issues post-LLM", file=sys.stderr)
-        for e in errors:
-            print(f"  {e}", file=sys.stderr)
-    edit_tl = _fix_edit_timeline(edit_tl, action_timeline, players)
-    errors_after = _validate_edit_timeline(edit_tl, action_timeline, players)
-    if errors_after:
-        print(f"[WARN] {len(errors_after)} issues remain after fix: {errors_after}", file=sys.stderr)
-    elif errors:
-        print(f"[OK] All issues fixed post-LLM", file=sys.stderr)
+        # Always run post-LLM fixes (anchoring, merges, POV correction, buy-time).
+        # Validation alone misses cases like round-0 truthiness (start too late but "valid").
+        errors = _validate_edit_timeline(edit_tl, action_timeline, players)
+        if errors:
+            print(f"[INFO] Fixing {len(errors)} validation issues post-LLM", file=sys.stderr)
+            for e in errors:
+                print(f"  {e}", file=sys.stderr)
+        edit_tl = _fix_edit_timeline(edit_tl, action_timeline, players)
+        errors_after = _validate_edit_timeline(edit_tl, action_timeline, players)
+        if not errors_after:
+            if errors:
+                print("[OK] All issues fixed post-LLM", file=sys.stderr)
+            break
+        last_errors = errors_after
+        if attempt == max_attempts:
+            print(
+                f"[WARN] {len(errors_after)} issues remain after {max_attempts} "
+                f"attempts: {errors_after}",
+                file=sys.stderr,
+            )
 
     return edit_tl
 
@@ -1096,6 +1520,8 @@ def main() -> int:
     )
     ap.add_argument("--model", default=DEFAULT_MODEL, help=f"Model to use (default: {DEFAULT_MODEL})")
     ap.add_argument("--batch-size", type=int, default=5, help="Rounds per LLM batch (default: 5)")
+    ap.add_argument("--max-attempts", type=int, default=3,
+                    help="Regenerate the edit timeline up to N times if it fails validation (default: 3)")
     ap.add_argument("--output", type=Path, help="Override output path (default: renders/hl-{stem}/edit_timeline.json)")
     args = ap.parse_args()
 
@@ -1122,7 +1548,7 @@ def main() -> int:
 
     if args.action_timeline:
         try:
-            edit_tl = build_edit_timeline(demo, args.action_timeline, args.model, args.batch_size)
+            edit_tl = build_edit_timeline(demo, args.action_timeline, args.model, args.batch_size, args.max_attempts)
         except Exception as e:
             print(f"[ERR] {e}", file=sys.stderr)
             return 1
@@ -1134,7 +1560,7 @@ def main() -> int:
             print(f"[ERR] demo not found: {demo}", file=sys.stderr)
             return 1
         try:
-            edit_tl = build_edit_timeline(demo, model=args.model, batch_size=args.batch_size)
+            edit_tl = build_edit_timeline(demo, model=args.model, batch_size=args.batch_size, max_attempts=args.max_attempts)
         except Exception as e:
             print(f"[ERR] {e}", file=sys.stderr)
             return 1
