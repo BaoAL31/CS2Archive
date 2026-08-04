@@ -13,6 +13,7 @@ the authenticated profile (which already holds the cf_clearance cookie).
 from __future__ import annotations
 
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -400,22 +401,102 @@ def get_match_details(match_id: str) -> MatchInfo:
         pw.stop()
 
 
-def _click_demo_and_save(page, out_dir: Path) -> Optional[Path]:
-    """Click the demo download button and capture the browser download."""
-    for txt in DOWNLOAD_BUTTON_TEXTS:
+DOWNLOAD_START_TIMEOUT = 10  # seconds to wait for the download to begin
+DOWNLOAD_MAX_RETRIES = 3     # restart attempts if the download doesn't start
+
+
+def _click_demo_and_save(page, out_dir: Path, room_url: Optional[str] = None) -> Optional[Path]:
+    """Click the demo download button and capture the browser download.
+
+    WATCH DEMO opens a popup that initiates the download — the download event
+    fires at the browser level, not on the page, so we use CDP
+    Browser.setDownloadBehavior to route it into out_dir natively, then wait
+    for the file to appear (the .crdownload suffix disappears on completion).
+
+    If the download doesn't start within DOWNLOAD_START_TIMEOUT of the click,
+    the attempt is restarted (page re-navigated to room_url, modal re-dismissed,
+    button re-clicked), up to DOWNLOAD_MAX_RETRIES times.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        cdp = page.context.new_cdp_session(page)
+        cdp.send(
+            "Browser.setDownloadBehavior",
+            {"behavior": "allow", "downloadPath": str(out_dir.resolve()), "eventsEnabled": True},
+        )
+    except Exception as e:
+        console.print(f"[yellow]   [WARN] CDP download setup failed: {e}[/yellow]")
+
+    before = set(out_dir.iterdir())
+
+    def _new_files() -> list[Path]:
+        return [p for p in out_dir.iterdir() if p.is_file() and p not in before]
+
+    def _download_started() -> Optional[Path]:
+        """True once any new file appears — .crdownload counts as started."""
+        files = _new_files()
+        if not files:
+            return None
+        # prefer a completed file; otherwise report the in-progress one
+        done = [p for p in files if p.suffix != ".crdownload"]
+        return (done or files)[0]
+
+    def _reload() -> bool:
+        """Re-navigate to the room page; returns False if impossible."""
+        if not room_url:
+            return False
         try:
-            loc = page.get_by_text(txt, exact=False)
-            if loc.count() == 0:
-                continue
-            console.print(f"[cyan]   [DL] Clicking '{txt}'...[/cyan]")
-            with page.expect_download(timeout=120_000) as dl_info:
-                loc.first.click()
-            dl = dl_info.value
-            dest = out_dir / dl.suggested_filename
-            dl.save_as(dest)
-            return dest
+            page.goto(room_url, wait_until="domcontentloaded")
+            page.wait_for_timeout(8000)
+            return True
         except Exception as e:
-            console.print(f"[yellow]   [WARN] '{txt}' failed: {e}[/yellow]")
+            console.print(f"[yellow]   [WARN] Reload failed: {e}[/yellow]")
+            return False
+
+    for txt in DOWNLOAD_BUTTON_TEXTS:
+        for attempt in range(1, DOWNLOAD_MAX_RETRIES + 1):
+            try:
+                if attempt > 1 and not _reload():
+                    return None
+                loc = page.get_by_text(txt, exact=False)
+                if loc.count() == 0:
+                    break  # try next button text
+
+                console.print(f"[cyan]   [DL] Clicking '{txt}' (attempt {attempt})...[/cyan]")
+                # Dismiss any interstitial modal (e.g. "Season recap") that
+                # would intercept pointer events on the demo button.
+                try:
+                    page.keyboard.press("Escape")
+                    page.wait_for_timeout(600)
+                except Exception:
+                    pass
+                loc.first.click(timeout=15_000)
+
+                # Watchdog: download must START within DOWNLOAD_START_TIMEOUT.
+                start = time.monotonic()
+                while time.monotonic() - start < DOWNLOAD_START_TIMEOUT:
+                    if _download_started():
+                        break
+                    time.sleep(0.5)
+                if not _download_started():
+                    console.print(
+                        f"[yellow]   [WARN] No download within {DOWNLOAD_START_TIMEOUT}s "
+                        f"(attempt {attempt}/{DOWNLOAD_MAX_RETRIES}) — restarting...[/yellow]"
+                    )
+                    continue
+
+                # Started — wait for it to complete (up to ~10 min).
+                deadline = time.monotonic() + 600
+                while time.monotonic() < deadline:
+                    dest = _download_started()
+                    if dest is not None and dest.suffix != ".crdownload" and dest.stat().st_size > 0:
+                        return dest
+                    time.sleep(3)
+                console.print("[yellow]   [WARN] Download started but never completed.[/yellow]")
+                return None
+            except Exception as e:
+                console.print(f"[yellow]   [WARN] '{txt}' attempt {attempt} failed: {e}[/yellow]")
+                continue
     return None
 
 
@@ -523,7 +604,7 @@ def _download_demo_browser(match_id: str, match_info: MatchInfo, started) -> Dow
 
             out_dir = settings.temp_dir
             out_dir.mkdir(parents=True, exist_ok=True)
-            saved = _click_demo_and_save(page, out_dir)
+            saved = _click_demo_and_save(page, out_dir, room_url=room_url)
 
             if not saved:
                 console.print("[red]   [ERR] Could not find a demo download button.[red]")
