@@ -34,7 +34,7 @@ from shorts import resolve_output_dir  # noqa: E402
 _PRE_KILL_TICK_MARGIN = 320  # 5s floor before first kill (at 64 tick)
 _POST_KILL_TICK_MARGIN = 128  # 2s after last kill (at 64 tick)
 _SHORT_TICK_DURATION = 1920  # 30s target total short length (30 * 64 tick)
-_CLUTCH_MIN_DURATION_TICKS = 1920  # 30s of playing at a disadvantage for a clutch
+_CLUTCH_MIN_DURATION_TICKS = 640  # 10s of playing at a disadvantage for a clutch
 
 # Weapon tiers for multikill filtering: at least two victims must hold a
 # weapon of tier >= attacker's primary tier (filters anti-eco farm multikills).
@@ -141,6 +141,7 @@ def build_short_timeline(demo_path: Path, player: str | None = None) -> dict:
     round_start = parser.parse_event("round_start")
     freeze_end = parser.parse_event("round_freeze_end")
     round_end = parser.parse_event("round_officially_ended")
+    round_end_winner = parser.parse_event("round_end")
     info = parser.parse_player_info()
     bomb_plant = parser.parse_event("bomb_planted")
     bomb_defuse = parser.parse_event("bomb_defused")
@@ -196,7 +197,71 @@ def build_short_timeline(demo_path: Path, player: str | None = None) -> dict:
         bomb_defuse=bomb_defuse,
         bomb_explode=bomb_explode,
         victim_weapon_map=victim_weapon_map,
+        winner_by_round=_winner_by_round_from_demo(parser, info, round_start, round_end_winner),
     )
+
+
+def _winner_by_round_from_demo(
+    parser,
+    info,
+    round_start,
+    round_end_winner,
+) -> dict[int, int]:
+    """Authoritative per-round winner (persistent team number).
+
+    ``round_end.winner`` carries the winning *side* ('T'/'CT'), which flips at
+    halftime, while ``parse_player_info.team_number`` is the persistent team
+    (stable across halves). Sample the side of every player at each round start
+    to map side -> persistent team per round, then convert each round_end winner.
+    """
+    winner_by_round: dict[int, int] = {}
+    if round_end_winner is None or round_end_winner.empty:
+        return winner_by_round
+    if round_start is None or round_start.empty or info is None or info.empty:
+        return winner_by_round
+
+    persist_team: dict[str, int] = {}
+    for _, row in info.iterrows():
+        sid = _sid(row.get("steamid"))
+        if sid:
+            persist_team[sid] = int(row.get("team_number", 0) or 0)
+
+    rs_ticks = sorted({int(t) for t in round_start["tick"].tolist() if int(t) > 1})
+    if not rs_ticks:
+        return winner_by_round
+    try:
+        side_snap = parser.parse_ticks(["steamid", "team_num"], ticks=rs_ticks)
+    except Exception:
+        return winner_by_round
+
+    side_to_team: dict[int, dict[int, int]] = {}
+    for _, row in side_snap.iterrows():
+        sid = _sid(row.get("steamid"))
+        tick = int(row["tick"])
+        side = int(row["team_num"]) if row.get("team_num") == row.get("team_num") else 0
+        if sid and sid in persist_team and side in (2, 3):
+            side_to_team.setdefault(tick, {})[side] = persist_team[sid]
+
+    rs_by_round: dict[int, int] = {}
+    for t, rn in zip(round_start["tick"].tolist(), round_start["round"].tolist()):
+        rn_i = int(rn or 0)
+        t_i = int(t)
+        if rn_i > 0 and t_i > 1:
+            rs_by_round[rn_i] = t_i
+
+    for _, row in round_end_winner.iterrows():
+        rn = int(row.get("round", 0) or 0)
+        side = str(row.get("winner", "") or "").strip().upper()
+        if rn <= 0 or side not in ("T", "CT"):
+            continue
+        rs_tick = rs_by_round.get(rn)
+        if rs_tick is None:
+            continue
+        slot = 2 if side == "T" else 3
+        team = side_to_team.get(rs_tick, {}).get(slot)
+        if team:
+            winner_by_round[rn] = team
+    return winner_by_round
 
 
 def detect_shorts(
@@ -207,6 +272,7 @@ def detect_shorts(
     round_start: "pd.DataFrame | None" = None,
     freeze_end: "pd.DataFrame | None" = None,
     round_end: "pd.DataFrame | None" = None,
+    round_end_winner: "pd.DataFrame | None" = None,
     info: "pd.DataFrame | None" = None,
     bomb_plant: "pd.DataFrame | None" = None,
     bomb_defuse: "pd.DataFrame | None" = None,
@@ -318,6 +384,14 @@ def detect_shorts(
         round_ends = _re
     elif round_ends is None:
         round_ends = {}
+
+    # --- Winner per round (authoritative) ---
+    # CS2's `round_end` event carries the actual winner side ('T'/'CT').
+    # It's derived in build_short_timeline() with a per-round side->team
+    # mapping (teams swap sides at halftime) and passed in as winner_by_round;
+    # if absent, the kills/bomb heuristic below fills the gaps.
+    if winner_by_round is None:
+        winner_by_round = {}
 
     # --- Kills ---
     if kill_events is not None:
@@ -453,6 +527,16 @@ def detect_shorts(
     _all_rounds = sorted(set(kills_by_round.keys()) | set(round_win_events.keys()))
     all_rounds = [r for r in _all_rounds if r > 0]
 
+    # Winner per round — authoritative round_end winners are supplied by the
+    # caller when available; fill any remaining rounds from kills/bomb events.
+    if winner_by_round is None:
+        winner_by_round = {}
+    for rn in all_rounds:
+        if rn not in winner_by_round:
+            w = _round_winner(rn)
+            if w is not None:
+                winner_by_round[rn] = w
+
     # Derive actual team numbers from player data (CS2 uses 2/3, not 1/2)
     _team_nums = sorted({t for t in team_by_sid.values() if t > 1})
     if len(_team_nums) < 2:
@@ -517,20 +601,35 @@ def detect_shorts(
 
             win_player = _last_surviving_killer(round_kills, team, team_by_sid, win_player_hint=win_player)
 
+            clutch_kill_ticks = [
+                k["tick"] for k in round_kills
+                if k["attacker_sid"] == win_player
+            ]
+
             if (
                 win_tick is not None
                 and win_player is not None
                 and win_tick - trigger["start_tick"] >= _CLUTCH_MIN_DURATION_TICKS
             ):
+                # Start from the player's first kill of the round (minus a
+                # lead-in), not the 1vX trigger, so every kill of a multi-kill
+                # clutch is on-screen. Falls back to the trigger tick if the
+                # player landed no kills before it.
+                if clutch_kill_ticks:
+                    first_kill = min(clutch_kill_ticks)
+                    start_tick = min(trigger["start_tick"], first_kill - _PRE_KILL_TICK_MARGIN)
+                else:
+                    start_tick = trigger["start_tick"]
                 shorts.append({
                     "short_type": "clutch",
                     "pov_steam_id": win_player,
                     "pov_nick": nickname_by_sid.get(win_player, "Unknown"),
-                    "start_tick": trigger["start_tick"],
+                    "start_tick": start_tick,
                     "end_tick": win_tick,
                     "clutch_initial_count": trigger["type"],
                     "round_win_tick": win_tick,
                     "win_event": win_event,
+                    "kill_ticks": clutch_kill_ticks,
                 })
 
     # Prioritise clutches over overlapping multikills: when a clutch short's
@@ -692,7 +791,8 @@ def _build_short_slug(short: dict) -> str:
         return f"{kills}k_multikill-{safe}-t{tick}"
     elif st == "clutch":
         cnt = short.get("clutch_initial_count", "XvX")
-        return f"{cnt}_clutch-{safe}-t{tick}"
+        kills = len(short.get("kill_ticks", []))
+        return f"{cnt}_{kills}k_clutch-{safe}-t{tick}"
     return f"{st}-{safe}-t{tick}"
 
 

@@ -321,8 +321,8 @@ def test_mixed_timeline_coexists():
 
 def test_clutch_rejected_if_disadvantage_brief():
     """Post-plant style win where the disadvantage only lasts a few seconds:
-    the 1v3 triggers at tick 9600 and the bomb explodes at 11200 (1600 ticks,
-    under the 1920-tick / 30s floor) -> no clutch."""
+    the 1v3 triggers at tick 9600 and the bomb explodes at 10000 (400 ticks,
+    under the 640-tick / 10s floor) -> no clutch."""
     kill_events = [
         {"tick": 8000, "round": 1, "attacker_sid": "T5", "victim_sid": "C5", "weapon": "ak47", "victim_weapon": "ak47"},
         {"tick": 8200, "round": 1, "attacker_sid": "T5", "victim_sid": "C4", "weapon": "ak47", "victim_weapon": "ak47"},
@@ -335,14 +335,14 @@ def test_clutch_rejected_if_disadvantage_brief():
         "T1": 2, "T2": 2, "T3": 2, "T4": 2, "T5": 2,
         "C1": 3, "C2": 3, "C3": 3, "C4": 3, "C5": 3,
     }
-    round_win_events = {1: [{"tick": 11200, "event": "explode", "player_sid": "T5"}]}
+    round_win_events = {1: [{"tick": 10000, "event": "explode", "player_sid": "T5"}]}
     result = detect_shorts(
         demo_path="test.dem",
         kill_events=kill_events,
         team_by_sid=team_by_sid,
         round_win_events=round_win_events,
         round_starts=[(500, 1)],
-        round_ends={1: 11200},
+        round_ends={1: 10000},
     )
     clutches = [s for s in result["shorts"] if s["short_type"] == "clutch"]
     assert clutches == []

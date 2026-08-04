@@ -302,8 +302,9 @@ def set_schedule(page, when: datetime | None) -> None:
     if page.get_by_text("Scheduled Release", exact=True).count():
         page.get_by_text("Scheduled Release", exact=True).first.click()
         page.wait_for_timeout(600)
+    full_s = f"{date_s} {time_s}"
     page.evaluate(
-        """({date_s, time_s}) => {
+        """({date_s, time_s, full_s}) => {
       const setNative = (el, val) => {
         const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
         if (desc && desc.set) desc.set.call(el, val); else el.value = val;
@@ -312,13 +313,12 @@ def set_schedule(page, when: datetime | None) -> None:
       };
       for (const el of document.querySelectorAll('input')) {
         const v = el.value || '', t = el.type || '', ph = (el.placeholder || '').toLowerCase();
-        if (t === 'date' || /^\\d{4}-\\d{2}-\\d{2}$/.test(v) || ph.includes('date'))
-          setNative(el, date_s);
-        if (t === 'time' || /^\\d{1,2}:\\d{2}$/.test(v) || ph.includes('time'))
-          setNative(el, time_s);
+        if (t === 'datetime-local' || ph.includes('date and time')) { setNative(el, full_s); continue; }
+        if (t === 'date' || /^\\d{4}-\\d{2}-\\d{2}$/.test(v) || ph.includes('date')) { setNative(el, date_s); continue; }
+        if (t === 'time' || /^\\d{1,2}:\\d{2}$/.test(v) || ph.includes('time')) setNative(el, time_s);
       }
     }""",
-        {"date_s": date_s, "time_s": time_s},
+        {"date_s": date_s, "time_s": time_s, "full_s": full_s},
     )
     for sel, val in (('input[type="date"]', date_s), ('input[type="time"]', time_s)):
         loc = page.locator(sel)
@@ -327,6 +327,18 @@ def set_schedule(page, when: datetime | None) -> None:
                 loc.first.fill(val)
             except Exception:
                 pass
+    # Composite el-date-picker (single text input) only parses real keystrokes —
+    # force-commit the full datetime so the bound model isn't left with just time.
+    try:
+        picker = page.locator('input[placeholder="Please select date and time"]')
+        if picker.count():
+            picker.first.click()
+            page.keyboard.press("Control+a")
+            page.keyboard.type(full_s)
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(500)
+    except Exception:
+        pass
     log(f"schedule {date_s} {time_s}")
 
 
