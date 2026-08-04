@@ -33,16 +33,24 @@ Domain glossary for the highlights product: root `CONTEXT.md`.
 
 ## Highlights (Kill Timeline) — FACEIT only
 
-Separate product from POV Archive. v1 builds **Kill Timeline data only** (no CSDM clip renders, no Kinocut yet).
+Separate product from POV Archive. v1 flow: action timeline → LLM edit timeline → CSDM segment renders → single reel (per-segment avatar cut-ins + crossfades).
 
 ```powershell
 python scripts/highlights/build_action_timeline.py demos/faceit/<demo>.dem
 # -> renders/hl-{demo_stem}/action_timeline.json
+python scripts/highlights/build_edit_timeline.py demos/faceit/<demo>.dem
+# -> renders/hl-{demo_stem}/edit_timeline.json  (LLM-batched, post-shaped by _fix_edit_timeline)
+python scripts/highlights/render_edit_timeline.py renders/hl-<stem>/edit_timeline.json
+# -> renders/hl-{stem}/segments/seg-NNN-pov-<sid>-tick-<a>-to-<b>.mp4  (batch-config CSDM, 1920x1080@64, resume-safe)
+python scripts/highlights/assemble_reel.py renders/hl-<stem>/edit_timeline.json
+# -> renders/hl-{stem}/reel.mp4
 ```
 
-- Hard-refuses demos outside `demos/faceit/`
+- Hard-refuses demos outside `demos/faceit/` (action timeline)
 - Every kill where **at least one** of attacker or victim is a Recognised Pro (`.data/player_accounts.json`). Includes unknown→pro picks.
 - Recognised Pros = `player_accounts.json` only (no `faceit_pros.json`)
+- `render_edit_timeline.py` renders via CSDM `--config-file` batches; segment files are the resume unit (existing ≥1MB skipped).
+- `assemble_reel.py` normalizes segments to 60fps, bakes each segment's POV player avatar (transparent cutout + white outline, bottom-centre — same treatment as `render_shorts.py`), then concatenates with `xfade`/`acrossfade` (default 0.4s) into `reel.mp4`. Intermediates in `reel_tmp/` (resumable).
 
 ## Pipeline (Primary Entry Point)
 
@@ -76,6 +84,8 @@ Key rules:
 ## Backlog Creation
 
 `python scripts/pov/create_backlog.py <hltv_url>` — downloads the match demo(s) and generates rating-ranked backlog cards for every player/map combo: `backlog/{match_slug}/{priority}/{player}-{map}-{match_slug}.json` (player, map, steam_id, demo_path, hltv_url, tournament, avatar_path, ratings_path, rating, kd, team, priority, `hf_root`). Validates each `.dem` exists on disk before writing — raises `FileNotFoundError` instead of placeholders. Details: `docs/agents/pipeline.md`.
+
+**FACEIT flow is split in two:** full match POVs — `scripts/faceit/create_faceit_match_backlog.py <demo_path>` analyzes the demo (`csdm json`) and creates cards **only for Recognised Pros** (`.data/player_accounts.json` by steam_id), each dropped into `backlog/faceit/{priority}/` by its in-match rating (`hltvRating2`; ≥1.5 high, ≥1.0 mid, else low — same thresholds as HLTV). No ELO; FACEIT matches are single-map so there's no per-match folder (match id stays in the filename + `faceit_match_id`). Each card carries `rating`, `kd`, `team`, `faceit_match_id`, `faceit_id`, `faceit_nickname`. Individual POV — `scripts/faceit/create_faceit_backlog.py <demo_path> --player <nick> --map <map>` (single card, same `backlog/faceit/{priority}/` layout) then the standard `pipeline.py`. Details: `docs/agents/pipeline.md`.
 
 ## CLI Entry Point
 
