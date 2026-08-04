@@ -1,10 +1,12 @@
 """Generate a FACEIT POV thumbnail (blurred kill-frame + text, no avatar/ratings).
 
+The individual FACEIT thumbnail shows player, match ELO ("3521 ELO" /
+"vs 3105 ELO") when available, and map — no team names, tournament, or stage.
+
 Usage:
     python scripts/faceit/faceit_thumbnail.py <demo_path> --player <nick> --map <map>
-                                  [--steam-id <id>] [--match-detail <text>]
-                                  [--tournament <name>] [--variant raw|overlay]
-                                  --output <youtube_dir>
+                                  [--steam-id <id>] [--elo <int>] [--opp-elo <int>]
+                                  [--variant raw|overlay] --output <youtube_dir>
 
 Requires CS2DemoManager (csdm) for kill-frame extraction, same as the HLTV
 thumbnail path (thumbnail.cli.extract_background_frame).
@@ -33,8 +35,8 @@ def main() -> None:
     ap.add_argument("--player", required=True)
     ap.add_argument("--map", required=True)
     ap.add_argument("--steam-id", default="")
-    ap.add_argument("--match-detail", default="", help="Opponent / team line")
-    ap.add_argument("--tournament", default="")
+    ap.add_argument("--elo", type=int, default=None, help="POV player's FACEIT ELO")
+    ap.add_argument("--opp-elo", type=int, default=None, help="Average FACEIT ELO of the opposing team")
     ap.add_argument("--variant", choices=["raw", "overlay"], default="raw")
     ap.add_argument("--output", required=True, help="youtube dir to write thumbnail.jpg")
     args = ap.parse_args()
@@ -58,9 +60,8 @@ def main() -> None:
         Image.new("RGB", (1280, 720), (20, 20, 24)).save(bg)
 
     img = generate_faceit(
-        bg, player, args.map, args.match_detail,
-        tournament=args.tournament, variant=args.variant,
-        avatar_path=av_path,
+        bg, player, args.map, args.elo, args.opp_elo,
+        variant=args.variant, avatar_path=av_path,
     )
     img = img.convert("RGB")
     out = out_dir / "thumbnail.jpg"

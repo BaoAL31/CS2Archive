@@ -1188,18 +1188,19 @@ class Pipeline:
 
         if self.is_faceit:
             # FACEIT path: blurred kill-frame + text, no ratings/avatar.
-            match_detail = self.meta.get("match_detail", "") or f"{self.player} FACEIT POV"
+            # ELO lines come from the backlog card (elo / opp_avg_elo).
             cmd = [
                 "scripts/faceit/faceit_thumbnail.py", str(self.demo_path),
                 "--player", self.player,
                 "--map", self.map_name,
-                "--match-detail", match_detail,
                 "--variant", variant,
             ]
             if self.steam_id:
                 cmd += ["--steam-id", self.steam_id]
-            if self.tournament:
-                cmd += ["--tournament", self.tournament]
+            elo = self.meta.get("elo")
+            opp_elo = self.meta.get("opp_avg_elo")
+            if elo is not None and opp_elo is not None:
+                cmd += ["--elo", str(elo), "--opp-elo", str(opp_elo)]
             cmd += ["--output", str(youtube_dir)]
             r = self._run_py(cmd, timeout=300)
             if r.returncode != 0:
@@ -1325,9 +1326,11 @@ class Pipeline:
             ]
             if self.steam_id:
                 titlize_args += ["--steam-id", self.steam_id]
-            if self.tournament:
-                titlize_args += ["--tournament", self.tournament]
-        if self.tournament:
+            elo = self.meta.get("elo")
+            opp_elo = self.meta.get("opp_avg_elo")
+            if elo is not None and opp_elo is not None:
+                titlize_args += ["--elo", str(elo), "--opp-elo", str(opp_elo)]
+        if self.tournament and not self.is_faceit:
             titlize_args += ["--tournament", self.tournament]
 
         r = self._run_py(titlize_args, capture_output=True, text=True, timeout=15)

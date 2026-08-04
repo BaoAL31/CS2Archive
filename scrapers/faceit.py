@@ -43,6 +43,27 @@ class FACEITClient:
     def __init__(self):
         self._client: Optional[httpx.AsyncClient] = None
         self._elo_cache: dict[str, int] = {}
+        self._elo_by_steam: dict[str, int] = {}
+
+    async def get_elo_by_steam_id(self, steam_id: str) -> Optional[int]:
+        """Current FACEIT ELO for a player, looked up by steam64.
+
+        Single ``/players?game=cs2&game_player_id=<steam64>`` call — the
+        response carries ``games.cs2.faceit_elo``. Cached per steam id.
+        """
+        if steam_id in self._elo_by_steam:
+            return self._elo_by_steam[steam_id]
+        try:
+            data = await self._request("GET", "/players", params={
+                "game": "cs2", "game_player_id": steam_id,
+            })
+            elo = data.get("games", {}).get("cs2", {}).get("faceit_elo")
+            if elo is not None:
+                self._elo_by_steam[steam_id] = int(elo)
+                return self._elo_by_steam[steam_id]
+        except Exception:
+            pass
+        return None
 
     async def get_player_elo(self, player_id: str) -> Optional[int]:
         """FACEIT ELO for a player (cached). None on failure."""

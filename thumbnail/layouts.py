@@ -187,8 +187,8 @@ def generate_faceit(
     bg_path: Path,
     player_name: str,
     map_name: str,
-    match_detail: str,
-    tournament: str = "",
+    elo: int | None = None,
+    opp_elo: int | None = None,
     variant: str = "raw",
     *,
     pbdems2: bool = False,
@@ -196,8 +196,10 @@ def generate_faceit(
 ) -> Image.Image:
     """FACEIT thumbnail: blurred kill-frame background + text overlay.
 
-    Avatar is composited when available (mirrors the HLTV layout). FACEIT demos
-    carry no HLTV-style ratings, so no K/D or Rating line is shown.
+    Avatar is composited when available (mirrors the HLTV layout). FACEIT
+    demos carry no HLTV-style ratings, so no K/D line — instead the POV
+    player's ELO and the opposing team's average ELO are shown when provided
+    ("3521 ELO" / "vs 3105 ELO").
     """
     bg = load_background(bg_path)
 
@@ -217,7 +219,7 @@ def generate_faceit(
 
     # FACEIT badge (top-left pill)
     _draw_pill(
-        draw, "FACEIT CS2", FONT_SIZES["tiny"],
+        draw, "FACEIT CS2", _load_font(FONT_SIZES["tiny"]),
         left=int(WIDTH * 0.04), top=int(HEIGHT * 0.06),
         fill=(250, 90, 30, 220), text_fill=(255, 255, 255, 255),
     )
@@ -226,11 +228,11 @@ def generate_faceit(
     text_y_center = int(HEIGHT * 0.55)
     lines = [
         (player_name, FONT_SIZES["player"]),
-        (map_name, FONT_SIZES["stat"]),
-        (match_detail, FONT_SIZES["small"]),
     ]
-    if tournament:
-        lines.append((tournament, FONT_SIZES["tiny"]))
+    if elo is not None and opp_elo is not None:
+        lines.append((f"{elo} ELO", FONT_SIZES["stat"]))
+        lines.append((f"vs {opp_elo} ELO", FONT_SIZES["stat"]))
+    lines.append((map_name, FONT_SIZES["small"]))
 
     total = sum(_line_height(s) for _, s in lines)
     current_y = text_y_center - total // 2

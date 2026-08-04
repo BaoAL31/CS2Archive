@@ -8,8 +8,12 @@ to the title.
 
 Usage:
     python scripts/faceit/faceit_title.py <demo_path> --player <nick> [--map <map>]
-                                  [--steam-id <id>] [--tournament <name>]
+                                  [--steam-id <id>] [--elo <int>] [--opp-elo <int>]
 Prints JSON: {"title": ..., "description": ..., "tags": [...]}
+
+The individual FACEIT title deliberately omits team names / tournament name /
+stage — a FACEIT pug has none worth showing. When --elo/--opp-elo are present
+the title reads "<player> <elo> ELO vs <opp-elo> ELO | <map> | FACEIT CS2 POV".
 """
 
 from __future__ import annotations
@@ -65,25 +69,22 @@ def _map_from_demo(demo_path: Path) -> str:
     return "Unknown"
 
 
-def build_title(player: str, map_name: str, notable: list[str], tournament: str = "") -> str:
-    title = f"{player} | {map_name} | FACEIT CS2 POV"
-    if notable:
-        others = " & ".join(notable[:2])
-        title = f"{player} vs {others} | {map_name} | FACEIT CS2 POV"
-    if tournament:
-        title += f" | {tournament}"
-    return title[:100]
+def build_title(player: str, map_name: str, notable: list[str], elo: int | None = None,
+                opp_elo: int | None = None) -> str:
+    if elo is not None and opp_elo is not None:
+        return f"{player} {elo} ELO vs {opp_elo} ELO | {map_name} | FACEIT CS2 POV"[:100]
+    return f"{player} | {map_name} | FACEIT CS2 POV"
 
 
-def build_description(player: str, map_name: str, notable: list[str], tournament: str,
-                      demo_path: Path) -> str:
+def build_description(player: str, map_name: str, notable: list[str], elo: int | None,
+                      opp_elo: int | None, demo_path: Path) -> str:
     lines = [
         f"FACEIT CS2 POV — {player} on {map_name}.",
     ]
+    if elo is not None and opp_elo is not None:
+        lines.append(f"Match ELO: {player} {elo} vs {opp_elo} (opponent average).")
     if notable:
         lines.append(f"Also featuring: {', '.join(notable)}.")
-    if tournament:
-        lines.append(f"Event: {tournament}")
     lines.append("")
     lines.append("Demo: " + demo_path.name)
     lines.append("")
@@ -97,7 +98,8 @@ def main() -> None:
     ap.add_argument("--player", required=True, help="POV player nickname")
     ap.add_argument("--map", default="", help="Map name (auto-detected if omitted)")
     ap.add_argument("--steam-id", default="", help="POV steam ID (optional)")
-    ap.add_argument("--tournament", default="", help="Event/tournament name")
+    ap.add_argument("--elo", type=int, default=None, help="POV player's FACEIT ELO")
+    ap.add_argument("--opp-elo", type=int, default=None, help="Average FACEIT ELO of the opposing team")
     args = ap.parse_args()
 
     demo = Path(args.demo_path)
@@ -124,8 +126,8 @@ def main() -> None:
         if nick.lower() in pro_set:
             notable.append(canonical_nick(nick))
 
-    title = build_title(player, map_name, notable, args.tournament)
-    description = build_description(player, map_name, notable, args.tournament, demo)
+    title = build_title(player, map_name, notable, args.elo, args.opp_elo)
+    description = build_description(player, map_name, notable, args.elo, args.opp_elo, demo)
     tags = ["FACEIT", "CS2", "POV", map_name, player] + notable
     tags = list(dict.fromkeys(t for t in tags if t))[:10]
 
