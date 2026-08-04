@@ -166,7 +166,7 @@ def _write_card(pro: dict, *, demo: Path, map_name: str, match_slug: str,
         "avatar_path": str(av_path.relative_to(PROJECT_ROOT)).replace("\\", "/") if av_path else "",
         "pipeline_cmd": (
             f'$env:PYTHONPATH=.; & C:/Users/jembo/anaconda3/envs/cs2archive/python.exe '
-            f'scripts/pov/pipeline.py --backlog backlog/faceit/{priority}/{slug}.json'
+            f'scripts/pov/pipeline.py --backlog backlog/faceit/{priority}/{slug}.json --overlay-only'
         ),
     }
     backlog_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")

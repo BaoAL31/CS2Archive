@@ -26,6 +26,9 @@ Dual-upload (default): produces a second, independent variant with
 keyboard/utility overlay. Raw variant -> youtube/{run_id}/
 Overlay variant -> youtube/{run_id}_overlay/   (separate title, thumbnail, meta)
 
+FACEIT POVs default to overlay-only: the keyboard + util-cam variant IS the
+upload, no raw variant is produced. Pass --raw-only for just the raw variant.
+
 Raw-only (--raw-only): produce only the raw variant, skip overlay entirely.
 """
 
@@ -207,7 +210,18 @@ class Pipeline:
         # if set, so a resume run doesn't need to re-pass them.
         state_dual = bool(self.state["data"].get("dual_upload"))
         state_overlay_only = bool(self.state["data"].get("overlay_only"))
-        self.overlay_only = bool(getattr(args, "overlay_only", False)) or state_overlay_only
+        # FACEIT POVs default to overlay-only: the keyboard + util-cam variant
+        # IS the product for pugs (raw has no audience). An explicit
+        # --raw-only or --overlay-only still wins.
+        explicit_variant = bool(getattr(args, "overlay_only", False)) or not bool(
+            getattr(args, "dual_upload", True)
+        )
+        faceit_overlay_default = self.is_faceit and not explicit_variant
+        self.overlay_only = (
+            bool(getattr(args, "overlay_only", False))
+            or state_overlay_only
+            or faceit_overlay_default
+        )
         # overlay_only implies dual_upload (we still want the overlay branch
         # in steps 3-7; we just skip the raw branch).
         self.dual_upload = bool(getattr(args, "dual_upload", False)) or state_dual or self.overlay_only

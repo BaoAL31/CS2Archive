@@ -189,7 +189,7 @@ def main() -> None:
 
     meta["pipeline_cmd"] = (
         f'$env:PYTHONPATH=.; & C:/Users/jembo/anaconda3/envs/cs2archive/python.exe '
-        f'scripts/pov/pipeline.py --backlog {backlog_file.relative_to(PROJECT_ROOT).as_posix()}'
+        f'scripts/pov/pipeline.py --backlog {backlog_file.relative_to(PROJECT_ROOT).as_posix()} --overlay-only'
     )
     backlog_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(f"[OK] Created: {backlog_file}")
