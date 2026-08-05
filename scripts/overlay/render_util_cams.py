@@ -206,6 +206,12 @@ def _find_demo_for_id(util_cams_root: Path, demo_id: str) -> Path:
                 cand = sub / f"{cand_id}.dem"
                 if cand.is_file():
                     return cand.resolve()
+    # FACEIT demos are stored flat (no match_id prefix): demos/faceit/<demo_id>.dem
+    faceit_root = project_root / "demos" / "faceit"
+    if faceit_root.is_dir():
+        cand = faceit_root / f"{demo_id}.dem"
+        if cand.is_file():
+            return cand.resolve()
     return Path(demo_id + ".dem")
 
 
