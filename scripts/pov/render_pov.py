@@ -16,7 +16,7 @@ sys.path.insert(0, str(_PROJECT_ROOT / "scripts"))
 from _pathsetup import ensure
 ensure()
 
-from cs2_minimizer import CS2Focuser, CS2Minimizer
+from cs2_minimizer import CS2Park
 
 CSDM = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
 FFMPEG_PATH = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
@@ -605,9 +605,13 @@ def main() -> None:
     try:
         minimizer = None
         if not args.no_minimize_cs2:
-            minimizer = CS2Minimizer()
+            # Park-behind: bring CS2 to the foreground for a beat on launch (so it
+            # renders at full speed instead of being throttled while unactivated),
+            # then drop it restored *behind* your other windows (not minimized).
+            # fps_max 0 in the render cfg removes any FPS cap.
+            minimizer = CS2Park()
             minimizer.start()
-            print("CS2 auto-minimize enabled (won't steal focus)")
+            print("CS2 park-behind enabled (briefly focuses on launch, then parks behind)")
 
         global_round = 0
         total_rendered = 0
