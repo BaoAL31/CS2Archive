@@ -94,7 +94,7 @@ def avatar_path(demo_nick: str) -> Path | None:
     base = AVATAR_DIR / nick
     if not base.is_dir():
         return None
-    for src in ("faceit", "hltv"):
+    for src in ("hltv", "faceit"):
         for ext in (".png", ".jpg"):
             p = base / src / f"{nick}{ext}"
             if p.exists():

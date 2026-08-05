@@ -224,8 +224,8 @@ def generate_faceit(
         fill=(250, 90, 30, 220), text_fill=(255, 255, 255, 255),
     )
 
-    text_x = int(WIDTH * 0.5)
-    text_y_center = int(HEIGHT * 0.55)
+    text_x = int(WIDTH * 0.68)
+    text_y_center = HEIGHT // 2
     lines = [
         (player_name, FONT_SIZES["player"]),
     ]
@@ -233,6 +233,7 @@ def generate_faceit(
         lines.append((f"{elo} ELO", FONT_SIZES["stat"]))
         lines.append((f"vs {opp_elo} ELO", FONT_SIZES["stat"]))
     lines.append((map_name, FONT_SIZES["small"]))
+    lines.append(("FACEIT CS2", FONT_SIZES["tiny"]))
 
     total = sum(_line_height(s) for _, s in lines)
     current_y = text_y_center - total // 2

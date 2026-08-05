@@ -5,8 +5,10 @@ per-player stats, keeps **Recognised Pros** only (`.data/player_accounts.json`
 by steam64 — see `docs/adr/0002-single-player-accounts-store.md`), and writes
 one backlog card per pro.
 
-No ELO: matches are pre-filtered by pro performance, so rating only picks the
-priority bucket, not the pipeline.
+No ELO notes: cards now also carry the POV player's FACEIT ELO and the
+opposing team's average ELO (``elo`` / ``opp_avg_elo``, fetched via the
+FACEIT API) so titles/thumbnails can show "3521 ELO vs 3105 ELO".
+Pass ``--no-elo`` to skip the fetch.
 
 This is the "full match POVs" half of the FACEIT flow. The other half is the
 individual single-player flow: `scripts/faceit/create_faceit_backlog.py`
@@ -25,6 +27,7 @@ faceit_match_id, faceit_id, faceit_nickname.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import re
 import subprocess
@@ -39,6 +42,7 @@ from _pathsetup import ensure  # noqa: E402
 ensure()
 
 from faceit_names import avatar_path  # noqa: E402
+from create_faceit_backlog import _match_elo  # noqa: E402
 
 BACKLOG_DIR = PROJECT_ROOT / "backlog" / "faceit"
 ACCOUNTS_PATH = PROJECT_ROOT / ".data" / "player_accounts.json"
@@ -135,7 +139,7 @@ def priority_from_rating(rating: float | None) -> str:
 
 
 def _write_card(pro: dict, *, demo: Path, map_name: str, match_slug: str,
-                tournament: str) -> Path:
+                tournament: str, elo_fields: dict | None = None) -> Path:
     priority = priority_from_rating(pro["rating"])
     player_key = re.sub(r"[^a-z0-9]+", "-", pro["canonical_nick"].lower()).strip("-")
     slug = f"{player_key}-{map_name.lower()}-{match_slug}"
@@ -164,6 +168,7 @@ def _write_card(pro: dict, *, demo: Path, map_name: str, match_slug: str,
         "faceit_id": pro["faceit_id"],
         "faceit_nickname": pro["faceit_nickname"],
         "avatar_path": str(av_path.relative_to(PROJECT_ROOT)).replace("\\", "/") if av_path else "",
+        **({} if not elo_fields else elo_fields),
         "pipeline_cmd": (
             f'$env:PYTHONPATH=.; & C:/Users/jembo/anaconda3/envs/cs2archive/python.exe '
             f'scripts/pov/pipeline.py --backlog backlog/faceit/{priority}/{slug}.json --overlay-only'
@@ -179,6 +184,8 @@ def main() -> None:
     ap.add_argument("--map", default="", help="Override map name (defaults to csdm mapName)")
     ap.add_argument("--tournament", default="", help="Event name (defaults to 'FACEIT')")
     ap.add_argument("--match-id", default="", help="FACEIT match id for run_id (defaults to demo stem)")
+    ap.add_argument("--no-elo", action="store_true",
+                    help="Skip FACEIT ELO fetch (title/thumbnail then omit the ELO line)")
     args = ap.parse_args()
 
     demo = Path(args.demo_path).resolve()
@@ -239,11 +246,25 @@ def main() -> None:
     # Rank by in-match rating — best performer first is the processing order.
     pros.sort(key=lambda x: (x["rating"] if x["rating"] is not None else -1), reverse=True)
 
+    # Per-pro ELO for the POV player + opposing-team average (title/thumbnail).
+    if args.no_elo:
+        elo_by_pro: dict[str, dict] = {}
+    else:
+        print("[FACEIT] Fetching ELOs (POV player + opposing-team average)...")
+        elo_by_pro = {}
+        for pro in pros:
+            ef = asyncio.run(_match_elo(demo, pro["steam_id"]))
+            if ef:
+                elo_by_pro[pro["steam_id"]] = ef
+                print(f"  [ELO] {pro['canonical_nick']:12s} "
+                      + " ".join(f"{k}={v}" for k, v in ef.items()))
+
     written: list[Path] = []
     for pro in pros:
         priority = priority_from_rating(pro["rating"])
         card = _write_card(pro, demo=demo, map_name=map_name,
-                           match_slug=match_slug, tournament=tournament)
+                           match_slug=match_slug, tournament=tournament,
+                           elo_fields=elo_by_pro.get(pro["steam_id"]))
         written.append(card)
         rating_txt = f"{pro['rating']:.2f}" if pro["rating"] is not None else "n/a"
         print(f"  [{priority.upper():4s} r{rating_txt:5s}] {pro['canonical_nick']:12s} "
