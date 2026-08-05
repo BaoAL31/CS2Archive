@@ -36,7 +36,7 @@ console = Console(force_terminal=True)
 AVATAR_DIR = settings.demo_storage_dir / "avatars"
 MIN_RES = 300  # Reject images smaller than 300×300
 
-CLOAK_PROFILE = Path(".cloak-hltv-profile")
+CLOAK_PROFILE = Path(".sessions/hltv-cloak")
 
 
 def _hltv_avatar_path(key: str) -> Path:

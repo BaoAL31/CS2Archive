@@ -26,7 +26,7 @@ from models import DemoSource, DownloadResult, DownloadStatus, MatchInfo
 
 console = Console(force_terminal=True)
 
-CLOAK_PROFILE = Path(".cloak-hltv-profile")
+CLOAK_PROFILE = Path(".sessions/hltv-cloak")
 
 
 class HLTVScraper:

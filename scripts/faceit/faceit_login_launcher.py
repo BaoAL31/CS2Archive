@@ -1,5 +1,5 @@
 """Launch a headed, persistent-profile Chrome at a FACEIT room so the user can
-log in manually. Session saved to .faceit_profile/ and reused by scrapers.
+log in manually. Session saved to .sessions/faceit/ and reused by scrapers.
 Keeps browser open until user closes it (or Ctrl-C).
 """
 import sys
@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 
-PROFILE = Path(__file__).resolve().parents[2] / ".faceit_profile"
+PROFILE = Path(__file__).resolve().parents[2] / ".sessions/faceit"
 URL = sys.argv[1] if len(sys.argv) > 1 else (
     "https://www.faceit.com/en/cs2/room/1-9ee7de08-444a-4617-99a7-3fd5974de4f1"
 )
@@ -36,7 +36,7 @@ def main():
             pass
         finally:
             browser.close()
-        print("[faceit_login_launcher] Closed. Session saved to .faceit_profile/")
+        print("[faceit_login_launcher] Closed. Session saved to .sessions/faceit/")
 
 
 if __name__ == "__main__":

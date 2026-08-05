@@ -2,7 +2,7 @@
 CS2Archive — FACEIT Demo Downloader (browser scrape)
 
 No FACEIT API key required. Uses a persistent, logged-in Chrome profile
-(`.faceit_profile/`, created via `scripts/faceit/faceit_login_launcher.py`) to open the
+(`.sessions/faceit/`, created via `scripts/faceit/faceit_login_launcher.py`) to open the
 match room, click "Watch Demo", and capture the browser download to disk.
 
 Cloudflare blocks automation browsers, so the launched context uses the system
@@ -30,7 +30,7 @@ from models import DemoSource, DownloadResult, DownloadStatus, MatchInfo
 
 console = Console(force_terminal=True)
 
-PROFILE_DIR = Path(__file__).resolve().parent.parent / ".faceit_profile"
+PROFILE_DIR = Path(__file__).resolve().parent.parent / ".sessions/faceit"
 
 
 class FACEITClient:

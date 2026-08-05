@@ -30,7 +30,7 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
     hltv_match.add_argument(
         "--profile-dir",
         default=None,
-        help="CloakBrowser profile directory (default: .cloak-hltv-profile)",
+        help="CloakBrowser profile directory (default: .sessions/hltv-cloak)",
     )
 
     hltv_player = sub.add_parser("player", help="Find & download demos for a player")

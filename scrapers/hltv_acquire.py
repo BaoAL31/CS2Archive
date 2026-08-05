@@ -19,7 +19,7 @@ console = Console(force_terminal=True)
 
 ARCHIVE_EXTENSIONS = {".rar", ".zip", ".7z"}
 MIN_ARCHIVE_BYTES = 1_000_000
-CDP_PROFILE_DIR = Path(".cdp-hltv-profile")
+CDP_PROFILE_DIR = Path(".sessions/hltv-cdp")
 DEFAULT_PROFILE_DIR = CDP_PROFILE_DIR
 
 

@@ -8,7 +8,7 @@ Usage:
 Player lookup + match history use the free FACEIT Data API v4 key
 (FACEIT_API_KEY). Demo download uses the FACEIT Downloads API
 (FACEIT_DOWNLOADS_TOKEN, Bearer) when configured, falling back to the
-browser scrape (authed Chrome, .faceit_profile/) if the API is unavailable.
+browser scrape (authed Chrome, .sessions/faceit/) if the API is unavailable.
 Log in once with `python scripts/faceit/faceit_login_launcher.py` for the fallback.
 
 Recognised Pros come from `.data/player_accounts.json` (single identity store).

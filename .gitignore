@@ -41,11 +41,10 @@ vault/
 .pipeline/
 
 # CloakBrowser HLTV session
-.cloak-hltv-profile/
-.cdp-hltv-profile/
+# Browser login sessions (per-site Chrome/CloakBrowser profiles)
+.sessions/
 
 # FACEIT browser session (contains login cookies — never commit)
-.faceit_profile/
 faceit_pros.json
 
 # IDE
@@ -70,12 +69,11 @@ backlog/
 
 # Bilibili session/cookies
 .bilibili_storage.json
-.bili-chrome-profile/
-.bili-cloak-profile/
+
 
 # Tool/browser caches & agent infra
-.hlae_update/
-.playwright-mcp/
+# Local caches
+.cache/
 .pi/
 .pi-subagents/
 .subagent-briefs/

@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from cloakbrowser import launch_persistent_context
 
-PROFILE = Path(__file__).resolve().parents[2] / ".bili-cloak-profile"
+PROFILE = Path(__file__).resolve().parents[2] / ".sessions/bili-cloak"
 STORAGE = Path(__file__).resolve().parents[2] / ".bilibili_storage.json"
 TARGET = "https://www.bilibili.tv/en/space/1604674785"
 
