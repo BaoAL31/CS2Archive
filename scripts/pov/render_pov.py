@@ -374,6 +374,15 @@ def _get_player_crosshair(steam_id: str, demo_parts: list[str]) -> list[str]:
     return []
 
 
+def _is_pbdems2(demo_path) -> bool:
+    """PBDEMS2 demos (FACEIT/PGL/BLAST) record voice but no input data."""
+    try:
+        with open(demo_path, "rb") as f:
+            return f.read(7) == b"PBDEMS2"
+    except OSError:
+        return False
+
+
 def _write_render_autoexec(cvars: list[str]) -> None:
     lines = ["crosshair 1", "cl_chatfilters 63", "snd_mvp_volume 0"] + cvars
     content = "\n".join(lines) + "\n"
@@ -554,6 +563,11 @@ def main() -> None:
     if vm_cvars:
         print(f"  Viewmodel: {' | '.join(vm_cvars)}")
         cvars = list(cvars) + vm_cvars
+    # PBDEMS2 demos record per-player voice; mute it in-game and re-add the
+    # POV team's voice post-render (scripts/faceit/mix_team_voice.py).
+    if _is_pbdems2(Path(parts[0])) and "voice_enable 0" not in cvars:
+        print("  [PBDEMS2] voice_enable 0 (team voice mixed post-render)")
+        cvars = list(cvars) + ["voice_enable 0"]
     if cvars:
         print(f"  Player crosshair/viewmodel ({len(cvars)} cvars)")
         _write_render_autoexec(cvars)

@@ -1114,9 +1114,52 @@ class Pipeline:
 
     def step_outro(self) -> None:
         if not self.overlay_only:
+            self._mix_team_voice(self.youtube_dir)
             self._append_outro(self.youtube_dir, step_num=5)
         if self.dual_upload and self.overlay_youtube_dir is not None:
+            self._mix_team_voice(self.overlay_youtube_dir)
             self._append_outro(self.overlay_youtube_dir, step_num=5)
+
+    def _mix_team_voice(self, target_dir: Path) -> None:
+        """Mix only the POV player's team voice into the variant video.
+
+        PBDEMS2 demos (FACEIT/PGL/BLAST) record per-player voice chat. The
+        render mutes all voice (``voice_enable 0``); this re-adds just the
+        POV team's voice aligned to the video timeline. Idempotent via a
+        ``video.mp4.teamvoice.json`` marker next to the output.
+        """
+        if not (self.demo_path and self.steam_id):
+            return
+        video = target_dir / "video.mp4"
+        if not video.is_file():
+            return
+        marker = video.with_name("video.mp4.teamvoice.json")
+        if marker.exists():
+            print(f"  [voice] {target_dir.name}/video.mp4 already has team voice")
+            return
+        try:
+            with open(self.demo_path, "rb") as f:
+                if f.read(7) != b"PBDEMS2":
+                    return  # non-PBDEMS2 demos: voice already rendered in-game
+        except OSError:
+            return
+        offsets = self.render_dir / "combined.round_offsets.json"
+        if not offsets.is_file():
+            print("  [voice] no combined.round_offsets.json — skipping team voice")
+            return
+        script = PROJECT_ROOT / "scripts" / "faceit" / "mix_team_voice.py"
+        cmd = [sys.executable, str(script),
+               "--demo", str(self.demo_path),
+               "--video", str(video),
+               "--steam-id", str(self.steam_id),
+               "--offsets", str(offsets),
+               "--out", str(video)]
+        print(f"  [voice] mixing POV-team voice into {target_dir.name}/video.mp4")
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        for line in (r.stdout or "").splitlines():
+            print(f"  {line}")
+        if r.returncode != 0:
+            print(f"  [voice] FAILED: {((r.stderr or '')[-500:])}")
 
     # ── Step 6: Thumbnail ────────────────────────────────────────────────
 
