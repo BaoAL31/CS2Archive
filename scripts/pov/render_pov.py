@@ -16,7 +16,7 @@ sys.path.insert(0, str(_PROJECT_ROOT / "scripts"))
 from _pathsetup import ensure
 ensure()
 
-from cs2_minimizer import CS2Minimizer
+from cs2_minimizer import CS2Focuser, CS2Minimizer
 
 CSDM = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
 FFMPEG_PATH = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
@@ -384,7 +384,10 @@ def _is_pbdems2(demo_path) -> bool:
 
 
 def _write_render_autoexec(cvars: list[str]) -> None:
-    lines = ["crosshair 1", "cl_chatfilters 63", "snd_mvp_volume 0"] + cvars
+    # cl_chatfilters 48: hide server/system messages (16 Console + 32 Error),
+    # keep player chat. Must match assets/cs2_pov.cfg — the cfg execs this
+    # autoexec AFTER setting its own value, so this file wins.
+    lines = ["crosshair 1", "cl_chatfilters 48", "snd_mvp_volume 0"] + cvars
     content = "\n".join(lines) + "\n"
     AUTOEXEC_RENDER.write_text(content, encoding="utf-8")
     RENDER_CROSSHAIR_CFG.write_text(content, encoding="utf-8")
