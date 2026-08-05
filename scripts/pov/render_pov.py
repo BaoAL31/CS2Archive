@@ -432,14 +432,61 @@ def _swap_autoexec(src: Path) -> None:
         print(f"  [ERROR] Swap source missing: {src}")
 
 
+# Image names of every process the render pipeline spawns. Killing the whole
+# tree (taskkill /t) is essential — csdm launches HLAE which launches ffmpeg,
+# and a plain /im kill leaves the children (especially ffmpeg) running.
+_RENDER_PROCESS_NAMES = ("cs2.exe", "HLAE.exe", "ffmpeg.exe", "csdm.exe", "csdm.cmd")
+
+
+def _taskkill_tree(image_name: str) -> bool:
+    """Force-kill a process image and its entire tree. Returns True if it ran."""
+    try:
+        r = subprocess.run(
+            ["taskkill", "/f", "/t", "/im", image_name],
+            capture_output=True, text=True, timeout=15,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _process_running(image_name: str) -> bool:
+    """True if any process with this image name is still alive."""
+    try:
+        r = subprocess.run(
+            ["tasklist", "/fi", f"IMAGENAME eq {image_name}"],
+            capture_output=True, text=True, timeout=15,
+        )
+        out = r.stdout or ""
+        return image_name.lower() in out.lower() and "no tasks" not in out.lower()
+    except Exception:
+        return True  # assume alive on failure so we retry the kill
+
+
 def _kill_stale_processes() -> None:
-    names = ["cs2.exe", "csdm.cmd", "csdm.exe", "HLAE.exe"]
-    for n in names:
-        try:
-            subprocess.run(["taskkill", "/f", "/im", n], capture_output=True, timeout=10)
-        except Exception:
-            pass
-    time.sleep(2)
+    """Kill every process left over from a previous render.
+
+    Kills the whole process tree for each render binary (cs2, HLAE, ffmpeg, csdm),
+    then polls tasklist and re-kills any survivors until they are gone (or a few
+    retries elapse). ffmpeg and HLAE often linger after a crashed batch, so they
+    are explicitly included and verified.
+    """
+    for name in _RENDER_PROCESS_NAMES:
+        _taskkill_tree(name)
+
+    # Give taskkill a beat, then hunt down anything that survived.
+    for _ in range(6):
+        survivors = [n for n in _RENDER_PROCESS_NAMES if _process_running(n)]
+        if not survivors:
+            break
+        time.sleep(0.5)
+        for n in survivors:
+            _taskkill_tree(n)
+
+    remaining = [n for n in _RENDER_PROCESS_NAMES if _process_running(n)]
+    if remaining:
+        print(f"  [WARN] could not kill: {', '.join(remaining)}")
+    time.sleep(1)
 
 
 def _check_nvenc() -> None:
