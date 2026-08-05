@@ -139,10 +139,15 @@ def _pip_geometry(pip_index: int, video_width: int, video_height: int) -> dict[s
     return {"body": body, "inner": inner, "x": x, "y": y, "outline": ol}
 
 # Column subset we actually need (avoid fetching huge unnecessary fields)
+# CS2 (Source 2) usercmd: button state lives in usercmd_buttonstate_1 (IN_* bitmask),
+# mouse in usercmd_mouse_dx/dy. The legacy CS:GO `buttons`/`FORWARD`/`FIRE` fields are
+# dropped on CS2 demos, so we read the usercmd fields and rename buttonstate_1 -> buttons
+# in _extract_keyboard_states so the bitmask decoder can consume it.
 REQUIRED_TICK_FIELDS = (
     "tick", "steamid",
-    "FORWARD", "LEFT", "RIGHT", "BACK", "FIRE", "RIGHTCLICK", "WALK",
-    "ducked", "ducking", "in_duck_jump", "old_jump_pressed", "buttons",
+    "usercmd_buttonstate_1", "usercmd_buttonstate_2",
+    "usercmd_mouse_dx", "usercmd_mouse_dy",
+    "ducked", "ducking",
     "is_airborne", "velocity_Z",
 )
 
@@ -170,17 +175,6 @@ def _probe_video_info(video_path: Path) -> tuple[int, int, float, int]:
     return w, h, fps, fc
 
 
-def _is_pbdems2(demo_path: Path) -> bool:
-    """Check if a .dem file uses PBDEMS2 format (BLAST/PGL tournaments).
-
-    PBDEMS2 demos lack button/input data — keyboard overlay is impossible.
-    Reads the first 7 bytes of the file to check the header.
-    """
-    try:
-        with open(demo_path, "rb") as f:
-            return f.read(7) == b"PBDEMS2"
-    except OSError:
-        return False
 
 
 # -- CS2UtilArchive data dir lookup --------------------------------------
@@ -404,6 +398,16 @@ def _extract_keyboard_states(
     if ticks_df.empty:
         _log("[ERROR] No tick data from demo")
         sys.exit(1)
+
+    # CS2 usercmd button state -> the `buttons` bitmask the decoder expects.
+    if "usercmd_buttonstate_1" in ticks_df.columns:
+        ticks_df = ticks_df.rename(columns={"usercmd_buttonstate_1": "buttons"})
+    if "usercmd_buttonstate_2" in ticks_df.columns and "buttons" in ticks_df.columns:
+        # buttonstate_2 carries extended buttons; merge into buttons for full coverage.
+        _bs2 = ticks_df["usercmd_buttonstate_2"].fillna(0).astype("int64")
+        ticks_df["buttons"] = (
+            ticks_df["buttons"].fillna(0).astype("int64") | _bs2
+        )
 
     ticks_df = ticks_df.sort_values(["tick"])
 
@@ -797,11 +801,11 @@ def run_overlay(
         round_start_tick, _ = round_tick_ranges[first_round]
         _log(f"First round {first_round} start tick: {round_start_tick}")
 
-    # -- PBDEMS2 detection (BLAST demos lack input data) -----------------------
-    is_pbdems2 = _is_pbdems2(demo_path)
-    if is_pbdems2:
-        _log("[PBDEMS2] Demo uses PBDEMS2 format — no keyboard/input data. "
-             "Skipping keyboard overlay (utility-throw flight PiP will still render).")
+    # -- PBDEMS2 note ------------------------------------------------------------
+    # All CS2 demos (HLTV + FACEIT) are PBDEMS2 containers, but they DO carry usercmd
+    # input (usercmd_buttonstate_*). The old assumption that PBDEMS2 lacks input data
+    # was wrong and silently disabled the keyboard overlay on every demo. Always decode.
+    is_pbdems2 = False
 
     # -- Step 1: Keyboard states -------------------------------------------------
     if not is_pbdems2:
@@ -814,8 +818,8 @@ def run_overlay(
             round_video_duration=round_video_duration or None,
         )
         if not per_sig or all(len(v) == 0 for v in per_sig.values()):
-            _log("[ERROR] No keyboard states extracted")
-            sys.exit(1)
+            _log("[WARN] No keyboard states extracted — rendering utility-only overlay")
+            per_sig = {s: [] for s in _OVERLAY_SIGNALS}
         _log(f"Keyboard: {len(next(iter(per_sig.values())))} frames x {len(per_sig)} signals ({time.time()-t1:.1f}s)")
     else:
         per_sig = {s: [] for s in _OVERLAY_SIGNALS}

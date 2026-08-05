@@ -59,6 +59,7 @@ def _highlights_run_dir(demo_path: Path) -> Path:
 
 
 def _load_action_timeline(path: Path) -> dict:
+    path = Path(path)
     data = json.loads(path.read_text(encoding="utf-8"))
     if not all(k in data for k in ("demo_path", "map", "source", "kill_count", "kills")):
         raise ValueError(f"Invalid action_timeline.json: missing required fields")
@@ -322,6 +323,13 @@ RULES:
 - Recognised Pros (PRO) get POV priority; non-pro players may be POV only for their own multi-kills (2+ kills) — never create a 1-kill segment for a non-pro
 - A single other-player kill must NOT split a Recognised Pro's multi-kill in the same round (merge pro POV; omit the interrupt)
 - USE BOMB EVENTS to identify clutch/defuse scenarios
+- ROUND-END CLOSER: the fix pass extends each round's latest segment to the round end
+  (minus a 2s trim) so the winner is shown. If that segment already ends close to the round
+  end it is extended in place and keeps its POV even if dead (NO rando closer). If the POV
+  dies well before the round end, the closer is re-pointed ONLY to a pro who has a segment in
+  the round; if no other pro has a segment there, it uses the most impressive winning-team
+  rando (no avatar cutout). So make the last POV segment of each round end near that round's
+  final kill, not far before it.
 - Hard constraints (output will be rejected if violated):
   1. start_tick < end_tick
   2. (end_tick - start_tick) >= 384
@@ -417,6 +425,11 @@ BOMB_LIFETIME_TICKS = 2624  # measured plant->explode = 41.00s @64 tick (CS2 C4 
 DEFUSE_PRE_TAIL_TICKS = 192  # comfortable CT-defuse closers end 3s before the defuse completes
 DEFUSE_KEEP_MAX_LEFT_TICKS = 128  # keep the whole defusal if the bomb had <2s left
 ROUND_END_TRIM_TICKS = 128  # trim 2s off every round-end tail (unless a post-round kill happens there)
+# If a round's latest POV died within this many ticks of the round end, keep that
+# dead POV and ride it out to the round end (-2s trim) instead of re-pointing to a
+# rando closer (which would desync the baked avatar cutout). 8s @64 tick. Only
+# re-point to an alive player when the POV died long before the round end.
+ROUND_END_EXTEND_TICKS = 512
 
 
 def _segment_kill_ticks(seg: dict, kills: list[dict], max_idx: int) -> list[int]:
@@ -690,6 +703,7 @@ def _merge_short_segments(
         return s["end_tick"] - s["start_tick"]
 
     out: list[dict] = []
+    merged_new: set[int] = set()  # indices into ``out`` that were freshly merged
     i = 0
     n = len(segments)
     while i < n:
@@ -704,7 +718,11 @@ def _merge_short_segments(
             j += 1
         if out:
             # First short merges into the preceding fine segment.
-            out.append(_merge_segment_pair(out.pop(), run[0]))
+            prev = out.pop()
+            idx = len(out)
+            merged_new.discard(idx)
+            out.append(_merge_segment_pair(prev, run[0]))
+            merged_new.add(idx)
             run = run[1:]
         if run:
             # Merge the rest of the run into one segment.
@@ -719,12 +737,19 @@ def _merge_short_segments(
                 j += 1
             if dur(acc) < min_ticks and out:
                 out[-1] = _merge_segment_pair(out[-1], acc)
+                merged_new.add(len(out) - 1)
             else:
                 out.append(acc)
+                merged_new.add(len(out) - 1)
         i = j
 
-    # Re-set POV to the majority killer and re-apply the death cap after merging.
-    for seg in out:
+    # Re-set POV to the majority killer and re-apply the death cap ONLY on
+    # freshly-merged segments. Untouched segments (e.g. round closers that
+    # _ensure_round_closers extended to the round end and re-pointed to an
+    # alive player) must NOT be re-finalized, or that round-end extension is
+    # undone (POV reset to a dead killer and end re-clamped to death + 2s).
+    for idx in sorted(merged_new):
+        seg = out[idx]
         attacker_counts: dict[str, int] = {}
         for ki in seg.get("kill_indices", []):
             if 0 <= ki <= max_idx:
@@ -798,22 +823,57 @@ def _ensure_round_closers(
         start = round_start_by_round.get(r, 0)
         end = int(seg.get("end_tick", 0))
         alive = _alive_sids_at(start, end)
+        # If this POV died but only just before the round end, keep the dead POV
+        # and ride it out to the trimmed round end instead of switching to a rando
+        # closer (which would desync the baked avatar cutout). A few seconds of
+        # dead-POV is acceptable; a long dead stretch is not.
+        pov_death = 0
+        for k in kills:
+            if k.get("victim_steam_id") == pov and start <= int(k["tick"]) <= end:
+                pov_death = max(pov_death, int(k["tick"]))
+        if pov_death and (end - pov_death) <= ROUND_END_EXTEND_TICKS:
+            seg["rationale"] = (
+                f"{seg.get('rationale', '')} | POV died {(end - pov_death) / 64:.1f}s "
+                f"before round end; kept dead POV through round end (no rando closer)."
+            ).strip(" |")
+            return
         if pov in alive or not alive:
             return  # POV survives through the round end (or can't determine) — keep it
         win_team = winner_by_round.get(r)
         win_sids = set(teams.get(str(win_team), [])) if win_team is not None else set()
-        cand_pros = sorted(alive & pro_sids, key=lambda sid: (sid not in win_sids, sid))
+
+        # Only re-point to a pro who already has a segment in this round. A pro
+        # who is alive but has NO segment (e.g. did nothing) shouldn't take over
+        # the closer — if no other pro has a segment in the round, use the most
+        # impressive rando instead (winning team preferred, ranked by kills).
+        round_segs = by_round.get(r, [])
+        pros_with_seg = {
+            s.get("pov_steam_id") for s in round_segs
+            if s.get("pov_steam_id") in pro_sids
+        }
+        cand_pros = sorted(alive & pros_with_seg, key=lambda sid: (sid not in win_sids, sid))
         if cand_pros:
             new_pov = cand_pros[0]
-        elif win_sids:
-            rando = sorted(alive & win_sids)
-            new_pov = rando[0] if rando else sorted(alive)[0]
+            pov_label = "a pro (has a segment in this round)"
         else:
-            new_pov = sorted(alive)[0]
+            # No other pro has a segment in this round — pick the most impressive
+            # rando: winning-team alive rando with the most kills in the round.
+            def _round_kills(sid: str) -> int:
+                return sum(
+                    1 for k in kills
+                    if k.get("attacker_steam_id") == sid and k.get("round") == r
+                )
+            rando_pool = (alive & win_sids) if (alive & win_sids) else alive
+            rando_pros = sorted(r for r in rando_pool if r not in pro_sids)
+            if not rando_pros:
+                new_pov = sorted(alive)[0]
+                pov_label = "a rando (no cutout)"
+            else:
+                new_pov = max(rando_pros, key=lambda sid: (_round_kills(sid), str(sid)))
+                pov_label = "the most impressive rando (no cutout)"
         seg["pov_steam_id"] = new_pov
         seg["rationale"] = (
-            f"{seg.get('rationale', '')} | POV switched to "
-            f"{'a pro' if new_pov in pro_sids else 'a rando (no cutout)'} alive at round end."
+            f"{seg.get('rationale', '')} | POV switched to {pov_label} alive at round end."
         ).strip(" |")
 
     def _trim_defuse_tail(seg: dict, r: int) -> None:
@@ -907,11 +967,42 @@ def _ensure_round_closers(
                 key=lambda s: _segment_kill_ticks(s, kills, max_idx)[-1]
                 if _segment_kill_ticks(s, kills, max_idx) else int(s.get("end_tick", 0)),
             )
-            closer["end_tick"] = max(int(closer.get("end_tick", 0)), end_tick)
+            pre_end = int(closer.get("end_tick", 0))
+            closer["end_tick"] = max(pre_end, end_tick)
             closer["rationale"] = (
                 f"{closer.get('rationale', '')} | Extended to round end (winner visible)."
             ).strip(" |")
+            orig_pov = closer.get("pov_steam_id")
             _repoint_to_alive(closer, r)
+            new_pov = closer.get("pov_steam_id")
+            if orig_pov in pro_sids and new_pov not in pro_sids and new_pov != orig_pov:
+                # The round's last pro POV died well before the round end and no
+                # other pro has a segment here, so we switched to a rando. Keep the
+                # pro's own segment capped at their death (so their play is shown
+                # from their POV), then append a separate rando closer for the
+                # round-end / winner (no cutout).
+                closer["end_tick"] = pre_end
+                closer["pov_steam_id"] = orig_pov
+                closer["rationale"] = (
+                    f"{closer.get('rationale', '')} | Entry/play capped at POV death; "
+                    f"switching to a rando closer for the round end."
+                ).strip(" |")
+                rando_kills = [
+                    ki for ki in range(max_idx + 1)
+                    if kills[ki].get("round") == r and kills[ki].get("attacker_steam_id") == new_pov
+                ]
+                rando_seg = {
+                    "start_tick": pre_end,
+                    "end_tick": end_tick,
+                    "pov_steam_id": new_pov,
+                    "segment_type": "closer",
+                    "kill_indices": rando_kills,
+                    "rationale": f"Round {r} closer: {new_pov} (rando, no cutout) — round end / winner.",
+                }
+                _trim_defuse_tail(rando_seg, r)
+                _trim_round_end_tail(rando_seg, r, end_tick)
+                by_round.setdefault(r, []).append(rando_seg)
+                continue  # original segment stays capped at pre_end — don't re-trim it
             _trim_defuse_tail(closer, r)
             _trim_round_end_tail(closer, r, end_tick)
         else:
@@ -1039,6 +1130,34 @@ def _validate_edit_timeline(edit_tl: dict, action_timeline: dict, players: dict)
             seen.add(ki)
     if dups:
         errors.append(f"Duplicate kill indices: {sorted(dups)[:10]}")
+
+    # Every live round must have a segment that reaches near its round end (so the
+    # winner is shown). The fix pass extends/synthesizes closers, so a round whose
+    # latest segment ends well before the round end indicates a missing closer.
+    # Defuse trims end a few seconds before the defuse; the 2s round-end trim also
+    # subtracts; both stay within this window.
+    kills = action_timeline["kills"]
+    # Bucket segments by the round of their FIRST kill, matching the fix pass
+    # (_ensure_round_closers) so a multi-round segment is counted as covering the
+    # round it starts in. This avoids false 'no closer' flags for cross-round segments.
+    round_start_by_round = {r["round"]: int(r["tick"]) for r in action_timeline.get("round_starts", [])}
+    def _first_kill_round(seg):
+        t = _segment_first_kill_tick(seg, kills, max_kill_idx)
+        cands = [r for r, st in round_start_by_round.items() if st <= t]
+        return max(cands) if cands else None
+    round_end_by_round = {re["round"]: int(re["tick"]) for re in action_timeline.get("round_ends", [])}
+    for r, rend in round_end_by_round.items():
+        if r == WARMUP_ROUND:
+            continue
+        rsegs = [s for s in segments if _first_kill_round(s) == r]
+        if not rsegs:
+            continue  # fully-skipped round — closer synthesizing is a fix-pass concern
+        latest = max(rsegs, key=lambda s: int(s.get("end_tick", 0)))
+        if latest["end_tick"] < rend - (ROUND_END_EXTEND_TICKS + DEFUSE_PRE_TAIL_TICKS):
+            errors.append(
+                f"Round {r}: no closer — latest segment ends {latest['end_tick']}, "
+                f"round ends {rend}"
+            )
 
     return errors
 

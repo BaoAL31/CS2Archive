@@ -1297,8 +1297,6 @@ class Pipeline:
             cmd += ["--steam-id", self.steam_id]
         if self.tournament:
             cmd += ["--tournament", self.tournament]
-        if variant == "overlay" and self._is_pbdems2():
-            cmd += ["--pbdems2"]
         cmd += ["--output", str(youtube_dir)]
 
         r = self._run_py(cmd, timeout=300)
@@ -1349,11 +1347,6 @@ class Pipeline:
 
     # ── Upload meta writer (runs inside thumbnail step) ────────────────
 
-    def _is_pbdems2(self) -> bool:
-        """Check if demo is PBDEMS2 format (Blast tournament demos)."""
-        from overlay.overlay_pov import _is_pbdems2 as _check_pbdems2
-        return _check_pbdems2(self.demo_path)
-
     def _write_upload_meta(
         self,
         youtube_dir: Path,
@@ -1373,8 +1366,6 @@ class Pipeline:
             "--map", self.map_name,
             "--variant", variant,
         ]
-        if variant == "overlay" and self._is_pbdems2():
-            titlize_args += ["--pbdems2"]
         if self.is_faceit:
             titlize_args = [
                 "scripts/faceit/faceit_title.py", str(self.demo_path),

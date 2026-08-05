@@ -60,13 +60,11 @@ def _draw_pill(
     return y1
 
 
-def _draw_overlay_badge(img: Image.Image, *, pbdems2: bool = False) -> None:
+def _draw_overlay_badge(img: Image.Image) -> None:
     """Draw stacked pills in top-left corner for the overlay variant.
 
-    When *pbdems2* is True, the primary pill reads ``W/ UTILITY CAMS``
-    (PBDEMS2 demos lack keyboard input data — only utility throw PiP is present).
-    Otherwise the primary pill reads ``W/ INPUT OVERLAY`` (always-on keyboard
-    state) and a secondary ``+ UTIL CAMS`` pill is stacked below.
+    The primary pill reads ``W/ INPUT OVERLAY`` (always-on keyboard state)
+    and a secondary ``+ UTIL CAMS`` pill is stacked below.
     """
     from PIL import ImageDraw, ImageFont
 
@@ -82,20 +80,6 @@ def _draw_overlay_badge(img: Image.Image, *, pbdems2: bool = False) -> None:
     except Exception:
         font_main = ImageFont.load_default()
         font_sub = font_main
-
-    if pbdems2:
-        # PBDEMS2 → single pill, no keyboard overlay section.
-        bbox = draw.textbbox((0, 0), "W/ UTILITY CAMS", font=font_main)
-        main_h = (bbox[3] - bbox[1]) + 7 * 2
-        _draw_pill(
-            draw,
-            "W/ UTILITY CAMS",
-            font_main,
-            left=margin,
-            top=margin,
-        )
-        img.paste(overlay, (0, 0), overlay)
-        return
 
     # Standard: two stacked pills.
     bbox1 = draw.textbbox((0, 0), "W/ INPUT OVERLAY", font=font_main)
@@ -139,8 +123,6 @@ def generate(
     tournament: str = "",
     stage: str = "",
     variant: str = "raw",
-    *,
-    pbdems2: bool = False,
 ) -> Image.Image:
     bg = load_background(bg_path)
 
@@ -178,7 +160,7 @@ def generate(
         current_y += _line_height(size)
 
     if variant == "overlay":
-        _draw_overlay_badge(bg, pbdems2=pbdems2)
+        _draw_overlay_badge(bg)
 
     return bg
 
@@ -190,8 +172,6 @@ def generate_faceit(
     elo: int | None = None,
     opp_elo: int | None = None,
     variant: str = "raw",
-    *,
-    pbdems2: bool = False,
     avatar_path: Path | None = None,
 ) -> Image.Image:
     """FACEIT thumbnail: blurred kill-frame background + text overlay.
@@ -242,6 +222,6 @@ def generate_faceit(
         current_y += _line_height(size)
 
     if variant == "overlay":
-        _draw_overlay_badge(bg, pbdems2=pbdems2)
+        _draw_overlay_badge(bg)
 
     return bg

@@ -375,7 +375,7 @@ def _get_player_crosshair(steam_id: str, demo_parts: list[str]) -> list[str]:
 
 
 def _is_pbdems2(demo_path) -> bool:
-    """PBDEMS2 demos (FACEIT/PGL/BLAST) record voice but no input data."""
+    """PBDEMS2 demos (FACEIT/PGL/BLAST) record per-player voice chat."""
     try:
         with open(demo_path, "rb") as f:
             return f.read(7) == b"PBDEMS2"
