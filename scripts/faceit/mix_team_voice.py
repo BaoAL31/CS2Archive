@@ -143,7 +143,8 @@ def load_offsets(offsets_path: Path) -> dict:
     #       per_round_ticks, per_round_durations
     ro = {int(k): float(v) for k, v in d["round_offsets"].items()}
     prt = {int(k): [int(a), int(b)] for k, (a, b) in d["per_round_ticks"].items()}
-    return {"round_offsets": ro, "per_round_ticks": prt}
+    prd = {int(k): float(v) for k, v in (d.get("per_round_durations") or {}).items()}
+    return {"round_offsets": ro, "per_round_ticks": prt, "per_round_durations": prd}
 
 
 def video_duration(video: Path) -> float:
@@ -157,11 +158,20 @@ def video_duration(video: Path) -> float:
 
 def tick_to_time(tick: int, offsets: dict, tickrate: int) -> float | None:
     prt = offsets["per_round_ticks"]
-    starts = sorted(prt)
+    prd = offsets.get("per_round_durations", {})
     # find round whose tick span contains tick
-    for r in starts:
+    for r in sorted(prt):
         a, b = prt[r]
         if a <= tick <= b:
+            span = max(1, b - a)
+            # The video is a CONCATENATION of COMPRESSED rounds (round video is
+            # shorter than the raw game ticks). Map the tick fraction to the
+            # round's actual (compressed) video duration, not game-time / tickrate,
+            # otherwise voice from late in a round spills past the round's video
+            # end into the next round -> echo/overlap.
+            dur = prd.get(r)
+            if dur and dur > 0:
+                return offsets["round_offsets"][r] + (tick - a) / span * dur
             return offsets["round_offsets"][r] + (tick - a) / tickrate
     return None
 
@@ -241,6 +251,12 @@ def main() -> None:
         sys.exit(0)
 
     # write voice track as f32le wav (ffmpeg amix input)
+    # Normalize so the loudest moment never clips: scale buf so that
+    # peak * voice_volume = ~0.9. Without this, summed team voice (multiple
+    # players) often exceeds 1.0 and the 2.5x boost clips hard -> static/robotic.
+    _peak = float(np.abs(buf).max())
+    if _peak > 0:
+        buf = buf * (0.9 / max(args.voice_volume, 0.1) / _peak)
     mix = (buf * args.voice_volume).astype(np.float32)
     with tempfile.NamedTemporaryFile(suffix=".f32", delete=False) as f:
         f.write(mix.tobytes())
