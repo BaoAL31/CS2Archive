@@ -392,13 +392,11 @@ def _write_render_autoexec(cvars: list[str]) -> None:
     # cl_chatfilters 48: hide server/system messages (16 Console + 32 Error),
     # keep player chat. Must match assets/cs2_pov.cfg — the cfg execs this
     # autoexec AFTER setting its own value, so this file wins.
-    # Bake the POV team's voice directly: voice stays ON (talking indicators
-    # show), the enemy team is muted (cl_mute_enemy_team 1) and teammates are
-    # NOT muted (cl_mute_all_but_friends_and_party 0), so only the POV team's
-    # comms + their indicators land in the rendered audio.
+    # Voice stays fully ON during render (CSDM --player-voices keeps
+    # voice_enable on); no cl_mute_* cvars — cl_mute_enemy_team muted ALL
+    # voice in PBDEMS2 demo playback and hid the talking indicators.
     lines = ["crosshair 1", "cl_chatfilters 48", "snd_mvp_volume 0",
-             "snd_mute_losefocus 0",
-             "cl_mute_enemy_team 1", "cl_mute_all_but_friends_and_party 0"] + cvars
+             "snd_mute_losefocus 0"] + cvars
     content = "\n".join(lines) + "\n"
     AUTOEXEC_RENDER.write_text(content, encoding="utf-8")
     RENDER_CROSSHAIR_CFG.write_text(content, encoding="utf-8")
