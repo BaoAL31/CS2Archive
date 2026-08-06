@@ -398,7 +398,7 @@ def _write_render_autoexec(cvars: list[str]) -> None:
     # 64-slot bitmask all-set) enables hearing + showing the talking indicator
     # for every player; tv_relaytextchat 2 shows the player text chat.
     lines = ["crosshair 1", "cl_chatfilters 48", "snd_mvp_volume 0",
-             "snd_mute_losefocus 0", "voice_enable 1",
+             "snd_mute_losefocus 0", "voice_enable 1", "voice_modenable 1",
              "tv_listen_voice_indices -1",
              "tv_listen_voice_indices_h -1",
              "tv_relaytextchat 2"] + cvars
