@@ -388,14 +388,22 @@ def _extract_keyboard_states(
     Returns per_signal frame lists (0/1 per frame).
     """
     from demoparser2 import DemoParser
-    from usercmd_extract import corrected_signals
+    from usercmd_extract import _run_cli, _parse_rows, signals_from_rows, _validate_from_rows
 
     t0 = time.time()
 
     # Corrected per-tick usercmd input (delta_data decoded correctly via the
     # vendored Rust parser — demoparser2 0.41.x misaligns usercmd_buttonstate).
-    corrected = corrected_signals(str(demo_path), steam_id)
+    _rows = _parse_rows(_run_cli(str(demo_path), steam_id))
+    corrected = signals_from_rows(_rows)
     _log(f"  [usercmd] corrected signals for {len(corrected)} ticks")
+    # Sanity check: extracted A/D keys vs the player's actual velocity.
+    _chk = _validate_from_rows(_rows)
+    _am = _chk.get("a_mismatch_rate"); _dm = _chk.get("d_mismatch_rate")
+    _log(f"  [usercmd] key-vs-velocity check: A mismatch={_am:.0%} D mismatch={_dm:.0%}"
+         if _am is not None else f"  [usercmd] key-vs-velocity: {_chk}")
+    if (_am is not None and _am > 0.5) or (_dm is not None and _dm > 0.5):
+        _log(f"  [WARN] input key-vs-velocity mismatch high — check A/D mapping: {_chk}")
 
     # demoparser2 only for jump inference (is_airborne / velocity_Z); the
     # movement/duck/walk/attack signals come from the corrected usercmd above.

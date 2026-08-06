@@ -15,6 +15,9 @@ fn main() {
             "tick".to_string(), "usercmd_buttonstate_1".to_string(),
             "usercmd_forward_move".to_string(), "usercmd_left_move".to_string(),
             "usercmd_mouse_dx".to_string(), "usercmd_mouse_dy".to_string(),
+            "usercmd_viewangle_y".to_string(),
+            "CCSPlayerPawn.CBodyComponentBaseAnimGraph.m_vecX".to_string(),
+            "CCSPlayerPawn.CBodyComponentBaseAnimGraph.m_vecY".to_string(),
         ],
         wanted_events: vec![], real_name_to_og_name: AHashMap::default(),
         wanted_other_props: vec![], parse_ents: true, wanted_players: vec![steamid],
@@ -35,9 +38,13 @@ fn main() {
     let lf = match cols.get(&100000033).and_then(|c|c.data.as_ref()) { Some(VarVec::F32(v))=>v, _=>&vec![] };
     let mdx= match cols.get(&100000027).and_then(|c|c.data.as_ref()) { Some(VarVec::I32(v))=>v, _=>&vec![] };
     let mdy= match cols.get(&100000028).and_then(|c|c.data.as_ref()) { Some(VarVec::I32(v))=>v, _=>&vec![] };
-    let n = t.len().min(b1.len()).min(fw.len()).min(lf.len()).min(mdx.len()).min(mdy.len());
+    let ya = match cols.get(&100000023).and_then(|c|c.data.as_ref()) { Some(VarVec::F32(v))=>v, _=>&vec![] };
+    let px = match cols.get(&3138).and_then(|c|c.data.as_ref()) { Some(VarVec::F32(v))=>v, _=>&vec![] };
+    let py = match cols.get(&3139).and_then(|c|c.data.as_ref()) { Some(VarVec::F32(v))=>v, _=>&vec![] };
+    let n = t.len().min(b1.len()).min(fw.len()).min(lf.len()).min(mdx.len()).min(mdy.len()).min(ya.len()).min(px.len()).min(py.len());
     for i in 0..n {
-        println!("{},{},{},{},{},{}", t[i].unwrap_or(0), b1[i].unwrap_or(0),
-            fw[i].unwrap_or(0.0), lf[i].unwrap_or(0.0), mdx[i].unwrap_or(0), mdy[i].unwrap_or(0));
+        println!("{},{},{},{},{},{},{},{},{}", t[i].unwrap_or(0), b1[i].unwrap_or(0),
+            fw[i].unwrap_or(0.0), lf[i].unwrap_or(0.0), mdx[i].unwrap_or(0), mdy[i].unwrap_or(0),
+            ya[i].unwrap_or(0.0), px[i].unwrap_or(0.0), py[i].unwrap_or(0.0));
     }
 }
