@@ -1112,54 +1112,13 @@ class Pipeline:
         vid_mb = video.stat().st_size / 1024 / 1024
         print(f"  [OK] Outro appended in {youtube_dir.name}/ ({vid_mb:.0f} MB)")
 
-    def _mix_team_voice(self, youtube_dir: Path, step_num: int = 5) -> None:
-        """Mix ONLY the POV player's team voice into video.mp4 in youtube_dir.
-
-        FACEIT (PBDEMS2) demos record per-player voice; the render mutes all
-        in-game voice, so this decodes the demo and mixes in just the POV
-        team's comms, aligned to combined.round_offsets.json.
-        """
-        faceit = self.demo_path and "demos/faceit" in str(self.demo_path).replace("\\", "/")
-        if not faceit or not self.demo_path or not self.demo_path.exists():
-            print("  [voice] not a FACEIT demo — skipping team voice mix")
-            return
-        if not self.steam_id:
-            print("  [voice] no steam_id — skipping team voice mix")
-            return
-        offsets = self.render_dir / "combined.round_offsets.json"
-        if not offsets.exists():
-            print("  [voice] no combined.round_offsets.json — skipping team voice mix")
-            return
-        video = youtube_dir / "video.mp4"
-        if not video.exists():
-            return
-        out = youtube_dir / "video.voice.mp4"
-        r = self._run_py(
-            ["scripts/faceit/mix_team_voice.py",
-             "--demo", str(self.demo_path),
-             "--video", str(video),
-             "--steam-id", str(self.steam_id),
-             "--offsets", str(offsets),
-             "--out", str(out)],
-            capture_output=True, text=True, timeout=3600,
-        )
-        log = (r.stdout or "") + (r.stderr or "")
-        for line in log.splitlines():
-            print(f"  {line}")
-        if out.exists() and out.stat().st_size > 1000:
-            out.replace(video)
-            print(f"  [OK] Team voice mixed in {youtube_dir.name}/")
-        else:
-            print(f"  [voice] no team voice produced in {youtube_dir.name}/ (already mixed or none)")
-
     def step_outro(self) -> None:
-        # Team-only voice: render is voice-free; mix in the POV team's comms.
+        # Voice is baked into the render (voice_enable 1 + enemy muted), so no
+        # post-render team-voice mix is needed.
         if not self.overlay_only:
             self._append_outro(self.youtube_dir, step_num=5)
-            self._mix_team_voice(self.youtube_dir, step_num=5)
         if self.dual_upload and self.overlay_youtube_dir is not None:
             self._append_outro(self.overlay_youtube_dir, step_num=5)
-            self._mix_team_voice(self.overlay_youtube_dir, step_num=5)
 
     # ── Step 6: Thumbnail ────────────────────────────────────────────────
 
