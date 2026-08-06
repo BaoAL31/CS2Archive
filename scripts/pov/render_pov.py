@@ -392,6 +392,7 @@ def _write_render_autoexec(cvars: list[str]) -> None:
     # NOT muted (cl_mute_all_but_friends_and_party 0), so only the POV team's
     # comms + their indicators land in the rendered audio.
     lines = ["crosshair 1", "cl_chatfilters 48", "snd_mvp_volume 0",
+             "snd_mute_losefocus 0",
              "cl_mute_enemy_team 1", "cl_mute_all_but_friends_and_party 0"] + cvars
     content = "\n".join(lines) + "\n"
     AUTOEXEC_RENDER.write_text(content, encoding="utf-8")
