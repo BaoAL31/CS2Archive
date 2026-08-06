@@ -549,7 +549,8 @@ def _build_pip_chain(
     fps: float,
     start_label: str = "[0:v]",
     pip_input_offset: int = 1,
-    mask_input_idx: int | None = None,
+    inner_mask_idx: int | None = None,
+    outer_mask_idx: int | None = None,
 ) -> tuple[list[str], str, list[PipClip]]:
     """Sort clips, assign stack rows, build PiP filter parts.
 
@@ -561,8 +562,10 @@ def _build_pip_chain(
     clip. When sprite PNGs occupy inputs 1-18, pass ``1 + len(png_inputs)``
     so clips are referenced as ``[19:v]``, ``[20:v]``, etc.
 
-    ``mask_input_idx`` is the ffmpeg input index of the rounded-corner mask
-    PNG (looped), used by ``alphamerge`` when PIP_CORNER_RADIUS > 0. Pass
+    ``inner_mask_idx`` / ``outer_mask_idx`` are the ffmpeg input indices of
+    the rounded-corner mask PNGs (looped) used by ``alphamerge`` when
+    PIP_CORNER_RADIUS > 0: the inner mask rounds the CONTENT corners before
+    the outline is drawn, the outer mask rounds the outline corners. Pass
     ``None`` to keep square corners.
     """
     sorted_clips = sorted(flight_clips, key=lambda c: c.start_frame)
@@ -579,7 +582,8 @@ def _build_pip_chain(
     for idx, clip in enumerate(sorted_clips, start=pip_input_offset):
         fc_part, tag = _build_pip_overlay(
             clip, pip_current, idx, width, height, fps,
-            mask_input_idx=mask_input_idx,
+            inner_mask_idx=inner_mask_idx,
+            outer_mask_idx=outer_mask_idx,
         )
         pip_parts.append(fc_part)
         pip_current = f"[{tag}]"
@@ -593,22 +597,24 @@ def _build_pip_overlay(
     width: int,
     height: int,
     fps: float,
-    mask_input_idx: int | None = None,
+    inner_mask_idx: int | None = None,
+    outer_mask_idx: int | None = None,
 ) -> tuple[str, str]:
     """Build filter string + tag for one PiP overlay at bottom-left.
 
     Scales flight clip (input_idx:v) to PIP size and delays its PTS so the
     clip's first frame aligns with clip.start_frame on the main timeline.
-    We MUST NOT use ``enable='between(n,...)'`` here: the overlay filter is a
-    sync filter that consumes the secondary stream frame-by-frame regardless
-    of ``enable``. With ``enable=false`` for frames 0..start_frame-1, ffmpeg
-    drains the entire short clip before the window opens, so at start_frame
-    the secondary is already EOF and overlay shows a single frozen frame.
 
-    Delaying PTS via ``setpts=PTS-STARTPTS+start/TB`` makes the clip's frames
-    arrive exactly during the window. ``eof_action=pass`` lets the main video
-    show through once the clip finishes (no frozen last-frame held over the
-    rest of the video).
+    Corner ordering: round the CONTENT corners FIRST, then draw the white
+    outline around the rounded content, then round the outline's own corners
+    (so the outline hugs the rounded content). This is done with two looped
+    grayscale masks via alphamerge (inner = content size, outer = body size).
+
+    The overlay is gated with ``enable='between(n,start,end)'`` so the PiP is
+    only on screen during its window and disappears cleanly afterwards. This
+    is necessary because the looped mask PNGs keep the clip stream from ever
+    EOFing (alphamerge is a framesync filter), so ``eof_action=pass`` alone
+    cannot tear the PiP down; the enable window bounds its visibility instead.
     """
     geom = _pip_geometry(clip.pip_index, width, height)
     pip_body = geom["body"]
@@ -617,7 +623,6 @@ def _build_pip_overlay(
     pip_y = geom["y"]
     ol = geom["outline"]
     tag = f"pip{clip.pip_index}_{input_idx}"
-    scaled_tag = f"pip_scaled_{input_idx}"
     start_seconds = clip.start_frame / fps
     # Cap clip playback to its PiP window (seconds on the clip's native
     # timeline). Without this a late-round smoke (whose window we clamped to
@@ -626,49 +631,52 @@ def _build_pip_overlay(
     # overlay batch.
     play_seconds = max(0.0, (clip.end_frame - clip.start_frame) / fps)
 
-    # Build pre-overlay filter chain for the flight clip:
-    #   0. trim to the PiP window length (native clip seconds)
-    #   1. scale to inner content size (body - 2*outline)
-    #   2. pad back up to body with white border = the outline
-    #   3. format=rgba + optional geq for rounded corners
-    #   4. setpts to align first frame with clip.start_frame on main timeline
-    # Aspect-preserving scale (force increase) + center-crop to square.
-    # Avoids horizontal squeeze on wide flight clips (1920x1080 -> 568x568).
-    pre_filters = []
+    parts: list[str] = []
+
+    # 1) Trim + scale to inner content, RGBA.
+    pre = []
     if play_seconds > 0:
-        pre_filters.append(f"trim=end={play_seconds:.6f}")
-        # trim keeps PTS; reset so setpts math is deterministic.
-        pre_filters.append("setpts=PTS-STARTPTS")
-    pre_filters += [
+        pre.append(f"trim=end={play_seconds:.6f}")
+        pre.append("setpts=PTS-STARTPTS")
+    pre += [
         f"scale=w={pip_inner}:h={pip_inner}:force_original_aspect_ratio=increase:flags=lanczos",
         f"crop={pip_inner}:{pip_inner}",
+        "format=rgba",
     ]
-    if ol > 0:
-        pre_filters.append(
-            f"pad=w={pip_body}:h={pip_body}:x={ol}:y={ol}:color=white"
-        )
-    # Rounded corners: punch out the four outer corners with a static RGBA
-    # mask via alphamerge. This is ~O(1) per pixel (channel select), unlike a
-    # per-pixel `geq` which measured +7.96 ms/frame/pip (see scripts/_bench_geq.py)
-    # and blows the 60 fps budget with two simultaneous PiPs.
-    rounded_tag = scaled_tag
-    if PIP_CORNER_RADIUS > 0 and mask_input_idx is not None:
-        pre_filters.append("format=rgba")
-        rounded_tag = f"pip_rounded_{input_idx}"
-    pre_filters.append(f"setpts=PTS-STARTPTS+{start_seconds:.6f}/TB")
-    pre_chain = f"[{input_idx}:v]" + ",".join(pre_filters) + f"[{scaled_tag}]"
+    scaled_tag = f"pip_scaled_{input_idx}"
+    parts.append(f"[{input_idx}:v]" + ",".join(pre) + f"[{scaled_tag}]")
 
-    parts = [
-        pre_chain,
-    ]
-    if rounded_tag != scaled_tag:
+    content_tag = scaled_tag
+    # 2) Round the CONTENT corners first.
+    if PIP_CORNER_RADIUS > 0 and inner_mask_idx is not None:
+        content_tag = f"pip_rnd_{input_idx}"
+        parts.append(f"[{scaled_tag}][{inner_mask_idx}:v]alphamerge[{content_tag}]")
+
+    # 3) Draw the white outline around the (rounded) content.
+    if ol > 0:
+        padded_tag = f"pip_pad_{input_idx}"
         parts.append(
-            f"[{scaled_tag}][{mask_input_idx}:v]alphamerge[{rounded_tag}]"
+            f"[{content_tag}]pad=w={pip_body}:h={pip_body}:x={ol}:y={ol}:color=white@1"
+            f"[{padded_tag}]"
         )
+        content_tag = padded_tag
+
+    # 4) Round the outline's outer corners.
+    if PIP_CORNER_RADIUS > 0 and outer_mask_idx is not None:
+        outer_tag = f"pip_outer_{input_idx}"
+        parts.append(f"[{content_tag}][{outer_mask_idx}:v]alphamerge[{outer_tag}]")
+        content_tag = outer_tag
+
+    # 5) Delay PTS so the clip's first frame lands on clip.start_frame.
+    final_tag = f"pip_final_{input_idx}"
+    parts.append(f"[{content_tag}]setpts=PTS-STARTPTS+{start_seconds:.6f}/TB[{final_tag}]")
+
+    # 6) Overlay onto main, gated to the window (and eof_action=pass as a
+    #    belt-and-suspenders so the main video shows through if the clip EOFs).
     parts.append(
-        f"{current_label}[{rounded_tag}]"
-        f"overlay=x={x}:y={pip_y}:eof_action=pass"
-        f"[{tag}]",
+        f"{current_label}[{final_tag}]overlay=x={x}:y={pip_y}:"
+        f"enable='between(n\\,{clip.start_frame}\\,{clip.end_frame})':eof_action=pass"
+        f"[{tag}]"
     )
     return ";".join(parts), tag
 
@@ -903,17 +911,23 @@ def run_overlay(
             keyboard_fc = ""
             keyboard_out_label = "[0:v]"
 
-        # Pre-render a static rounded-corner mask for the PiP body. One mask
-        # is shared by all PiPs in every batch/pass; the looped PNG is fed to
-        # ffmpeg as an extra input and applied via alphamerge in each
-        # _build_pip_overlay when PIP_CORNER_RADIUS > 0.
-        pip_mask_path: Path | None = None
+        # Pre-render rounded-corner masks for the PiP. Two masks are shared by
+        # every PiP in every batch/pass: an INNER one (size = content area) to
+        # round the CONTENT corners first, and an OUTER one (size = full body)
+        # to round the white outline corners around it. Both are looped PNGs
+        # fed to ffmpeg as extra inputs and applied via alphamerge.
+        pip_inner_mask: Path | None = None
+        pip_outer_mask: Path | None = None
         if PIP_CORNER_RADIUS > 0:
-            pip_body_size = _pip_body(height)
-            pip_mask_path = work_dir / f"pip_corner_mask_{pip_body_size}.png"
-            if not pip_mask_path.exists():
-                _make_rounded_corner_mask(pip_mask_path, pip_body_size, PIP_CORNER_RADIUS)
-            _log(f"  Rounded PiP corners radius={PIP_CORNER_RADIUS}px mask={pip_mask_path.name}")
+            body_size = _pip_body(height)
+            inner_size = max(1, body_size - 2 * PIP_OUTLINE_THICKNESS)
+            pip_inner_mask = work_dir / f"pip_mask_inner_{inner_size}.png"
+            pip_outer_mask = work_dir / f"pip_mask_outer_{body_size}.png"
+            if not pip_outer_mask.exists():
+                _make_rounded_corner_mask(pip_outer_mask, body_size, PIP_CORNER_RADIUS)
+            if not pip_inner_mask.exists():
+                _make_rounded_corner_mask(pip_inner_mask, inner_size, PIP_CORNER_RADIUS)
+            _log(f"  Rounded PiP corners radius={PIP_CORNER_RADIUS}px (content + outline)")
 
         # -- Step 3: Render utility throw flight clips ---------------------------
         t3 = time.time()
@@ -1027,14 +1041,17 @@ def run_overlay(
                     pip_label = batch_kb_label
                     sorted_batch_pips: list[PipClip] = []
                     if batch_pips:
-                        mask_idx = None
-                        if pip_mask_path is not None:
-                            mask_idx = pip_input_offset + len(batch_pips)
+                        inner_idx = None
+                        outer_idx = None
+                        if pip_inner_mask is not None and pip_outer_mask is not None:
+                            inner_idx = pip_input_offset + len(batch_pips)
+                            outer_idx = inner_idx + 1
                         pip_parts, pip_label, sorted_batch_pips = _build_pip_chain(
                             batch_pips, width, height, fps,
                             start_label=batch_kb_label,
                             pip_input_offset=pip_input_offset,
-                            mask_input_idx=mask_idx,
+                            inner_mask_idx=inner_idx,
+                            outer_mask_idx=outer_idx,
                         )
                         pip_fc = ";".join(pip_parts)
 
@@ -1061,9 +1078,11 @@ def run_overlay(
                     fc_script = work_dir / f"batch_{batch_start_rn:03d}_{batch_end_rn:03d}.txt"
                     fc_script.write_text(combined_fc, encoding="utf-8")
                     extra = list(png_inputs) + [c.clip_path for c in sorted_batch_pips]
-                    loops = {str(pip_mask_path)} if pip_mask_path is not None else None
-                    if pip_mask_path is not None:
-                        extra.append(pip_mask_path)
+                    loops = None
+                    if pip_inner_mask is not None and pip_outer_mask is not None:
+                        extra.append(pip_inner_mask)
+                        extra.append(pip_outer_mask)
+                        loops = {str(pip_inner_mask), str(pip_outer_mask)}
                     _ffmpeg_encode(
                         str(video_path), extra,
                         ["-filter_complex_script", str(fc_script.resolve())],
@@ -1103,17 +1122,21 @@ def run_overlay(
                            keyboard_out_label, str(kb_temp))
             _log(f"  ({time.time()-t4:.1f}s)")
 
+            has_mask = pip_inner_mask is not None and pip_outer_mask is not None
             pip_parts, pip_current, sorted_clips = _build_pip_chain(
                 flight_clips, width, height, fps,
-                mask_input_idx=(1 + len(flight_clips) if pip_mask_path is not None else None))
+                inner_mask_idx=(1 + len(flight_clips) if has_mask else None),
+                outer_mask_idx=(2 + len(flight_clips) if has_mask else None))
             pip_fc = ";".join(pip_parts)
             fc_script2 = work_dir / "pip_fc.txt"
             fc_script2.write_text(pip_fc, encoding="utf-8")
             _log(f"Pass 2: PiP composite (1 vid + {len(flight_clips)} flight clips)...")
             pass2_inputs: list[Path] = [c.clip_path for c in sorted_clips]
-            pass2_loops = {str(pip_mask_path)} if pip_mask_path is not None else None
-            if pip_mask_path is not None:
-                pass2_inputs.append(pip_mask_path)
+            pass2_loops = None
+            if has_mask:
+                pass2_inputs.append(pip_inner_mask)
+                pass2_inputs.append(pip_outer_mask)
+                pass2_loops = {str(pip_inner_mask), str(pip_outer_mask)}
             _ffmpeg_encode(str(kb_temp), pass2_inputs,
                            ["-filter_complex_script", str(fc_script2.resolve())],
                            pip_current, str(output_path),
@@ -1132,17 +1155,21 @@ def run_overlay(
 
         elif flight_clips:
             # PiP only
+            has_mask = pip_inner_mask is not None and pip_outer_mask is not None
             pip_parts, pip_current, sorted_clips = _build_pip_chain(
                 flight_clips, width, height, fps,
-                mask_input_idx=(1 + len(flight_clips) if pip_mask_path is not None else None))
+                inner_mask_idx=(1 + len(flight_clips) if has_mask else None),
+                outer_mask_idx=(2 + len(flight_clips) if has_mask else None))
             pip_fc = ";".join(pip_parts)
             fc_script = work_dir / "pip_fc.txt"
             fc_script.write_text(pip_fc, encoding="utf-8")
             _log(f"PiP composite (1 vid + {len(flight_clips)} flight clips)...")
             pip_only_inputs: list[Path] = [c.clip_path for c in sorted_clips]
-            pip_only_loops = {str(pip_mask_path)} if pip_mask_path is not None else None
-            if pip_mask_path is not None:
-                pip_only_inputs.append(pip_mask_path)
+            pip_only_loops = None
+            if has_mask:
+                pip_only_inputs.append(pip_inner_mask)
+                pip_only_inputs.append(pip_outer_mask)
+                pip_only_loops = {str(pip_inner_mask), str(pip_outer_mask)}
             _ffmpeg_encode(str(video_path), pip_only_inputs,
                            ["-filter_complex_script", str(fc_script.resolve())],
                            pip_current, str(output_path),

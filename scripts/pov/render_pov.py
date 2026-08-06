@@ -387,14 +387,7 @@ def _write_render_autoexec(cvars: list[str]) -> None:
     # cl_chatfilters 48: hide server/system messages (16 Console + 32 Error),
     # keep player chat. Must match assets/cs2_pov.cfg — the cfg execs this
     # autoexec AFTER setting its own value, so this file wins.
-    # Mute ALL in-game voice. voice_enable alone does NOT reliably silence the
-    # recorded voice during demo playback (CS2 still mixes it into the audio
-    # output), so we also zero the voice volume and disable voip/modulate.
-    # This must produce a clean no-voice audio track; nothing is mixed back.
-    lines = ["crosshair 1", "cl_chatfilters 48", "snd_mvp_volume 0",
-             "voice_enable 0", "voice_scale 0", "voice_modenable 0",
-             "snd_voipvolume 0", "cl_mute_all_but_friends_and_party 1",
-             "cl_mute_enemy_team 1"] + cvars
+    lines = ["crosshair 1", "cl_chatfilters 48", "snd_mvp_volume 0"] + cvars
     content = "\n".join(lines) + "\n"
     AUTOEXEC_RENDER.write_text(content, encoding="utf-8")
     RENDER_CROSSHAIR_CFG.write_text(content, encoding="utf-8")
@@ -620,11 +613,6 @@ def main() -> None:
     if vm_cvars:
         print(f"  Viewmodel: {' | '.join(vm_cvars)}")
         cvars = list(cvars) + vm_cvars
-    # PBDEMS2 demos record per-player voice; mute it in-game and re-add the
-    # POV team's voice post-render (scripts/faceit/mix_team_voice.py).
-    if _is_pbdems2(Path(parts[0])) and "voice_enable 0" not in cvars:
-        print("  [PBDEMS2] voice_enable 0 (team voice mixed post-render)")
-        cvars = list(cvars) + ["voice_enable 0"]
     if cvars:
         print(f"  Player crosshair/viewmodel ({len(cvars)} cvars)")
         _write_render_autoexec(cvars)
