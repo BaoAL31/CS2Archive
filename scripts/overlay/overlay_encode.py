@@ -53,6 +53,7 @@ def _ffmpeg_encode(
     out_label: str,
     output_path: str,
     segment: tuple[float, float] | None = None,
+    loop_inputs: set[str] | None = None,
 ) -> None:
     """Run ffmpeg with h264_nvenc. No CPU fallback (libx forbidden by user).
 
@@ -96,7 +97,14 @@ def _ffmpeg_encode(
             cmd.extend(["-ss", f"{start_sec:.6f}"])
         cmd.extend(["-to", f"{end_sec:.6f}"])
     cmd.extend(["-i", main_input])
+    loop_set = loop_inputs or set()
     for inp in extra_inputs:
+        if str(inp) in loop_set:
+            # Loop a still image so it keeps producing frames for the whole
+            # encode (framesync filters like alphamerge would otherwise EOF
+            # after the first frame). Sprite PNGs fed to `overlay` do NOT
+            # need this — overlay's eof_action repeats their last frame.
+            cmd.extend(["-loop", "1"])
         cmd.extend(["-i", str(inp)])
     cmd.extend([
         *fc_out, "-map", map_label, "-map", "0:a?", "-shortest",

@@ -1,2 +1,7 @@
+[sandbox]
+# Overlay asset/layout pipeline (keyboard sprites, geometry) lives in the
+# sibling CS2UtilArchive repo and is loaded at runtime via sys.path.
+allow_write = ["D:\\Projects\\CS2UtilArchive"]
+
 [permissions]
 allow = ["Bash=cd /d/Projects/CS2Archive && \"C:\\Users\\jembo\\anaconda3\\envs\\cs2archive\\python.exe\" -c \"\nfrom PIL import Image\nimport os\nfor nick in ['senzu','s1mple','mzinho','jl']:\n    for src in ['hltv','faceit']:\n        d = os.path.join('demos','avatars',nick,src)\n        if not os.path.isdir(d): continue\n        for f in sorted(os.listdir(d)):\n            p = os.path.join(d,f)\n            try:\n                im = Image.open(p).convert('RGBA')\n                a = im.getchannel('A')\n                ext = a.getextrema()\n                alpha_frac = sum(1 for b in a.tobytes() if b>10)/ (im.size[0]*im.size[1])\n                print(f'{nick}/{src}/{f}: {im.size} alpha_extrema={ext} opaque_frac={alpha_frac:.3f}')\n            except Exception as e:\n                print(f'{nick}/{src}/{f}: ERR {e}')\n\""]

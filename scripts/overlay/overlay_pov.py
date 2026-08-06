@@ -97,7 +97,7 @@ from overlay.overlay_encode import (
 # Preferred body = video_height * 2 // 5; shrinks if PIP_MAX_SIMULTANEOUS
 # stacked slots (plus gaps/margins) would not fit the frame height.
 PIP_OUTLINE_THICKNESS = 2       # Pixels. White border around each PiP (0 disables outline).
-PIP_CORNER_RADIUS = 0           # Pixels. Rounded corner radius. 0 = disabled (see note below).
+PIP_CORNER_RADIUS = 16          # Pixels. Rounded corner radius. 0 = square corners.
 PIP_MARGIN = 12                 # Pixels. Outline-to-outline gap from video edge.
 PIP_GAP = 12                    # Pixels. Outline-to-outline gap between stacked PiPs.
 PIP_MAX_SIMULTANEOUS = 3
@@ -116,6 +116,35 @@ def _pip_body(video_height: int) -> int:
     n = max(1, PIP_MAX_SIMULTANEOUS)
     max_fit = (available - (n - 1) * PIP_GAP) // n
     return min(preferred, max(1, max_fit))
+
+
+def _make_rounded_corner_mask(path: Path, size: int, radius: int) -> None:
+    """Write a grayscale rounded-rect mask (white 255 interior, black 0 corners).
+
+    Used with ``alphamerge`` to punch the four outer corners out of a PiP
+    body (including its white outline) so the main video shows through.
+    ffmpeg's ``alphamerge`` maps the SECOND input's luma to the alpha
+    channel, so the mask must be a black-and-white image (0 = transparent,
+    255 = opaque) — an RGBA mask would contribute its white luma everywhere.
+    This is ~O(1) per pixel (channel select), unlike a per-pixel ``geq``
+    which measured +7.96 ms/frame/pip (see scripts/_bench_geq.py) and blows
+    the 60 fps budget with two simultaneous PiPs.
+    """
+    from PIL import Image, ImageDraw
+
+    radius = max(1, min(radius, size // 2))
+    img = Image.new("L", (size, size), 255)
+    d = ImageDraw.Draw(img)
+    r = radius
+    # Erase the four corner squares (the slivers the arcs clip off), then
+    # restore the quarter-circles so the rounded arc itself stays opaque.
+    d.rectangle((0, 0, r, r), fill=0)
+    d.rectangle((size - r, 0, size, r), fill=0)
+    d.rectangle((0, size - r, r, size), fill=0)
+    d.rectangle((size - r, size - r, size, size), fill=0)
+    for cx, cy in ((r, r), (size - r, r), (r, size - r), (size - r, size - r)):
+        d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=255)
+    img.save(path)
 
 
 # Reference size for 1440p (test helpers); render path uses _pip_body(height).
@@ -520,6 +549,7 @@ def _build_pip_chain(
     fps: float,
     start_label: str = "[0:v]",
     pip_input_offset: int = 1,
+    mask_input_idx: int | None = None,
 ) -> tuple[list[str], str, list[PipClip]]:
     """Sort clips, assign stack rows, build PiP filter parts.
 
@@ -530,6 +560,10 @@ def _build_pip_chain(
     ``pip_input_offset`` is the ffmpeg input index for the FIRST flight
     clip. When sprite PNGs occupy inputs 1-18, pass ``1 + len(png_inputs)``
     so clips are referenced as ``[19:v]``, ``[20:v]``, etc.
+
+    ``mask_input_idx`` is the ffmpeg input index of the rounded-corner mask
+    PNG (looped), used by ``alphamerge`` when PIP_CORNER_RADIUS > 0. Pass
+    ``None`` to keep square corners.
     """
     sorted_clips = sorted(flight_clips, key=lambda c: c.start_frame)
     active: list[PipClip] = []
@@ -543,7 +577,10 @@ def _build_pip_chain(
     pip_parts: list[str] = []
     pip_current = start_label
     for idx, clip in enumerate(sorted_clips, start=pip_input_offset):
-        fc_part, tag = _build_pip_overlay(clip, pip_current, idx, width, height, fps)
+        fc_part, tag = _build_pip_overlay(
+            clip, pip_current, idx, width, height, fps,
+            mask_input_idx=mask_input_idx,
+        )
         pip_parts.append(fc_part)
         pip_current = f"[{tag}]"
     return pip_parts, pip_current, sorted_clips
@@ -556,6 +593,7 @@ def _build_pip_overlay(
     width: int,
     height: int,
     fps: float,
+    mask_input_idx: int | None = None,
 ) -> tuple[str, str]:
     """Build filter string + tag for one PiP overlay at bottom-left.
 
@@ -609,38 +647,29 @@ def _build_pip_overlay(
         pre_filters.append(
             f"pad=w={pip_body}:h={pip_body}:x={ol}:y={ol}:color=white"
         )
-    # NOTE: Rounded corners (PIP_CORNER_RADIUS > 0) deliberately disabled.
-    # Benchmark on this machine (scripts/_bench_geq.py, 576x576 RGBA, 300 frames):
-    #   baseline (format=rgba only): 0.50s
-    #   with corner geq:            2.89s  (+7.96 ms/frame/pip, +476% CPU)
-    # At 60 fps the per-frame budget is 16.67 ms; one pip consumes ~48% of it,
-    # two pips blow the budget and the pipeline would need to drop to ~30 fps.
-    # Re-enable only if (a) the project moves overlay compositing to a GPU
-    # path (e.g. vspipe + glsl, or a hardware overlay layer) or (b) the target
-    # framerate is lowered. Filter expression preserved below for that case:
-    #
-    #   R = PIP_CORNER_RADIUS
-    #   half = pip_body // 2
-    #   inner_half = half - R
-    #   pre_filters.append("format=rgba")
-    #   pre_filters.append(
-    #       "geq="
-    #       f"r='p(X,Y)':g='p(X,Y)':b='p(X,Y)':"
-    #       f"a='if(gt(abs(X-{half})-{inner_half},0)*"
-    #       f"gt(abs(Y-{half})-{inner_half},0),"
-    #       f"if(lte(hypot(abs(X-{half})-{inner_half},"
-    #       f"abs(Y-{half})-{inner_half}),{R}),"
-    #       f"255,0),255)'"
-    #   )
+    # Rounded corners: punch out the four outer corners with a static RGBA
+    # mask via alphamerge. This is ~O(1) per pixel (channel select), unlike a
+    # per-pixel `geq` which measured +7.96 ms/frame/pip (see scripts/_bench_geq.py)
+    # and blows the 60 fps budget with two simultaneous PiPs.
+    rounded_tag = scaled_tag
+    if PIP_CORNER_RADIUS > 0 and mask_input_idx is not None:
+        pre_filters.append("format=rgba")
+        rounded_tag = f"pip_rounded_{input_idx}"
     pre_filters.append(f"setpts=PTS-STARTPTS+{start_seconds:.6f}/TB")
     pre_chain = f"[{input_idx}:v]" + ",".join(pre_filters) + f"[{scaled_tag}]"
 
     parts = [
         pre_chain,
-        f"{current_label}[{scaled_tag}]"
+    ]
+    if rounded_tag != scaled_tag:
+        parts.append(
+            f"[{scaled_tag}][{mask_input_idx}:v]alphamerge[{rounded_tag}]"
+        )
+    parts.append(
+        f"{current_label}[{rounded_tag}]"
         f"overlay=x={x}:y={pip_y}:eof_action=pass"
         f"[{tag}]",
-    ]
+    )
     return ";".join(parts), tag
 
 
@@ -874,6 +903,18 @@ def run_overlay(
             keyboard_fc = ""
             keyboard_out_label = "[0:v]"
 
+        # Pre-render a static rounded-corner mask for the PiP body. One mask
+        # is shared by all PiPs in every batch/pass; the looped PNG is fed to
+        # ffmpeg as an extra input and applied via alphamerge in each
+        # _build_pip_overlay when PIP_CORNER_RADIUS > 0.
+        pip_mask_path: Path | None = None
+        if PIP_CORNER_RADIUS > 0:
+            pip_body_size = _pip_body(height)
+            pip_mask_path = work_dir / f"pip_corner_mask_{pip_body_size}.png"
+            if not pip_mask_path.exists():
+                _make_rounded_corner_mask(pip_mask_path, pip_body_size, PIP_CORNER_RADIUS)
+            _log(f"  Rounded PiP corners radius={PIP_CORNER_RADIUS}px mask={pip_mask_path.name}")
+
         # -- Step 3: Render utility throw flight clips ---------------------------
         t3 = time.time()
         _log(f"Rendering utility throw flight clips...")
@@ -986,10 +1027,14 @@ def run_overlay(
                     pip_label = batch_kb_label
                     sorted_batch_pips: list[PipClip] = []
                     if batch_pips:
+                        mask_idx = None
+                        if pip_mask_path is not None:
+                            mask_idx = pip_input_offset + len(batch_pips)
                         pip_parts, pip_label, sorted_batch_pips = _build_pip_chain(
                             batch_pips, width, height, fps,
                             start_label=batch_kb_label,
                             pip_input_offset=pip_input_offset,
+                            mask_input_idx=mask_idx,
                         )
                         pip_fc = ";".join(pip_parts)
 
@@ -1016,11 +1061,15 @@ def run_overlay(
                     fc_script = work_dir / f"batch_{batch_start_rn:03d}_{batch_end_rn:03d}.txt"
                     fc_script.write_text(combined_fc, encoding="utf-8")
                     extra = list(png_inputs) + [c.clip_path for c in sorted_batch_pips]
+                    loops = {str(pip_mask_path)} if pip_mask_path is not None else None
+                    if pip_mask_path is not None:
+                        extra.append(pip_mask_path)
                     _ffmpeg_encode(
                         str(video_path), extra,
                         ["-filter_complex_script", str(fc_script.resolve())],
                         out_label, str(batch_path),
                         segment=(batch_start_sec, batch_end_sec),
+                        loop_inputs=loops,
                     )
 
                 _log(f"  [batch] All batches encoded in {time.time()-t5:.1f}s")
@@ -1055,14 +1104,20 @@ def run_overlay(
             _log(f"  ({time.time()-t4:.1f}s)")
 
             pip_parts, pip_current, sorted_clips = _build_pip_chain(
-                flight_clips, width, height, fps)
+                flight_clips, width, height, fps,
+                mask_input_idx=(1 + len(flight_clips) if pip_mask_path is not None else None))
             pip_fc = ";".join(pip_parts)
             fc_script2 = work_dir / "pip_fc.txt"
             fc_script2.write_text(pip_fc, encoding="utf-8")
             _log(f"Pass 2: PiP composite (1 vid + {len(flight_clips)} flight clips)...")
-            _ffmpeg_encode(str(kb_temp), [c.clip_path for c in sorted_clips],
+            pass2_inputs: list[Path] = [c.clip_path for c in sorted_clips]
+            pass2_loops = {str(pip_mask_path)} if pip_mask_path is not None else None
+            if pip_mask_path is not None:
+                pass2_inputs.append(pip_mask_path)
+            _ffmpeg_encode(str(kb_temp), pass2_inputs,
                            ["-filter_complex_script", str(fc_script2.resolve())],
-                           pip_current, str(output_path))
+                           pip_current, str(output_path),
+                           loop_inputs=pass2_loops)
 
         elif keyboard_fc:
             # Keyboard only
@@ -1078,14 +1133,20 @@ def run_overlay(
         elif flight_clips:
             # PiP only
             pip_parts, pip_current, sorted_clips = _build_pip_chain(
-                flight_clips, width, height, fps)
+                flight_clips, width, height, fps,
+                mask_input_idx=(1 + len(flight_clips) if pip_mask_path is not None else None))
             pip_fc = ";".join(pip_parts)
             fc_script = work_dir / "pip_fc.txt"
             fc_script.write_text(pip_fc, encoding="utf-8")
             _log(f"PiP composite (1 vid + {len(flight_clips)} flight clips)...")
-            _ffmpeg_encode(str(video_path), [c.clip_path for c in sorted_clips],
+            pip_only_inputs: list[Path] = [c.clip_path for c in sorted_clips]
+            pip_only_loops = {str(pip_mask_path)} if pip_mask_path is not None else None
+            if pip_mask_path is not None:
+                pip_only_inputs.append(pip_mask_path)
+            _ffmpeg_encode(str(video_path), pip_only_inputs,
                            ["-filter_complex_script", str(fc_script.resolve())],
-                           pip_current, str(output_path))
+                           pip_current, str(output_path),
+                           loop_inputs=pip_only_loops)
 
         else:
             _log("No overlay to apply.")
