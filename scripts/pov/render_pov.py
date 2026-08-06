@@ -387,11 +387,14 @@ def _write_render_autoexec(cvars: list[str]) -> None:
     # cl_chatfilters 48: hide server/system messages (16 Console + 32 Error),
     # keep player chat. Must match assets/cs2_pov.cfg — the cfg execs this
     # autoexec AFTER setting its own value, so this file wins.
-    # voice_enable 0: mute ALL in-game voice (per-player voice is mixed back
-    # post-render by mix_team_voice.py). Without it the recorded game audio
-    # captures both teams' voice -> echo + non-POV-team comms.
+    # Mute ALL in-game voice. voice_enable alone does NOT reliably silence the
+    # recorded voice during demo playback (CS2 still mixes it into the audio
+    # output), so we also zero the voice volume and disable voip/modulate.
+    # This must produce a clean no-voice audio track; nothing is mixed back.
     lines = ["crosshair 1", "cl_chatfilters 48", "snd_mvp_volume 0",
-             "voice_enable 0"] + cvars
+             "voice_enable 0", "voice_scale 0", "voice_modenable 0",
+             "snd_voipvolume 0", "cl_mute_all_but_friends_and_party 1",
+             "cl_mute_enemy_team 1"] + cvars
     content = "\n".join(lines) + "\n"
     AUTOEXEC_RENDER.write_text(content, encoding="utf-8")
     RENDER_CROSSHAIR_CFG.write_text(content, encoding="utf-8")
