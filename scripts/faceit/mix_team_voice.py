@@ -216,6 +216,8 @@ def main() -> None:
                 continue
             idx = int(t * SAMPLE_RATE)
             seg = pcm[i * FRAME_SAMPLES:(i + 1) * FRAME_SAMPLES]
+            if idx >= len(buf):
+                continue  # voice tick falls beyond the video — skip, don't crash
             if idx + FRAME_SAMPLES > len(buf):
                 seg = seg[:len(buf) - idx]
             buf[idx:idx + len(seg)] += seg

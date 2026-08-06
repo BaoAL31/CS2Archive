@@ -1,0 +1,9 @@
+[package]
+name = "button_extract"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+parser = { path = "../vendor_demoparser/src/parser" }
+ahash = "0.8.3"
+memmap2 = "0.9.4"

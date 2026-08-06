@@ -388,44 +388,45 @@ def _extract_keyboard_states(
     Returns per_signal frame lists (0/1 per frame).
     """
     from demoparser2 import DemoParser
+    from usercmd_extract import corrected_signals
 
     t0 = time.time()
+
+    # Corrected per-tick usercmd input (delta_data decoded correctly via the
+    # vendored Rust parser — demoparser2 0.41.x misaligns usercmd_buttonstate).
+    corrected = corrected_signals(str(demo_path), steam_id)
+    _log(f"  [usercmd] corrected signals for {len(corrected)} ticks")
+
+    # demoparser2 only for jump inference (is_airborne / velocity_Z); the
+    # movement/duck/walk/attack signals come from the corrected usercmd above.
     parser = DemoParser(str(demo_path))
-    ticks_df = parser.parse_ticks(
-        list(REQUIRED_TICK_FIELDS),
+    jump_df = parser.parse_ticks(
+        ["is_airborne", "velocity_Z"],
         players=[int(steam_id)],
     )
-    if ticks_df.empty:
+    if jump_df.empty:
         _log("[ERROR] No tick data from demo")
         sys.exit(1)
+    jump_df = jump_df.sort_values(["tick"])
 
-    # CS2 usercmd button state -> the `buttons` bitmask the decoder expects.
-    if "usercmd_buttonstate_1" in ticks_df.columns:
-        ticks_df = ticks_df.rename(columns={"usercmd_buttonstate_1": "buttons"})
-    if "usercmd_buttonstate_2" in ticks_df.columns and "buttons" in ticks_df.columns:
-        # buttonstate_2 carries extended buttons; merge into buttons for full coverage.
-        _bs2 = ticks_df["usercmd_buttonstate_2"].fillna(0).astype("int64")
-        ticks_df["buttons"] = (
-            ticks_df["buttons"].fillna(0).astype("int64") | _bs2
-        )
-
-    ticks_df = ticks_df.sort_values(["tick"])
-
-    # Build per-tick state lookup
+    # Build per-tick state lookup from corrected input, plus jump inference.
     # apply_jump_inference=False avoids mid-air bhop spam.
     # Inferred jumps: leave-ground crouch burst, or standing leave-ground
     # confirmed by upward vz a tick later (CS2 often omits IN_JUMP).
+    zero = {"w": 0, "a": 0, "s": 0, "d": 0, "jump": 0, "duck": 0,
+            "lmb": 0, "rmb": 0, "walk": 0}
     tick_states: dict[int, dict[str, int]] = {}
     prev_row = None
     jump_burst = JumpBurstState()
-    for _, row in ticks_df.iterrows():
+    for _, row in jump_df.iterrows():
         tick = int(row["tick"])
-        states, _ = overlay_tick_from_row(row, apply_jump_inference=False)
+        states = dict(zero)
+        states.update(corrected.get(tick, {}))
         jump, _ = advance_inferred_jump_burst(
             row,
             prev_row,
             duck_on=states["duck"],
-            bitmask_jump=states["jump"],
+            bitmask_jump=0,  # CS2 doesn't record IN_JUMP in buttonstate; infer only
             state=jump_burst,
         )
         states["jump"] = jump
