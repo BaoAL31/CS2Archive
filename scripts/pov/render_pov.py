@@ -393,10 +393,11 @@ def _write_render_autoexec(cvars: list[str]) -> None:
     # keep player chat. Must match assets/cs2_pov.cfg — the cfg execs this
     # autoexec AFTER setting its own value, so this file wins.
     # Voice stays fully ON during render (CSDM --player-voices keeps
-    # voice_enable on); no cl_mute_* cvars — cl_mute_enemy_team muted ALL
-    # voice in PBDEMS2 demo playback and hid the talking indicators.
+    # voice_enable on); force voice_enable 1 explicitly in case CSDM's
+    # playerVoices flag doesn't land, and don't mute anyone (cl_mute_enemy_team
+    # muted all voice in PBDEMS2 demo playback + hid indicators).
     lines = ["crosshair 1", "cl_chatfilters 48", "snd_mvp_volume 0",
-             "snd_mute_losefocus 0"] + cvars
+             "snd_mute_losefocus 0", "voice_enable 1"] + cvars
     content = "\n".join(lines) + "\n"
     AUTOEXEC_RENDER.write_text(content, encoding="utf-8")
     RENDER_CROSSHAIR_CFG.write_text(content, encoding="utf-8")
