@@ -37,6 +37,9 @@ def main() -> None:
     ap.add_argument("--steam-id", default="")
     ap.add_argument("--elo", type=int, default=None, help="POV player's FACEIT ELO")
     ap.add_argument("--opp-elo", type=int, default=None, help="Average FACEIT ELO of the opposing team")
+    ap.add_argument("--kd", default=None, help="K/D line for the POV player, e.g. '38/9'")
+    ap.add_argument("--background", default=None,
+                    help="Reuse a cached background frame (jpg) instead of rendering a new kill frame")
     ap.add_argument("--variant", choices=["raw", "overlay"], default="raw")
     ap.add_argument("--output", required=True, help="youtube dir to write thumbnail.jpg")
     args = ap.parse_args()
@@ -52,8 +55,13 @@ def main() -> None:
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    bg = extract_background_frame(str(demo), args.steam_id) if args.steam_id else None
-    if bg is None:
+    if args.background:
+        bg = Path(args.background)
+    elif args.steam_id:
+        bg = extract_background_frame(str(demo), args.steam_id)
+    else:
+        bg = None
+    if bg is None or not Path(bg).exists():
         # fallback: solid dark bg
         from PIL import Image
         bg = PROJECT_ROOT / "tmp" / "faceit_bg_fallback.png"
@@ -61,6 +69,7 @@ def main() -> None:
 
     img = generate_faceit(
         bg, player, args.map, args.elo, args.opp_elo,
+        kd=(args.kd or "").replace("/", "-"),
         variant=args.variant, avatar_path=av_path,
     )
     img = img.convert("RGB")
