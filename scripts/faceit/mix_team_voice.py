@@ -68,9 +68,16 @@ def _ogg_page(serial: int, seq: int, granule: int, header_type: int, payload: by
 
 
 def build_ogg(packets: list[bytes]) -> bytes:
-    """Wrap raw opus frames in an Ogg-Opus stream (mono, 48 kHz timing)."""
+    """Wrap raw opus frames in an Ogg-Opus stream.
+
+    CS2 voice packets decode to 480 samples (10 ms) each. The granule only sets
+    ffmpeg's internal timestamps, which the mix ignores (it re-places each frame
+    by its demo tick), so we advance by 480 per packet. The key fix is
+    channels=2: CS2 packets encode stereo (TOC s bit) but the old mono OpusHead
+    made ffmpeg decode them incorrectly (robotic). We downmix to mono later.
+    """
     serial = 0x51CE
-    head = struct.pack("<8sBBHIHB", b"OpusHead", 1, 1, 0, SAMPLE_RATE, 0, 0)
+    head = struct.pack("<8sBBHIHB", b"OpusHead", 1, 2, 0, SAMPLE_RATE, 0, 0)
     vendor = b"cs2archive-mix-team-voice"
     tags = struct.pack("<8sI", b"OpusTags", len(vendor)) + vendor + struct.pack("<I", 0)
     out = _ogg_page(serial, 0, 0, 0x02, head)

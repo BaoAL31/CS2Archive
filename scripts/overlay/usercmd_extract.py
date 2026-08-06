@@ -19,8 +19,8 @@ from pathlib import Path
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 _CLI = _PROJECT_ROOT / "tools" / "button_extract" / "target" / "release" / "button_extract.exe"
 
-# CS2 usercmd buttonstate bits (confirmed by correlating against donk's movement):
-#  W=bit3(8), S=bit4(16), A=bit10(1024), D=bit9(512) [A/D swapped vs standard IN_*],
+# CS2 usercmd values (from the vendored parser's correct delta decode):
+#  forwardmove>0=W, <0=S; leftmove>0=A (strafe left), <0=D (strafe right).
 #  duck=bit2(4), walk=bit16(65536), M1=bit0(1), M2=bit11(2048).
 _BIT_DUCK = 4
 _BIT_WALK = 1 << 16
@@ -59,8 +59,8 @@ def corrected_signals(demo_path, steam_id: str) -> dict[int, dict]:
         out[tick] = {
             "w": 1 if fw > 0.5 else 0,
             "s": 1 if fw < -0.5 else 0,
-            "a": 1 if lf < -0.5 else 0,
-            "d": 1 if lf > 0.5 else 0,
+            "a": 1 if lf > 0.5 else 0,   # leftmove > 0 = strafe LEFT (A)
+            "d": 1 if lf < -0.5 else 0,  # leftmove < 0 = strafe RIGHT (D)
             "duck": 1 if (b1 & _BIT_DUCK) else 0,
             "walk": 1 if (b1 & _BIT_WALK) else 0,
             "lmb": 1 if (b1 & _BIT_M1) else 0,
