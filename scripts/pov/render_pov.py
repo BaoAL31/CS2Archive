@@ -93,6 +93,11 @@ BASE_FLAGS = [
     "--no-show-only-death-notices",
     "--show-assists",
     "--record-audio",
+    # CSDM defaults to --no-player-voices, which pushes `voice_enable 0` during
+    # the render (kills voice + talking indicators). Keep player voice on; the
+    # in-game cfg (cl_mute_enemy_team 1) drops the enemy, so only the POV
+    # team's comms + indicators land in the recorded audio.
+    "--player-voices",
     # NOTE: --concatenate-sequences intentionally omitted. Without it CSDM
     # emits one sequence-{i}-tick-{A}-to-{B}.mp4 per round. We keep those files
     # so concat_rounds.py can read the real per-round tick spans and write
