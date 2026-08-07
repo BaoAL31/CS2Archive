@@ -108,10 +108,13 @@ async def main():
             else:
                 print(f"  [warn] {acc_nick}: faceit {pid} steam {sid} "
                       f"!= account steam {pro_steam.get(acc_nick)}; skipping", flush=True)
-        # per-pro elo + kd
+        # per-pro elo + kd — look up stats by FACEIT id (the in-game nickname in
+        # the stats can differ from the account nickname, e.g. donk -> donk666).
+        pid_to_stats = {p.get("player_id"): p for p in players.values() if p.get("player_id")}
         pro_detail = []
         for nick in sorted(roster):
-            info = players.get(nick, {})
+            pid = pros.get(nick)
+            info = pid_to_stats.get(pid, {}) if pid else {}
             kd = info.get("kd")
             if kd in (None, "?", "-1", "-"):
                 kd = None
