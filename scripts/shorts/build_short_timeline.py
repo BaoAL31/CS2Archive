@@ -4,6 +4,10 @@ Detects two Short types:
   - **4K** : 4+ kills by same attacker in a single round (incl. 5-kill aces).
   - **Clutch** : team wins from 2v4 or worse (1v3, 1v4, 1v5, 2v4, 2v5).
 
+By default only shorts whose POV player is a Recognised Pro
+(``.data/player_accounts.json``) are kept — randos are dropped
+(``--include-all-players`` opts out).
+
 Two input modes:
   1. **Direct demo parse** (default): parses the full demo via demoparser2.
   2. **From Action Timeline** (``--from-action-timeline``): reads an existing
@@ -30,6 +34,7 @@ from _pathsetup import ensure
 ensure()
 
 from shorts import resolve_output_dir  # noqa: E402
+from faceit_names import known_pro_steam_ids  # noqa: E402
 
 _PRE_KILL_TICK_MARGIN = 320  # 5s floor before first kill (at 64 tick)
 _POST_KILL_TICK_MARGIN = 128  # 2s after last kill (at 64 tick)
@@ -131,7 +136,8 @@ def _build_nickname_map(info) -> dict[str, str]:
     return nid
 
 
-def build_short_timeline(demo_path: Path, player: str | None = None) -> dict:
+def build_short_timeline(demo_path: Path, player: str | None = None,
+                         pros_only: bool = True) -> dict:
     """Parse demo via demoparser2 and extract 4K/Clutch Shorts."""
     import demoparser2 as dp
 
@@ -198,6 +204,7 @@ def build_short_timeline(demo_path: Path, player: str | None = None) -> dict:
         bomb_explode=bomb_explode,
         victim_weapon_map=victim_weapon_map,
         winner_by_round=_winner_by_round_from_demo(parser, info, round_start, round_end_winner),
+        pros_only=pros_only,
     )
 
 
@@ -287,13 +294,29 @@ def detect_shorts(
     round_ends: dict[int, int] | None = None,
     round_win_events: dict[int, list[dict]] | None = None,
     victim_weapon_map: dict[tuple[int, str], str] | None = None,
+    pros_only: bool = True,
 ) -> dict:
     """Detect 4K and Clutch Shorts from parsed or synthetic events.
 
     Accepts either pandas DataFrames (from demoparser2) or plain Python
     dicts/lists for easy unit testing without a real demo file.
+
+    ``pros_only=True`` keeps only shorts whose POV player is a Recognised Pro
+    (``.data/player_accounts.json``) and rewrites their ``pov_nick`` to the
+    canonical nickname (e.g. "donk666" -> "donk").
     """
     import pandas as pd
+
+    _pro_sids: dict[str, str] = {}
+    if pros_only:
+        try:
+            _pro_sids = known_pro_steam_ids()
+        except Exception:
+            _pro_sids = {}
+        if not _pro_sids:
+            print("[WARN] pros_only is on but .data/player_accounts.json is empty/missing "
+                  "— no shorts will be kept. Use --include-all-players to override.",
+                  file=sys.stderr)
 
     # --- Team + name lookup from player_info ---
     _tid: dict[str, int] = {}
@@ -593,6 +616,19 @@ def detect_shorts(
                     win_event = we["event"]
                     win_player = psid
 
+            if win_tick is None and round_win_events:
+                # If the bomb exploded and it wasn't the clutch team, the clutch
+                # team LOST (detonation = planting/T side wins). Do not fall back
+                # to round_end_winner — it's misaligned for some demos and would
+                # wrongly mark a losing round as a won clutch.
+                exploded_by_other = any(
+                    we["event"] == "explode"
+                    and we.get("player_sid")
+                    and team_by_sid.get(we["player_sid"]) != team
+                    for we in round_win_events.get(roundn, [])
+                )
+                if exploded_by_other:
+                    continue  # bomb detonated for the other side => not a clutch
             if win_tick is None and winner_by_round and roundn in winner_by_round:
                 if winner_by_round[roundn] != team:
                     continue  # clutch team did NOT win => skip
@@ -632,6 +668,22 @@ def detect_shorts(
                     "kill_ticks": clutch_kill_ticks,
                 })
 
+    # --- Recognised-Pro gate (drop randos) ---
+    # Filter BEFORE the clutch-over-4K dedup so a non-pro clutch can never
+    # suppress a pro 4K (and vice versa).
+    dropped_randos = 0
+    if pros_only and _pro_sids:
+        kept: list[dict] = []
+        for s in shorts:
+            sid = str(s.get("pov_steam_id") or "")
+            canon = _pro_sids.get(sid)
+            if not canon:
+                dropped_randos += 1  # not a catalogued pro -> drop
+                continue
+            s["pov_nick"] = canon  # canonical nickname for slug/title
+            kept.append(s)
+        shorts = kept
+
     # Prioritise clutches over overlapping multikills: when a clutch short's
     # [trigger, win] window overlaps a 4K short, keep the clutch, drop the 4K.
     clutches = [s for s in shorts if s["short_type"] == "clutch"]
@@ -650,6 +702,7 @@ def detect_shorts(
         "demo_path": demo_path,
         "map": header_map or "Unknown",
         "short_count": len(shorts),
+        "_dropped_randos": dropped_randos,
         "shorts": shorts,
     }
 
@@ -694,7 +747,8 @@ def _last_surviving_killer(
     return None
 
 
-def build_short_timeline_from_action(action_timeline_path: Path, demo_path: Path) -> dict:
+def build_short_timeline_from_action(action_timeline_path: Path, demo_path: Path,
+                                     pros_only: bool = True) -> dict:
     """Build a Short Timeline from an existing action_timeline.json.
 
     Reads Recognised Pro-gated kills + bomb events from the Action Timeline,
@@ -778,6 +832,7 @@ def build_short_timeline_from_action(action_timeline_path: Path, demo_path: Path
         round_ends=round_ends,
         round_freeze_ends=round_freeze_ends,
         round_win_events=round_win_events,
+        pros_only=pros_only,
     )
 
 
@@ -808,7 +863,15 @@ def main() -> int:
         help="Build shorts from an existing action_timeline.json (Recognised Pro-gated). "
              "Demo used only for player_info (team assignments).",
     )
+    ap.add_argument(
+        "--include-all-players",
+        action="store_true",
+        help="Keep shorts for any player (default: only Recognised Pros from "
+             ".data/player_accounts.json).",
+    )
     args = ap.parse_args()
+
+    pros_only = not args.include_all_players
 
     demo = args.demo_path
     if not demo.is_file():
@@ -820,13 +883,19 @@ def main() -> int:
         if not at_path.is_file():
             print(f"[ERR] action_timeline.json not found: {at_path}", file=sys.stderr)
             return 1
-        timeline = build_short_timeline_from_action(at_path, demo)
+        timeline = build_short_timeline_from_action(at_path, demo, pros_only=pros_only)
     else:
-        timeline = build_short_timeline(demo, player=args.player)
+        timeline = build_short_timeline(demo, player=args.player, pros_only=pros_only)
+
+    dropped = timeline.get("_dropped_randos", 0)
+    # _dropped_randos is run-reporting only — keep it out of the persisted
+    # short_timeline.json schema.
+    timeline = {k: v for k, v in timeline.items() if k != "_dropped_randos"}
 
     shorts_list = timeline.get("shorts", [])
     if not shorts_list:
-        print("[OK] 0 shorts detected (no output written)")
+        suffix = f" ({dropped} non-pro short(s) filtered)" if dropped else ""
+        print(f"[OK] 0 shorts detected{suffix} (no output written)")
         return 0
 
     if args.from_action_timeline:
@@ -844,7 +913,8 @@ def main() -> int:
         out.write_text(json.dumps(single_tl, indent=2), encoding="utf-8")
         written += 1
 
-    print(f"[OK] {len(shorts_list)} shorts -> {written} files under {base_dir}")
+    print(f"[OK] {len(shorts_list)} shorts -> {written} files under {base_dir}"
+          + (f" ({dropped} non-pro short(s) filtered)" if dropped else ""))
     return 0
 
 
