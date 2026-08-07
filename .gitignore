@@ -86,3 +86,6 @@ token_youtube_readonly.json
 
 # Rust build output (button_extract)
 tools/**/target/
+
+# reasonix local state
+.reasonix/
