@@ -239,12 +239,16 @@ class FACEITDownloadsClient:
     def __init__(self):
         self._client: Optional[httpx.AsyncClient] = None
 
+    def _token(self) -> str:
+        # The Downloads API scope is now granted on the same Data API key.
+        return settings.faceit_downloads_token or settings.faceit_api_key
+
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
                 base_url=settings.faceit_downloads_api_base,
                 headers={
-                    "Authorization": f"Bearer {settings.faceit_downloads_token}",
+                    "Authorization": f"Bearer {self._token()}",
                     "Content-Type": "application/json",
                     "Accept": "application/json",
                 },
@@ -262,8 +266,8 @@ class FACEITDownloadsClient:
 
         Returns None on auth failure (400 invalid_token) or server error (500).
         """
-        if not settings.has_faceit_downloads_token:
-            console.print("[yellow]   [WARN] FACEIT_DOWNLOADS_TOKEN not set; use browser scrape.[/yellow]")
+        if not (settings.faceit_downloads_token or settings.faceit_api_key):
+            console.print("[yellow]   [WARN] no FACEIT token set; use browser scrape.[/yellow]")
             return None
         try:
             client = self._get_client()
@@ -587,7 +591,7 @@ def download_demo(match_id: str) -> DownloadResult:
         )
 
     # ── Primary: token-based Downloads API ──────────────────────────────
-    if settings.has_faceit_downloads_token:
+    if settings.faceit_downloads_token or settings.faceit_api_key:
         console.print("[cyan]   [API] Trying FACEIT Downloads API...[/cyan]")
         saved = download_demo_api(match_id)
         if saved:
