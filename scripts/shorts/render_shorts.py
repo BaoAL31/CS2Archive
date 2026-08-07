@@ -594,6 +594,25 @@ def _composite_9x16(
     _dbg("composite", f"OK ({mb:.1f} MB)")
 
 
+def _short_output_path(out_dir: Path, short: dict, name: str | None = None) -> Path:
+    """Compute the final 9:16 output path for a short (or ``name`` override)."""
+    if name:
+        base = name
+    else:
+        st = short["short_type"]
+        nick = short.get("pov_nick", "unknown")
+        tick = short.get("start_tick", 0)
+        if st == "4k":
+            kills = len(short.get("kill_ticks", []))
+            base = f"{kills}k_multikill-{nick}-t{tick}"
+        elif st == "clutch":
+            cnt = short.get("clutch_initial_count", "XvX")
+            base = f"{cnt}_clutch-{nick}-t{tick}"
+        else:
+            base = f"{st}-{nick}-t{tick}"
+    return out_dir / f"{base}.mp4"
+
+
 def render_shorts(
     timeline_path: Path,
     player: str | None = None,
@@ -657,6 +676,26 @@ def render_shorts(
 
     print(f"  Batches: {len(batches)} (batch size: {batch_size if batch_size > 0 else 'all'})")
 
+    # Early resume: if every short's final output already exists at the target
+    # resolution, skip the whole pipeline (CSDM render + composite). The per-short
+    # composite skip below alone is pointless — it fires AFTER the expensive
+    # CSDM segment render.
+    if not composite_only:
+        all_done = True
+        for short in shorts:
+            dst = _short_output_path(out_dir, short, name)
+            if not (dst.exists() and dst.stat().st_size >= 1_048_576):
+                all_done = False
+                break
+            w, h = _probe_resolution(dst)
+            if not (w == OUT_WIDTH and h == OUT_HEIGHT):
+                all_done = False
+                break
+        if all_done:
+            print(f"  [SKIP] all {len(shorts)} short(s) already rendered at "
+                  f"{OUT_WIDTH}x{OUT_HEIGHT} — nothing to do")
+            return out_dir
+
     if not composite_only:
         # Fresh render: clear stale segments, then run CSDM for each batch
         if segments_dir.exists():
@@ -697,22 +736,8 @@ def render_shorts(
             raise RuntimeError(f"No rendered sequence files found in {segments_dir}")
 
     for i, (seg_file, short) in enumerate(zip(seq_files, shorts)):
-        if name:
-            base = name
-        else:
-            st = short["short_type"]
-            nick = short.get("pov_nick", "unknown")
-            tick = short.get("start_tick", 0)
-            if st == "4k":
-                kills = len(short.get("kill_ticks", []))
-                base = f"{kills}k_multikill-{nick}-t{tick}"
-            elif st == "clutch":
-                cnt = short.get("clutch_initial_count", "XvX")
-                base = f"{cnt}_clutch-{nick}-t{tick}"
-            else:
-                base = f"{st}-{nick}-t{tick}"
-        out_name = f"{base}.mp4"
-        dst = out_dir / out_name
+        dst = _short_output_path(out_dir, short, name)
+        out_name = dst.name
         if dst.exists() and dst.stat().st_size >= 1_048_576:
             w, h = _probe_resolution(dst)
             if w == OUT_WIDTH and h == OUT_HEIGHT:
