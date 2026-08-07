@@ -138,14 +138,18 @@ def _map_from_demo(demo_path: Path) -> str:
 def build_title(player: str, map_name: str, notable: list[str],
                 elo: int | None = None, opp_elo: int | None = None,
                 kd: str | None = None) -> str:
-    """Title: "{player} ({kd}) {elo} ELO vs {opp_elo} ELO | {map} | FACEIT CS2 POV".
+    """Title: "{player} ({kd}) {elo} ELO vs ~{opp_elo} ELOs | {map} | FACEIT CS2 POV".
 
     ``kd`` is a "kills/deaths" string (e.g. "34/11"), rendered hyphenated
-    "(34-11)" to match the thumbnail style.
+    "(34-11)" to match the thumbnail style. The opponent ELO is a team
+    average, signalled by "~" + plural "ELOs".
     """
     kd_part = f"({kd.replace('/', '-')}) " if kd else ""
     if elo is not None and opp_elo is not None:
-        return f"{player} {kd_part}{elo} ELO vs {opp_elo} ELO | {map_name} | FACEIT CS2 POV"[:100]
+        # Opponent ELO is an average of the opposing team, so prefix with "~"
+        # and pluralise "ELOs" to signal it's a team average, not one player's
+        # exact ELO. E.g. "3631 ELO vs ~3566 ELOs".
+        return f"{player} {kd_part}{elo} ELO vs ~{opp_elo} ELOs | {map_name} | FACEIT CS2 POV"[:100]
     return f"{player} {kd_part}| {map_name} | FACEIT CS2 POV"[:100]
 
 
