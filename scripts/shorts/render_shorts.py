@@ -224,6 +224,7 @@ def _build_csdm_config(
     output_dir: Path,
     src_width: int = _DEFAULT_SRC_WIDTH,
     src_height: int = _DEFAULT_SRC_HEIGHT,
+    rename: bool = True,
 ) -> dict:
     pov_sids = {s["pov_steam_id"] for s in shorts}
     crosshair_cache = {}
@@ -255,6 +256,18 @@ def _build_csdm_config(
             "cl_showfps 0",
             "net_graph 0",
         ] + cvars
+
+        # Automatically rename the POV player's in-HUD name to their canonical
+        # nickname (HLAE mirv_replace_name, 2.184+). The demo records the
+        # FACEIT account name (e.g. "CEMEN_BAKIN"); pov_nick is the canonical
+        # nickname from player_accounts.json (e.g. "kyousuke"). byXuid is stable
+        # per-player across demos. Only covers "some parts of the HUD" — chat is
+        # not replaced.
+        if rename:
+            nick = (s.get("pov_nick") or "").strip()
+            if nick and nick.lower() != "unknown":
+                cfg_lines.append(f'mirv_replace_name byXuid add x{pov_sid} "{nick}"')
+
         cfg_text = "\n".join(cfg_lines) + "\n"
 
         seq = {
@@ -625,6 +638,7 @@ def render_shorts(
     avatar_height: int = AVATAR_DEFAULT_HEIGHT,
     avatar_bottom_margin: int = AVATAR_BOTTOM_MARGIN,
     avatar_outline_width: int = AVATAR_OUTLINE_WIDTH,
+    rename: bool = True,
 ) -> Path:
     """Render all shorts from a timeline JSON.
     
@@ -708,7 +722,7 @@ def render_shorts(
             batch_end = batch_start + len(batch) - 1
             _dbg("batch", f"batch {batch_idx + 1}/{len(batches)}: shorts {batch_start + 1}-{batch_end + 1}")
 
-            config = _build_csdm_config(batch, demo_path, segments_dir, src_w, src_h)
+            config = _build_csdm_config(batch, demo_path, segments_dir, src_w, src_h, rename)
             conf_path = out_dir / f"batch_{batch_idx + 1}_config.json"
             conf_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
@@ -798,6 +812,9 @@ def main() -> int:
                    help=f"Clearance from the bottom edge in px (default: {AVATAR_BOTTOM_MARGIN})")
     ap.add_argument("--avatar-outline-width", type=int, default=AVATAR_OUTLINE_WIDTH,
                    help=f"White outline width around the avatar in px (default: {AVATAR_OUTLINE_WIDTH}; 0 = none)")
+    ap.add_argument("--no-rename", action="store_true",
+                   help="Disable automatic HUD player-name rename to canonical nickname "
+                        "(mirv_replace_name). Default: on.")
     args = ap.parse_args()
 
     try:
@@ -806,7 +823,8 @@ def main() -> int:
                        name=args.name, avatar=not args.no_avatar,
                        avatar_height=args.avatar_height,
                        avatar_bottom_margin=args.avatar_bottom_margin,
-                       avatar_outline_width=args.avatar_outline_width)
+                       avatar_outline_width=args.avatar_outline_width,
+                       rename=not args.no_rename)
         return 0
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)
