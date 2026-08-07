@@ -405,6 +405,27 @@ DOWNLOAD_START_TIMEOUT = 10  # seconds to wait for the download to begin
 DOWNLOAD_MAX_RETRIES = 3     # restart attempts if the download doesn't start
 
 
+def _find_demo_button(page, txt: str):
+    """Locate the FACEIT 'Watch Demo' button via several selector strategies.
+    Returns a locator or None if not found."""
+    strategies = [
+        lambda: page.get_by_text(txt, exact=False),
+        lambda: page.locator(f"a:has-text('{txt}')"),
+        lambda: page.get_by_role("link", name=txt),
+        lambda: page.get_by_role("button", name=txt),
+        lambda: page.locator(f"a[href*='{txt}']"),
+        lambda: page.locator("a[href*='demo'], a[href*='download']"),
+    ]
+    for strat in strategies:
+        try:
+            loc = strat()
+            if loc.count() > 0:
+                return loc
+        except Exception:
+            continue
+    return None
+
+
 def _click_demo_and_save(page, out_dir: Path, room_url: Optional[str] = None) -> Optional[Path]:
     """Click the demo download button and capture the browser download.
 
@@ -458,8 +479,8 @@ def _click_demo_and_save(page, out_dir: Path, room_url: Optional[str] = None) ->
             try:
                 if attempt > 1 and not _reload():
                     return None
-                loc = page.get_by_text(txt, exact=False)
-                if loc.count() == 0:
+                loc = _find_demo_button(page, txt)
+                if loc is None:
                     break  # try next button text
 
                 console.print(f"[cyan]   [DL] Clicking '{txt}' (attempt {attempt})...[/cyan]")
@@ -470,7 +491,46 @@ def _click_demo_and_save(page, out_dir: Path, room_url: Optional[str] = None) ->
                     page.wait_for_timeout(600)
                 except Exception:
                     pass
-                loc.first.click(timeout=15_000)
+                # FACEIT's Watch Demo opens a popup that triggers the download.
+                # A Playwright element .click() doesn't always open it (and just
+                # navigates/loads), so we dispatch a REAL mouse gesture at the
+                # button center and catch the popup, then let the download fire.
+                popup = None
+                try:
+                    bbox = loc.first.bounding_box()
+                except Exception:
+                    bbox = None
+                if bbox:
+                    try:
+                        with page.context.expect_page(timeout=8000) as pinfo:
+                            page.mouse.click(
+                                bbox["x"] + bbox["width"] / 2,
+                                bbox["y"] + bbox["height"] / 2,
+                            )
+                        popup = pinfo.value
+                    except Exception:
+                        popup = None
+                if popup is None:
+                    try:
+                        loc.first.click(timeout=15_000)
+                    except Exception:
+                        pass
+                if popup is not None:
+                    console.print("[cyan]   [DL] Popup opened — waiting for download...[/cyan]")
+                    try:
+                        try:
+                            cdp2 = popup.context.new_cdp_session(popup)
+                            cdp2.send(
+                                "Browser.setDownloadBehavior",
+                                {"behavior": "allow",
+                                 "downloadPath": str(out_dir.resolve()),
+                                 "eventsEnabled": True},
+                            )
+                        except Exception:
+                            pass
+                        popup.wait_for_timeout(5000)
+                    except Exception:
+                        pass
 
                 # Watchdog: download must START within DOWNLOAD_START_TIMEOUT.
                 start = time.monotonic()
@@ -490,6 +550,11 @@ def _click_demo_and_save(page, out_dir: Path, room_url: Optional[str] = None) ->
                 while time.monotonic() < deadline:
                     dest = _download_started()
                     if dest is not None and dest.suffix != ".crdownload" and dest.stat().st_size > 0:
+                        if "popup" in dir() and popup is not None:
+                            try:
+                                popup.close()
+                            except Exception:
+                                pass
                         return dest
                     time.sleep(3)
                 console.print("[yellow]   [WARN] Download started but never completed.[/yellow]")

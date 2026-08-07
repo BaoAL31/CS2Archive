@@ -137,7 +137,7 @@ def _parse_backlog(path: str) -> dict:
     missing = [f for f in REQUIRED_META_FIELDS if not meta.get(f)]
     # FACEIT matches have no HLTV url/ratings — those fields are optional there.
     if meta.get("is_faceit") or str(meta.get("demo_path", "")).replace("\\", "/").count("demos/faceit"):
-        missing = [f for f in missing if f not in ("hltv_url", "ratings_path")]
+        missing = [f for f in missing if f not in ("hltv_url", "ratings_path", "tournament")]
     if missing:
         fail(0, "BACKLOG_MISSING_FIELDS",
              f"Backlog missing required fields: {', '.join(missing)}")
@@ -664,6 +664,30 @@ class Pipeline:
             if not jf:
                 return None
             return json.loads(jf[0].read_text(encoding="utf-8"))
+
+    def _pov_crosshair_code(self) -> str:
+        """POV player's crosshair share code from the persisted csdm analysis.
+
+        Reads only the step-1 sidecar (``render_dir/csdm_analysis.json``) —
+        never re-runs csdm, so this stays cheap inside the title step. Returns
+        "" when unavailable.
+        """
+        saved = (self.state.get("data") or {}).get("analysis_json")
+        analysis_path = Path(saved) if saved else None
+        if analysis_path is None or not analysis_path.is_file():
+            cand = self.render_dir / "csdm_analysis.json"
+            if cand.is_file():
+                analysis_path = cand
+        if analysis_path is None or not analysis_path.is_file():
+            return ""
+        try:
+            data = json.loads(analysis_path.read_text(encoding="utf-8"))
+        except Exception:
+            return ""
+        for pl in data.get("players", []):
+            if str(pl.get("steamId") or "") == self.steam_id:
+                return str(pl.get("crosshairShareCode") or "").strip()
+        return ""
 
     @staticmethod
     def _probe_duration(path: Path) -> float:
@@ -1217,6 +1241,10 @@ class Pipeline:
             opp_elo = self.meta.get("opp_avg_elo")
             if elo is not None and opp_elo is not None:
                 cmd += ["--elo", str(elo), "--opp-elo", str(opp_elo)]
+            kills = self.meta.get("kills")
+            deaths = self.meta.get("deaths")
+            if kills is not None and deaths is not None:
+                cmd += ["--kd", f"{kills}/{deaths}"]
             cmd += ["--output", str(youtube_dir)]
             r = self._run_py(cmd, timeout=300)
             if r.returncode != 0:
@@ -1337,6 +1365,30 @@ class Pipeline:
             opp_elo = self.meta.get("opp_avg_elo")
             if elo is not None and opp_elo is not None:
                 titlize_args += ["--elo", str(elo), "--opp-elo", str(opp_elo)]
+            mid = self.meta.get("faceit_match_id")
+            if mid:
+                titlize_args += ["--match-id", str(mid)]
+            kills = self.meta.get("kills")
+            deaths = self.meta.get("deaths")
+            if kills is not None and deaths is not None:
+                titlize_args += ["--kd", f"{kills}/{deaths}"]
+            code = self._pov_crosshair_code()
+            if code:
+                titlize_args += ["--crosshair-code", code]
+            for flag, key in (
+                ("--viewmodel-fov", "viewmodel_fov"),
+                ("--viewmodel-offset-x", "viewmodel_offset_x"),
+                ("--viewmodel-offset-y", "viewmodel_offset_y"),
+                ("--viewmodel-offset-z", "viewmodel_offset_z"),
+                ("--viewmodel-presetpos", "viewmodel_presetpos"),
+                ("--resolution", "resolution"),
+                ("--aspect-ratio", "aspect_ratio"),
+                ("--scaling-mode", "scaling_mode"),
+                ("--video-settings-source", "video_settings_source"),
+            ):
+                val = self.meta.get(key)
+                if val is not None and val != "":
+                    titlize_args += [flag, str(val)]
         if self.tournament and not self.is_faceit:
             titlize_args += ["--tournament", self.tournament]
 

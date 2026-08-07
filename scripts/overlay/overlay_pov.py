@@ -924,7 +924,14 @@ def run_overlay(
             pip_inner_mask = work_dir / f"pip_mask_inner_{inner_size}.png"
             pip_outer_mask = work_dir / f"pip_mask_outer_{body_size}.png"
             if not pip_outer_mask.exists():
-                _make_rounded_corner_mask(pip_outer_mask, body_size, PIP_CORNER_RADIUS)
+                # The outline pads the (already-rounded) content by
+                # PIP_OUTLINE_THICKNESS, so its outer boundary has corner radius
+                # PIP_CORNER_RADIUS + PIP_OUTLINE_THICKNESS (concentric). Using
+                # just PIP_CORNER_RADIUS here cuts the outline's corners off.
+                _make_rounded_corner_mask(
+                    pip_outer_mask, body_size,
+                    PIP_CORNER_RADIUS + PIP_OUTLINE_THICKNESS,
+                )
             if not pip_inner_mask.exists():
                 _make_rounded_corner_mask(pip_inner_mask, inner_size, PIP_CORNER_RADIUS)
             _log(f"  Rounded PiP corners radius={PIP_CORNER_RADIUS}px (content + outline)")
