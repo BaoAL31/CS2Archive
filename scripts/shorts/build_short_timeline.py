@@ -41,6 +41,28 @@ _POST_KILL_TICK_MARGIN = 128  # 2s after last kill (at 64 tick)
 _SHORT_TICK_DURATION = 1920  # 30s target total short length (30 * 64 tick)
 _CLUTCH_MIN_DURATION_TICKS = 640  # 10s of playing at a disadvantage for a clutch
 
+
+def _as_event_df(result):
+    """Normalize a demoparser2 parse_event result to a pandas DataFrame.
+
+    Some demoparser2 versions return a plain empty ``list`` for events with no
+    rows (e.g. ``bomb_defused`` when nobody defused), but downstream code
+    (``detect_shorts``) calls DataFrame APIs (``.empty``, ``sort_values``,
+    ``iterrows``, ``["tick"]``). Coerce any non-DataFrame result to an empty
+    DataFrame so the pipeline is robust to empty events.
+    """
+    import pandas as pd
+
+    if isinstance(result, pd.DataFrame):
+        return result
+    if result is None:
+        return pd.DataFrame(columns=["tick"])
+    try:
+        return pd.DataFrame(list(result), columns=["tick"])
+    except Exception:
+        return pd.DataFrame(columns=["tick"])
+
+
 # Weapon tiers for multikill filtering: at least two victims must hold a
 # weapon of tier >= attacker's primary tier (filters anti-eco farm multikills).
 # Handles both player_death short names (e.g. "m4a1") and display names (e.g. "M4A4").
@@ -143,15 +165,15 @@ def build_short_timeline(demo_path: Path, player: str | None = None,
 
     parser = dp.DemoParser(str(demo_path))
 
-    deaths = parser.parse_event("player_death")
-    round_start = parser.parse_event("round_start")
-    freeze_end = parser.parse_event("round_freeze_end")
-    round_end = parser.parse_event("round_officially_ended")
-    round_end_winner = parser.parse_event("round_end")
+    deaths = _as_event_df(parser.parse_event("player_death"))
+    round_start = _as_event_df(parser.parse_event("round_start"))
+    freeze_end = _as_event_df(parser.parse_event("round_freeze_end"))
+    round_end = _as_event_df(parser.parse_event("round_officially_ended"))
+    round_end_winner = _as_event_df(parser.parse_event("round_end"))
     info = parser.parse_player_info()
-    bomb_plant = parser.parse_event("bomb_planted")
-    bomb_defuse = parser.parse_event("bomb_defused")
-    bomb_explode = parser.parse_event("bomb_exploded")
+    bomb_plant = _as_event_df(parser.parse_event("bomb_planted"))
+    bomb_defuse = _as_event_df(parser.parse_event("bomb_defused"))
+    bomb_explode = _as_event_df(parser.parse_event("bomb_exploded"))
 
     try:
         header = parser.parse_header()
