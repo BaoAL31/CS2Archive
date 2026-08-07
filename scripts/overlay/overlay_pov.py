@@ -647,25 +647,35 @@ def _build_pip_overlay(
     parts.append(f"[{input_idx}:v]" + ",".join(pre) + f"[{scaled_tag}]")
 
     content_tag = scaled_tag
-    # 2) Round the CONTENT corners first.
-    if PIP_CORNER_RADIUS > 0 and inner_mask_idx is not None:
-        content_tag = f"pip_rnd_{input_idx}"
-        parts.append(f"[{scaled_tag}][{inner_mask_idx}:v]alphamerge[{content_tag}]")
-
-    # 3) Draw the white outline around the (rounded) content.
-    if ol > 0:
-        padded_tag = f"pip_pad_{input_idx}"
-        parts.append(
-            f"[{content_tag}]pad=w={pip_body}:h={pip_body}:x={ol}:y={ol}:color=white@1"
-            f"[{padded_tag}]"
-        )
-        content_tag = padded_tag
-
-    # 4) Round the outline's outer corners.
-    if PIP_CORNER_RADIUS > 0 and outer_mask_idx is not None:
-        outer_tag = f"pip_outer_{input_idx}"
-        parts.append(f"[{content_tag}][{outer_mask_idx}:v]alphamerge[{outer_tag}]")
-        content_tag = outer_tag
+    # 2) Round the CONTENT corners first (inner mask, radius R).
+    if PIP_CORNER_RADIUS > 0 and inner_mask_idx is not None and outer_mask_idx is not None and ol > 0:
+        rnd = f"pip_rnd_{input_idx}"
+        parts.append(f"[{scaled_tag}][{inner_mask_idx}:v]alphamerge[{rnd}]")
+        # Fork the rounded content: one copy becomes the white rounded-rect
+        # background, the other is the content overlaid on top. (Reusing the
+        # same label in both lutrgb and overlay makes ffmpeg's overlay drop the
+        # rounded alpha, so we must `split` explicitly.)
+        r_ol = f"pip_rol_{input_idx}"
+        r_w = f"pip_rw_{input_idx}"
+        parts.append(f"[{rnd}]split[{r_ol}][{r_w}]")
+        wc = f"pip_wc_{input_idx}"
+        parts.append(f"[{r_w}]lutrgb=r=255:g=255:b=255[{wc}]")
+        wp = f"pip_wp_{input_idx}"
+        parts.append(f"[{wc}]pad=w={pip_body}:h={pip_body}:x={ol}:y={ol}:color=white@1[{wp}]")
+        wr = f"pip_wr_{input_idx}"
+        parts.append(f"[{wp}][{outer_mask_idx}:v]alphamerge[{wr}]")
+        comp = f"pip_comp_{input_idx}"
+        parts.append(f"[{wr}][{r_ol}]overlay=x={ol}:y={ol}:eof_action=pass[{comp}]")
+        content_tag = comp
+    else:
+        # Fallback (no rounding): simple rectangular pad outline.
+        if ol > 0:
+            padded_tag = f"pip_pad_{input_idx}"
+            parts.append(
+                f"[{content_tag}]pad=w={pip_body}:h={pip_body}:x={ol}:y={ol}:color=white@1"
+                f"[{padded_tag}]"
+            )
+            content_tag = padded_tag
 
     # 5) Delay PTS so the clip's first frame lands on clip.start_frame.
     final_tag = f"pip_final_{input_idx}"
