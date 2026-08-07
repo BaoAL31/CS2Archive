@@ -67,6 +67,22 @@ async def main():
         elo_cache[nick] = val
         return val
 
+    steam_cache = {}
+
+    async def steam_for_faceit(pid):
+        """Steam id for a FACEIT player id, cached. None on failure."""
+        if pid in steam_cache:
+            return steam_cache[pid]
+        val = None
+        for a in range(3):
+            try:
+                val = await fc.get_player_steam_id(pid)
+                break
+            except Exception:
+                await asyncio.sleep(1.2 * (a + 1))
+        steam_cache[pid] = val
+        return val
+
     results = []
     ordered = sorted(candidates, key=lambda m: match_meta[m][0].timestamp(), reverse=True)
     for mid in ordered:
@@ -83,8 +99,15 @@ async def main():
         players = st.get("players", {})
         for nick, p in players.items():
             pid = p.get("player_id")
-            if pid and pid in pro_id_to_nick:
-                roster.add(pro_id_to_nick[pid])
+            if not (pid and pid in pro_id_to_nick):
+                continue
+            acc_nick = pro_id_to_nick[pid]
+            sid = await steam_for_faceit(pid)
+            if sid is not None and str(sid) == str(pro_steam.get(acc_nick)):
+                roster.add(acc_nick)
+            else:
+                print(f"  [warn] {acc_nick}: faceit {pid} steam {sid} "
+                      f"!= account steam {pro_steam.get(acc_nick)}; skipping", flush=True)
         # per-pro elo + kd
         pro_detail = []
         for nick in sorted(roster):
