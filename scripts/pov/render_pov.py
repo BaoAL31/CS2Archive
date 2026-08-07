@@ -388,7 +388,7 @@ def _is_pbdems2(demo_path) -> bool:
         return False
 
 
-def _write_render_autoexec(cvars: list[str]) -> None:
+def _write_render_autoexec(cvars: list[str], rename_map: dict[str, str] | None = None) -> None:
     # cl_chatfilters 48: hide server/system messages (16 Console + 32 Error),
     # keep player chat. Must match assets/cs2_pov.cfg — the cfg execs this
     # autoexec AFTER setting its own value, so this file wins.
@@ -402,6 +402,15 @@ def _write_render_autoexec(cvars: list[str]) -> None:
              "tv_listen_voice_indices -1",
              "tv_listen_voice_indices_h -1",
              "tv_relaytextchat 2"] + cvars
+
+    # HLAE name override (mirv_replace_name, HLAE 2.184+). This cfg is exec'd
+    # in the CS2 console under HLAE, so mirv_* commands are available. byXuid
+    # is stable per-player across demos (unlike byUserId, which differs each
+    # demo). Only covers "some parts of the HUD" — chat is not replaced.
+    for steamid, name in (rename_map or {}).items():
+        xuid = f"x{steamid}" if not str(steamid).startswith("x") else str(steamid)
+        lines.append(f'mirv_replace_name byXuid add {xuid} "{name}"')
+
     content = "\n".join(lines) + "\n"
     AUTOEXEC_RENDER.write_text(content, encoding="utf-8")
     RENDER_CROSSHAIR_CFG.write_text(content, encoding="utf-8")
@@ -551,6 +560,13 @@ def main() -> None:
                         help="Apply input overlay + util cam trajectory after render.")
     parser.add_argument("--player", default="",
                         help="Player nickname for prosettings viewmodel lookup.")
+    parser.add_argument("--rename", default="",
+                        help="Overwrite player names in the rendered HUD via HLAE mirv_replace_name. "
+                             "Pass a JSON object mapping SteamID64 -> display name, e.g. "
+                             "'{\"76561198012345678\":\"kyousuke\"}'. Injects "
+                             "'mirv_replace_name byXuid add x<steamid> \"name\"' into the render cfg. "
+                             "Applies to the in-game scoreboard/killfeed/observer HUD; chat is NOT "
+                             "replaced (use tv_nochat true if you must hide chat).")
     parser.add_argument("--viewmodel-fov", type=float, default=None)
     parser.add_argument("--viewmodel-offset-x", type=float, default=None)
     parser.add_argument("--viewmodel-offset-y", type=float, default=None)
@@ -627,13 +643,30 @@ def main() -> None:
     if vm_cvars:
         print(f"  Viewmodel: {' | '.join(vm_cvars)}")
         cvars = list(cvars) + vm_cvars
-    if cvars:
-        print(f"  Player crosshair/viewmodel ({len(cvars)} cvars)")
-        _write_render_autoexec(cvars)
+
+    # Parse --rename JSON map (SteamID64 -> display name) for mirv_replace_name.
+    rename_map: dict[str, str] = {}
+    if args.rename:
+        try:
+            rename_map = json.loads(args.rename)
+        except json.JSONDecodeError:
+            sys.exit(f"[ERROR] --rename must be a JSON object of SteamID64 -> name, got: {args.rename!r}")
+        if not isinstance(rename_map, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in rename_map.items()
+        ):
+            sys.exit(f"[ERROR] --rename must be a JSON object mapping SteamID64 strings to name strings.")
+        print(f"  Name overrides ({len(rename_map)}): " + ", ".join(
+            f"{sid} -> {name}" for sid, name in rename_map.items()
+        ))
+
+    if cvars or rename_map:
+        print(f"  Player crosshair/viewmodel ({len(cvars)} cvars)"
+              + (f", {len(rename_map)} name override(s)" if rename_map else ""))
+        _write_render_autoexec(cvars, rename_map)
         _swap_autoexec(AUTOEXEC_RENDER)
         print(f"  Swapped {AUTOEXEC_RENDER.name} -> {AUTOEXEC_MAIN.name}")
     else:
-        print("  [WARN] No crosshair/viewmodel — keeping current autoexec.cfg")
+        print("  [WARN] No crosshair/viewmodel and no --rename — keeping current autoexec.cfg")
 
     print(f"Output:  {output_dir}")
     total_rounds = sum(get_round_count(p) for p in parts)
