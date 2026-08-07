@@ -83,7 +83,7 @@ Shorts are co-located with their parent pipeline's render directory:
 The `shorts/` subfolder contains `short_timeline.json` and all rendered `short_NNN.mp4` files.
 _Avoid_: `renders/shorts-{demo_stem}/` (no separate top-level `shorts-` dir)
 
-**Short Timeline Builder**The script `scripts/shorts/build_short_timeline.py` that uses demoparser2 to extract kill events, bomb events, and round lifetime data, then identifies 4K/5K and Clutch moments. Accepts any demo path (not FACEIT-gated like the highlights Action Timeline Builder). Writes `short_timeline.json` to the correct colocated output dir based on demo location.
+**Short Timeline Builder**The script `scripts/shorts/build_short_timeline.py` that uses demoparser2 to extract kill events, bomb events, and round lifetime data, then identifies 4K/5K and Clutch moments. Accepts any demo path (not FACEIT-gated like the highlights Action Timeline Builder). By default keeps **only shorts whose POV player is a Recognised Pro** (`.data/player_accounts.json`); randos are dropped (`--include-all-players` opts out). Surviving shorts get their `pov_nick` rewritten to the canonical nickname. Writes `short_timeline.json` to the correct colocated output dir based on demo location.
 _Avoid_: build_short_timeline.py (different name), extract shorts (this IS the extract)
 
 **Short Renderer**:

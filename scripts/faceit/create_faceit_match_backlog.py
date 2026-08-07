@@ -235,6 +235,8 @@ def main() -> None:
             "team": str(p.get("teamName") or "").strip(),
             "rating": _round2(rating),
             "kd": _round2(p.get("killDeathRatio")),
+            "kills": p.get("killCount"),
+            "deaths": p.get("deathCount"),
         })
     if skipped:
         print(f"  [SKIP] {len(skipped)} non-pro player(s): {', '.join(skipped[:5])}"

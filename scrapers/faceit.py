@@ -405,7 +405,8 @@ def get_match_details(match_id: str) -> MatchInfo:
         pw.stop()
 
 
-DOWNLOAD_START_TIMEOUT = 10  # seconds to wait for the download to begin
+DOWNLOAD_START_TIMEOUT = 120  # seconds to wait for the download to begin
+# (FACEIT's demo server can be slow to start — allow up to 2 min)
 DOWNLOAD_MAX_RETRIES = 3     # restart attempts if the download doesn't start
 
 

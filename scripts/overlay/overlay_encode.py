@@ -108,9 +108,18 @@ def _ffmpeg_encode(
         cmd.extend(["-i", str(inp)])
     cmd.extend([
         *fc_out, "-map", map_label, "-map", "0:a?", "-shortest",
-        # Max quality for YouTube: constant-quality nvenc, no bitrate cap, slowest preset.
-        # CQ 14 (lower = better); p7 = slowest/highest-quality nvenc preset.
-        "-c:v", "h264_nvenc", "-preset", "p7", "-b:v", "0", "-cq", "14",
+        # FINAL EXPORT — uploaded verbatim (YouTube copy + outro append are both
+        # -c copy, so this bitstream is exactly what goes up). Max practical
+        # 1440p quality for overlay content (text/UI/keyboard-cam edges are the
+        # most banding/ringing-prone): CQ 15 with a 60M cap. Well below
+        # YouTube's own re-encode so their lossy pass has clean input, but not
+        # so low that the cap clips on busy motion (a too-low maxrate would just
+        # become capped VBR, silently raising the QP in busy scenes). p7 =
+        # highest-quality nvenc preset. If upload size ever matters more than
+        # edge quality, drop toward CQ 18/35M; if graphics still shimmer, step
+        # to CQ 14/80M.
+        "-c:v", "h264_nvenc", "-preset", "p7", "-b:v", "0", "-cq", "15",
+        "-maxrate", "60M", "-bufsize", "120M",
         "-profile:v", "high", "-pix_fmt", "yuv420p",
         "-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
         "-c:a", "aac", "-b:a", "256k",
@@ -119,7 +128,7 @@ def _ffmpeg_encode(
         "-g", "60", "-keyint_min", "60",
         "-f", "mp4", str(tmp_path),
     ])
-    _log(f"  [ffmpeg] nvenc preset p7 cq 14 (max quality; no libx fallback)")
+    _log(f"  [ffmpeg] nvenc preset p7 cq 15 maxrate 60M (final export -> uploaded verbatim)")
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=21600)  # 6h
     if result.returncode != 0 or not tmp_path.is_file():
         _log(f"[ERROR] nvenc ffmpeg failed: rc={result.returncode}")

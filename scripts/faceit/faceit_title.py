@@ -3,13 +3,23 @@
 No HLTV ratings/avatars — FACEIT demos carry player names + steam IDs in the
 header (via demoparser2). The POV player comes from the backlog (--player /
 --steam-id); any other demo player who is a Recognised Pro
-(``.data/player_accounts.json``) is treated as a "notable name" and appended
-to the title.
+(``.data/player_accounts.json``) is treated as a "notable name" and listed in
+the description ("Also featuring: ...").
 
 Usage:
     python scripts/faceit/faceit_title.py <demo_path> --player <nick> [--map <map>]
                                   [--steam-id <id>] [--elo <int>] [--opp-elo <int>]
+                                  [--kd <float>] [--match-id <id>] [--crosshair-code <code>]
+                                  [--viewmodel-fov <n>] [--viewmodel-offset-{x,y,z} <n>]
+                                  [--viewmodel-presetpos <n>] [--resolution <res>]
+                                  [--aspect-ratio <ar>] [--scaling-mode <mode>]
+                                  [--video-settings-source <source>]
 Prints JSON: {"title": ..., "description": ..., "tags": [...]}
+
+The description carries the POV player's actual settings as rendered: their
+crosshair share code (decoded from the demo via csdm analysis) and their
+viewmodel/resolution from prosettings.net, plus a link to the FACEIT room
+when a match id is available. No render-credit boilerplate.
 
 The individual FACEIT title deliberately omits team names / tournament name /
 stage — a FACEIT pug has none worth showing. When --elo/--opp-elo are present
@@ -34,6 +44,62 @@ MAP_DISPLAY = {
     "de_nuke": "Nuke", "de_anubis": "Anubis", "de_overpass": "Overpass",
     "de_vertigo": "Vertigo", "de_dust2": "Dust2", "de_train": "Train",
 }
+
+# CS2 cl_crosshairstyle display names (share-code style 0-5).
+_CROSSHAIR_STYLES = {
+    0: "Default", 1: "Default", 2: "Classic", 3: "Classic Static",
+    4: "Classic Dynamic", 5: "Classic Dynamic Legacy",
+}
+# Share-code preset colors 0-3; 4+ are custom RGB (see crosshair_code.py).
+_COLOR_NAMES = {0: "green", 1: "red", 2: "blue", 3: "yellow"}
+
+
+def _crosshair_summary(code: str) -> str | None:
+    """Compact one-line crosshair summary from a share code, or None."""
+    try:
+        from crosshair_code import decode_crosshair
+        ch = decode_crosshair(code)
+    except Exception:
+        return None
+    parts = [
+        _CROSSHAIR_STYLES.get(ch["style"], f"style {ch['style']}"),
+        f"size {ch['length']:g}",
+        f"thickness {ch['thickness']:g}",
+        f"gap {ch['gap']:g}",
+    ]
+    if ch.get("centerDotEnabled"):
+        parts.append("dot")
+    if ch.get("outlineEnabled"):
+        parts.append(f"outline {ch['outline']:g}")
+    color = ch.get("color")
+    if color in _COLOR_NAMES:
+        parts.append(_COLOR_NAMES[color])
+    else:
+        parts.append(f"rgb({ch.get('red', 0)},{ch.get('green', 0)},{ch.get('blue', 0)})")
+    return ", ".join(parts)
+
+
+def _viewmodel_line(video: dict) -> str | None:
+    """'FOV 68, offset 2.5/0/-1.5, presetpos 2' from whatever fields exist."""
+    fov = video.get("viewmodel_fov")
+    ox, oy, oz = video.get("viewmodel_offset_x"), video.get("viewmodel_offset_y"), video.get("viewmodel_offset_z")
+    preset = video.get("viewmodel_presetpos")
+    if fov is None and ox is None and oy is None and oz is None and preset is None:
+        return None
+    parts = []
+    if fov is not None:
+        parts.append(f"FOV {fov:g}")
+    if any(v is not None for v in (ox, oy, oz)):
+        if all(v is not None for v in (ox, oy, oz)):
+            parts.append(f"offset {ox:g}/{oy:g}/{oz:g}")
+        else:
+            labels = [f"X {ox:g}" for ox in (ox,) if ox is not None] \
+                   + [f"Y {oy:g}" for oy in (oy,) if oy is not None] \
+                   + [f"Z {oz:g}" for oz in (oz,) if oz is not None]
+            parts.append("offset " + ", ".join(labels))
+    if preset is not None:
+        parts.append(f"presetpos {preset:g}")
+    return ", ".join(parts)
 
 
 def _demo_players(demo_path: Path) -> list[dict]:
@@ -69,27 +135,63 @@ def _map_from_demo(demo_path: Path) -> str:
     return "Unknown"
 
 
-def build_title(player: str, map_name: str, notable: list[str], elo: int | None = None,
-                opp_elo: int | None = None) -> str:
+def build_title(player: str, map_name: str, notable: list[str],
+                elo: int | None = None, opp_elo: int | None = None,
+                kd: str | None = None) -> str:
+    """Title: "{player} ({kd}) {elo} ELO vs {opp_elo} ELO | {map} | FACEIT CS2 POV".
+
+    ``kd`` is a "kills/deaths" string (e.g. "34/11"), rendered hyphenated
+    "(34-11)" to match the thumbnail style.
+    """
+    kd_part = f"({kd.replace('/', '-')}) " if kd else ""
     if elo is not None and opp_elo is not None:
-        return f"{player} {elo} ELO vs {opp_elo} ELO | {map_name} | FACEIT CS2 POV"[:100]
-    return f"{player} | {map_name} | FACEIT CS2 POV"
+        return f"{player} {kd_part}{elo} ELO vs {opp_elo} ELO | {map_name} | FACEIT CS2 POV"[:100]
+    return f"{player} {kd_part}| {map_name} | FACEIT CS2 POV"[:100]
 
 
-def build_description(player: str, map_name: str, notable: list[str], elo: int | None,
-                      opp_elo: int | None, demo_path: Path) -> str:
-    lines = [
-        f"FACEIT CS2 POV — {player} on {map_name}.",
-    ]
+def build_description(player: str, notable: list[str], elo: int | None,
+                      opp_elo: int | None, *,
+                      match_id: str = "", crosshair_code: str = "",
+                      video: dict | None = None) -> str:
+    lines: list[str] = []
     if elo is not None and opp_elo is not None:
-        lines.append(f"Match ELO: {player} {elo} vs {opp_elo} (opponent average).")
+        lines.append(f"Match ELO: {player} {elo} vs {opp_elo} (opponent team average).")
     if notable:
         lines.append(f"Also featuring: {', '.join(notable)}.")
-    lines.append("")
-    lines.append("Demo: " + demo_path.name)
-    lines.append("")
-    lines.append("Rendered with CS2Archive (CS2 Demo Manager + HLAE).")
+    if match_id:
+        if lines:
+            lines.append("")
+        lines.append(f"Match: https://www.faceit.com/en/cs2/room/{match_id}")
+
+    settings: list[str] = []
+    if crosshair_code:
+        summary = _crosshair_summary(crosshair_code)
+        settings.append(f"Crosshair: {crosshair_code}"
+                        + (f" ({summary})" if summary else ""))
+    video = video or {}
+    vm = _viewmodel_line(video)
+    if vm:
+        settings.append(f"Viewmodel: {vm}")
+    if video.get("video_settings_source") == "prosettings" and video.get("resolution"):
+        extra = [e for e in (video.get("aspect_ratio"), video.get("scaling_mode")) if e]
+        settings.append(f"Resolution: {video['resolution']}"
+                        + (f" ({', '.join(extra)})" if extra else ""))
+    if settings:
+        if lines:
+            lines.append("")
+        lines.append("Settings (as rendered):")
+        lines.extend(settings)
     return "\n".join(lines)
+
+
+def _num(value: str) -> int | float | None:
+    """Coerce a CLI string to int/float for display (None when empty)."""
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return float(value) if "." in str(value) else int(value)
+    except ValueError:
+        return None
 
 
 def main() -> None:
@@ -100,6 +202,19 @@ def main() -> None:
     ap.add_argument("--steam-id", default="", help="POV steam ID (optional)")
     ap.add_argument("--elo", type=int, default=None, help="POV player's FACEIT ELO")
     ap.add_argument("--opp-elo", type=int, default=None, help="Average FACEIT ELO of the opposing team")
+    ap.add_argument("--kd", default=None, help="POV player's K/D as kills/deaths, e.g. '34/11' (shown in title)")
+    ap.add_argument("--match-id", default="", help="FACEIT match id → room link in description")
+    ap.add_argument("--crosshair-code", default="", help="POV player's crosshair share code (from csdm analysis)")
+    ap.add_argument("--viewmodel-fov", default="", help="Viewmodel FOV as rendered")
+    ap.add_argument("--viewmodel-offset-x", default="", help="Viewmodel offset X as rendered")
+    ap.add_argument("--viewmodel-offset-y", default="", help="Viewmodel offset Y as rendered")
+    ap.add_argument("--viewmodel-offset-z", default="", help="Viewmodel offset Z as rendered")
+    ap.add_argument("--viewmodel-presetpos", default="", help="Viewmodel presetpos as rendered")
+    ap.add_argument("--resolution", default="", help="Capture resolution (e.g. 1280x960)")
+    ap.add_argument("--aspect-ratio", default="", help="Aspect ratio (e.g. 4:3)")
+    ap.add_argument("--scaling-mode", default="", help="Scaling mode (e.g. Stretched)")
+    ap.add_argument("--video-settings-source", default="",
+                    help="Source of video settings ('prosettings' gates the resolution line)")
     args = ap.parse_args()
 
     demo = Path(args.demo_path)
@@ -126,8 +241,27 @@ def main() -> None:
         if nick.lower() in pro_set:
             notable.append(canonical_nick(nick))
 
-    title = build_title(player, map_name, notable, args.elo, args.opp_elo)
-    description = build_description(player, map_name, notable, args.elo, args.opp_elo, demo)
+    video = {}
+    for key in ("viewmodel_fov", "viewmodel_offset_x", "viewmodel_offset_y",
+                "viewmodel_offset_z", "viewmodel_presetpos"):
+        val = _num(getattr(args, key))
+        if val is not None:
+            video[key] = val
+    if args.resolution:
+        video["resolution"] = args.resolution
+    if args.aspect_ratio:
+        video["aspect_ratio"] = args.aspect_ratio
+    if args.scaling_mode:
+        video["scaling_mode"] = args.scaling_mode
+    if args.video_settings_source:
+        video["video_settings_source"] = args.video_settings_source
+
+    title = build_title(player, map_name, notable, args.elo, args.opp_elo, args.kd)
+    description = build_description(
+        player, notable, args.elo, args.opp_elo,
+        match_id=args.match_id.strip(), crosshair_code=args.crosshair_code.strip(),
+        video=video,
+    )
     tags = ["FACEIT", "CS2", "POV", map_name, player] + notable
     tags = list(dict.fromkeys(t for t in tags if t))[:10]
 

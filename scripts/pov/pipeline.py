@@ -26,7 +26,7 @@ Dual-upload (default): produces a second, independent variant with
 keyboard/utility overlay. Raw variant -> youtube/{run_id}/
 Overlay variant -> youtube/{run_id}_overlay/   (separate title, thumbnail, meta)
 
-FACEIT POVs default to overlay-only: the keyboard + util-cam variant IS the
+All POVs default to overlay-only: the keyboard + util-cam variant IS the
 upload, no raw variant is produced. Pass --raw-only for just the raw variant.
 
 Raw-only (--raw-only): produce only the raw variant, skip overlay entirely.
@@ -210,17 +210,17 @@ class Pipeline:
         # if set, so a resume run doesn't need to re-pass them.
         state_dual = bool(self.state["data"].get("dual_upload"))
         state_overlay_only = bool(self.state["data"].get("overlay_only"))
-        # FACEIT POVs default to overlay-only: the keyboard + util-cam variant
-        # IS the product for pugs (raw has no audience). An explicit
-        # --raw-only or --overlay-only still wins.
+        # Every pipeline defaults to overlay-only: the keyboard + util-cam
+        # variant IS the product (raw has no standalone audience). An explicit
+        # --raw-only (dual_upload=False) or --overlay-only still wins.
         explicit_variant = bool(getattr(args, "overlay_only", False)) or not bool(
             getattr(args, "dual_upload", True)
         )
-        faceit_overlay_default = self.is_faceit and not explicit_variant
+        overlay_default = not explicit_variant
         self.overlay_only = (
             bool(getattr(args, "overlay_only", False))
             or state_overlay_only
-            or faceit_overlay_default
+            or overlay_default
         )
         # overlay_only implies dual_upload (we still want the overlay branch
         # in steps 3-7; we just skip the raw branch).
@@ -1460,10 +1460,10 @@ def main() -> None:
     parser.add_argument(
         "--overlay-only",
         action="store_true",
-        help="Upload only the overlay variant. Skips raw video copy, raw "
-             "outro, raw thumbnail, and raw upload. Implies --dual-upload's "
-             "overlay branch. Use this when you only ever want the "
-             "keyboard+util-cam version on the channel.",
+        help="Upload only the overlay variant. This is now the DEFAULT for "
+             "all POVs; the flag exists for explicitness / resume. Skips raw "
+             "video copy, raw outro, raw thumbnail, and raw upload. Use "
+             "--raw-only to force the raw-only variant instead.",
     )
     parser.add_argument(
         "--batches",

@@ -105,8 +105,8 @@ BASE_FLAGS = [
     # longer produced by CSDM; concat consumes the round-* files directly.
     "--ffmpeg-executable-path", FFMPEG_PATH,
     "--ffmpeg-video-codec", "h264_nvenc",
-    "--ffmpeg-crf", "14",
-    "--ffmpeg-output-parameters=-cq 14 -preset p7 -profile:v high -pix_fmt yuv420p -level 5.1",
+    "--ffmpeg-crf", "10",
+    "--ffmpeg-output-parameters=-cq 10 -preset p7 -maxrate 200M -bufsize 400M -profile:v high -pix_fmt yuv420p -level 5.1",
     "--recording-system", "HLAE",
     "--close-game-after-recording",
 ]

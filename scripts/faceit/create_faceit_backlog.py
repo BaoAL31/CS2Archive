@@ -14,7 +14,11 @@ straight from the card, so no API calls happen during rendering. Pass
 Usage:
     python scripts/faceit/create_faceit_backlog.py <demo_path> --player <nick> --map <map>
                                   [--steam-id <id>] [--tournament <name>]
-                                  [--priority high] [--no-elo]
+                                  [--match-id <id>] [--priority high] [--no-elo]
+
+``--match-id`` stores the FACEIT match id on the card (drives the room link in
+the YouTube description); when omitted it is auto-resolved from
+``.data/download_history.json`` for demos downloaded via ``faceit match``.
 """
 
 from __future__ import annotations
@@ -70,6 +74,40 @@ def _demo_players(demo_path: Path) -> list[dict]:
             "team_number": int(row.get("team_number", 0)),
         })
     return out
+
+
+def _kd_from_demo(demo_path: Path, steam_id: str) -> tuple[int, int] | None:
+    """(kills, deaths) for one player from the demo's player_death events.
+
+    Matches csdm's convention: suicides (attacker == victim) and the knife
+    round (demo round 1 before the real first round starts) are excluded.
+    None when unavailable or the player had zero deaths.
+    """
+    try:
+        import demoparser2 as dp
+        parser = dp.DemoParser(str(demo_path))
+        deaths = parser.parse_event("player_death")
+        round_starts = parser.parse_event("round_start")
+    except Exception as e:
+        print(f"  [WARN] kd computation failed: {e}")
+        return None
+    if deaths is None or len(deaths) == 0:
+        return None
+    # Last round_start with round == 1 is the real first round; earlier
+    # round-1 events are the knife round (not counted in match stats).
+    first_real_tick = 0
+    if round_starts is not None and len(round_starts):
+        r1 = round_starts[round_starts["round"] == 1]
+        if len(r1):
+            first_real_tick = int(r1["tick"].max())
+    att = deaths["attacker_steamid"].astype(str)
+    vic = deaths["user_steamid"].astype(str)
+    core = deaths[(deaths["tick"] >= first_real_tick) & (att != vic)]
+    kills = int((core["attacker_steamid"].astype(str) == steam_id).sum())
+    deaths_n = int((core["user_steamid"].astype(str) == steam_id).sum())
+    if deaths_n == 0:
+        return None
+    return kills, deaths_n
 
 
 def _resolve_steam_id(demo_path: Path, nick: str) -> str:
@@ -135,6 +173,30 @@ async def _match_elo(demo_path: Path, pov_steam_id: str) -> dict:
     return {"elo": pov_elo, "opp_avg_elo": round(sum(opp) / len(opp))}
 
 
+def _match_id_from_history(demo: Path) -> str:
+    """Resolve the FACEIT match id from .data/download_history.json by demo
+    path (populated by `main.py faceit match <id>` downloads)."""
+    hist = PROJECT_ROOT / ".data" / "download_history.json"
+    try:
+        records = json.loads(hist.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(records, list):
+        return ""
+    try:
+        demo_rel = demo.relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        demo_rel = str(demo).replace("\\", "/")
+    for rec in reversed(records):
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("source") or "").lower() != "faceit":
+            continue
+        if str(rec.get("demo_path") or "").replace("\\", "/") == demo_rel:
+            return str(rec.get("match_id") or "")
+    return ""
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("demo_path")
@@ -142,6 +204,8 @@ def main() -> None:
     ap.add_argument("--map", default="")
     ap.add_argument("--steam-id", default="")
     ap.add_argument("--tournament", default="")
+    ap.add_argument("--match-id", default="",
+                    help="FACEIT match id (auto-resolved from download history if omitted)")
     ap.add_argument("--priority", choices=["high", "mid", "low"], default="high")
     ap.add_argument("--no-elo", action="store_true",
                     help="Skip FACEIT ELO fetch (title/thumbnail omit ELO line)")
@@ -159,6 +223,8 @@ def main() -> None:
 
     map_name = args.map or _map_from_demo(demo)
 
+    match_id = args.match_id.strip() or _match_id_from_history(demo)
+
     meta: dict = {
         "player": args.player,
         "map": map_name,
@@ -168,6 +234,15 @@ def main() -> None:
         "priority": args.priority,
         "is_faceit": True,
     }
+    if match_id:
+        meta["faceit_match_id"] = match_id
+
+    kd_stats = _kd_from_demo(demo, steam_id)
+    if kd_stats is not None:
+        kills, deaths = kd_stats
+        meta["kills"] = kills
+        meta["deaths"] = deaths
+        meta["kd"] = round(kills / deaths, 2)
 
     if not args.no_elo:
         print("[FACEIT] Fetching match ELO ...")

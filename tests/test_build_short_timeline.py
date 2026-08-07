@@ -10,7 +10,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-from shorts.build_short_timeline import detect_shorts
+from shorts.build_short_timeline import detect_shorts as _detect_shorts
+
+
+def detect_shorts(*args, **kwargs):
+    """Test shim: unit tests exercise detection itself, so bypass the
+    Recognised-Pro gate (synthetic steam ids like "A" are never catalogued)."""
+    kwargs.setdefault("pros_only", False)
+    return _detect_shorts(*args, **kwargs)
 
 
 def _make_kill(tick: int, round_n: int, attacker_sid: str, victim_sid: str, weapon: str = "ak47", victim_weapon: str = "ak47") -> dict:
@@ -507,7 +514,7 @@ def test_build_from_action_timeline_detects_4k(tmp_path):
     mock_parser.return_value.parse_player_info.return_value = mock_info
 
     with patch("demoparser2.DemoParser", mock_parser):
-        result = build_short_timeline_from_action(at_path, demo_path)
+        result = build_short_timeline_from_action(at_path, demo_path, pros_only=False)
 
     assert result["short_count"] >= 1
     types = {s["short_type"] for s in result["shorts"]}
@@ -545,8 +552,62 @@ def test_build_from_action_preserves_demo_path(tmp_path):
     mock_parser.return_value.parse_player_info.return_value = mock_info
 
     with patch("demoparser2.DemoParser", mock_parser):
-        result = build_short_timeline_from_action(at_path, demo_path)
+        result = build_short_timeline_from_action(at_path, demo_path, pros_only=False)
 
     assert result["demo_path"] == str(demo_path)
     assert result["map"] == "Inferno"
     assert result["short_count"] == 0
+
+
+# ------------------- RECOGNISED-PRO GATE -------------------
+
+def test_pros_only_filters_randos_and_canonicalizes_nick():
+    """pros_only=True drops non-catalogued POV players and rewrites the
+    surviving short's pov_nick to the canonical nickname."""
+    import shorts.build_short_timeline as bst
+
+    kill_events = [
+        {"tick": 1000, "round": 1, "attacker_sid": "PRO1", "victim_sid": "B", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 2000, "round": 1, "attacker_sid": "PRO1", "victim_sid": "C", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 3000, "round": 1, "attacker_sid": "PRO1", "victim_sid": "D", "weapon": "ak47", "victim_weapon": "glock"},
+        {"tick": 4000, "round": 1, "attacker_sid": "PRO1", "victim_sid": "E", "weapon": "ak47", "victim_weapon": "glock"},
+        {"tick": 1500, "round": 1, "attacker_sid": "RANDO", "victim_sid": "P", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 2500, "round": 1, "attacker_sid": "RANDO", "victim_sid": "Q", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 3500, "round": 1, "attacker_sid": "RANDO", "victim_sid": "R", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 4500, "round": 1, "attacker_sid": "RANDO", "victim_sid": "S", "weapon": "ak47", "victim_weapon": "glock"},
+    ]
+    with patch.object(bst, "known_pro_steam_ids", return_value={"PRO1": "NiKo"}):
+        result = bst.detect_shorts(
+            demo_path="test.dem",
+            kill_events=kill_events,
+            round_starts=[(900, 1)],
+            pros_only=True,
+        )
+
+    assert result["_dropped_randos"] == 1  # RANDO's 4K dropped
+    assert len(result["shorts"]) == 1
+    s = result["shorts"][0]
+    assert s["pov_steam_id"] == "PRO1"
+    assert s["pov_nick"] == "NiKo"  # canonical nickname applied
+
+
+def test_pros_only_false_keeps_everyone():
+    """pros_only=False (opt-out) keeps randos and leaves pov_nick as-is."""
+    import shorts.build_short_timeline as bst
+
+    kill_events = [
+        {"tick": 1000, "round": 1, "attacker_sid": "RANDO", "victim_sid": "B", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 2000, "round": 1, "attacker_sid": "RANDO", "victim_sid": "C", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 3000, "round": 1, "attacker_sid": "RANDO", "victim_sid": "D", "weapon": "ak47", "victim_weapon": "glock"},
+        {"tick": 4000, "round": 1, "attacker_sid": "RANDO", "victim_sid": "E", "weapon": "ak47", "victim_weapon": "glock"},
+    ]
+    result = bst.detect_shorts(
+        demo_path="test.dem",
+        kill_events=kill_events,
+        round_starts=[(900, 1)],
+        pros_only=False,
+    )
+
+    assert result["_dropped_randos"] == 0
+    assert len(result["shorts"]) == 1
+    assert result["shorts"][0]["pov_steam_id"] == "RANDO"

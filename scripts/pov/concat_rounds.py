@@ -490,7 +490,7 @@ def _encode_scaled(src: Path, dst: Path, w: int, h: int, scaling_mode: str) -> N
     """Single encode: resample (stretch and/or upscale) straight to target WxH."""
     src_mb = src.stat().st_size / 1024 / 1024
     vf, label = _scale_vf(w, h, scaling_mode)
-    print(f"\n  [Scale] {src_mb:.0f} MB -> {w}x{h} ({label}, spline + NVENC CQ14)...",
+    print(f"\n  [Scale] {src_mb:.0f} MB -> {w}x{h} ({label}, spline + NVENC CQ8)...",
           end=" ", flush=True)
 
     if not _check_gpu_available():
@@ -503,7 +503,8 @@ def _encode_scaled(src: Path, dst: Path, w: int, h: int, scaling_mode: str) -> N
     cmd = [
         "ffmpeg", "-y", "-i", str(src),
         "-vf", vf,
-        "-c:v", "h264_nvenc", "-preset", "p7", "-b:v", "0", "-cq", "14",
+        "-c:v", "h264_nvenc", "-preset", "p7", "-b:v", "0", "-cq", "8",
+        "-maxrate", "200M", "-bufsize", "400M",
         "-profile:v", "high", "-pix_fmt", "yuv420p", "-level", "5.1",
         "-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
         "-movflags", "+faststart",
