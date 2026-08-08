@@ -699,6 +699,7 @@ def run_overlay(
     batches: int = 5,
     util_cams_root: Path | None = None,
     work_dir: Path | None = None,
+    allow_missing_util_cams: bool = False,
 ) -> None:
     """Apply keyboard overlay + utility throw flight PiP onto video_path (in place)."""
     if not video_path.exists():
@@ -983,8 +984,18 @@ def run_overlay(
         n_expected = len([t for t in n_expected_raw
                           if str(t.get("util_type", "")).lower() != "decoy"])
         if n_clips < n_expected:
-            _log(f"[WARN] Only {n_clips} flight clips for {n_expected} throws "
-                  f"({n_expected - n_clips} missing — edge cases; continuing with {n_clips} clips)")
+            missing = n_expected - n_clips
+            if allow_missing_util_cams:
+                _log(f"[WARN] Only {n_clips} flight clips for {n_expected} throws "
+                     f"({missing} missing) — continuing with {n_clips} clips "
+                     f"(--allow-missing-util-cams)")
+            else:
+                _log(f"[ERROR] Only {n_clips} flight clips for {n_expected} throws "
+                     f"({missing} missing). A POV overlay missing util-cam PiPs is "
+                     f"broken output, not an edge case. Fix the utility-cam render "
+                     f"first (re-run render_util_cams.py --render-only), or pass "
+                     f"--allow-missing-util-cams to force a keyboard-only overlay.")
+                sys.exit(1)
 
         if batches > 0 and round_offsets:
             _log(f"Batched overlay: {batches} round(s) per batch")
@@ -1229,6 +1240,10 @@ def main() -> None:
                         help="Path to utility_cams/ cache dir. Default: walk up from video.")
     parser.add_argument("--work-dir", type=Path, default=None,
                         help="Working directory for temp files (default: tempdir)")
+    parser.add_argument("--allow-missing-util-cams", action="store_true",
+                        help="Force a keyboard-only overlay even when some util-cam "
+                             "flight clips are missing (default: hard-fail so broken "
+                             "output is never shipped silently).")
     args = parser.parse_args()
 
     # Ensure CS2UtilArchive has extracted+analyzed this demo (throws.parquet).
@@ -1236,7 +1251,8 @@ def main() -> None:
     _ensure_cs2util_data(Path(args.demo))
 
     run_overlay(Path(args.video), Path(args.demo), args.steam_id, args.round, args.batches,
-                util_cams_root=args.util_cams_root, work_dir=args.work_dir)
+                util_cams_root=args.util_cams_root, work_dir=args.work_dir,
+                allow_missing_util_cams=args.allow_missing_util_cams)
 
 
 if __name__ == "__main__":
