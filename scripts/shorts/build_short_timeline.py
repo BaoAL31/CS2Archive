@@ -1,8 +1,12 @@
 """Build a Short Timeline from any CS2 demo (HLTV or FACEIT).
 
-Detects two Short types:
+Detects three Short types:
   - **4K** : 4+ kills by same attacker in a single round (incl. 5-kill aces).
   - **Clutch** : team wins from 2v4 or worse (1v3, 1v4, 1v5, 2v4, 2v5).
+  - **1v3** : exactly 3 kills in a single round while at a 1v3-or-worse numbers
+    disadvantage, where at least 2 of those kills "punch up" (killed with a
+    lower-tier weapon than the victim held). Unlike 4K, the round does NOT need
+    to be won.
 
 By default only shorts whose POV player is a Recognised Pro
 (``.data/player_accounts.json``) are kept — randos are dropped
@@ -12,7 +16,7 @@ Two input modes:
   1. **Direct demo parse** (default): parses the full demo via demoparser2.
   2. **From Action Timeline** (``--from-action-timeline``): reads an existing
      ``action_timeline.json`` (Recognised Pro-gated, FACEIT-only), extracts
-     kill events + team assignments, and runs the same 4K/Clutch detection.
+     kill events + team assignments, and runs the same 4K/Clutch/1v3 detection.
      This reuses the highlights pipeline's Recognised Pro filtering without
      re-parsing the demo.
 
@@ -131,6 +135,20 @@ def _meets_tier_criterion(kills: list[dict]) -> bool:
         if vw and _weapon_tier(vw) >= attacker_tier:
             eligible += 1
     return eligible >= 2
+
+
+def _is_punch_up(k: dict) -> bool:
+    """True when the kill is "punching up": attacker used a LOWER-tier weapon
+    than the victim held (e.g. a pistol/knife taking out a rifle).
+
+    A lower tier beats a higher tier — the bigger the gap the more impressive.
+    Unknown weapon tiers (-1) never count as punch-up (can't verify).
+    """
+    at = _weapon_tier(str(k.get("weapon", "") or ""))
+    vt = _weapon_tier(str(k.get("victim_weapon", "") or ""))
+    if vt < 0 or at < 0:
+        return False
+    return at < vt
 
 
 def _sid(val) -> str:
@@ -588,6 +606,66 @@ def detect_shorts(
         _team_nums = [2, 3]
     _team_a, _team_b = _team_nums[:2]
 
+    # ================================================================
+    # 1V3 DETECTION (punch-up triple) — no win required
+    # ================================================================
+    # A player who gets exactly 3 kills in a round while at a 1v3 (or worse)
+    # numbers disadvantage, where at least 2 of those kills "punch up" (killed
+    # with a lower-tier weapon than the victim held). Unlike the 4K rule, the
+    # round does NOT need to be won — the feat is the outnumbered triple with
+    # weaker weapons.
+    for roundn in all_rounds:
+        rk = sorted(kills_by_round.get(roundn, []), key=lambda x: x["tick"])
+        if not rk:
+            continue
+        alive13: dict[int, int] = {_team_a: 5, _team_b: 5}
+        # Track, per attacker, the kills they made and the alive counts at the
+        # moment of their FIRST kill (that's when the 1v3 state is set).
+        attacker_first_kill_state: dict[str, tuple[int, int]] = {}
+        attacker_kills: dict[str, list[dict]] = {}
+        seen_first: set[str] = set()
+        for k in rk:
+            aid = k["attacker_sid"]
+            if aid:
+                if aid not in seen_first:
+                    seen_first.add(aid)
+                    attacker_first_kill_state[aid] = (alive13[_team_a], alive13[_team_b])
+                attacker_kills.setdefault(aid, []).append(k)
+            vt = team_by_sid.get(k["victim_sid"], 0)
+            if vt in alive13:
+                alive13[vt] = max(0, alive13[vt] - 1)
+
+        for aid, kills in attacker_kills.items():
+            if len(kills) != 3:
+                continue
+            at_team = team_by_sid.get(aid, 0)
+            if at_team not in (_team_a, _team_b):
+                continue
+            enemy = _team_b if at_team == _team_a else _team_a
+            my_alive, enemy_alive = attacker_first_kill_state.get(aid, (5, 5))
+            # 1v3 or worse: the attacker's team is down to 1 vs >=3 enemies at
+            # the moment they start fragging.
+            if not (my_alive == 1 and enemy_alive >= 3):
+                continue
+            punch_up = sum(1 for k in kills if _is_punch_up(k))
+            if punch_up < 2:
+                continue
+            ticks = sorted(k["tick"] for k in kills)
+            end_tick = ticks[-1] + _POST_KILL_TICK_MARGIN
+            start_tick = min(
+                end_tick - _SHORT_TICK_DURATION,
+                ticks[0] - _PRE_KILL_TICK_MARGIN,
+            )
+            shorts.append({
+                "short_type": "1v3",
+                "pov_steam_id": aid,
+                "pov_nick": nickname_by_sid.get(aid, "Unknown"),
+                "start_tick": start_tick,
+                "end_tick": end_tick,
+                "kill_ticks": ticks,
+                "clutch_initial_count": f"{my_alive}v{enemy_alive}",
+            })
+
     for roundn in all_rounds:
         round_kills = kills_by_round.get(roundn, [])
         alive: dict[int, int] = {_team_a: 5, _team_b: 5}
@@ -870,6 +948,10 @@ def _build_short_slug(short: dict) -> str:
         cnt = short.get("clutch_initial_count", "XvX")
         kills = len(short.get("kill_ticks", []))
         return f"{cnt}_{kills}k_clutch-{safe}-t{tick}"
+    elif st == "1v3":
+        cnt = short.get("clutch_initial_count", "1v3")
+        kills = len(short.get("kill_ticks", []))
+        return f"{cnt}_{kills}k_1v3-{safe}-t{tick}"
     return f"{st}-{safe}-t{tick}"
 
 
