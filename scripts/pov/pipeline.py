@@ -1072,7 +1072,7 @@ class Pipeline:
 
         work_dir = self.render_dir / ".overlay_work"
         work_dir.mkdir(parents=True, exist_ok=True)
-        r = self._run_py([
+        ov_args = [
             "scripts/overlay/overlay_pov.py",
             "--video", str(video_path),
             "--demo", str(self.demo_path),
@@ -1080,7 +1080,15 @@ class Pipeline:
             "--batches", str(getattr(self.args, "overlay_batches", 10)),
             "--util-cams-root", str(self.render_dir / "utility_cams"),
             "--work-dir", str(work_dir),
-        ], timeout=7200, capture_output=True, text=True)
+        ]
+        if getattr(self.args, "voice_shade", False):
+            ov_args += ["--voice-shade",
+                        "--voice-shade-fade", str(getattr(self.args, "voice_shade_fade", 0.3))]
+            cap_w = int(self.meta.get("capture_width") or 0)
+            cap_h = int(self.meta.get("capture_height") or 0)
+            if cap_w >= 800 and cap_h >= 600:
+                ov_args += ["--voice-shade-native-res", f"{cap_w}x{cap_h}"]
+        r = self._run_py(ov_args, timeout=7200, capture_output=True, text=True)
         if r.returncode != 0:
             if r.stdout:
                 print(r.stdout)
@@ -1479,6 +1487,21 @@ def main() -> None:
         help="Rounds per overlay batch (default: 10). Splits overlay ffmpeg "
              "composite into per-batch segments for ~2-3x speedup and crash "
              "resume. Set 0 for single-pass (original behavior).",
+    )
+    parser.add_argument(
+        "--voice-shade",
+        action="store_true",
+        default=False,
+        help="Also overlay a voice-activity shade on the POV team's scoreboard "
+             "avatars (shade fades out when a teammate talks). Requires the "
+             "demo's voice data + combined.round_offsets.json. Runs as an "
+             "extra ffmpeg pass after overlay_pov.py.",
+    )
+    parser.add_argument(
+        "--voice-shade-fade",
+        type=float,
+        default=0.3,
+        help="Voice-shade fade duration in seconds (default: 0.3).",
     )
     parser.add_argument(
         "--skip-failed-rounds",

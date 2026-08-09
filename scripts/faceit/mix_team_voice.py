@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import struct
+import os
 import subprocess
 import sys
 import tempfile
@@ -39,74 +39,139 @@ from demoparser2 import DemoParser  # noqa: E402
 SAMPLE_RATE = 48000
 FRAME_SAMPLES = 480  # 10 ms opus frame @ 48 kHz
 _TICKRATE = 64  # CS2 PBDEMS2 demo tickrate
+# Decoded output is never assumed to be exactly this; it's just an upper bound on
+# the per-packet decode buffer (opus packets can hold up to 120 ms of audio).
+_MAX_FRAME_SAMPLES = FRAME_SAMPLES * 6
+# Voice packets that land closer than this (seconds) are treated as one utterance
+# (burst); larger gaps are real pauses.
+_MAX_GROUP_GAP_S = 0.100
+# When placing a burst, a packet whose tick maps ahead of the current write
+# position by more than this is treated as a real pause and we jump forward.
+_MAX_SLIP_S = 0.020
 
 
-# ── Ogg-Opus container (raw opus frames -> ffmpeg-decodable stream) ────────
+# ── Opus packet-aligned decode (via libopus, not ffmpeg/Ogg) ───────────────
 
-def _crc32(data: bytes) -> int:
-    crc = 0
-    for byte in data:
-        crc ^= byte << 24
-        for _ in range(8):
-            crc = ((crc << 1) ^ 0x04C11DB7) & 0xFFFFFFFF if crc & 0x80000000 else (crc << 1) & 0xFFFFFFFF
-    return crc
-
-
-def _ogg_page(serial: int, seq: int, granule: int, header_type: int, payload: bytes) -> bytes:
-    rem = len(payload)
-    segs: list[int] = []
-    while rem >= 255:
-        segs.append(255)
-        rem -= 255
-    segs.append(rem)
-    seg_table = bytes(segs)
-    header = (b"OggS" + bytes([0, header_type]) + struct.pack("<q", granule)
-              + struct.pack("<I", serial) + struct.pack("<I", seq)
-              + b"\x00\x00\x00\x00" + bytes([len(seg_table)]) + seg_table)
-    crc = _crc32(header + payload)
-    return header[:22] + struct.pack("<I", crc) + header[26:] + payload
+# opuslib uses ``ctypes.util.find_library("opus")`` which fails to locate the
+# bundled dll on Windows. Prepend a dir that contains libopus to PATH so the
+# import finds it. We only need the decoder symbols; any full libopus works.
+def _ensure_opus_library() -> None:
+    # opuslib uses ``ctypes.util.find_library("opus")`` which looks for a file
+    # named ``opus.dll``/``opus`` on PATH. We vendor a full libopus as
+    # ``opus.dll`` inside the opuslib package dir; ensure that dir is on PATH
+    # before opuslib is imported. (``find_library`` wants exactly ``opus.dll``,
+    # not ``libopus-0.dll``, so only the opuslib package dir matches reliably.)
+    opuslib_pkg = Path(
+        r"C:\Users\jembo\anaconda3\envs\cs2archive\Lib\site-packages\opuslib")
+    if not (opuslib_pkg / "opus.dll").exists():
+        for src in [Path(r"C:\Program Files\Kdenlive\bin\libopus.dll")]:
+            if src.exists():
+                import shutil
+                shutil.copy2(src, opuslib_pkg / "opus.dll")
+                break
+    sp = str(opuslib_pkg)
+    if sp not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = sp + os.pathsep + os.environ.get("PATH", "")
 
 
-def build_ogg(packets: list[bytes]) -> bytes:
-    """Wrap raw opus frames in an Ogg-Opus stream.
+def detect_channels(sample_packet: bytes) -> int:
+    """Read stereo/mono from the packet's own Opus TOC byte (bit 0x04).
 
-    CS2 voice packets decode to 480 samples (10 ms) each. The granule only sets
-    ffmpeg's internal timestamps, which the mix ignores (it re-places each frame
-    by its demo tick), so we advance by 480 per packet. The key fix is
-    channels=2: CS2 packets encode stereo (TOC s bit) but the old mono OpusHead
-    made ffmpeg decode them incorrectly (robotic). We downmix to mono later.
+    This is authoritative per-packet, unlike the OpusHead channel claim. CS2
+    FACEIT voice decodes as mono (bit unset).
     """
-    serial = 0x51CE
-    head = struct.pack("<8sBBHIHB", b"OpusHead", 1, 2, 0, SAMPLE_RATE, 0, 0)
-    vendor = b"cs2archive-mix-team-voice"
-    tags = struct.pack("<8sI", b"OpusTags", len(vendor)) + vendor + struct.pack("<I", 0)
-    out = _ogg_page(serial, 0, 0, 0x02, head)
-    out += _ogg_page(serial, 1, 0, 0x00, tags)
-    granule = 0
-    for i, pkt in enumerate(packets):
-        granule += FRAME_SAMPLES
-        out += _ogg_page(serial, 2 + i, granule, 0x00, pkt)
+    return 2 if (sample_packet[0] & 0x04) else 1
+
+
+def decode_player_packets(
+    packets_sorted: list[tuple[int, bytes]],
+    channels: int,
+) -> list[tuple[int, np.ndarray]]:
+    """Decode one player's packets with a single persistent Opus decoder.
+
+    Returns ``[(tick, pcm_float32_mono), ...]`` where each ``pcm`` length is the
+    ACTUAL decoded sample count for that packet (never assumed to be 480). Using
+    one persistent decoder preserves the inter-frame prediction state that makes
+    the "individual player" path sound clean.
+    """
+    _ensure_opus_library()
+    from opuslib import Decoder
+
+    decoder = Decoder(SAMPLE_RATE, channels)
+    out: list[tuple[int, np.ndarray]] = []
+    for tick, raw in packets_sorted:
+        pcm_bytes = decoder.decode(raw, _MAX_FRAME_SAMPLES, decode_fec=False)
+        pcm = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        if channels == 2:
+            pcm = pcm.reshape(-1, 2).mean(axis=1)  # downmix to mono
+        out.append((tick, pcm))
     return out
 
 
-def decode_packets(packets: list[bytes]) -> np.ndarray:
-    """Decode raw opus frames to float32 mono PCM @ 48 kHz."""
-    if not packets:
-        return np.zeros(0, dtype=np.float32)
-    ogg = build_ogg(packets)
-    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
-        f.write(ogg)
-        ogg_path = f.name
-    try:
-        r = subprocess.run(
-            ["ffmpeg", "-y", "-i", ogg_path, "-f", "f32le", "-ac", "1", "-"],
-            capture_output=True,
-        )
-        if r.returncode != 0:
-            raise RuntimeError(f"ffmpeg opus decode failed: {r.stderr[-400:]!r}")
-        return np.frombuffer(r.stdout, dtype=np.float32).copy()
-    finally:
-        Path(ogg_path).unlink(missing_ok=True)
+def group_voice_rows(
+    rows_sorted: list[dict],
+    tick_rate: int = _TICKRATE,
+    max_gap_s: float = _MAX_GROUP_GAP_S,
+):
+    """Yield contiguous bursts of voice rows (packets within ``max_gap_s``)."""
+    group: list[dict] = []
+    last_tick: int | None = None
+    for r in rows_sorted:
+        if not group:
+            group.append(r)
+            last_tick = r["tick"]
+            continue
+        gap_s = (r["tick"] - last_tick) / tick_rate
+        if gap_s <= max_gap_s:
+            group.append(r)
+        else:
+            yield group
+            group = [r]
+        last_tick = r["tick"]
+    if group:
+        yield group
+
+
+def place_into_buffer(buf: np.ndarray, rows_sorted: list[dict], offsets: dict,
+                     tickrate: int) -> int:
+    """Place a player's decoded bursts into ``buf`` at tick-derived times.
+
+    Within a burst, packets are placed SEQUENTIALLY (each right after the
+    previous) rather than at their own tick sample. This avoids the exact
+    overlap that happens when many packets share the same tick (comb filtering
+    -> robotic/static). A tick that maps ahead by more than ``_MAX_SLIP_S`` is
+    treated as a real pause and we jump forward.
+    """
+    rows_sorted = sorted(rows_sorted, key=lambda r: r["tick"])
+    channels = detect_channels(rows_sorted[0]["bytes"])
+    placed = 0
+    for group in group_voice_rows(rows_sorted):
+        packets = [(r["tick"], r["bytes"]) for r in group]
+        decoded = decode_player_packets(packets, channels)
+        if not decoded:
+            continue
+        # anchor the burst at its first packet's tick time
+        t0 = tick_to_time(decoded[0][0], offsets, tickrate)
+        if t0 is None:
+            continue
+        pos = int(round(t0 * SAMPLE_RATE))
+        for tick, pcm in decoded:
+            desired = tick_to_time(tick, offsets, tickrate)
+            if desired is not None:
+                desired_idx = int(round(desired * SAMPLE_RATE))
+                # real pause -> jump; duplicate/late tick -> keep sequential
+                if desired_idx > pos + int(_MAX_SLIP_S * SAMPLE_RATE):
+                    pos = desired_idx
+            end = pos + len(pcm)
+            if pos >= len(buf):
+                break
+            if end > len(buf):
+                pcm = pcm[:len(buf) - pos]
+                end = len(buf)
+            buf[pos:end] += pcm
+            pos = end
+            placed += 1
+    return placed
 
 
 # ── demo voice extraction ──────────────────────────────────────────────────
@@ -213,33 +278,18 @@ def main() -> None:
     print(f"[voice] {len(rows)} voice packets total, "
           f"{len(team_rows)} from POV team (team {pov_team})")
 
-    # group by steamid (order preserved) so each player decodes in one pass
-    by_player: dict[str, list[bytes]] = {}
+    # group by steamid so each player decodes in one pass
+    by_player: dict[str, list[dict]] = {}
     for r in team_rows:
-        by_player.setdefault(r["steamid"], []).append(r["bytes"])
+        by_player.setdefault(r["steamid"], []).append(r)
 
     dur = video_duration(video)
     buf = np.zeros(int(dur * SAMPLE_RATE) + FRAME_SAMPLES, dtype=np.float64)
     placed = 0
-    for sid, packets in by_player.items():
-        pcm = decode_packets(packets)
-        if len(pcm) != len(packets) * FRAME_SAMPLES:
-            print(f"  [warn] {sid}: decoded {len(pcm)} != {len(packets)*FRAME_SAMPLES}")
-        # re-map ticks for this player
-        ticks = [r["tick"] for r in team_rows if r["steamid"] == sid]
-        for i, tick in enumerate(ticks):
-            t = tick_to_time(tick, offsets, args.tickrate)
-            if t is None:
-                continue
-            idx = int(t * SAMPLE_RATE)
-            seg = pcm[i * FRAME_SAMPLES:(i + 1) * FRAME_SAMPLES]
-            if idx >= len(buf):
-                continue  # voice tick falls beyond the video — skip, don't crash
-            if idx + FRAME_SAMPLES > len(buf):
-                seg = seg[:len(buf) - idx]
-            buf[idx:idx + len(seg)] += seg
-            placed += 1
-        print(f"  [voice] {sid}: {len(packets)} pkts decoded")
+    for sid, rows_p in by_player.items():
+        rows_p.sort(key=lambda r: r["tick"])
+        placed += place_into_buffer(buf, rows_p, offsets, args.tickrate)
+        print(f"  [voice] {sid}: {len(rows_p)} pkts decoded")
 
     active = np.count_nonzero(buf != 0)
     print(f"[voice] placed {placed} packets; "
@@ -250,35 +300,64 @@ def main() -> None:
         print("[voice] nothing to mix (no team voice in rendered rounds)")
         sys.exit(0)
 
-    # write voice track as f32le wav (ffmpeg amix input)
-    # Normalize so the loudest moment never clips: scale buf so that
-    # peak * voice_volume = ~0.9. Without this, summed team voice (multiple
-    # players) often exceeds 1.0 and the 2.5x boost clips hard -> static/robotic.
+    # Mix voice UNDER the video's audio track by summing PCM buffers in numpy
+    # (replacing the old ffmpeg `amix` filter, which resampled and corrupted the
+    # output -> continuous noise / "cutting out"). Steps:
+    #   1. decode the video's audio to float32 mono PCM at SAMPLE_RATE,
+    #   2. add the (normalized, gain-scaled) voice buffer onto it,
+    #   3. re-encode the video with the new audio (video stream-copied).
     _peak = float(np.abs(buf).max())
     if _peak > 0:
         buf = buf * (0.9 / max(args.voice_volume, 0.1) / _peak)
     mix = (buf * args.voice_volume).astype(np.float32)
-    with tempfile.NamedTemporaryFile(suffix=".f32", delete=False) as f:
-        f.write(mix.tobytes())
-        wav_path = f.name
+    if mix.shape[0] > int(dur * SAMPLE_RATE):
+        mix = mix[:int(dur * SAMPLE_RATE)]
+
+    # Decode video audio to mono PCM.
+    va = subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-i", str(video), "-ac", "1",
+         "-ar", str(SAMPLE_RATE), "-f", "f32le", "-"],
+        capture_output=True,
+    )
+    if va.returncode != 0 or not va.stdout:
+        # No/invalid audio stream in the video -> start from silence.
+        base = np.zeros(mix.shape[0], dtype=np.float32)
+    else:
+        base = np.frombuffer(va.stdout, dtype=np.float32).copy()
+        if base.shape[0] < mix.shape[0]:
+            base = np.pad(base, (0, mix.shape[0] - base.shape[0]))
+        elif base.shape[0] > mix.shape[0]:
+            base = base[:mix.shape[0]]
+    summed = base + mix
+    peak = float(np.abs(summed).max())
+    if peak > 1.0:
+        summed = summed * (0.95 / peak)
+    summed16 = (np.clip(summed, -1.0, 1.0) * 32767).astype(np.int16)
+
     tmp_out = out
     if out.resolve() == video.resolve():
         tmp_out = out.with_name(out.stem + ".voice.mp4")
     try:
-        # mix voice under the video's audio; stream-copy video
+        # Encode video with the mixed audio; stream-copy video.
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            import wave
+            with wave.open(f.name, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(SAMPLE_RATE)
+                w.writeframes(summed16.tobytes())
+            wav_path = f.name
         cmd = [
             "ffmpeg", "-y",
             "-i", str(video),
-            "-f", "f32le", "-ar", str(SAMPLE_RATE), "-ac", "1", "-i", wav_path,
-            "-filter_complex",
-            "[0:a][1:a]amix=inputs=2:duration=first:normalize=0[a]",
-            "-map", "0:v", "-map", "[a]",
+            "-i", wav_path,
+            "-map", "0:v", "-map", "1:a",
             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
             str(tmp_out),
         ]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
-            raise RuntimeError(f"ffmpeg mix failed: {r.stderr[-600:]!r}")
+            raise RuntimeError(f"ffmpeg encode failed: {r.stderr[-600:]!r}")
         if tmp_out != out:
             tmp_out.replace(out)
     finally:

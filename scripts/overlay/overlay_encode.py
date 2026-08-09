@@ -54,6 +54,7 @@ def _ffmpeg_encode(
     output_path: str,
     segment: tuple[float, float] | None = None,
     loop_inputs: set[str] | None = None,
+    raw_inputs: list[tuple[Path, list[str]]] | None = None,
 ) -> None:
     """Run ffmpeg with h264_nvenc. No CPU fallback (libx forbidden by user).
 
@@ -62,6 +63,11 @@ def _ffmpeg_encode(
     frame-accurately by ffmpeg's demuxer. Keyframe-aligned (input-side
     seeking is fast; visible round-boundary jumps are avoided by the
     round_offsets sidecar using actual per-round frames).
+
+    ``raw_inputs`` is a list of ``(path, input_options)`` for raw video inputs
+    (e.g. 1x1 RGBA alpha controls) that need explicit demuxer flags before
+    ``-i`` (``-f rawvideo -pix_fmt rgba -s 1x1 -r <fps>``). They are appended
+    AFTER ``extra_inputs`` in input order.
 
     Atomic write: ffmpeg renders to ``{output}.part`` and the file is
     renamed onto ``output_path`` only after a successful exit. A cancelled /
@@ -106,6 +112,9 @@ def _ffmpeg_encode(
             # need this — overlay's eof_action repeats their last frame.
             cmd.extend(["-loop", "1"])
         cmd.extend(["-i", str(inp)])
+    for raw_path, raw_opts in (raw_inputs or []):
+        cmd.extend(raw_opts)
+        cmd.extend(["-i", str(raw_path)])
     cmd.extend([
         *fc_out, "-map", map_label, "-map", "0:a?", "-shortest",
         # FINAL EXPORT — uploaded verbatim (YouTube copy + outro append are both
