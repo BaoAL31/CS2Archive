@@ -16,7 +16,7 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 from rich.console import Console
@@ -31,7 +31,6 @@ from models import DemoSource, DownloadResult, DownloadStatus, MatchInfo
 console = Console(force_terminal=True)
 
 PROFILE_DIR = Path(__file__).resolve().parent.parent / ".sessions/faceit"
-
 
 class FACEITClient:
     """FACEIT Data API v4 client — lookup only (player + match history).
@@ -222,7 +221,6 @@ class FACEITClient:
                     }
         return out
 
-
 # Button text fragments that trigger the demo download on a FACEIT room page.
 class FACEITDownloadsClient:
     """FACEIT Downloads API client (token-based, no browser).
@@ -330,7 +328,6 @@ class FACEITDownloadsClient:
                 dest.unlink()
             return None
 
-
 def download_demo_api(match_id: str) -> Optional[Path]:
     """Download a FACEIT demo via the official Downloads API (token-based)."""
     import asyncio
@@ -338,9 +335,7 @@ def download_demo_api(match_id: str) -> Optional[Path]:
     client = FACEITDownloadsClient()
     return asyncio.run(client.download_match(match_id, out_dir))
 
-
 DOWNLOAD_BUTTON_TEXTS = ["watch demo", "download demo", "download", "demo"]
-
 
 def _resolve_match_id(room_or_id: str) -> str:
     """Accept a full room URL or a bare match id."""
@@ -348,9 +343,13 @@ def _resolve_match_id(room_or_id: str) -> str:
         return room_or_id.rstrip("/").split("/room/")[-1]
     return room_or_id.strip()
 
-
 def _launch_context():
-    """Launch the persistent, authenticated Chrome context."""
+    """Launch the persistent, authenticated Chrome context (plain Playwright).
+
+    Reuses the logged-in profile (``.sessions/faceit/``). Clicks are humanized
+    via ``_human_click`` (jittered mouse path + delays) to avoid FACEIT bot
+    detection without a stealth-layer dependency.
+    """
     from playwright.sync_api import sync_playwright
 
     pw = sync_playwright().start()
@@ -363,7 +362,6 @@ def _launch_context():
         accept_downloads=True,
     )
     return pw, browser
-
 
 def get_match_details(match_id: str) -> MatchInfo:
     """Scrape the room page for team names, map, and score (no API key)."""
@@ -404,11 +402,9 @@ def get_match_details(match_id: str) -> MatchInfo:
         browser.close()
         pw.stop()
 
-
 DOWNLOAD_START_TIMEOUT = 120  # seconds to wait for the download to begin
 # (FACEIT's demo server can be slow to start — allow up to 2 min)
 DOWNLOAD_MAX_RETRIES = 3     # restart attempts if the download doesn't start
-
 
 def _find_demo_button(page, txt: str):
     """Locate the FACEIT 'Watch Demo' button via several selector strategies.
@@ -430,18 +426,60 @@ def _find_demo_button(page, txt: str):
             continue
     return None
 
+def _human_click(page, x: float, y: float, variance: float = 3.0) -> None:
+    """Humanized real mouse click at (x, y).
+
+    Moves the pointer to a point near the target, then to the target in a few
+    small jittered steps with human-like delays, then clicks. FACEIT's bot
+    detection flags teleport-to-target + instant clicks; this gives the pointer
+    a natural path so the interaction reads as human. Delays are short and
+    randomized so it stays fast enough for a download scrape.
+    """
+    import random
+    import time as _t
+
+    # start slightly off-target, then converge in small steps
+    sx = x + random.uniform(-8, 8)
+    sy = y + random.uniform(-8, 8)
+    page.mouse.move(sx, sy)
+    _t.sleep(random.uniform(0.08, 0.25))
+    steps = random.randint(2, 4)
+    for i in range(1, steps + 1):
+        tx = x + random.uniform(-variance, variance)
+        ty = y + random.uniform(-variance, variance)
+        page.mouse.move(tx, ty, steps=random.randint(3, 6))
+        _t.sleep(random.uniform(0.04, 0.12))
+    page.mouse.move(x, y, steps=random.randint(2, 4))
+    _t.sleep(random.uniform(0.1, 0.3))
+    page.mouse.down()
+    _t.sleep(random.uniform(0.03, 0.09))
+    page.mouse.up()
+    _t.sleep(random.uniform(0.05, 0.15))
+
+def _reload(page, room_url: Optional[str]) -> bool:
+    """Re-navigate to the room page; returns False if impossible."""
+    if not room_url:
+        return False
+    try:
+        page.goto(room_url, wait_until="domcontentloaded")
+        page.wait_for_timeout(8000)
+        return True
+    except Exception as e:
+        console.print(f"[yellow]   [WARN] Reload failed: {e}[/yellow]")
+        return False
 
 def _click_demo_and_save(page, out_dir: Path, room_url: Optional[str] = None) -> Optional[Path]:
-    """Click the demo download button and capture the browser download.
+    """Click Watch Demo -> dropdown -> a demo option, then wait for the download.
 
-    WATCH DEMO opens a popup that initiates the download — the download event
-    fires at the browser level, not on the page, so we use CDP
-    Browser.setDownloadBehavior to route it into out_dir natively, then wait
-    for the file to appear (the .crdownload suffix disappears on completion).
-
-    If the download doesn't start within DOWNLOAD_START_TIMEOUT of the click,
-    the attempt is restarted (page re-navigated to room_url, modal re-dismissed,
-    button re-clicked), up to DOWNLOAD_MAX_RETRIES times.
+    Expected FACEIT behavior:
+      * "Watch Demo" opens an inline dropdown with "Demo 1" / "Demo 2" (one per
+        map in a multi-map match). If it doesn't drop down, click it again.
+      * Clicking a demo option opens a blank page for 1-2s, then the download
+        starts (the CDN response routes to the browser download, landing in the
+        OS default Downloads folder). The blank page is the signal a download is
+        imminent.
+      * The blank page can take up to ~2 minutes to appear; wait that long
+        before giving up and restarting.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -453,120 +491,194 @@ def _click_demo_and_save(page, out_dir: Path, room_url: Optional[str] = None) ->
     except Exception as e:
         console.print(f"[yellow]   [WARN] CDP download setup failed: {e}[/yellow]")
 
-    before = set(out_dir.iterdir())
+    # The download lands in the OS default Downloads folder (the CDN request
+    # bypasses page-level CDP routing). Watch BOTH out_dir and the OS Downloads
+    # folder so a download is never missed (and never double-clicked).
+    watch_dirs = [out_dir]
+    try:
+        # Resolve the real OS Downloads folder (FOLDERID_Downloads) — the CDN
+        # download lands there, bypassing CDP's page-level routing.
+        import ctypes
+        import uuid
+
+        class _GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", ctypes.c_ulong),
+                ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        _fd = _GUID()
+        _u = uuid.UUID("{374de290-123f-4565-9164-39c4925e467b}")
+        _fd.Data1, _fd.Data2, _fd.Data3 = _u.time_low, _u.time_mid, _u.time_hi_version
+        _fd.Data4 = (ctypes.c_ubyte * 8)(*_u.bytes[8:])
+        _get = ctypes.windll.shell32.SHGetKnownFolderPath
+        _get.argtypes = [
+            ctypes.POINTER(_GUID), ctypes.c_ulong,
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p),
+        ]
+        _get.restype = ctypes.c_long
+        _p = ctypes.c_wchar_p()
+        if _get(ctypes.byref(_fd), 0, None, ctypes.byref(_p)) == 0 and _p.value:
+            watch_dirs.append(Path(_p.value))
+            try:
+                ctypes.windll.ole32.CoTaskMemFree(_p)
+            except Exception:
+                pass
+    except Exception:
+        # Last-resort fallback: the conventional user Downloads path.
+        try:
+            watch_dirs.append(Path.home() / "Downloads")
+        except Exception:
+            pass
+
+    def _snapshot() -> dict[Path, int]:
+        snap: dict[Path, int] = {}
+        for d in watch_dirs:
+            if not d.is_dir():
+                continue
+            for p in d.iterdir():
+                if p.is_file():
+                    snap[p] = p.stat().st_size
+        return snap
+
+    before = _snapshot()
 
     def _new_files() -> list[Path]:
-        return [p for p in out_dir.iterdir() if p.is_file() and p not in before]
+        return [p for p, _ in _snapshot().items() if p not in before]
 
     def _download_started() -> Optional[Path]:
         """True once any new file appears — .crdownload counts as started."""
         files = _new_files()
         if not files:
             return None
-        # prefer a completed file; otherwise report the in-progress one
         done = [p for p in files if p.suffix != ".crdownload"]
         return (done or files)[0]
 
-    def _reload() -> bool:
-        """Re-navigate to the room page; returns False if impossible."""
-        if not room_url:
-            return False
-        try:
-            page.goto(room_url, wait_until="domcontentloaded")
-            page.wait_for_timeout(8000)
-            return True
-        except Exception as e:
-            console.print(f"[yellow]   [WARN] Reload failed: {e}[/yellow]")
-            return False
+    def _wait_for_download(timeout: float = 600.0) -> Optional[Path]:
+        """Wait until a download completes in a watched dir; return its path."""
+        deadline = time.monotonic() + timeout
+        last_log = time.monotonic()
+        while time.monotonic() < deadline:
+            dest = _download_started()
+            if dest is not None and dest.suffix != ".crdownload" and dest.stat().st_size > 0:
+                return dest
+            # periodic progress so it's clear we're waiting, not hung
+            if time.monotonic() - last_log >= 30:
+                live = _new_files()
+                console.print(f"  [DL] waiting for download to complete ({len(live)} new file(s) seen)...")
+                last_log = time.monotonic()
+            time.sleep(3)
+        return None
 
-    for txt in DOWNLOAD_BUTTON_TEXTS:
-        for attempt in range(1, DOWNLOAD_MAX_RETRIES + 1):
+    def _open_dropdown(attempt: int) -> bool:
+        """Click 'Watch Demo', retrying until the dropdown (Demo 1/Demo 2) appears."""
+        for _ in range(3):
             try:
-                if attempt > 1 and not _reload():
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(500)
+            except Exception:
+                pass
+            loc = _find_demo_button(page, "watch demo") or _find_demo_button(page, "demo")
+            if loc is None:
+                return False
+            bbox = loc.first.bounding_box()
+            if not bbox:
+                return False
+            console.print(f"[cyan]   [DL] Clicking 'Watch Demo' (dropdown attempt {attempt})...[/cyan]")
+            _human_click(page, bbox["x"] + bbox["width"] / 2, bbox["y"] + bbox["height"] / 2)
+            page.wait_for_timeout(2500)
+            if page.locator("text=Demo 1").count() > 0 or page.locator("text=Demo 2").count() > 0:
+                return True
+        return False
+
+    page_count_before = len(page.context.pages)
+
+    for attempt in range(1, DOWNLOAD_MAX_RETRIES + 1):
+        try:
+            if not _open_dropdown(attempt):
+                console.print(f"[yellow]   [DL] Could not open demo dropdown (attempt {attempt}/{DOWNLOAD_MAX_RETRIES}) — restarting...[/yellow]")
+                if not _reload(page, room_url):
                     return None
-                loc = _find_demo_button(page, txt)
-                if loc is None:
-                    break  # try next button text
-
-                console.print(f"[cyan]   [DL] Clicking '{txt}' (attempt {attempt})...[/cyan]")
-                # Dismiss any interstitial modal (e.g. "Season recap") that
-                # would intercept pointer events on the demo button.
-                try:
-                    page.keyboard.press("Escape")
-                    page.wait_for_timeout(600)
-                except Exception:
-                    pass
-                # FACEIT's Watch Demo opens a popup that triggers the download.
-                # A Playwright element .click() doesn't always open it (and just
-                # navigates/loads), so we dispatch a REAL mouse gesture at the
-                # button center and catch the popup, then let the download fire.
-                popup = None
-                try:
-                    bbox = loc.first.bounding_box()
-                except Exception:
-                    bbox = None
-                if bbox:
-                    try:
-                        with page.context.expect_page(timeout=8000) as pinfo:
-                            page.mouse.click(
-                                bbox["x"] + bbox["width"] / 2,
-                                bbox["y"] + bbox["height"] / 2,
-                            )
-                        popup = pinfo.value
-                    except Exception:
-                        popup = None
-                if popup is None:
-                    try:
-                        loc.first.click(timeout=15_000)
-                    except Exception:
-                        pass
-                if popup is not None:
-                    console.print("[cyan]   [DL] Popup opened — waiting for download...[/cyan]")
-                    try:
-                        try:
-                            cdp2 = popup.context.new_cdp_session(popup)
-                            cdp2.send(
-                                "Browser.setDownloadBehavior",
-                                {"behavior": "allow",
-                                 "downloadPath": str(out_dir.resolve()),
-                                 "eventsEnabled": True},
-                            )
-                        except Exception:
-                            pass
-                        popup.wait_for_timeout(5000)
-                    except Exception:
-                        pass
-
-                # Watchdog: download must START within DOWNLOAD_START_TIMEOUT.
-                start = time.monotonic()
-                while time.monotonic() - start < DOWNLOAD_START_TIMEOUT:
-                    if _download_started():
-                        break
-                    time.sleep(0.5)
-                if not _download_started():
-                    console.print(
-                        f"[yellow]   [WARN] No download within {DOWNLOAD_START_TIMEOUT}s "
-                        f"(attempt {attempt}/{DOWNLOAD_MAX_RETRIES}) — restarting...[/yellow]"
-                    )
-                    continue
-
-                # Started — wait for it to complete (up to ~10 min).
-                deadline = time.monotonic() + 600
-                while time.monotonic() < deadline:
-                    dest = _download_started()
-                    if dest is not None and dest.suffix != ".crdownload" and dest.stat().st_size > 0:
-                        if "popup" in dir() and popup is not None:
-                            try:
-                                popup.close()
-                            except Exception:
-                                pass
-                        return dest
-                    time.sleep(3)
-                console.print("[yellow]   [WARN] Download started but never completed.[/yellow]")
-                return None
-            except Exception as e:
-                console.print(f"[yellow]   [WARN] '{txt}' attempt {attempt} failed: {e}[/yellow]")
                 continue
+
+            # Click the first demo option (Demo 1 preferred, else Demo 2).
+            demo_opt = page.get_by_text("Demo 1", exact=True).first
+            if demo_opt.count() == 0:
+                demo_opt = page.get_by_text("Demo 2", exact=True).first
+            if demo_opt.count() == 0:
+                console.print("[yellow]   [DL] Dropdown open but no demo option found — restarting...[/yellow]")
+                if not _reload(page, room_url):
+                    return None
+                continue
+
+            console.print(f"[cyan]   [DL] Clicking '{demo_opt.inner_text().strip()}' (attempt {attempt})...[/cyan]")
+            bb = demo_opt.bounding_box()
+            _human_click(page, bb["x"] + bb["width"] / 2, bb["y"] + bb["height"] / 2)
+
+            # Wait for the blank page to open (the download trigger). This can
+            # take up to ~2 min for FACEIT to spin up the CDN link.
+            blank_page: Optional[Any] = None
+            start = time.monotonic()
+            while time.monotonic() - start < DOWNLOAD_START_TIMEOUT:
+                new_pages = [pg for pg in page.context.pages[page_count_before:]
+                             if pg != page]
+                if new_pages:
+                    blank_page = new_pages[0]
+                    console.print(
+                        f"[cyan]   [DL] Blank page opened: '{blank_page.url[:60]}' — download should start...[/cyan]"
+                    )
+                    # Instrument the popup so we can see what it's doing if the
+                    # download is slow or never starts: log its navigation, final
+                    # response headers (status / content-type / content-disposition),
+                    # console messages, and page errors.
+                    try:
+                        blank_page.on("framenavigated", lambda f: console.print(
+                            f"  [popup nav] {f.url[:100]}" if f.url and not f.url.startswith("about:") else ""
+                        ))
+                        def _popup_response(r):
+                            h = r.headers
+                            console.print(
+                                f"  [popup resp] {r.status} {r.url[:100]} "
+                                f"type={h.get('content-type','?')} "
+                                f"disp={h.get('content-disposition','-')}"
+                            )
+                        blank_page.on("response", _popup_response)
+                        blank_page.on("console", lambda m: console.print(
+                            f"  [popup console] {m.type}: {m.text[:120]}"
+                        ))
+                        blank_page.on("pageerror", lambda e: console.print(
+                            f"  [popup pageerror] {e}"
+                        ))
+                    except Exception as _pe:
+                        console.print(f"  [popup] instrument failed: {_pe}")
+                    break
+                if _download_started():
+                    break
+                time.sleep(1)
+
+            # Wait for the download to appear and complete. The popup can sit
+            # open for a while before the CDN responds — don't give up early.
+            dest = _wait_for_download(timeout=600.0)
+            if dest is not None:
+                if blank_page is not None:
+                    try:
+                        blank_page.close()
+                    except Exception:
+                        pass
+                return dest
+
+            console.print(
+                f"[yellow]   [WARN] No download within {DOWNLOAD_START_TIMEOUT}s "
+                f"(attempt {attempt}/{DOWNLOAD_MAX_RETRIES}) — restarting...[/yellow]"
+            )
+            if not _reload(page, room_url):
+                return None
+        except Exception as e:
+            console.print(f"[yellow]   [DL] attempt {attempt} failed: {e}[/yellow]")
+            if not _reload(page, room_url):
+                return None
     return None
 
 
@@ -602,7 +714,6 @@ def download_demo(match_id: str) -> DownloadResult:
     # ── Fallback: browser scrape ───────────────────────────────────────
     return _download_demo_browser(match_id, match_info, started)
 
-
 def _finalize_download(match_info, saved, started) -> DownloadResult:
     """Extract the archived demo and organize it into the FACEIT demo dir."""
     from downloader import build_demo_path, record_download
@@ -615,6 +726,54 @@ def _finalize_download(match_info, saved, started) -> DownloadResult:
         organized.unlink()
     dem_path.replace(organized)
     dem_path = organized
+
+    # The browser download lands in the OS default Downloads folder (FACEIT's
+    # CDN request bypasses CDP routing). After we've moved the .dem into the
+    # project's demos/ dir, clean up any leftover downloaded archive there so it
+    # isn't left behind in the user's Downloads folder.
+    def _downloads_dir() -> Optional[Path]:
+        try:
+            import ctypes
+            import uuid
+
+            class _GUID(ctypes.Structure):
+                _fields_ = [
+                    ("Data1", ctypes.c_ulong),
+                    ("Data2", ctypes.c_ushort),
+                    ("Data3", ctypes.c_ushort),
+                    ("Data4", ctypes.c_ubyte * 8),
+                ]
+
+            _fd = _GUID()
+            _u = uuid.UUID("{374de290-123f-4565-9164-39c4925e467b}")
+            _fd.Data1, _fd.Data2, _fd.Data3 = _u.time_low, _u.time_mid, _u.time_hi_version
+            _fd.Data4 = (ctypes.c_ubyte * 8)(*_u.bytes[8:])
+            _get = ctypes.windll.shell32.SHGetKnownFolderPath
+            _get.argtypes = [
+                ctypes.POINTER(_GUID), ctypes.c_ulong,
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p),
+            ]
+            _get.restype = ctypes.c_long
+            _p = ctypes.c_wchar_p()
+            if _get(ctypes.byref(_fd), 0, None, ctypes.byref(_p)) == 0 and _p.value:
+                d = Path(_p.value)
+                try:
+                    ctypes.windll.ole32.CoTaskMemFree(_p)
+                except Exception:
+                    pass
+                return d
+        except Exception:
+            pass
+        return Path.home() / "Downloads"
+    try:
+        dl_dir = _downloads_dir()
+        for p in dl_dir.iterdir():
+            if p.is_file() and match_info.match_id in p.name and p.name != organized.name:
+                p.unlink(missing_ok=True)
+                console.print(f"[cyan]   [CLEAN] removed {dl_dir.name}/{p.name}[/cyan]")
+    except Exception:
+        pass
+
     record_download(DownloadResult(
         match=match_info, status=DownloadStatus.COMPLETED,
         demo_path=dem_path, file_size_mb=file_size_mb(dem_path),
@@ -626,7 +785,6 @@ def _finalize_download(match_info, saved, started) -> DownloadResult:
         demo_path=dem_path, file_size_mb=file_size_mb(dem_path),
         started_at=started, completed_at=datetime.now(),
     )
-
 
 def _download_demo_browser(match_id: str, match_info: MatchInfo, started) -> DownloadResult:
     """Fallback: open room (authed) → click demo → extract → organize."""
