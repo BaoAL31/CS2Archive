@@ -250,6 +250,10 @@ def main() -> None:
     ap.add_argument("--out", required=True, help="output mp4")
     ap.add_argument("--voice-volume", type=float, default=2.5,
                     help="gain applied to the voice track (default 2.5)")
+    ap.add_argument("--voice-rms-target", type=float, default=0.08,
+                    help="per-player target active-RMS for equal loudness (default 0.08)")
+    ap.add_argument("--voice-max-gain", type=float, default=12.0,
+                    help="max per-player normalization gain (default 12.0)")
     ap.add_argument("--tickrate", type=int, default=_TICKRATE)
     ap.add_argument("--force", action="store_true",
                     help="overwrite out even if a teamvoice marker exists")
@@ -277,6 +281,11 @@ def main() -> None:
     team_rows = [r for r in rows if team_map.get(r["steamid"]) == pov_team]
     print(f"[voice] {len(rows)} voice packets total, "
           f"{len(team_rows)} from POV team (team {pov_team})")
+    if not team_rows:
+        print(f"[ERROR] No voice data for the POV team (team {pov_team}) in {demo.name}. "
+              f"Voice comms/indicators require per-player voice in the demo. "
+              f"Nothing to mix — refusing to produce a silent 'comms' result.")
+        sys.exit(1)
 
     # group by steamid so each player decodes in one pass
     by_player: dict[str, list[dict]] = {}
@@ -284,12 +293,41 @@ def main() -> None:
         by_player.setdefault(r["steamid"], []).append(r)
 
     dur = video_duration(video)
-    buf = np.zeros(int(dur * SAMPLE_RATE) + FRAME_SAMPLES, dtype=np.float64)
+    n = int(dur * SAMPLE_RATE) + FRAME_SAMPLES
+
+    # Place each player into its OWN buffer so we can normalize players
+    # independently before summing. Previously everyone shared one buffer and got
+    # a single global peak-normalize, so the loudest player set the ceiling and
+    # quieter players (e.g. magixx) stayed buried under the team voice.
+    player_bufs: dict[str, np.ndarray] = {}
     placed = 0
     for sid, rows_p in by_player.items():
         rows_p.sort(key=lambda r: r["tick"])
-        placed += place_into_buffer(buf, rows_p, offsets, args.tickrate)
+        pb = np.zeros(n, dtype=np.float64)
+        placed += place_into_buffer(pb, rows_p, offsets, args.tickrate)
+        player_bufs[sid] = pb
         print(f"  [voice] {sid}: {len(rows_p)} pkts decoded")
+
+    # Equal-loudness: normalize each player to a target RMS measured over their
+    # ACTIVE (non-silent) voice, so no one is buried under a louder teammate.
+    # Whole-buffer RMS is diluted by silence, so we measure loudness only where
+    # the player actually speaks. Cap the gain so a single soft or sparse player
+    # isn't amplified into a wall of noise.
+    target_rms = args.voice_rms_target
+    gains = {}
+    for sid, pb in player_bufs.items():
+        nz = pb[pb != 0]
+        active_rms = float(np.sqrt((nz ** 2).mean())) if len(nz) else 0.0
+        gain = target_rms / active_rms if active_rms > 0 else 0.0
+        gain = min(gain, args.voice_max_gain)
+        gains[sid] = round(gain, 3)
+        if gain > 0:
+            player_bufs[sid] = pb * gain
+    print(f"  [voice] per-player gains (x{target_rms:.3f} active-RMS target): {gains}")
+
+    buf = np.zeros(n, dtype=np.float64)
+    for pb in player_bufs.values():
+        buf += pb
 
     active = np.count_nonzero(buf != 0)
     print(f"[voice] placed {placed} packets; "

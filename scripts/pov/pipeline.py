@@ -120,6 +120,33 @@ def pov_render_dir(dem_stem: str, player: str) -> Path:
     return PROJECT_ROOT / "renders" / f"pov-{dem_stem}_{player_slug}"
 
 
+def _faceit_rename_map(demo_path: Path) -> dict:
+    """Build {SteamID64 -> canonical pro name} for recognized pros in a FACEIT demo.
+
+    Players often change their in-game FACEIT name to avoid recognition, so the
+    rendered HUD shows each recognized pro's canonical name instead of the demo's
+    recorded (possibly disguised) name. Only pros we actually recognize are
+    renamed; everyone else keeps their recorded name.
+    """
+    from scripts.faceit.faceit_names import known_pro_steam_ids
+
+    if not demo_path or not demo_path.exists():
+        return {}
+    try:
+        import demoparser2 as dp
+        info = dp.DemoParser(str(demo_path)).parse_player_info()
+        steam_ids = {str(r.get("steamid", "")).strip() for _, r in info.iterrows()}
+    except Exception:
+        return {}
+    pro_names = known_pro_steam_ids()  # steam_id_64 -> canonical pro name
+    rename_map = {}
+    for sid in steam_ids:
+        name = pro_names.get(sid)
+        if name:
+            rename_map[sid] = name
+    return rename_map
+
+
 def _parse_backlog(path: str) -> dict:
     """Parse backlog .json file and validate required fields."""
     p = Path(path)
@@ -534,6 +561,15 @@ class Pipeline:
         player = (self.meta.get("player") or "").strip()
         if player:
             render_args += ["--player", player]
+
+        # Default for FACEIT: rename recognized pros in the rendered HUD to their
+        # canonical pro name (players often change their FACEIT name to avoid
+        # recognition, so we display the official pro name instead). Uses the same
+        # canonical nickname logic as the title/thumbnail.
+        if self.is_faceit and self.demo_path and self.demo_path.exists():
+            rename_map = _faceit_rename_map(self.demo_path)
+            if rename_map:
+                render_args += ["--rename", json.dumps(rename_map)]
         for flag, key in (
             ("--viewmodel-fov", "viewmodel_fov"),
             ("--viewmodel-offset-x", "viewmodel_offset_x"),
@@ -977,6 +1013,24 @@ class Pipeline:
             concat_args += ["--scaling-mode", scaling]
         if skip_failed:
             concat_args += ["--allow-gaps"]
+        # Voice is ONE feature: the shade indicator AND the comms audio always
+        # go together. --enable-voice-comms turns on both. (--voice-shade is a
+        # legacy alias kept for backward-compat; it implies the same.)
+        # The shade is applied at NATIVE res in the SCALE step so it stretches
+        # together with the video (boxes stay locked to avatars).
+        enable_voice = (
+            getattr(self.args, "enable_voice_comms", False)
+            or getattr(self.args, "voice_shade", False)
+        )
+        if enable_voice and self.demo_path and self.demo_path.exists():
+            cap_w = int(self.meta.get("capture_width") or 0)
+            cap_h = int(self.meta.get("capture_height") or 0)
+            concat_args += [
+                "--voice-shade-demo", str(self.demo_path),
+                "--voice-shade-steam-id", self.steam_id,
+                "--voice-shade-fade", str(getattr(self.args, "voice_shade_fade", 0.3)),
+                "--voice-shade-side", "right",
+            ]
         r = self._run_py(concat_args, timeout=7200)
         if r.returncode != 0:
             fail(3, "CONCAT_FAILED", f"concat_rounds.py exited {r.returncode}")
@@ -1030,6 +1084,17 @@ class Pipeline:
         target_dir = self.render_dir / ".overlay_work"
 
         video_path = target_dir / "video.mp4"
+        # Ensure the round_offsets sidecar is always present next to video.mp4.
+        # overlay_pov.py needs <video>.round_offsets.json for tick->frame sync.
+        # The copy below is normally done together with video.mp4, but if a
+        # previous run left video.mp4 behind without its sidecar (e.g. killed
+        # between the two copies), re-copy the sidecar so resume works.
+        sidecar_dst = target_dir / "video.round_offsets.json"
+        sidecar_src = self.render_dir / "combined.round_offsets.json"
+        if video_path.exists() and not sidecar_dst.exists() and sidecar_src.is_file():
+            target_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(sidecar_src), str(sidecar_dst))
+            print(f"  [setup] re-copied missing sidecar to {sidecar_dst.name}")
         if not video_path.exists():
             # Auto-recover from render-side overlay artifacts only.
             # Do NOT treat youtube/..._overlay/video.mp4 as a resume source —
@@ -1081,13 +1146,10 @@ class Pipeline:
             "--util-cams-root", str(self.render_dir / "utility_cams"),
             "--work-dir", str(work_dir),
         ]
-        if getattr(self.args, "voice_shade", False):
-            ov_args += ["--voice-shade",
-                        "--voice-shade-fade", str(getattr(self.args, "voice_shade_fade", 0.3))]
-            cap_w = int(self.meta.get("capture_width") or 0)
-            cap_h = int(self.meta.get("capture_height") or 0)
-            if cap_w >= 800 and cap_h >= 600:
-                ov_args += ["--voice-shade-native-res", f"{cap_w}x{cap_h}"]
+        # Note: the voice-activity SHADE is applied in the SCALE step (step 3),
+        # not here — the shade must stretch together with the video. Step 4 only
+        # handles keyboard + util-cam PiP overlays. The comms AUDIO mix happens
+        # right after this step (below).
         r = self._run_py(ov_args, timeout=7200, capture_output=True, text=True)
         if r.returncode != 0:
             if r.stdout:
@@ -1101,6 +1163,34 @@ class Pipeline:
             fail(4, "OVERLAY_NO_OUTPUT",
                  f"overlay_pov.py succeeded but {overlay_sidecar} not found")
             return
+
+        # -- Voice comms: mix POV-team voice into the overlay audio. ---------
+        # Runs only when voice is enabled, and always together with the shade
+        # (the shade is baked into overlay_sidecar by overlay_pov above). Uses
+        # the FIXED packet-aligned decoder; video is stream-copied (no re-encode).
+        if enable_voice:
+            offsets_for_comms = target_dir / "video.round_offsets.json"
+            if not offsets_for_comms.is_file():
+                offsets_for_comms = self.render_dir / "combined.round_offsets.json"
+            comms_out = video_path.with_name("video.overlay.voice.mp4")
+            r = self._run_py([
+                "scripts/faceit/mix_team_voice.py",
+                "--demo", str(self.demo_path),
+                "--video", str(overlay_sidecar),
+                "--steam-id", steam_id,
+                "--offsets", str(offsets_for_comms),
+                "--out", str(comms_out),
+                "--force",
+            ], timeout=7200, capture_output=True, text=True)
+            if r.stdout:
+                print(r.stdout)
+            if r.returncode != 0:
+                if r.stderr:
+                    print("[stderr]", r.stderr[-2000:])
+                fail(4, "VOICE_COMMS_FAILED", f"mix_team_voice.py exited {r.returncode}")
+            if comms_out.exists() and comms_out.stat().st_size > 100_000:
+                comms_out.replace(overlay_sidecar)
+                print(f"  [voice-comms] mixed team voice into {overlay_sidecar.name}")
 
         # Copy overlay result from renders/ work dir -> youtube/ variant dir
         self._copy_overlay_result_to_youtube(overlay=overlay_sidecar)
@@ -1489,13 +1579,20 @@ def main() -> None:
              "resume. Set 0 for single-pass (original behavior).",
     )
     parser.add_argument(
+        "--enable-voice-comms",
+        action="store_true",
+        default=False,
+        help="Enable BOTH the voice-activity shade indicator AND the POV-team "
+             "voice comms (they always go together). Folds the shade into the "
+             "batched overlay encode and mixes the team voice into the audio "
+             "(via mix_team_voice.py).",
+    )
+    parser.add_argument(
         "--voice-shade",
         action="store_true",
         default=False,
-        help="Also overlay a voice-activity shade on the POV team's scoreboard "
-             "avatars (shade fades out when a teammate talks). Requires the "
-             "demo's voice data + combined.round_offsets.json. Runs as an "
-             "extra ffmpeg pass after overlay_pov.py.",
+        help="[legacy alias of --enable-voice-comms] Overlay a voice-activity "
+             "shade + mix team voice comms.",
     )
     parser.add_argument(
         "--voice-shade-fade",

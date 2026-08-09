@@ -90,8 +90,6 @@ from overlay.overlay_encode import (
     _concat_overlay_batches,
     _compute_batch_boundaries,
 )
-from overlay.voice_shade import build_voice_shade_data, _write_alpha_control
-
 # -- Constants -----------------------------------------------------------
 
 # --- Util PiP burn-in geometry -----------------------------------------
@@ -701,11 +699,6 @@ def run_overlay(
     util_cams_root: Path | None = None,
     work_dir: Path | None = None,
     allow_missing_util_cams: bool = False,
-    voice_shade: bool = False,
-    voice_shade_fade: float = 0.3,
-    voice_shade_shade: float = 0.55,
-    voice_shade_side: str = "right",
-    voice_shade_native_res: str | None = None,
 ) -> None:
     """Apply keyboard overlay + utility throw flight PiP onto video_path (in place)."""
     if not video_path.exists():
@@ -1003,37 +996,6 @@ def run_overlay(
                      f"--allow-missing-util-cams to force a keyboard-only overlay.")
                 sys.exit(1)
 
-        # -- Optional: voice-activity shade on POV team's avatars -------------
-        # Compute the per-box alpha timelines ONCE (full duration), then slice
-        # them per batch below and fold the shade overlays into the SAME ffmpeg
-        # encode as keyboard/PiP (no separate re-encode).
-        voice_shade_data = None
-        voice_shade_ctrl_dir: Path | None = None
-        if voice_shade:
-            offsets_for_shade = None
-            # prefer the per-round sidecar used by keyboard/PiP mapping
-            offset_path = video_path.with_suffix(".mp4").with_name(f"{video_path.stem}.round_offsets.json")
-            if offset_path.is_file():
-                from mix_team_voice import load_offsets
-                offsets_for_shade = load_offsets(offset_path)
-            if offsets_for_shade is None:
-                _log("[ERROR] --voice-shade requires <video>.round_offsets.json sidecar")
-                sys.exit(1)
-            voice_shade_data = build_voice_shade_data(
-                demo_path, video_path, steam_id, offsets_for_shade, fps,
-                frame_count / fps,
-                native_res=voice_shade_native_res,
-                pov_side=voice_shade_side,
-                fade=voice_shade_fade,
-                shade=voice_shade_shade,
-            )
-            voice_shade_ctrl_dir = work_dir / "voice_shade_ctrl"
-            voice_shade_ctrl_dir.mkdir(parents=True, exist_ok=True)
-            # Pre-write full-length 1x1 RGBA controls (sliced per batch below).
-            for bi, alpha in enumerate(voice_shade_data.alpha_frames):
-                _write_alpha_control(voice_shade_ctrl_dir / f"box_{bi}.rgba", alpha)
-            _log(f"[voice-shade] {len(voice_shade_data.box_rects)} boxes, "
-                 f"{voice_shade_data.total_frames} frames")
 
         if batches > 0 and round_offsets:
             _log(f"Batched overlay: {batches} round(s) per batch")
@@ -1141,43 +1103,6 @@ def run_overlay(
                         )
                         continue
 
-                    # -- Voice-shade: slice per-box alpha controls to this batch
-                    # and append the shade overlays onto the SAME encode.
-                    raw_inputs: list[tuple[Path, list[str]]] = []
-                    if voice_shade_data is not None and voice_shade_ctrl_dir is not None:
-                        shade_parts = []
-                        shade_cur = out_label
-                        # raw inputs come after png_inputs + pip clips + masks
-                        shade_input_offset = 1 + len(png_inputs) + len(sorted_batch_pips) + (2 if pip_inner_mask is not None else 0)
-                        for bi, (rect, alpha) in enumerate(
-                                zip(voice_shade_data.box_rects, voice_shade_data.alpha_frames)):
-                            x0, y0, x1, y1 = rect
-                            bw, bh = x1 - x0 + 1, y1 - y0 + 1
-                            # slice alpha to batch frame range
-                            batch_alpha = alpha[batch_start_frame:batch_end_frame]
-                            if len(batch_alpha) == 0:
-                                continue
-                            ctrl_slice = voice_shade_ctrl_dir / f"box_{bi}_{batch_start_rn:03d}.rgba"
-                            _write_alpha_control(ctrl_slice, batch_alpha)
-                            in_idx = shade_input_offset + bi
-                            tag = f"vs{bi}"
-                            # offset control PTS to batch start (like PiP) so it
-                            # aligns with the main (batch-trimmed) timeline
-                            shade_parts.append(
-                                f"[{in_idx}:v]setpts=PTS-STARTPTS+{batch_start_sec:.6f}/TB,"
-                                f"scale={bw}:{bh}:flags=bilinear[sc{bi}];"
-                                f"{shade_cur}[sc{bi}]overlay=x={x0}:y={y0}:shortest=1[{tag}]"
-                            )
-                            shade_cur = f"[{tag}]"
-                            raw_inputs.append((ctrl_slice, [
-                                "-f", "rawvideo", "-pix_fmt", "rgba", "-s", "1x1",
-                                "-r", f"{fps:.3f}",
-                            ]))
-                        if shade_parts:
-                            combined_fc = f"{combined_fc};{';'.join(shade_parts)}"
-                            out_label = shade_cur
-                            _log(f"  [voice-shade] {len(shade_parts)} overlays in {batch_name}")
-
                     fc_script = work_dir / f"batch_{batch_start_rn:03d}_{batch_end_rn:03d}.txt"
                     fc_script.write_text(combined_fc, encoding="utf-8")
                     extra = list(png_inputs) + [c.clip_path for c in sorted_batch_pips]
@@ -1192,7 +1117,6 @@ def run_overlay(
                         out_label, str(batch_path),
                         segment=(batch_start_sec, batch_end_sec),
                         loop_inputs=loops,
-                        raw_inputs=raw_inputs or None,
                     )
 
                 _log(f"  [batch] All batches encoded in {time.time()-t5:.1f}s")
@@ -1320,19 +1244,6 @@ def main() -> None:
                         help="Force a keyboard-only overlay even when some util-cam "
                              "flight clips are missing (default: hard-fail so broken "
                              "output is never shipped silently).")
-    parser.add_argument("--voice-shade", action="store_true",
-                        help="Also overlay a voice-activity shade on the POV team's "
-                             "scoreboard avatars (folded into the same batched encode "
-                             "as keyboard/PiP, so no extra re-encode).")
-    parser.add_argument("--voice-shade-fade", type=float, default=0.3,
-                        help="Voice-shade fade duration in seconds (default 0.3).")
-    parser.add_argument("--voice-shade-shade", type=float, default=0.55,
-                        help="Shade opacity when not talking (default 0.55).")
-    parser.add_argument("--voice-shade-side", choices=["left", "right"], default="right",
-                        help="Scoreboard side of the POV team (default right).")
-    parser.add_argument("--voice-shade-native-res", default=None,
-                        help="Native render resolution WxH the avatar-box config is "
-                             "keyed to (set when video was upscaled/stretched).")
     args = parser.parse_args()
 
     # Ensure CS2UtilArchive has extracted+analyzed this demo (throws.parquet).
@@ -1341,12 +1252,7 @@ def main() -> None:
 
     run_overlay(Path(args.video), Path(args.demo), args.steam_id, args.round, args.batches,
                 util_cams_root=args.util_cams_root, work_dir=args.work_dir,
-                allow_missing_util_cams=args.allow_missing_util_cams,
-                voice_shade=args.voice_shade,
-                voice_shade_fade=args.voice_shade_fade,
-                voice_shade_shade=args.voice_shade_shade,
-                voice_shade_side=args.voice_shade_side,
-                voice_shade_native_res=args.voice_shade_native_res)
+                allow_missing_util_cams=args.allow_missing_util_cams)
 
 
 if __name__ == "__main__":

@@ -486,8 +486,59 @@ def _scale_vf(w: int, h: int, scaling_mode: str = "") -> tuple[str, str]:
 
 
 
-def _encode_scaled(src: Path, dst: Path, w: int, h: int, scaling_mode: str) -> None:
-    """Single encode: resample (stretch and/or upscale) straight to target WxH."""
+def _write_filter_script(filter_complex: str) -> str:
+    """Write a filter_complex string to a temp script file, return its path."""
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix="fcs_")
+    with open(fd, "w", encoding="utf-8") as f:
+        f.write(filter_complex)
+    return path
+
+
+def _build_shade_filter(
+    box_rects: list[tuple[int, int, int, int]],
+    shade_ctrls: list[Path],
+    fps: float,
+    w: int,
+    h: int,
+    scaling_mode: str,
+) -> tuple[str, int]:
+    """Build a filter_complex graph that composites native-res voice-shade boxes
+    THEN scales video+shade together to target WxH.
+
+    Returns ``(filter_complex, next_input_index)``. The shade is applied at the
+    video's NATIVE coordinates, so the trailing ``scale`` stretches the video and
+    the shade identically — the boxes stay locked to the avatars. This is the
+    whole reason the shade lives in the scale step, not the overlay step.
+    """
+    vf, _ = _scale_vf(w, h, scaling_mode)
+    parts = ["[0:v]null[v0]"]
+    cur = "v0"
+    idx = 1
+    for ctrl, rect in zip(shade_ctrls, box_rects):
+        x0, y0, x1, y1 = rect
+        bw, bh = x1 - x0 + 1, y1 - y0 + 1
+        cur2 = f"{cur}s"
+        nxt = f"{cur}o"
+        parts.append(
+            f"[{idx}:v]scale={bw}:{bh}:flags=bilinear[{cur2}];"
+            f"[{cur}][{cur2}]overlay=x={x0}:y={y0}:shortest=1[{nxt}]"
+        )
+        cur = nxt
+        idx += 1
+    parts.append(f"[{cur}]{vf}[vout]")
+    fc = ";".join(parts)
+    return fc, idx
+
+
+def _encode_scaled(src: Path, dst: Path, w: int, h: int, scaling_mode: str,
+                   shade: dict | None = None) -> None:
+    """Single encode: resample (stretch and/or upscale) straight to target WxH.
+
+    ``shade`` (optional) = ``{"box_rects": [...], "alpha_frames": np.ndarray,
+    "fps": float}`` for the voice-activity shade. When provided the shade is
+    composited at native resolution BEFORE the upscale, so the scale stretches
+    the video and the shade together (boxes stay locked to avatars).
+    """
     src_mb = src.stat().st_size / 1024 / 1024
     vf, label = _scale_vf(w, h, scaling_mode)
     print(f"\n  [Scale] {src_mb:.0f} MB -> {w}x{h} ({label}, spline + NVENC CQ8)...",
@@ -500,9 +551,39 @@ def _encode_scaled(src: Path, dst: Path, w: int, h: int, scaling_mode: str) -> N
 
     temp = dst.with_suffix(".temp.mp4")
     t0 = time.time()
-    cmd = [
-        "ffmpeg", "-y", "-i", str(src),
-        "-vf", vf,
+
+    filter_complex = None
+    shade_ctrls: list[Path] = []
+    next_input = 1
+    cmd_prefix = ["ffmpeg", "-y", "-i", str(src)]
+    if shade:
+        import tempfile as _tf
+        shade_tmp = _tf.mkdtemp(prefix="shade_scale_")
+        try:
+            from overlay.voice_shade import _write_alpha_control
+            for bi, alpha in enumerate(shade["alpha_frames"]):
+                ctrl = Path(shade_tmp) / f"box_{bi}.rgba"
+                _write_alpha_control(ctrl, alpha)
+                shade_ctrls.append(ctrl)
+                cmd_prefix += ["-f", "rawvideo", "-pix_fmt", "rgba", "-s", "1x1",
+                               "-r", f"{shade['fps']:.3f}", "-i", str(ctrl)]
+            filter_complex, next_input = _build_shade_filter(
+                shade["box_rects"], shade_ctrls, shade["fps"], w, h, scaling_mode)
+        except Exception:
+            import shutil as _sh
+            _sh.rmtree(shade_tmp, ignore_errors=True)
+            raise
+
+    cmd = list(cmd_prefix)
+    if filter_complex is not None:
+        cmd += [
+            "-filter_complex_script",
+            _write_filter_script(filter_complex),
+        ]
+        cmd += ["-map", "[vout]", "-map", "0:a?", "-shortest"]
+    else:
+        cmd += ["-vf", vf]
+    cmd += [
         "-c:v", "h264_nvenc", "-preset", "p7", "-b:v", "0", "-cq", "8",
         "-maxrate", "200M", "-bufsize", "400M",
         "-profile:v", "high", "-pix_fmt", "yuv420p", "-level", "5.1",
@@ -516,15 +597,26 @@ def _encode_scaled(src: Path, dst: Path, w: int, h: int, scaling_mode: str) -> N
         temp.unlink(missing_ok=True)
         print(f"\n[ERROR] Scale failed: {r.stderr[-300:]}")
         print("  [Fallback] Retrying with CPU Lanczos + libx264...")
-        vf_cpu = vf.replace("flags=spline", "flags=lanczos")
-        cmd = [
-            "ffmpeg", "-y", "-i", str(src),
-            "-vf", vf_cpu,
-            "-c:v", "libx264", "-crf", "15", "-preset", "slow",
-            "-profile:v", "high", "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            "-c:a", "copy", str(temp),
-        ]
+        if filter_complex is not None:
+            fc_cpu = filter_complex.replace("flags=spline", "flags=lanczos")
+            cmd = list(cmd_prefix)
+            cmd += ["-filter_complex_script", _write_filter_script(fc_cpu)]
+            cmd += ["-map", "[vout]", "-map", "0:a?", "-shortest"]
+            cmd += [
+                "-c:v", "libx264", "-crf", "15", "-preset", "slow",
+                "-profile:v", "high", "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart", "-c:a", "copy", str(temp),
+            ]
+        else:
+            vf_cpu = vf.replace("flags=spline", "flags=lanczos")
+            cmd = [
+                "ffmpeg", "-y", "-i", str(src),
+                "-vf", vf_cpu,
+                "-c:v", "libx264", "-crf", "15", "-preset", "slow",
+                "-profile:v", "high", "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                "-c:a", "copy", str(temp),
+            ]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
         if r.returncode != 0:
             temp.unlink(missing_ok=True)
@@ -533,6 +625,42 @@ def _encode_scaled(src: Path, dst: Path, w: int, h: int, scaling_mode: str) -> N
     temp.replace(dst)
     mb = dst.stat().st_size / 1024 / 1024
     print(f"OK ({elapsed:.0f}s, {mb:.0f} MB)")
+
+
+def _build_shade_for_scale(args, folder: Path) -> dict | None:
+    """Build the shade data dict for the scale step, or None if not requested.
+
+    The shade must be computed against the NATIVE combined.mp4 (pre-scale) so the
+    box coords are native and stretch together with the video during upscale.
+    """
+    if not args.voice_shade_demo:
+        return None
+    if not args.voice_shade_steam_id:
+        print("[voice-shade] --voice-shade-steam-id required with --voice-shade-demo")
+        sys.exit(1)
+    combined = folder / "combined.mp4"
+    offsets_path = folder / "combined.round_offsets.json"
+    if not offsets_path.is_file():
+        print("[voice-shade] combined.round_offsets.json not found; cannot align shade")
+        sys.exit(1)
+
+    # Use the same ffprobe/ffmpeg resolution as this module (from PATH).
+    from overlay.voice_shade import build_voice_shade_data, _probe_video_info
+
+    src = combined
+    native_w, native_h, fps, dur = _probe_video_info(src)
+    data = build_voice_shade_data(
+        Path(args.voice_shade_demo), src, args.voice_shade_steam_id,
+        json.loads(offsets_path.read_text(encoding="utf-8")), fps, dur,
+        native_res=f"{native_w}x{native_h}",
+        pov_side=args.voice_shade_side,
+        fade=args.voice_shade_fade,
+    )
+    return {
+        "box_rects": data.box_rects,
+        "alpha_frames": data.alpha_frames,
+        "fps": fps,
+    }
 
 
 def main() -> None:
@@ -553,6 +681,29 @@ def main() -> None:
         help="Allow non-contiguous round ranges (for --skip-failed-rounds). "
              "Gaps in round numbers are logged but do not abort.",
     )
+    parser.add_argument(
+        "--voice-shade-demo",
+        default=None,
+        help="Demo path used to compute the voice-activity shade. When set, the "
+             "shade is composited at native res BEFORE the upscale so it stretches "
+             "together with the video (boxes stay locked to avatars).",
+    )
+    parser.add_argument(
+        "--voice-shade-steam-id",
+        default=None,
+        help="POV player steam64 (required with --voice-shade-demo).",
+    )
+    parser.add_argument(
+        "--voice-shade-fade",
+        type=float,
+        default=0.3,
+        help="Shade fade in/out seconds (default 0.3).",
+    )
+    parser.add_argument(
+        "--voice-shade-side",
+        default="right",
+        help="Which side is the POV team's avatar block (left/right, default right).",
+    )
     args = parser.parse_args()
 
     folder = Path(args.folder)
@@ -562,6 +713,7 @@ def main() -> None:
 
     combined = folder / "combined.mp4"
     has_clips = any(folder.glob("batch-*.mp4")) or any(folder.glob("round-*.mp4"))
+    shade = _build_shade_for_scale(args, folder)
     if combined.exists() and combined.stat().st_size >= 1_000_000 and not has_clips:
         vid_w, vid_h = _get_resolution(combined)
         if (vid_w, vid_h) == (args.width, args.height):
@@ -576,7 +728,8 @@ def main() -> None:
             if not _is_valid_video(p):
                 p.unlink(missing_ok=True)
         if not scaled.exists():
-            _encode_scaled(combined, scaled, args.width, args.height, args.scaling_mode)
+            _encode_scaled(combined, scaled, args.width, args.height, args.scaling_mode,
+                           shade=shade)
         scaled.replace(combined)
         mb = combined.stat().st_size / 1024 / 1024
         print(f"\nDone. {combined} ({mb:.0f} MB)")
@@ -589,6 +742,7 @@ def main() -> None:
         sys.exit(1)
 
     # One encode: stretch/pillarbox + upscale to final 16:9 size (no 1080p middle).
+    shade = _build_shade_for_scale(args, folder)
     vid_w, vid_h = _get_resolution(combined)
     if (vid_w, vid_h) == (args.width, args.height):
         print(f"\n  [Skip scale] Already {vid_w}x{vid_h}")
@@ -598,7 +752,8 @@ def main() -> None:
             print(f"\n  [Cleanup] Removing corrupt {scaled.name}")
             scaled.unlink()
         if not scaled.exists():
-            _encode_scaled(combined, scaled, args.width, args.height, args.scaling_mode)
+            _encode_scaled(combined, scaled, args.width, args.height, args.scaling_mode,
+                           shade=shade)
         scaled.replace(combined)
 
     if args.output:
