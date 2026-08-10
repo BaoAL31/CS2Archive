@@ -46,19 +46,17 @@ from overlay._common import _log  # noqa: E402
 from avatar_boxes import boxes_for_resolution  # noqa: E402
 from mix_team_voice import (  # noqa: E402
     SAMPLE_RATE,
-    FRAME_SAMPLES,
     _TICKRATE,
     decode_player_packets,
     detect_channels,
+    group_voice_rows,
     load_offsets,
     load_team_map,
     load_voice,
     tick_to_time,
 )
 
-_TALK_RMS_THRESH = 0.01          # RMS above which a frame counts as "talking"
-_TALK_MIN_SEGMENT = 0.12         # min talk-segment length (s) to keep
-_TALK_GAP_MERGE = 0.10           # merge talk segments closer than this (s)
+
 
 
 def _probe_video_info(video: Path) -> tuple[int, int, float, float]:
@@ -82,73 +80,39 @@ def _probe_video_info(video: Path) -> tuple[int, int, float, float]:
     return w, h, fps, dur
 
 
-def _player_voice_pcm(demo: Path, offsets: dict, pov_team: int,
-                      duration: float, tickrate: int) -> dict[str, np.ndarray]:
-    """Return {steamid: video-timeline PCM buffer} for POV-team players."""
+def _player_talk_segments(demo: Path, offsets: dict, pov_team: int,
+                          tickrate: int) -> dict[str, list[tuple[float, float]]]:
+    """Return {steamid: [(start_sec, end_sec), ...]} for POV-team players.
+
+    Talk segments come from RAW packet activity, not decoded-PCM RMS: a player
+    is "talking" from the first packet of a burst to the last packet plus its
+    decoded duration (the mic is live for exactly that span). Decoded-PCM RMS
+    is a poor proxy here — a soft/short word mid-sentence dips below threshold
+    and the shade turns off early or misses speech entirely. Packet presence
+    tracks the actual mic state (the in-game speaker indicator uses the same).
+    """
     rows = load_voice(demo)
     team_map = load_team_map(demo)
-    by_player: dict[str, list[tuple[int, bytes]]] = {}
-    for r in rows:
-        if team_map.get(r["steamid"]) != pov_team:
+    out: dict[str, list[tuple[float, float]]] = {}
+    for sid in {r["steamid"] for r in rows}:
+        if team_map.get(sid) != pov_team:
             continue
-        by_player.setdefault(r["steamid"], []).append((r["tick"], r["bytes"]))
-
-    nbuf = int(duration * SAMPLE_RATE) + FRAME_SAMPLES + 1
-    out: dict[str, np.ndarray] = {}
-    for sid, packets in by_player.items():
-        packets.sort(key=lambda t: t[0])
-        channels = detect_channels(packets[0][1])
-        decoded = decode_player_packets(packets, channels)
-        buf = np.zeros(nbuf, dtype=np.float32)
-        pos = 0
-        for tick, pcm in decoded:
-            t = tick_to_time(tick, offsets, tickrate)
-            if t is not None:
-                idx = int(round(t * SAMPLE_RATE))
-                if idx > pos + int(0.020 * SAMPLE_RATE):
-                    pos = idx  # real pause -> jump forward
-            if pos >= len(buf):
+        player_rows = sorted(
+            (r for r in rows if r["steamid"] == sid), key=lambda r: r["tick"])
+        segs: list[tuple[float, float]] = []
+        for group in group_voice_rows(player_rows):
+            channels = detect_channels(group[0]["bytes"])
+            # decode only the first packet to get the per-packet frame length;
+            # CS2 FACEIT voice is 10 ms frames, but decode to be exact.
+            decoded = decode_player_packets([(g["tick"], g["bytes"]) for g in group], channels)
+            last = decoded[-1]
+            t0 = tick_to_time(group[0]["tick"], offsets, tickrate)
+            t1 = tick_to_time(group[-1]["tick"], offsets, tickrate)
+            if t0 is None or t1 is None:
                 continue
-            seg = pcm[:len(buf) - pos] if pos + len(pcm) > len(buf) else pcm
-            buf[pos:pos + len(seg)] += seg
-            pos += len(seg)
-        out[sid] = buf
-    return out
-
-
-def _talk_segments(pcm: np.ndarray, fps: float) -> list[tuple[float, float]]:
-    """Return [(start_sec, end_sec), ...] talk segments for one player's PCM."""
-    if len(pcm) == 0:
-        return []
-    hop = max(1, int(SAMPLE_RATE / max(fps, 1)))
-    n = len(pcm) // hop
-    if n == 0:
-        return []
-    rms = np.sqrt((pcm[:n * hop].reshape(n, hop) ** 2).mean(axis=1))
-    active = rms > _TALK_RMS_THRESH
-    segs: list[tuple[int, int]] = []
-    i = 0
-    while i < n:
-        if active[i]:
-            j = i
-            while j < n and active[j]:
-                j += 1
-            segs.append((i, j))
-            i = j
-        else:
-            i += 1
-    if not segs:
-        return []
-    merged = [segs[0]]
-    for s, e in segs[1:]:
-        if (s - merged[-1][1]) * (1 / fps) <= _TALK_GAP_MERGE:
-            merged[-1] = (merged[-1][0], e)
-        else:
-            merged.append((s, e))
-    out = []
-    for s, e in merged:
-        if (e - s) / fps >= _TALK_MIN_SEGMENT:
-            out.append((s / fps, e / fps))
+            dur_s = len(last[1]) / SAMPLE_RATE
+            segs.append((t0, t1 + dur_s))
+        out[sid] = segs
     return out
 
 
@@ -264,7 +228,7 @@ def build_voice_shade_data(
         sys.exit(1)
     side = pov_side.lower()
 
-    pcms = _player_voice_pcm(demo, offsets, pov_team, duration, tickrate)
+    pcms = _player_talk_segments(demo, offsets, pov_team, tickrate)
     box_map = _map_boxes(demo, pov_team, side, boxes)
     if not box_map:
         _log("[ERROR] could not map any POV player to a box")
@@ -279,7 +243,7 @@ def build_voice_shade_data(
     rects: list[tuple[int, int, int, int]] = []
     alpha_frames: list[np.ndarray] = []
     for sid, rect in sorted(box_map.items()):
-        segs = _talk_segments(pcms.get(sid, np.zeros(0)), fps)
+        segs = pcms.get(sid, [])
         alpha = _box_alpha_timeline(segs, n_frames, fps, fade, shade)
         rects.append(rect)
         alpha_frames.append(alpha)

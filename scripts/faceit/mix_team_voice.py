@@ -328,8 +328,8 @@ def main() -> None:
     round_spans = []  # (round, start_sample, end_sample)
     for r in sorted(ro):
         start = ro[r]
-        dur = prd.get(r)
-        end = start + dur if dur and dur > 0 else ro.get(r + 1, start)
+        rdur = prd.get(r)
+        end = start + rdur if rdur and rdur > 0 else ro.get(r + 1, start)
         round_spans.append((r, int(start * SAMPLE_RATE), int(end * SAMPLE_RATE)))
     if not round_spans:
         round_spans = [(0, 0, n)]
