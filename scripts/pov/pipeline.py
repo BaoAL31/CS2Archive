@@ -1031,7 +1031,7 @@ class Pipeline:
                 "--voice-shade-fade", str(getattr(self.args, "voice_shade_fade", 0.3)),
                 "--voice-shade-side", "right",
             ]
-        r = self._run_py(concat_args, timeout=7200)
+        r = self._run_py(concat_args, timeout=36000)
         if r.returncode != 0:
             fail(3, "CONCAT_FAILED", f"concat_rounds.py exited {r.returncode}")
 
@@ -1069,6 +1069,14 @@ class Pipeline:
         if not self.dual_upload:
             print("  [skip] Raw-only mode: overlay step disabled")
             return
+
+        # Voice is ONE feature: the comms AUDIO mix runs here in step 4
+        # (the shade indicator was applied at native res in the step-3 scale).
+        # --enable-voice-comms turns both on; --voice-shade is a legacy alias.
+        enable_voice = (
+            getattr(self.args, "enable_voice_comms", False)
+            or getattr(self.args, "voice_shade", False)
+        )
 
         # Skip if the overlay variant already has a valid video (resume from
         # a previous successful run where .overlay_work was cleaned).

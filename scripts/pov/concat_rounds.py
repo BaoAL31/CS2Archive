@@ -12,6 +12,12 @@ from pathlib import Path
 FFMPEG = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
 FFPROBE = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffprobe.exe"
 
+# Add scripts/ to sys.path so the lazy `from overlay.voice_shade import ...`
+# inside _build_shade_for_scale resolves when this script is run directly by
+# the pipeline (PYTHONPATH=.<project> only). parents[0]=scripts/pov,
+# parents[1]=scripts.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 _BATCH_RE = re.compile(r"batch-(\d+)-(\d+)\.mp4$")
 _ROUND_SEQ_RE = re.compile(r"round-(\d+)-tick-(\d+)-to-(\d+)\.mp4$")
 
@@ -38,7 +44,7 @@ def _concat_two(a: Path, b: Path, out: Path) -> None:
         r = subprocess.run(
             ["ffmpeg", "-f", "concat", "-safe", "0", "-i", str(lst),
              "-c", "copy", str(out)],
-            capture_output=True, text=True, timeout=3600,
+            capture_output=True, text=True, timeout=36000,
         )
         if r.returncode != 0:
             print(f"\n  [CONCAT FAILED] {r.stderr[-300:]}")
@@ -713,7 +719,6 @@ def main() -> None:
 
     combined = folder / "combined.mp4"
     has_clips = any(folder.glob("batch-*.mp4")) or any(folder.glob("round-*.mp4"))
-    shade = _build_shade_for_scale(args, folder)
     if combined.exists() and combined.stat().st_size >= 1_000_000 and not has_clips:
         vid_w, vid_h = _get_resolution(combined)
         if (vid_w, vid_h) == (args.width, args.height):
@@ -723,6 +728,9 @@ def main() -> None:
             return
         print(f"  [Resume scale] combined.mp4 is {vid_w}x{vid_h}, scaling to "
               f"{args.width}x{args.height}...")
+        # Sidecar already exists on resume (combined.mp4 was built with it), so
+        # the shade can be built here before scaling.
+        shade = _build_shade_for_scale(args, folder)
         scaled = folder / "_scaled.mp4"
         for p in folder.glob("_scaled*"):
             if not _is_valid_video(p):

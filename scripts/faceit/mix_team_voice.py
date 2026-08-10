@@ -313,17 +313,45 @@ def main() -> None:
     # Whole-buffer RMS is diluted by silence, so we measure loudness only where
     # the player actually speaks. Cap the gain so a single soft or sparse player
     # isn't amplified into a wall of noise.
+    #
+    # PER-ROUND scope: a single whole-match gain penalizes a player who is loud
+    # in one round (small gain) and quiet in another (stays buried) — e.g. magixx
+    # talks loudly late but is nearly silent in round 1, and a whole-match gain
+    # leaves his early rounds at ~14-57% of target. So the gain is computed and
+    # applied PER ROUND: each player's voice in each round is normalized to the
+    # target active-RMS. This keeps a player's voice audible in every round it
+    # exists, regardless of how loud they are in other rounds.
     target_rms = args.voice_rms_target
-    gains = {}
+    # Build per-round sample spans [start,end) from the concat sidecar.
+    ro = offsets["round_offsets"]
+    prd = offsets.get("per_round_durations", {})
+    round_spans = []  # (round, start_sample, end_sample)
+    for r in sorted(ro):
+        start = ro[r]
+        dur = prd.get(r)
+        end = start + dur if dur and dur > 0 else ro.get(r + 1, start)
+        round_spans.append((r, int(start * SAMPLE_RATE), int(end * SAMPLE_RATE)))
+    if not round_spans:
+        round_spans = [(0, 0, n)]
+
+    per_round = {sid: {} for sid in player_bufs}
     for sid, pb in player_bufs.items():
-        nz = pb[pb != 0]
-        active_rms = float(np.sqrt((nz ** 2).mean())) if len(nz) else 0.0
-        gain = target_rms / active_rms if active_rms > 0 else 0.0
-        gain = min(gain, args.voice_max_gain)
-        gains[sid] = round(gain, 3)
-        if gain > 0:
-            player_bufs[sid] = pb * gain
-    print(f"  [voice] per-player gains (x{target_rms:.3f} active-RMS target): {gains}")
+        pb_norm = np.zeros_like(pb)
+        for r, s0, s1 in round_spans:
+            seg = pb[s0:s1]
+            nz = seg[seg != 0]
+            active_rms = float(np.sqrt((nz ** 2).mean())) if len(nz) else 0.0
+            gain = target_rms / active_rms if active_rms > 0 else 0.0
+            gain = min(gain, args.voice_max_gain)
+            per_round[sid][r] = round(gain, 3)
+            if gain > 0:
+                pb_norm[s0:s1] = seg * gain
+        player_bufs[sid] = pb_norm
+    print(f"  [voice] per-ROUND gains (x{target_rms:.3f} active-RMS target, "
+          f"cap {args.voice_max_gain:.1f}x):")
+    for sid, rg in per_round.items():
+        vals = {r: g for r, g in sorted(rg.items()) if g}
+        print(f"    {sid}: {vals}")
 
     buf = np.zeros(n, dtype=np.float64)
     for pb in player_bufs.values():
