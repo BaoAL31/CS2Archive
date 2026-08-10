@@ -179,6 +179,37 @@ def _ffmpeg_segment_copy(
 
 
 
+def _remux_source_audio(overlay_path: Path, source_path: Path) -> None:
+    """Replace the overlay video's audio with the original source audio.
+
+    The overlay re-encodes audio per batch and stream-copies the batches
+    together, which lets audio drift a few ms per batch (video is frame
+    quantized, audio is sample-precise) — cumulative A/V desync. The overlay
+    adds no audio, so the source's audio is the correct sync reference. Mux it
+    back, trimmed to the overlay video's duration, stream-copying the video.
+    """
+    from overlay._common import _log
+    tmp = overlay_path.with_name(overlay_path.name + ".resync.mp4")
+    tmp.unlink(missing_ok=True)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(overlay_path),
+        "-i", str(source_path),
+        "-map", "0:v", "-map", "1:a?",
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "256k",
+        "-movflags", "+faststart",
+        "-shortest",
+        str(tmp),
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    if r.returncode != 0 or not tmp.is_file():
+        _log(f"[ERROR] audio resync failed: {r.stderr[-500:]}")
+        tmp.unlink(missing_ok=True)
+        sys.exit(1)
+    os.replace(tmp, overlay_path)
+
+
 def _concat_overlay_batches(batch_files: list[Path], output_path: Path) -> None:
     """Concat batch-overlay-*.mp4 files via ffmpeg stream copy (no re-encode).
 

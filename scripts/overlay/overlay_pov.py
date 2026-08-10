@@ -88,6 +88,7 @@ from overlay.overlay_encode import (
     _ffmpeg_encode,
     _ffmpeg_segment_copy,
     _concat_overlay_batches,
+    _remux_source_audio,
     _compute_batch_boundaries,
 )
 # -- Constants -----------------------------------------------------------
@@ -1133,6 +1134,14 @@ def run_overlay(
                 _log(f"  [concat] OK in {time.time()-t6:.1f}s")
                 for bf in batch_files:
                     bf.unlink(missing_ok=True)
+                # Re-sync audio: the per-batch re-encode + stream-copy concat lets
+                # audio drift a few ms per batch (measured ~44ms after batch 1,
+                # ~33ms more per subsequent batch) because video is frame-quantized
+                # while audio is sample-precise. Replace the concatenated audio
+                # with the ORIGINAL source audio (sample-locked to the video),
+                # stream-copied from video_path. The overlay adds no audio, so the
+                # source audio is the correct sync reference.
+                _remux_source_audio(output_path, video_path)
                 mb = output_path.stat().st_size / 1024 / 1024
                 _log(f"Overlay: {output_path.name} ({mb:.0f} MB) in {time.time()-t4:.1f}s")
                 return
