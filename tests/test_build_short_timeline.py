@@ -11,6 +11,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 from shorts.build_short_timeline import detect_shorts as _detect_shorts
+from shorts.build_short_timeline import _winner_by_round_from_demo
 
 
 def detect_shorts(*args, **kwargs):
@@ -611,3 +612,79 @@ def test_pros_only_false_keeps_everyone():
     assert result["_dropped_randos"] == 0
     assert len(result["shorts"]) == 1
     assert result["shorts"][0]["pov_steam_id"] == "RANDO"
+
+
+# ------------------- Winner-by-round round-numbering (off-by-one) -------------------
+
+
+def _fake_parser_with_sides(sides_at_ticks):
+    """Parser whose parse_ticks returns a fixed side (2=T, 3=CT) per player."""
+    import pandas as pd
+
+    parser = MagicMock()
+    records = []
+    for tick, mapping in sides_at_ticks.items():
+        for sid, side in mapping.items():
+            records.append({"tick": tick, "steamid": sid, "team_num": side})
+    parser.parse_ticks.return_value = pd.DataFrame(records)
+    return parser
+
+
+def test_winner_by_round_uses_tick_not_shifted_round_field():
+    """Regression: round_end.round is +1 shifted from round_start.round in some
+    FACEIT demos. The winner must be keyed by the round its *tick* falls into
+    (round_start numbering), otherwise a lost round gets mislabelled as a win.
+    """
+    import pandas as pd
+
+    info = pd.DataFrame([
+        {"steamid": "P", "team_number": 3, "name": "Pro"},
+        {"steamid": "Q", "team_number": 2, "name": "Other"},
+    ])
+    # round_start.round -> tick (round 1 starts at 1000, round 2 at 5000)
+    round_start = pd.DataFrame([
+        {"round": 1, "tick": 1000},
+        {"round": 2, "tick": 5000},
+    ])
+    # The round_end event has round=2 (shifted +1) but its tick 4900 actually
+    # falls inside round 1 (1000..5000). Winner side CT.
+    round_end_winner = pd.DataFrame([
+        {"round": 2, "tick": 4900, "winner": "CT"},
+    ])
+    parser = _fake_parser_with_sides({
+        1000: {"P": 3, "Q": 2},   # at round-1 start: P is CT(3), Q is T(2)
+        5000: {"P": 3, "Q": 2},
+    })
+
+    result = _winner_by_round_from_demo(parser, info, round_start, round_end_winner)
+
+    # Winner belongs to round 1, not round 2. The +1 in round_end.round must be
+    # ignored so the winning persistent team (3 = P) is keyed under round 1.
+    assert result == {1: 3}
+
+
+def test_winner_by_round_respects_halftime_side_swap():
+    """Side->persistent-team mapping is per-round (teams swap at halftime)."""
+    import pandas as pd
+
+    info = pd.DataFrame([
+        {"steamid": "P", "team_number": 3, "name": "Pro"},
+        {"steamid": "Q", "team_number": 2, "name": "Other"},
+    ])
+    round_start = pd.DataFrame([
+        {"round": 1, "tick": 1000},
+        {"round": 2, "tick": 5000},
+    ])
+    # Two round_end events, each in a different round, both winner=T.
+    round_end_winner = pd.DataFrame([
+        {"round": 1, "tick": 4900, "winner": "T"},   # round 1, T wins
+        {"round": 2, "tick": 9000, "winner": "T"},   # round 2, T wins
+    ])
+    parser = _fake_parser_with_sides({
+        1000: {"P": 3, "Q": 2},   # round 1: P=CT(3), Q=T(2)  -> T winner = team 2
+        5000: {"P": 2, "Q": 3},   # round 2 (halftime): P=T(2), Q=CT(3) -> T winner = team 3
+    })
+
+    result = _winner_by_round_from_demo(parser, info, round_start, round_end_winner)
+
+    assert result == {1: 2, 2: 3}

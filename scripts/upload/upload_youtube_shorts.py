@@ -2,14 +2,15 @@
 Upload a YouTube Short (plus bilibili.tv, TikTok, and Instagram by default).
 
 Schedules on YouTube, bilibili.tv, TikTok, and Instagram using the shared
-CS2UtilArchive slot pool (11:30 / 17:30 Australia/Sydney). Resume-safe: a
+CS2UtilArchive slot pool (17:30 Australia/Sydney, once daily). Resume-safe: a
 completed platform upload is skipped on re-run.
 
 Usage:
     python scripts/upload/upload_youtube_shorts.py <short.mp4> --meta upload_meta_shorts.json
     python scripts/upload/upload_youtube_shorts.py youtube/.../short.mp4 --publish-at "2026-06-12 17:00"
 
-Shorts naming convention (see channel's existing shorts for examples):
+Shorts naming convention (see `docs/agents/shorts-titles.md` for the full
+guide + approved examples):
     Title must contain the PLAYER name, the clip KIND (clutch or multikill,
     e.g. "1v3 Clutch + 4K", "ACE", "5K"), and the OPPONENT. Wording is
     flexible beyond that. Hashtags go in the TITLE (never a ``tags`` field):
@@ -17,6 +18,8 @@ Shorts naming convention (see channel's existing shorts for examples):
     squashed, e.g. ``#blastbounty2026``. No ``#csgo``, no ``#Shorts``, no map
     hashtags.
     e.g. ``donk's 1v3 Clutch + 4K vs MOUZ #cs2 #counterstrike #blastbounty2026``
+    (HLTV/team matches name the org; FACEIT lobbies use an ELO label — number
+    at >=3000, "level 10" below.)
 """
 
 from __future__ import annotations

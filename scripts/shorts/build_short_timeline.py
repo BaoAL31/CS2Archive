@@ -289,17 +289,37 @@ def _winner_by_round_from_demo(
         if sid and sid in persist_team and side in (2, 3):
             side_to_team.setdefault(tick, {})[side] = persist_team[sid]
 
+    # round_start.round -> its start tick. This is the round-numbering used
+    # everywhere downstream (kills, clutch triggers, _round_for_tick).
     rs_by_round: dict[int, int] = {}
     for t, rn in zip(round_start["tick"].tolist(), round_start["round"].tolist()):
         rn_i = int(rn or 0)
         t_i = int(t)
         if rn_i > 0 and t_i > 1:
             rs_by_round[rn_i] = t_i
+    # Sorted (start_tick, round_num) so a round_end tick can be mapped back to
+    # its round via round_start numbering. We cannot trust round_end.round:
+    # in many FACEIT demos it is +1 shifted from round_start.round (e.g.
+    # round_end.round == 8 fires for the round that round_start.round == 7
+    # started). Deriving the round by tick keeps winner_by_round keyed the
+    # same way as every other per-round structure.
+    _rs_sorted = sorted((t, rn) for rn, t in rs_by_round.items())
+
+    def _round_for_tick(tick: int) -> int:
+        rn = 0
+        for st_tick, rn_candidate in _rs_sorted:
+            if st_tick <= tick:
+                rn = rn_candidate
+            else:
+                break
+        return rn
 
     for _, row in round_end_winner.iterrows():
-        rn = int(row.get("round", 0) or 0)
         side = str(row.get("winner", "") or "").strip().upper()
-        if rn <= 0 or side not in ("T", "CT"):
+        if side not in ("T", "CT"):
+            continue
+        rn = _round_for_tick(int(row["tick"]))
+        if rn <= 0:
             continue
         rs_tick = rs_by_round.get(rn)
         if rs_tick is None:

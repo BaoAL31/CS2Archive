@@ -12,6 +12,7 @@ Operational deep-dives live in `docs/agents/`; this file is the quick reference:
 | `docs/agents/steps.md` | Individual step scripts (debugging / manual use) |
 | `docs/agents/rendering.md` | CSDM/HLAE/ffmpeg rendering details |
 | `docs/agents/gotchas.md` | Full gotcha list |
+| `docs/agents/shorts-titles.md` | YouTube Short title conventions + approved examples (creative, ELO/level-10 opponent labels) |
 
 ## Scripts layout
 
@@ -131,7 +132,7 @@ Renders via **CSDM** (`C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csd
 - **Windows PowerShell** — no `&&`, `||`, `tail`; use `; if ($?) {}` and `Select-String -Last 3`. `@'...'@` heredocs broken with f-strings — write Python scripts to files.
 - **RAR extraction** — `rarfile` doesn't work on Windows. Use `patoolib` (via `patool` pip package) which wraps WinRAR.
 - **All async** — every scraper/command is `asyncio.run()`. New commands must follow `async def` + `register_subparser` + `handle` in `commands/`.
-- **YouTube scheduling** — **Long-form** (`upload_pending.py` / pipeline) default `--publish-at auto`: next future **10:00 or 16:30 Australia/Sydney** slot via the **YouTube API** (channel uploads playlist). **Shorts** (`upload_youtube_shorts.py`) reuse **CS2UtilArchive's schedule** (`scripts/publish_schedule.py` `SLOT_TIMES = ["11:30", "17:30"]` + `find_next_upload_slot`) against the same occupied-slot pool, so both projects' shorts never double-book. Local ledger (`youtube/.publish_schedule.json`) deprecated. Explicit `--publish-at "YYYY-MM-DD HH:MM"` still schedules exactly.
+- **YouTube scheduling** — **Long-form** (`upload_pending.py` / pipeline) default `--publish-at auto`: next future **10:00 or 16:30 Australia/Sydney** slot via the **YouTube API** (channel uploads playlist). **Shorts** (`upload_youtube_shorts.py`) reuse **CS2UtilArchive's schedule** (`scripts/publish_schedule.py` `SLOT_TIMES = ["17:30"]` + `find_next_upload_slot`) against the same occupied-slot pool, so both projects' shorts never double-book. Local ledger (`youtube/.publish_schedule.json`) deprecated. Explicit `--publish-at "YYYY-MM-DD HH:MM"` still schedules exactly.
 - **YouTube verification** — custom thumbnails require a phone-verified account (https://www.youtube.com/verify).
 - **HLTV Cloudflare block** — `net::ERR_CONNECTION_RESET` on HLTV while regular Chrome works = Cloudflare fingerprinting. Fix: Playwright with system Chrome + `ignore_default_args=["--enable-automation"]` (applied in `scrapers/hltv_acquire.py` and `scrapers/hltv.py`). Custom DNS does NOT help.
 - **HLTV demo acquisition** — CloakBrowser, persistent profile `.sessions/hltv-cloak/`. Undersized archives (<1MB) are not cache hits. Fallback: `--demo` with local `.rar`/`.dem`.
