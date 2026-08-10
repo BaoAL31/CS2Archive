@@ -449,6 +449,15 @@ def main() -> None:
         summed = summed * (0.95 / peak)
     summed16 = (np.clip(summed, -1.0, 1.0) * 32767).astype(np.int16)
 
+    # The final aac encoder adds ~1024 samples of priming delay (21.3ms @48kHz)
+    # that the container does NOT tag (initial_padding=0), so players play the
+    # audio 21ms late vs the video. Trim the first 1024 samples so the output
+    # stays sample-locked to the video (verified: trimming 1024 samples makes
+    # the final align exactly with the native source).
+    _AAC_DELAY_SAMPLES = 1024
+    if summed16.shape[0] > _AAC_DELAY_SAMPLES:
+        summed16 = summed16[_AAC_DELAY_SAMPLES:].copy()
+
     tmp_out = out
     if out.resolve() == video.resolve():
         tmp_out = out.with_name(out.stem + ".voice.mp4")
