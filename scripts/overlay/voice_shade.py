@@ -116,6 +116,45 @@ def _player_talk_segments(demo: Path, offsets: dict, pov_team: int,
     return out
 
 
+def _halftime_frame(demo: Path, pov_steamid: str, offsets: dict, fps: float,
+                    tickrate: int = _TICKRATE) -> int:
+    """Return the video frame index where the POV team switches T<->CT side.
+
+    The scoreboard team block flips at halftime: the POV team is on the RIGHT
+    block when T and LEFT when CT (per CS2 HUD). We use the demo's
+    ``round_announce_last_round_half`` event (the authoritative halftime marker)
+    and map its tick to video time via the concat sidecar, then to a frame.
+    Returns the total frame count if no half marker is found.
+    """
+    try:
+        from demoparser2 import DemoParser
+    except Exception:
+        return 0
+    p = DemoParser(str(demo))
+    try:
+        half = p.parse_event("round_announce_last_round_half")
+    except Exception:
+        return 0
+    if half is None or half.empty:
+        return 0
+    half_tick = int(half.iloc[0]["tick"])
+    # Map the half tick to a round boundary in the sidecar. Keys may be int or
+    # str depending on whether the caller used load_offsets() or raw JSON.
+    prt = {int(k): [int(a), int(b)] for k, (a, b) in offsets["per_round_ticks"].items()}
+    ro = {int(k): float(v) for k, v in offsets["round_offsets"].items()}
+    rounds = sorted(prt)
+    # find the first round whose start tick is >= the half tick -> 2nd half
+    second_half_round = None
+    for r in rounds:
+        if prt[r][0] >= half_tick:
+            second_half_round = r
+            break
+    if second_half_round is not None:
+        video_s = ro.get(second_half_round, 0.0)
+        return int(round(video_s * fps))
+    return 0  # no flip -> shade on default side all match
+
+
 def _box_alpha_timeline(segments: list[tuple[float, float]], n_frames: int, fps: float,
                         fade: float, shade: float) -> np.ndarray:
     """Per-frame shade alpha (0=avatar visible, shade=dimmed) for one box.
@@ -227,29 +266,49 @@ def build_voice_shade_data(
     if pov_team is None:
         _log(f"[ERROR] steam id {steam_id} not found in demo player info")
         sys.exit(1)
-    side = pov_side.lower()
 
     pcms = _player_talk_segments(demo, offsets, pov_team, tickrate)
-    box_map = _map_boxes(demo, pov_team, side, boxes)
-    if not box_map:
-        _log("[ERROR] could not map any POV player to a box")
+    # Build box maps for BOTH scoreboard sides. The POV team's block flips at
+    # halftime: RIGHT when T, LEFT when CT (CS2 HUD). So each player needs two
+    # boxes — RIGHT (active 1st half) and LEFT (active 2nd half).
+    right_map = _map_boxes(demo, pov_team, "right", boxes)
+    left_map = _map_boxes(demo, pov_team, "left", boxes)
+    if not right_map or not left_map:
+        _log("[ERROR] could not map any POV player to a box (left/right)")
         sys.exit(1)
-    box_map = {sid: (int(round(x0 * scale_x)), int(round(y0 * scale_y)),
-                     int(round(x1 * scale_x)), int(round(y1 * scale_y)))
-               for sid, (x0, y0, x1, y1) in box_map.items()}
 
     n_frames = int(round(duration * fps))
     fade = max(0.05, fade)
     shade = max(0.0, min(1.0, shade))
+    halftime_frame = _halftime_frame(demo, steam_id, offsets, fps, tickrate)
+    _log(f"[shade] halftime at frame {halftime_frame} "
+         f"({halftime_frame/fps:.1f}s): POV team side flips here")
+
+    def _scale_rect(r):
+        x0, y0, x1, y1 = r
+        return (int(round(x0 * scale_x)), int(round(y0 * scale_y)),
+                int(round(x1 * scale_x)), int(round(y1 * scale_y)))
+
     rects: list[tuple[int, int, int, int]] = []
     alpha_frames: list[np.ndarray] = []
-    for sid, rect in sorted(box_map.items()):
+    for sid in sorted(right_map):
         segs = pcms.get(sid, [])
-        alpha = _box_alpha_timeline(segs, n_frames, fps, fade, shade)
-        rects.append(rect)
-        alpha_frames.append(alpha)
+        full = _box_alpha_timeline(segs, n_frames, fps, fade, shade)
+        # RIGHT box: shade active only in the 1st half (frames < halftime).
+        alpha_right = full.copy()
+        if halftime_frame < n_frames:
+            alpha_right[halftime_frame:] = 0.0
+        rects.append(_scale_rect(right_map[sid]))
+        alpha_frames.append(alpha_right)
+        # LEFT box: shade active only in the 2nd half (frames >= halftime).
+        alpha_left = full.copy()
+        if halftime_frame > 0:
+            alpha_left[:halftime_frame] = 0.0
+        rects.append(_scale_rect(left_map[sid]))
+        alpha_frames.append(alpha_left)
+
     return VoiceShadeData(rects, np.array(alpha_frames), fps, n_frames,
-                          side, fade, shade)
+                          "dual", fade, shade)
 
 
 def _write_alpha_control(path: Path, alpha: np.ndarray) -> None:
