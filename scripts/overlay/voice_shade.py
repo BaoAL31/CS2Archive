@@ -155,8 +155,9 @@ def _map_boxes(demo: Path, pov_team: int, side: str, boxes: dict) -> dict[str, t
     block is the given ``side``.
     """
     info = DemoParser(str(demo)).parse_player_info()
+    team_map = load_team_map(demo)
     slot_order = [str(r["steamid"]) for _, r in info.iterrows()
-                  if int(r["team_number"]) == pov_team]
+                  if team_map.get(str(r["steamid"])) == pov_team]
     x_ranges = boxes.get(side.upper(), [])
     y0, y1 = boxes["y0"], boxes["y1"]
     out: dict[str, tuple[int, int, int, int]] = {}

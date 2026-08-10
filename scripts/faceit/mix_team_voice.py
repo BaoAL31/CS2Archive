@@ -191,14 +191,63 @@ def load_voice(demo: Path) -> list[dict]:
 
 
 def load_team_map(demo: Path) -> dict[str, int]:
+    """Return {steamid: stable_team_id} for every player in the demo.
+
+    ``parse_player_info().team_number`` is the CURRENT T/CT side (2=CT, 3=T),
+    which FLIPS at halftime — so it is NOT a stable team identity and cannot be
+    used to group teammates across the whole match (it would mix the POV team's
+    voice with the opponents' in one half). Here we derive a stable id from each
+    player's side in the FIRST half (before the swap). Because both teams swap
+    sides at halftime, a player's first-half side uniquely identifies their team:
+    teammates share the POV player's first-half side, opponents have the other.
+    """
     p = DemoParser(str(demo))
-    info = p.parse_player_info()
+    # Sample the per-player side over the whole match so we can (a) detect the
+    # halftime flip and (b) read the first-half side for every player.
+    header = p.parse_header()
+    total = int(header.get("map_ticks") or 0)
+    # map_ticks may not be present; fall back to a wide tick range.
+    ticks = list(range(0, 2_000_000, 20000))
+    if total and total > 0:
+        ticks = list(range(0, total, max(1, total // 60)))
+    try:
+        side = p.parse_ticks(
+            ["CCSPlayerController.m_iTeamNum", "CCSPlayerController.m_steamID"],
+            ticks=ticks,
+        )
+    except Exception:
+        side = None
+    if side is None or side.empty:
+        # Fallback: parse_player_info snapshot (pre-halftime if we can pick the
+        # earliest). Usually this is fine when ticks aren't available.
+        info = p.parse_player_info()
+        mapping: dict[str, int] = {}
+        for _, row in info.iterrows():
+            sid = str(row.get("steamid", ""))
+            tn = row.get("team_number")
+            if sid and tn is not None and sid not in mapping:
+                mapping[sid] = int(tn)
+        return mapping
+
+    # Stable team id for each player = their side in the earliest half. We take
+    # the side at the EARLIEST sampled tick (first half) as the stable id. To be
+    # robust to edge ticks, use the mode of the first 40% of that player's rows
+    # (all pre-halftime since halftime is ~mid-match).
+    from collections import Counter
+    per_player: dict[str, list[int]] = {}
+    for _, row in side.iterrows():
+        sid = str(row.get("CCSPlayerController.m_steamID", ""))
+        tn = row.get("CCSPlayerController.m_iTeamNum")
+        if sid and tn is not None and tn not in (0,):
+            per_player.setdefault(sid, []).append(int(tn))
+
     mapping: dict[str, int] = {}
-    for _, row in info.iterrows():
-        sid = str(row.get("steamid", ""))
-        tn = row.get("team_number")
-        if sid and tn is not None and sid not in mapping:
-            mapping[sid] = int(tn)
+    for sid, teams in per_player.items():
+        if not teams:
+            continue
+        half = teams[: max(1, len(teams) // 3)]  # earliest ~1/3 rows = first half
+        stable = Counter(half).most_common(1)[0][0]
+        mapping[sid] = stable
     return mapping
 
 
