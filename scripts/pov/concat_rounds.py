@@ -633,11 +633,30 @@ def _encode_scaled(src: Path, dst: Path, w: int, h: int, scaling_mode: str,
     print(f"OK ({elapsed:.0f}s, {mb:.0f} MB)")
 
 
-def _build_shade_for_scale(args, folder: Path) -> dict | None:
+def _preserve_native(folder: Path, combined: Path) -> Path:
+    """Copy the native (pre-scale) combined.mp4 to combined.native.mp4.
+
+    The scale step overwrites ``combined.mp4`` in place, destroying the native
+    source — so re-baking the voice shade (which lives in the scale step)
+    previously forced a full re-render. Keeping a native copy lets step 3 be
+    re-run alone to re-bake the shade. Returns the native copy path.
+    """
+    native = folder / "combined.native.mp4"
+    if not native.exists() or native.stat().st_size < 1_000_000:
+        import shutil
+        shutil.copy2(combined, native)
+        print(f"  [Preserve] saved native source -> {native.name}")
+    return native
+
+
+def _build_shade_for_scale(args, folder: Path,
+                           src: Path | None = None) -> dict | None:
     """Build the shade data dict for the scale step, or None if not requested.
 
     The shade must be computed against the NATIVE combined.mp4 (pre-scale) so the
     box coords are native and stretch together with the video during upscale.
+    ``src`` lets callers pass a preserved native copy when re-baking the shade
+    from a source other than the (already-scaled) ``combined.mp4``.
     """
     if not args.voice_shade_demo:
         return None
@@ -645,6 +664,7 @@ def _build_shade_for_scale(args, folder: Path) -> dict | None:
         print("[voice-shade] --voice-shade-steam-id required with --voice-shade-demo")
         sys.exit(1)
     combined = folder / "combined.mp4"
+    src = src or combined
     offsets_path = folder / "combined.round_offsets.json"
     if not offsets_path.is_file():
         print("[voice-shade] combined.round_offsets.json not found; cannot align shade")
@@ -653,7 +673,6 @@ def _build_shade_for_scale(args, folder: Path) -> dict | None:
     # Use the same ffprobe/ffmpeg resolution as this module (from PATH).
     from overlay.voice_shade import build_voice_shade_data, _probe_video_info
 
-    src = combined
     native_w, native_h, fps, dur = _probe_video_info(src)
     data = build_voice_shade_data(
         Path(args.voice_shade_demo), src, args.voice_shade_steam_id,
@@ -718,10 +737,32 @@ def main() -> None:
         sys.exit(1)
 
     combined = folder / "combined.mp4"
+    native_copy = folder / "combined.native.mp4"
     has_clips = any(folder.glob("batch-*.mp4")) or any(folder.glob("round-*.mp4"))
     if combined.exists() and combined.stat().st_size >= 1_000_000 and not has_clips:
         vid_w, vid_h = _get_resolution(combined)
-        if (vid_w, vid_h) == (args.width, args.height):
+        at_target = (vid_w, vid_h) == (args.width, args.height)
+        # Re-bake the shade (and re-scale) whenever the native source is still
+        # around — so changing the shade/fade or fixing the shade logic only
+        # needs a step-3 re-run, not a full re-render.
+        if at_target and native_copy.exists() and native_copy.stat().st_size >= 1_000_000 \
+                and args.voice_shade_demo:
+            print(f"  [Re-bake shade] combined.mp4 is {vid_w}x{vid_h}; re-scaling "
+                  f"from {native_copy.name} to re-bake the shade...")
+            shade = _build_shade_for_scale(args, folder, src=native_copy)
+            scaled = folder / "_scaled.mp4"
+            for p in folder.glob("_scaled*"):
+                if not _is_valid_video(p):
+                    p.unlink(missing_ok=True)
+            if scaled.exists():
+                scaled.unlink(missing_ok=True)  # stale shade -> re-encode
+            _encode_scaled(native_copy, scaled, args.width, args.height,
+                           args.scaling_mode, shade=shade)
+            scaled.replace(combined)
+            mb = combined.stat().st_size / 1024 / 1024
+            print(f"\nDone. {combined} ({mb:.0f} MB)")
+            return
+        if at_target:
             print(f"  [Skip] combined.mp4 already {vid_w}x{vid_h}, no clips left")
             mb = combined.stat().st_size / 1024 / 1024
             print(f"\nDone. {combined} ({mb:.0f} MB)")
@@ -729,7 +770,8 @@ def main() -> None:
         print(f"  [Resume scale] combined.mp4 is {vid_w}x{vid_h}, scaling to "
               f"{args.width}x{args.height}...")
         # Sidecar already exists on resume (combined.mp4 was built with it), so
-        # the shade can be built here before scaling.
+        # the shade can be built here before scaling. Preserve native first.
+        _preserve_native(folder, combined)
         shade = _build_shade_for_scale(args, folder)
         scaled = folder / "_scaled.mp4"
         for p in folder.glob("_scaled*"):
@@ -748,6 +790,10 @@ def main() -> None:
     except FileNotFoundError as e:
         print(f"[ERROR] {e}")
         sys.exit(1)
+
+    # Preserve the native combined.mp4 before the scale step overwrites it, so
+    # the voice shade can be re-baked later via a step-3 re-run (no re-render).
+    _preserve_native(folder, combined)
 
     # One encode: stretch/pillarbox + upscale to final 16:9 size (no 1080p middle).
     shade = _build_shade_for_scale(args, folder)
