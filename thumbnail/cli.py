@@ -19,7 +19,8 @@ for _p in (str(_PROJECT_ROOT), str(_SCRIPTS_DIR)):
 
 from rich.console import Console
 
-from cs2_minimizer import CS2Minimizer
+from cs2_minimizer import CS2Park
+from hook_aware import run_csdm_hook_aware
 from thumbnail.layouts import generate
 from thumbnail.utils import (
     YOUTUBE_DIR,
@@ -67,7 +68,10 @@ def extract_background_frame(demo_path: str, steam_id: str) -> Path:
     tmp_dir = Path(tempfile.mkdtemp(prefix="thumb_bg_", dir=TMP_DIR)).resolve()
     demo = Path(demo_path).resolve()
     cfg = (_PROJECT_ROOT / "assets" / "cs2_pov.cfg").resolve()
-    minimizer = CS2Minimizer(verbose=True)
+    # Park-behind (NOT minimize): a minimized CS2 window gets throttled by
+    # Windows and HLAE fails to hook it (no clip is produced). Parking it
+    # restored-but-behind lets the short kill clip render at full speed.
+    minimizer = CS2Park()
     minimizer.start()
     try:
         console.print(f"  Finding kills for player...")
@@ -120,18 +124,18 @@ def extract_background_frame(demo_path: str, steam_id: str) -> Path:
             "--cfg", str(cfg),
         ]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        err = (result.stderr or "") + (result.stdout or "")
-        if result.returncode != 0 or "Raw files not found" in err:
-            console.print(f"[red]  Clip render failed: {err[-300:]}[/red]")
+        # HLAE hook detection + retry: if no clip appears within hook_timeout
+        # (~2 min) the hook failed (vanilla demo viewer) and must be re-run.
+        # run_csdm_hook_aware watches tmp_dir for a new >= 1 MB .mp4 and
+        # returns None if every attempt fails to hook.
+        clip = run_csdm_hook_aware(
+            cmd, "thumbnail-clip", tmp_dir,
+            hook_timeout=120.0, hook_retries=2,
+            min_video_bytes=50 * 1024,  # a 1s kill clip can be well under 1MB
+        )
+        if clip is None:
+            console.print("[red]  Clip render failed to hook CS2 after retries[/red]")
             sys.exit(1)
-
-        clips = sorted(tmp_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
-        if not clips:
-            console.print("[red]  No clip generated[/red]")
-            sys.exit(1)
-
-        clip = clips[-1]
         frame_path = tmp_dir / "bg_frame.jpg"
         subprocess.run(
             ["ffmpeg", "-y", "-i", str(clip), "-vframes", "1", "-update", "1", str(frame_path)],
