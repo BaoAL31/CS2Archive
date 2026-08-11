@@ -1,7 +1,7 @@
 """
-Upload a YouTube Short (plus bilibili.tv, TikTok, and Instagram by default).
+Upload a YouTube Short (plus TikTok and Instagram by default).
 
-Schedules on YouTube, bilibili.tv, TikTok, and Instagram using the shared
+Schedules on YouTube, TikTok, and Instagram using the shared
 CS2UtilArchive slot pool (17:30 Australia/Sydney, once daily). Resume-safe: a
 completed platform upload is skipped on re-run.
 
@@ -43,7 +43,6 @@ for _p in (_UTIL_SCRIPTS, _SCRIPTS_DIR, _UPLOAD_DIR):
     sys.path.insert(0, str(_p))
 _UTIL_ROOT = _UTIL_SCRIPTS.parent
 
-from upload_bilibili import is_bilibili_pending, resolve_publish, upload_to_bilibili  # noqa: E402
 from upload_youtube import (  # noqa: E402
     _record_publish_meta,
     get_authenticated_service,
@@ -80,11 +79,6 @@ def main() -> None:
     parser.add_argument("--description", "-d", default="", help="Video description")
     parser.add_argument("--tags", help="Comma-separated tags")
     parser.add_argument("--privacy", choices=["private", "unlisted", "public"], default="unlisted")
-    parser.add_argument(
-        "--no-bilibili",
-        action="store_true",
-        help="Skip the bilibili.tv upload (default: upload to bilibili after YouTube)",
-    )
     parser.add_argument(
         "--skip-tiktok",
         action="store_true",
@@ -229,7 +223,7 @@ def main() -> None:
     # YouTube is the master schedule. Whatever slot YouTube actually committed
     # (ground truth from the upload response publishAt) is the single source
     # of truth for every other platform. Re-derive the local wall-clock and
-    # persist publish fields so bilibili/tiktok/instagram follow it exactly.
+    # persist publish fields so tiktok/instagram follow it exactly.
     if publish_at_utc:
         _record_publish_meta(meta_file_path, publish_tz, publish_at_utc)
         meta_now = _read_meta(meta_path)
@@ -250,9 +244,6 @@ def main() -> None:
             browser_date, browser_time = wall_clock_to_local_schedule(pdate, ptime, publish_tz)
         except Exception as exc:
             print(f"  [warn] could not convert slot for browser UIs: {exc}", flush=True)
-
-    if not args.no_bilibili:
-        _run_bilibili(video, title, description, tags, meta_file_path)
 
     if not args.skip_tiktok:
         _run_tiktok(video, title, browser_date, browser_time, meta_file_path)
@@ -281,50 +272,6 @@ def _utc_to_local_publish(publish_at_utc: str, tz: str) -> tuple[str, str]:
     utc_dt = datetime.fromisoformat(publish_at_utc.replace("Z", "+00:00"))
     local_dt = utc_dt.astimezone(ZoneInfo(tz))
     return local_dt.strftime("%Y-%m-%d"), local_dt.strftime("%H:%M")
-
-
-def _run_bilibili(
-    video: Path,
-    title: str,
-    description: str,
-    tags: list[str] | None,
-    meta_file_path: str,
-) -> None:
-    """Upload the Short to bilibili.tv (cover.png as thumbnail). Resume-safe."""
-    meta_path = Path(meta_file_path)
-    meta_now: dict = {}
-    if meta_path.exists():
-        try:
-            meta_now = json.loads(meta_path.read_text(encoding="utf-8"))
-        except Exception:
-            meta_now = {}
-    if not is_bilibili_pending(meta_now):
-        print(
-            f"  [bili] already completed aid={meta_now.get('bilibili_aid')}",
-            flush=True,
-        )
-        return
-
-    cover = video.parent / SHORTS_COVER_NAME
-    thumb_path = cover if cover.exists() else None
-    if thumb_path is None:
-        print(
-            f"  [bili] no {SHORTS_COVER_NAME} found next to short — uploading without cover",
-            flush=True,
-        )
-
-    pub = resolve_publish(meta_now)
-    print("Uploading to bilibili.tv...", flush=True)
-    aid = upload_to_bilibili(
-        video,
-        title=title,
-        description=description,
-        tags=list(tags or []),
-        thumbnail_path=thumb_path,
-        meta_path=meta_path,
-        publish_at=pub,
-    )
-    print(f"  Bilibili aid={aid}", flush=True)
 
 
 def _run_tiktok(
