@@ -1445,7 +1445,7 @@ class Pipeline:
                 kills, deaths = kd
                 cmd += ["--kd", f"{kills}/{deaths}"]
             cmd += ["--output", str(youtube_dir)]
-            r = self._run_py(cmd, timeout=300)
+            r = self._run_py(cmd, timeout=900)
             if r.returncode != 0:
                 fail(step_num, "THUMBNAIL_FAILED",
                      f"faceit thumbnail exited {r.returncode} for variant={variant}")
@@ -1485,7 +1485,7 @@ class Pipeline:
             cmd += ["--tournament", self.tournament]
         cmd += ["--output", str(youtube_dir)]
 
-        r = self._run_py(cmd, timeout=300)
+        r = self._run_py(cmd, timeout=900)
         if r.returncode != 0:
             if bg_cleanup:
                 bg_cleanup.unlink(missing_ok=True)
