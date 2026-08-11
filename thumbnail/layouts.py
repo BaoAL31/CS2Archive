@@ -159,12 +159,12 @@ def _draw_elo_line(
 
     Layout::
 
-        5512 vs 3740
-         (ELO)   (AVG)
+        5512 vs ~3740s
+         (ELO)
 
-    ``(ELO)`` sits under ``vs`` and ``(AVG)`` under the opponent's average,
-    both on their own tag line below the numbers. The AVG tag follows
-    whichever number is the opponent's.
+    The opponent's average is shown inline as ``~<avg>s`` under the "vs", so
+    the separate ``(AVG)`` tag is dropped (its number now carries the ``~`` and
+    trailing ``s``). ``(ELO)`` stays centered under the line.
     """
     fav_fill = (250, 90, 30, 255)     # red/orange accent
     dog_fill = (255, 255, 255, 255)
@@ -180,19 +180,29 @@ def _draw_elo_line(
         return b[2] - b[0]
 
     mid = " vs "
-    avg_tag = "(AVG)"
     elo_tag = "(ELO)"
+    opp_str = f"~{opp_elo}s"
 
     # Determine left/right strings + which side is the opponent.
     if elo >= opp_elo:
-        left_str, right_str = str(elo), str(opp_elo)
+        left_str, right_str = str(elo), opp_str
         left_fill, right_fill = fav_fill, dog_fill
-        avg_on_right = True
     else:
-        left_str, right_str = str(opp_elo), str(elo)
+        left_str, right_str = opp_str, str(elo)
         left_fill, right_fill = fav_fill, dog_fill
-        avg_on_right = False
 
+    # Pad the shorter side so both numbers take equal width, keeping "vs"
+    # centered exactly on ``x``.
+    def _pad_side(shorter: str, target_w: int) -> str:
+        sp_w = max(1, _w(font, " ")) or 1
+        pad = " " * max(0, round((target_w - _w(font, shorter)) / sp_w))
+        return shorter if not pad else pad + shorter
+
+    wl, wm, wr = _w(font, left_str), _w(font, mid), _w(font, right_str)
+    if wl < wr:
+        left_str = _pad_side(left_str, wr)
+    elif wr < wl:
+        right_str = _pad_side(right_str, wl)
     wl, wm, wr = _w(font, left_str), _w(font, mid), _w(font, right_str)
     total = wl + wm + wr
     left = x - total // 2
@@ -205,13 +215,10 @@ def _draw_elo_line(
     _draw_text_custom(draw, mid, mx, y, font, mid_fill)
     _draw_text_custom(draw, right_str, rx, y, font, right_fill)
 
-    # Tag line beneath the numbers: (ELO) under "vs", (AVG) under opponent.
+    # Tag line beneath the numbers: (ELO) under the player's number only.
+    # The opponent average is now self-labelled ("~3257s"), so no (AVG) tag.
     tag_y = y + font_size - ELO_TAG_GAP
     _draw_text_custom(draw, elo_tag, mx, tag_y, small_font, tag_fill)
-    if avg_on_right:
-        _draw_text_custom(draw, avg_tag, rx, tag_y, small_font, tag_fill)
-    else:
-        _draw_text_custom(draw, avg_tag, lx, tag_y, small_font, tag_fill)
 
 
 def _draw_text_scrim(img: Image.Image) -> None:
