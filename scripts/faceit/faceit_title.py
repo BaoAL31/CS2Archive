@@ -137,20 +137,22 @@ def _map_from_demo(demo_path: Path) -> str:
 
 def build_title(player: str, map_name: str, notable: list[str],
                 elo: int | None = None, opp_elo: int | None = None,
-                kd: str | None = None) -> str:
+                kd: str | None = None, *, voice_comms: bool = False) -> str:
     """Title: "{player} ({kd}) {elo} ELO vs ~{opp_elo} ELOs | {map} | FACEIT CS2 POV".
 
     ``kd`` is a "kills/deaths" string (e.g. "34/11"), rendered hyphenated
     "(34-11)" to match the thumbnail style. The opponent ELO is a team
-    average, signalled by "~" + plural "ELOs".
+    average, signalled by "~" + plural "ELOs". When ``voice_comms`` is true a
+    " + VOICE COMMS" suffix is appended.
     """
     kd_part = f"({kd.replace('/', '-')}) " if kd else ""
+    suffix = " + VOICE COMMS" if voice_comms else ""
     if elo is not None and opp_elo is not None:
         # Opponent ELO is an average of the opposing team, so prefix with "~"
         # and pluralise "ELOs" to signal it's a team average, not one player's
         # exact ELO. E.g. "3631 ELO vs ~3566 ELOs".
-        return f"{player} {kd_part}{elo} ELO vs ~{opp_elo} ELOs | {map_name} | FACEIT CS2 POV"[:100]
-    return f"{player} {kd_part}| {map_name} | FACEIT CS2 POV"[:100]
+        return f"{player} {kd_part}{elo} ELO vs ~{opp_elo} ELOs | {map_name} | FACEIT CS2 POV{suffix}"[:100]
+    return f"{player} {kd_part}| {map_name} | FACEIT CS2 POV{suffix}"[:100]
 
 
 def build_description(player: str, notable: list[str], elo: int | None,
@@ -207,6 +209,7 @@ def main() -> None:
     ap.add_argument("--elo", type=int, default=None, help="POV player's FACEIT ELO")
     ap.add_argument("--opp-elo", type=int, default=None, help="Average FACEIT ELO of the opposing team")
     ap.add_argument("--kd", default=None, help="POV player's K/D as kills/deaths, e.g. '34/11' (shown in title)")
+    ap.add_argument("--voice-comms", action="store_true", help="Append ' + VOICE COMMS' to the title")
     ap.add_argument("--match-id", default="", help="FACEIT match id → room link in description")
     ap.add_argument("--crosshair-code", default="", help="POV player's crosshair share code (from csdm analysis)")
     ap.add_argument("--viewmodel-fov", default="", help="Viewmodel FOV as rendered")
@@ -260,7 +263,8 @@ def main() -> None:
     if args.video_settings_source:
         video["video_settings_source"] = args.video_settings_source
 
-    title = build_title(player, map_name, notable, args.elo, args.opp_elo, args.kd)
+    title = build_title(player, map_name, notable, args.elo, args.opp_elo, args.kd,
+                        voice_comms=args.voice_comms)
     description = build_description(
         player, notable, args.elo, args.opp_elo,
         match_id=args.match_id.strip(), crosshair_code=args.crosshair_code.strip(),
