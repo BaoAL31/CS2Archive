@@ -242,7 +242,6 @@ def main() -> None:
         kills, deaths = kd_stats
         meta["kills"] = kills
         meta["deaths"] = deaths
-        meta["kd"] = round(kills / deaths, 2)
 
     if not args.no_elo:
         print("[FACEIT] Fetching match ELO ...")

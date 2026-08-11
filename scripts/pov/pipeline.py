@@ -147,6 +147,38 @@ def _faceit_rename_map(demo_path: Path) -> dict:
     return rename_map
 
 
+def _faceit_kd_from_demo(demo_path: Path, steam_id: str) -> tuple[int, int] | None:
+    """(kills, deaths) for the POV player from the demo's player_death events.
+
+    Fallback used when the backlog card lacks explicit kills/deaths (older match
+    cards only stored the `kd` ratio). Matches csdm's convention: suicides
+    (attacker == victim) and the knife round are excluded. None when unavailable
+    or the player had zero deaths.
+    """
+    try:
+        import demoparser2 as dp
+        parser = dp.DemoParser(str(demo_path))
+        deaths = parser.parse_event("player_death")
+        round_starts = parser.parse_event("round_start")
+    except Exception:
+        return None
+    if deaths is None or len(deaths) == 0:
+        return None
+    first_real_tick = 0
+    if round_starts is not None and len(round_starts):
+        r1 = round_starts[round_starts["round"] == 1]
+        if len(r1):
+            first_real_tick = int(r1["tick"].max())
+    att = deaths["attacker_steamid"].astype(str)
+    vic = deaths["user_steamid"].astype(str)
+    core = deaths[(deaths["tick"] >= first_real_tick) & (att != vic)]
+    kills = int((core["attacker_steamid"].astype(str) == steam_id).sum())
+    deaths_n = int((core["user_steamid"].astype(str) == steam_id).sum())
+    if deaths_n == 0:
+        return None
+    return kills, deaths_n
+
+
 def _parse_backlog(path: str) -> dict:
     """Parse backlog .json file and validate required fields."""
     p = Path(path)
@@ -724,6 +756,24 @@ class Pipeline:
             if str(pl.get("steamId") or "") == self.steam_id:
                 return str(pl.get("crosshairShareCode") or "").strip()
         return ""
+
+    def _faceit_kd(self) -> tuple[int, int] | None:
+        """(kills, deaths) for the POV player, resolved from the backlog card
+        or computed from the demo as a fallback.
+
+        Caches the result into ``self.meta`` so both the title and thumbnail
+        steps agree and we only parse the demo once per run.
+        """
+        if not self.is_faceit:
+            return None
+        kills = self.meta.get("kills")
+        deaths = self.meta.get("deaths")
+        if kills is not None and deaths is not None:
+            return int(kills), int(deaths)
+        kd = _faceit_kd_from_demo(self.demo_path, str(self.steam_id))
+        if kd is not None:
+            self.meta["kills"], self.meta["deaths"] = kd
+        return kd
 
     @staticmethod
     def _probe_duration(path: Path) -> float:
@@ -1354,9 +1404,9 @@ class Pipeline:
             opp_elo = self.meta.get("opp_avg_elo")
             if elo is not None and opp_elo is not None:
                 cmd += ["--elo", str(elo), "--opp-elo", str(opp_elo)]
-            kills = self.meta.get("kills")
-            deaths = self.meta.get("deaths")
-            if kills is not None and deaths is not None:
+            kd = self._faceit_kd()
+            if kd is not None:
+                kills, deaths = kd
                 cmd += ["--kd", f"{kills}/{deaths}"]
             cmd += ["--output", str(youtube_dir)]
             r = self._run_py(cmd, timeout=300)
@@ -1481,9 +1531,9 @@ class Pipeline:
             mid = self.meta.get("faceit_match_id")
             if mid:
                 titlize_args += ["--match-id", str(mid)]
-            kills = self.meta.get("kills")
-            deaths = self.meta.get("deaths")
-            if kills is not None and deaths is not None:
+            kd = self._faceit_kd()
+            if kd is not None:
+                kills, deaths = kd
                 titlize_args += ["--kd", f"{kills}/{deaths}"]
             code = self._pov_crosshair_code()
             if code:

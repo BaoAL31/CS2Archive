@@ -20,7 +20,7 @@ Usage:
                                   [--match-id <faceit_match_id>]
 
 Output: backlog/faceit/{priority}/{player}-{map}-{match_slug}.json
-Each card carries the pipeline fields plus: rating, kd, team,
+Each card carries the pipeline fields plus: rating, kills, deaths, team,
 faceit_match_id, faceit_id, faceit_nickname.
 """
 
@@ -161,7 +161,8 @@ def _write_card(pro: dict, *, demo: Path, map_name: str, match_slug: str,
         "tournament": tournament,
         "priority": priority,
         "rating": pro["rating"],
-        "kd": pro["kd"],
+        "kills": pro["kills"],
+        "deaths": pro["deaths"],
         "team": pro["team"],
         "is_faceit": True,
         "faceit_match_id": pro["faceit_match_id"],
@@ -234,7 +235,6 @@ def main() -> None:
             "faceit_match_id": match_id,
             "team": str(p.get("teamName") or "").strip(),
             "rating": _round2(rating),
-            "kd": _round2(p.get("killDeathRatio")),
             "kills": p.get("killCount"),
             "deaths": p.get("deathCount"),
         })
