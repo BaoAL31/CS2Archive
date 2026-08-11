@@ -428,10 +428,15 @@ def main() -> None:
     if mix.shape[0] > int(dur * SAMPLE_RATE):
         mix = mix[:int(dur * SAMPLE_RATE)]
 
-    # Decode video audio to mono PCM.
+    # Decode through FFmpeg's timestamp-aware resampler. The source contains
+    # concatenated MP3 round clips; a bare raw-PCM decode materializes every
+    # packet's encoder padding, adding silence at every round join and making
+    # the reconstructed audio progressively late.
     va = subprocess.run(
         ["ffmpeg", "-loglevel", "error", "-i", str(video), "-ac", "1",
-         "-ar", str(SAMPLE_RATE), "-f", "f32le", "-"],
+         "-ar", str(SAMPLE_RATE),
+         "-af", "aresample=async=1:first_pts=0",
+         "-f", "f32le", "-"],
         capture_output=True,
     )
     if va.returncode != 0 or not va.stdout:
@@ -448,15 +453,6 @@ def main() -> None:
     if peak > 1.0:
         summed = summed * (0.95 / peak)
     summed16 = (np.clip(summed, -1.0, 1.0) * 32767).astype(np.int16)
-
-    # The final aac encoder adds ~1024 samples of priming delay (21.3ms @48kHz)
-    # that the container does NOT tag (initial_padding=0), so players play the
-    # audio 21ms late vs the video. Trim the first 1024 samples so the output
-    # stays sample-locked to the video (verified: trimming 1024 samples makes
-    # the final align exactly with the native source).
-    _AAC_DELAY_SAMPLES = 1024
-    if summed16.shape[0] > _AAC_DELAY_SAMPLES:
-        summed16 = summed16[_AAC_DELAY_SAMPLES:].copy()
 
     tmp_out = out
     if out.resolve() == video.resolve():
