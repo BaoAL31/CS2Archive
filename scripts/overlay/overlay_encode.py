@@ -58,11 +58,15 @@ def _ffmpeg_encode(
 ) -> None:
     """Run ffmpeg with h264_nvenc. No CPU fallback (libx forbidden by user).
 
-    When ``segment`` is set, ``-ss {start} -to {end}`` is applied as INPUT
-    options on the main video so both video and audio streams are trimmed
-    frame-accurately by ffmpeg's demuxer. Keyframe-aligned (input-side
-    seeking is fast; visible round-boundary jumps are avoided by the
-    round_offsets sidecar using actual per-round frames).
+    When ``segment`` is set, input-side ``-ss`` plus an explicit ``-t``
+    duration is applied to the main video. Using ``-to`` here is subtly
+    wrong: with input-side seeking ffmpeg can retain the original absolute
+    end timestamp, making each independently encoded batch longer than its
+    corresponding video interval. Those extra timestamps accumulate when
+    batches are concatenated and make the remuxed source audio sound late.
+    Keyframe-aligned input seeking is intentional; visible round-boundary
+    jumps are avoided by the round_offsets sidecar using actual per-round
+    frames.
 
     ``raw_inputs`` is a list of ``(path, input_options)`` for raw video inputs
     (e.g. 1x1 RGBA alpha controls) that need explicit demuxer flags before
@@ -101,7 +105,8 @@ def _ffmpeg_encode(
         start_sec, end_sec = segment
         if start_sec > 0:
             cmd.extend(["-ss", f"{start_sec:.6f}"])
-        cmd.extend(["-to", f"{end_sec:.6f}"])
+        duration_sec = max(0.0, end_sec - start_sec)
+        cmd.extend(["-t", f"{duration_sec:.6f}"])
     cmd.extend(["-i", main_input])
     loop_set = loop_inputs or set()
     for inp in extra_inputs:

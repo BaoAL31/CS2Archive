@@ -1018,8 +1018,12 @@ class Pipeline:
         # legacy alias kept for backward-compat; it implies the same.)
         # The shade is applied at NATIVE res in the SCALE step so it stretches
         # together with the video (boxes stay locked to avatars).
+        # FACEIT demos carry packet-aligned team voice by definition. Keep
+        # the shade and comms as one feature: enabling either explicitly, or
+        # processing a FACEIT backlog card, enables both halves.
         enable_voice = (
-            getattr(self.args, "enable_voice_comms", False)
+            self.is_faceit
+            or getattr(self.args, "enable_voice_comms", False)
             or getattr(self.args, "voice_shade", False)
         )
         if enable_voice and self.demo_path and self.demo_path.exists():
@@ -1073,8 +1077,11 @@ class Pipeline:
         # Voice is ONE feature: the comms AUDIO mix runs here in step 4
         # (the shade indicator was applied at native res in the step-3 scale).
         # --enable-voice-comms turns both on; --voice-shade is a legacy alias.
+        # Keep FACEIT voice shade and team comms inseparable. FACEIT cards
+        # default this on because their demos contain per-player voice.
         enable_voice = (
-            getattr(self.args, "enable_voice_comms", False)
+            self.is_faceit
+            or getattr(self.args, "enable_voice_comms", False)
             or getattr(self.args, "voice_shade", False)
         )
 
