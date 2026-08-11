@@ -147,6 +147,30 @@ def _faceit_rename_map(demo_path: Path) -> dict:
     return rename_map
 
 
+# FACEIT POVs enable voice comms by default ONLY when the demo has enough
+# real voice to be worth it (shade + comms mix). Below this many seconds of
+# POV-team voice, default stays OFF to avoid mixing near-empty comms.
+VOICE_AUTO_MIN_TEAM_SECONDS = 180.0  # ~3 min of team voice
+
+
+def _faceit_voice_enabled(demo_path: Path, steam_id: str) -> bool:
+    """Whether a FACEIT demo warrants voice by default (enough team voice).
+
+    Auto-detection: enable voice only if the POV player's team has at least
+    VOICE_AUTO_MIN_TEAM_SECONDS of recorded voice. Absent/unknown → False so we
+    never default into mixing a demo that has no real comms.
+    """
+    if not demo_path or not demo_path.exists():
+        return False
+    try:
+        from scripts.faceit.mix_team_voice import pov_team_voice_seconds
+        secs = pov_team_voice_seconds(demo_path, steam_id)
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] _faceit_voice_enabled: {e}; voice disabled")
+        return False
+    return secs >= VOICE_AUTO_MIN_TEAM_SECONDS
+
+
 def _faceit_kd_from_demo(demo_path: Path, steam_id: str) -> tuple[int, int] | None:
     """(kills, deaths) for the POV player from the demo's player_death events.
 
@@ -222,6 +246,7 @@ class Pipeline:
         self.is_faceit = bool(self.meta.get("is_faceit")) or bool(
             self.demo_path and "demos/faceit" in str(self.demo_path).replace("\\", "/")
         )
+        self._voice_cache: bool | None = None
 
         ratings_path_str = self.meta.get("ratings_path", "")
         self.ratings_json = Path(ratings_path_str) if ratings_path_str else PROJECT_ROOT / "demos" / "analysis" / ""
@@ -429,6 +454,23 @@ class Pipeline:
         # re-analyze is fine) but DO NOT skip render (filesystem-based resume
         # inside render_pov.py will pick up existing batches).
         # Step 3: no combined.mp4 yet → keep at user's start_step
+
+    def _voice_enabled(self) -> bool:
+        """Whether voice comms (shade + comms mix) should run for this card.
+
+        Explicit flags always win. Otherwise FACEIT cards enable voice by
+        default ONLY when the demo has enough real POV-team voice (auto-detected
+        once and cached). Non-FACEIT cards default OFF.
+        """
+        if getattr(self.args, "enable_voice_comms", False) or getattr(
+            self.args, "voice_shade", False
+        ):
+            return True
+        if not self.is_faceit:
+            return False
+        if self._voice_cache is None:
+            self._voice_cache = _faceit_voice_enabled(self.demo_path, self.steam_id)
+        return self._voice_cache
 
     def _setup_logging(self) -> Path:
         """Redirect all output (Python prints + subprocess stdout/stderr) to
@@ -1068,14 +1110,10 @@ class Pipeline:
         # legacy alias kept for backward-compat; it implies the same.)
         # The shade is applied at NATIVE res in the SCALE step so it stretches
         # together with the video (boxes stay locked to avatars).
-        # FACEIT demos carry packet-aligned team voice by definition. Keep
-        # the shade and comms as one feature: enabling either explicitly, or
-        # processing a FACEIT backlog card, enables both halves.
-        enable_voice = (
-            self.is_faceit
-            or getattr(self.args, "enable_voice_comms", False)
-            or getattr(self.args, "voice_shade", False)
-        )
+        # FACEIT demos carry packet-aligned team voice; they enable voice by
+        # default only when the demo has enough real team voice (see
+        # _voice_enabled / VOICE_AUTO_MIN_TEAM_SECONDS).
+        enable_voice = self._voice_enabled()
         if enable_voice and self.demo_path and self.demo_path.exists():
             cap_w = int(self.meta.get("capture_width") or 0)
             cap_h = int(self.meta.get("capture_height") or 0)
@@ -1128,12 +1166,8 @@ class Pipeline:
         # (the shade indicator was applied at native res in the step-3 scale).
         # --enable-voice-comms turns both on; --voice-shade is a legacy alias.
         # Keep FACEIT voice shade and team comms inseparable. FACEIT cards
-        # default this on because their demos contain per-player voice.
-        enable_voice = (
-            self.is_faceit
-            or getattr(self.args, "enable_voice_comms", False)
-            or getattr(self.args, "voice_shade", False)
-        )
+        # enable this by default only when the demo has enough team voice.
+        enable_voice = self._voice_enabled()
 
         # Skip if the overlay variant already has a valid video (resume from
         # a previous successful run where .overlay_work was cleaned).
@@ -1535,6 +1569,10 @@ class Pipeline:
             if kd is not None:
                 kills, deaths = kd
                 titlize_args += ["--kd", f"{kills}/{deaths}"]
+            # FACEIT POVs mix in team voice comms when voice is enabled
+            # (auto-detected by team-voice volume, or explicit flag).
+            if self._voice_enabled():
+                titlize_args += ["--voice-comms"]
             code = self._pov_crosshair_code()
             if code:
                 titlize_args += ["--crosshair-code", code]

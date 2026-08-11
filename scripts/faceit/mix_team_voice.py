@@ -251,6 +251,34 @@ def load_team_map(demo: Path) -> dict[str, int]:
     return mapping
 
 
+def pov_team_voice_seconds(demo: Path, steam_id: str) -> float:
+    """Total seconds of voice emitted by the POV player's team across the match.
+
+    Each voice packet is ~10ms of audio (480 samples @ 48 kHz). We count only
+    packets from the POV player's stable team so the caller can decide whether
+    there is "enough" comms to warrant enabling voice (shade + comms mix).
+    """
+    try:
+        tm = load_team_map(demo)
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] pov_team_voice_seconds: could not build team map ({e}); returning 0")
+        return 0.0
+    pov_team = tm.get(str(steam_id))
+    if pov_team is None:
+        print(f"[warn] pov_team_voice_seconds: POV steamid {steam_id} not in team map")
+        return 0.0
+    try:
+        rows = load_voice(demo)
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] pov_team_voice_seconds: could not parse voice ({e}); returning 0")
+        return 0.0
+    seconds = 0.0
+    for r in rows:
+        if tm.get(r["steamid"]) == pov_team:
+            seconds += 0.010
+    return seconds
+
+
 def load_offsets(offsets_path: Path) -> dict:
     d = json.loads(offsets_path.read_text(encoding="utf-8"))
     # keys: total_rounds, total_duration_seconds, round_offsets, batches,
