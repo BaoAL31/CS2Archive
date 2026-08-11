@@ -386,16 +386,52 @@ def _finish_csdm(cmd: list[str], label: str, expected: Path | None,
 
 
 def _existing_sequences(output_dir: Path) -> set[str]:
-    """Names of already-complete sequence mp4s in output_dir."""
-    return {
-        p.name for p in output_dir.glob("sequence-*.mp4")
-        if p.stat().st_size >= 1_048_576
-    }
+    """Identifiers of already-complete sequence videos in output_dir.
+
+    Handles both CSDM output layouts:
+      - New (3.20+):  N-sequence/video.mp4 directories under output_dir.
+      - Old:          sequence-{i}-tick-{A}-to-{B}.mp4 in output_dir root.
+    Returns a set of relative-path identifiers for videos >= 1 MB, so a newly
+    appearing (growing) file is seen as a change vs the captured `before` set.
+    """
+    found: set[str] = set()
+
+    for seq_dir in output_dir.glob("*-sequence"):
+        if not seq_dir.is_dir():
+            continue
+        video = seq_dir / "video.mp4"
+        if video.is_file() and video.stat().st_size >= 1_048_576:
+            found.add(str(video.relative_to(output_dir)))
+
+    for p in output_dir.glob("sequence-*-tick-*-to-*.mp4"):
+        if p.is_file() and p.stat().st_size >= 1_048_576:
+            found.add(p.name)
+
+    return found
 
 
 def _new_sequence_appeared(output_dir: Path, before: set[str]) -> bool:
     now = _existing_sequences(output_dir)
     return now - before != set()
+
+
+def _purge_partial_sequences(output_dir: Path) -> None:
+    """Remove partial sequence outputs from a killed/aborted attempt.
+
+    Deletes N-sequence/video.mp4 dirs (new format) and sequence-*.mp4 (old
+    format). These are the raw CSDM outputs that would otherwise be mistaken
+    for newly-engaged work on the next retry (same relative path), and would
+    mask a genuine hook failure. Already-renamed round_*.mp4 files are left
+    untouched.
+    """
+    for seq_dir in output_dir.glob("*-sequence"):
+        if seq_dir.is_dir():
+            shutil.rmtree(seq_dir, ignore_errors=True)
+    for p in output_dir.glob("sequence-*-tick-*-to-*.mp4"):
+        try:
+            p.unlink()
+        except OSError:
+            pass
 
 
 def _run_csdm_hook_aware(cmd: list[str], label: str, expected: Path | None,
@@ -407,12 +443,16 @@ def _run_csdm_hook_aware(cmd: list[str], label: str, expected: Path | None,
     failure never produces one, so we kill CS2/HLAE and retry. Returns the video
     Path on success, or exits after exhausting retries.
     """
-    before = _existing_sequences(output_dir)
-
     for attempt in range(1, hook_retries + 1):
         attempt_suffix = f" (attempt {attempt}/{hook_retries})" if hook_retries > 1 else ""
         print(f"  [{label}]{attempt_suffix}...", end=" ", flush=True)
         t0 = time.time()
+
+        # Each attempt renders from a clean slate: purge any partial sequences
+        # left by a killed/aborted attempt, then re-baseline what counts as
+        # "new". round_*.mp4 from completed batches are preserved.
+        _purge_partial_sequences(output_dir)
+        before = _existing_sequences(output_dir)
 
         log_path = output_dir / f".csdm_hook_attempt_{attempt}.log"
         with open(log_path, "w", encoding="utf-8") as logf:
