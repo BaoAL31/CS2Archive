@@ -621,6 +621,8 @@ class Pipeline:
             "scripts/pov/render_pov.py", str(self.demo_path), self.steam_id,
             "--output", str(self.render_dir),
             "--batches", str(getattr(self.args, "batches", 20)),
+            "--hook-timeout", str(getattr(self.args, "hook_timeout", 150.0)),
+            "--hook-retries", str(getattr(self.args, "hook_retries", 2)),
         ]
         if skip_failed:
             render_args += ["--skip-failed-rounds"]
@@ -1669,9 +1671,24 @@ def main() -> None:
     parser.add_argument(
         "--batches",
         type=int,
+        default=1,
+        help="Number of render batches (default: 1). Rounds are divided equally across batches "
+             "and rendered in N separate CSDM calls. Each call launches a fresh CS2 (HLAE hook), "
+             "so keep 1 to minimize the flaky vanilla-viewer hook failure.",
+    )
+    parser.add_argument(
+        "--hook-timeout",
+        type=float,
+        default=150.0,
+        help="Seconds to wait for a new >=1 MB sequence file before declaring a failed HLAE "
+             "hook (default: 150). The vanilla-viewer failure produces nothing.",
+    )
+    parser.add_argument(
+        "--hook-retries",
+        type=int,
         default=2,
-        help="Number of render batches (default: 2). Rounds are divided equally across batches "
-             "and rendered in N separate CSDM calls. Set 1 for a single call.",
+        help="Times to kill + relaunch a batch when the HLAE hook fails to engage "
+             "(default: 2). 0 disables hook detection.",
     )
     parser.add_argument(
         "--overlay-batches",

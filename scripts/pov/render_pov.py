@@ -290,7 +290,24 @@ def get_round_count(demo_path: str) -> int:
         return len(data.get("rounds", []))
 
 
-def run_csdm(cmd: list[str], label: str, expected: Path | None = None) -> Path | None:
+def run_csdm(cmd: list[str], label: str, expected: Path | None = None,
+             hook_timeout: float = 0.0, hook_retries: int = 0,
+             output_dir: Path | None = None) -> Path | None:
+    """Run a CSDM render command.
+
+    When hook_timeout > 0 and output_dir is set, run in hook-detection mode:
+    csdm runs in the background while we watch output_dir for a new >=1 MB
+    `sequence-*.mp4` file (the "Raw files" / encoded sequence). That file only
+    appears once HLAE actually hooks CS2 and starts encoding; the flaky
+    vanilla-viewer failure produces nothing. If no new sequence appears within
+    hook_timeout seconds, the CS2/HLAE tree is killed and the batch retried up
+    to hook_retries times. Otherwise (or when hook_timeout is 0) the command
+    blocks synchronously as before.
+    """
+    if hook_timeout > 0 and hook_retries > 0 and output_dir is not None:
+        return _run_csdm_hook_aware(cmd, label, expected,
+                                    output_dir, hook_timeout, hook_retries)
+
     print(f"  [{label}]...", end=" ", flush=True)
     t0 = time.time()
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=14400)
@@ -300,7 +317,17 @@ def run_csdm(cmd: list[str], label: str, expected: Path | None = None) -> Path |
         cmd += ["--source", "challengermode"]
         return run_csdm(cmd, f"{label} (challengermode)", expected)
 
-    elapsed = time.time() - t0
+    return _finish_csdm(cmd, label, expected, time.time() - t0,
+                        result.returncode, err)
+
+
+def _finish_csdm(cmd: list[str], label: str, expected: Path | None,
+                 elapsed: float, returncode: int, err: str) -> Path | None:
+    """Post-process a completed CSDM run. Returns the produced video Path, or
+    the string "RETRY_CHALLENGERMODE" when the demo needs a challengermode
+    source re-run, or exits on failure."""
+    if "unknown demo source" in err.lower() and "--source" not in cmd:
+        return "RETRY_CHALLENGERMODE"
 
     if "Steam is not running" in err:
         print("FAILED - Steam is not running.")
@@ -310,8 +337,8 @@ def run_csdm(cmd: list[str], label: str, expected: Path | None = None) -> Path |
         print("FAILED - HLAE produced no video (check absolute --output; see AGENTS.md).")
         sys.exit(1)
 
-    if result.returncode != 0:
-        print(f"FAILED ({elapsed:.0f}s, exit {result.returncode})")
+    if returncode != 0:
+        print(f"FAILED ({elapsed:.0f}s, exit {returncode})")
         print(err[-500:])
         sys.exit(1)
 
@@ -355,6 +382,109 @@ def run_csdm(cmd: list[str], label: str, expected: Path | None = None) -> Path |
     print(f"FAILED ({elapsed:.0f}s, no video)")
     if err.strip():
         print(err[-800:])
+    sys.exit(1)
+
+
+def _existing_sequences(output_dir: Path) -> set[str]:
+    """Names of already-complete sequence mp4s in output_dir."""
+    return {
+        p.name for p in output_dir.glob("sequence-*.mp4")
+        if p.stat().st_size >= 1_048_576
+    }
+
+
+def _new_sequence_appeared(output_dir: Path, before: set[str]) -> bool:
+    now = _existing_sequences(output_dir)
+    return now - before != set()
+
+
+def _run_csdm_hook_aware(cmd: list[str], label: str, expected: Path | None,
+                         output_dir: Path, hook_timeout: float,
+                         hook_retries: int) -> Path | None:
+    """Run csdm with hook detection + retry.
+
+    Watches output_dir for a new >=1 MB sequence file; the vanilla-viewer hook
+    failure never produces one, so we kill CS2/HLAE and retry. Returns the video
+    Path on success, or exits after exhausting retries.
+    """
+    before = _existing_sequences(output_dir)
+
+    for attempt in range(1, hook_retries + 1):
+        attempt_suffix = f" (attempt {attempt}/{hook_retries})" if hook_retries > 1 else ""
+        print(f"  [{label}]{attempt_suffix}...", end=" ", flush=True)
+        t0 = time.time()
+
+        log_path = output_dir / f".csdm_hook_attempt_{attempt}.log"
+        with open(log_path, "w", encoding="utf-8") as logf:
+            proc = subprocess.Popen(
+                cmd, stdout=logf, stderr=subprocess.STDOUT, text=True,
+            )
+
+            # Poll for the hook to engage (a new sequence file appears) or the
+            # process to exit on its own.
+            engaged = False
+            poll_start = time.time()
+            while time.time() - poll_start < hook_timeout:
+                if proc.poll() is not None:
+                    break  # csdm exited on its own
+                if _new_sequence_appeared(output_dir, before):
+                    engaged = True
+                    break
+                time.sleep(5)
+
+            if not engaged:
+                if proc.poll() is not None:
+                    # csdm exited early without producing a sequence. That's
+                    # usually a hook failure too (e.g. CS2 opened the vanilla
+                    # viewer and exited) — retry, unless a known-fatal error.
+                    log_tail = ""
+                    try:
+                        log_tail = log_path.read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        pass
+                    fatal = any(m in log_tail.lower() for m in (
+                        "steam is not running", "raw files not found",
+                        "unknown demo source"))
+                    if fatal:
+                        # Let the normal completion path report it accurately.
+                        proc.wait(timeout=14400)
+                    else:
+                        print("HOOK-FAIL (exited early, no sequence) - killing and retrying")
+                        _kill_stale_processes()
+                        continue
+                else:
+                    # Still running but no sequence -> hook failed (vanilla viewer).
+                    print(f"HOOK-FAIL (no sequence in {hook_timeout:.0f}s) - killing and retrying")
+                    _kill_stale_processes()
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    proc.wait()
+                    continue
+
+            proc.wait(timeout=14400)
+
+        err = ""
+        try:
+            err = log_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+        # Challengermode re-run: restart the whole (hook-aware) command.
+        if "unknown demo source" in err.lower() and "--source" not in cmd:
+            cmd = cmd + ["--source", "challengermode"]
+            before = _existing_sequences(output_dir)
+            continue
+
+        try:
+            return _finish_csdm(cmd, label, expected, time.time() - t0,
+                                proc.returncode, err)
+        except SystemExit:
+            raise
+
+    print(f"[ERROR] CS2 failed to hook after {hook_retries} attempt(s) "
+          f"(no sequence produced in {hook_timeout:.0f}s).")
     sys.exit(1)
 
 
@@ -540,9 +670,18 @@ def main() -> None:
                         help="Render width (default: 2560, or player's capture_width from player_accounts.json).")
     parser.add_argument("--height", type=int, default=None,
                         help="Render height (default: 1440, or player's capture_height from player_accounts.json).")
-    parser.add_argument("--batches", type=int, default=2,
-                        help="Number of render batches (default: 2). Rounds are divided equally across batches. "
-                             "E.g. --batches 3 with 30 rounds produces 3 batches of 10 rounds each.")
+    parser.add_argument("--batches", type=int, default=1,
+                        help="Number of render batches (default: 1). Rounds are divided equally across batches. "
+                             "E.g. --batches 3 with 30 rounds produces 3 batches of 10 rounds each. "
+                             "Keep 1 by default: each batch launches a fresh CS2 (HLAE hook), and "
+                             "extra launches raise the odds of the flaky vanilla-viewer hook failure.")
+    parser.add_argument("--hook-timeout", type=float, default=150.0,
+                        help="Seconds to wait for a new >=1 MB sequence file before declaring a "
+                             "failed HLAE hook (default: 150). A hooked CS2 encodes a sequence within "
+                             "about a round's duration; the vanilla-viewer failure produces nothing.")
+    parser.add_argument("--hook-retries", type=int, default=2,
+                        help="Times to kill + relaunch a batch when the HLAE hook fails to engage "
+                             "(default: 2). 0 disables hook detection entirely.")
     parser.add_argument("--rounds", type=str, default="",
                     help="Comma-separated list of specific rounds to render, e.g. '1,3,5' or '2-4,7'. If omitted, all rounds are rendered.")
 
@@ -815,7 +954,11 @@ def main() -> None:
                 failed_this_batch: list[int] = []
                 csdm_crashed = False
                 try:
-                    run_csdm(cmd, f"rounds {missing_global[0]}-{missing_global[-1]}", expected=None)
+                    run_csdm(cmd, f"rounds {missing_global[0]}-{missing_global[-1]}",
+                             expected=None,
+                             hook_timeout=args.hook_timeout,
+                             hook_retries=args.hook_retries,
+                             output_dir=output_dir)
                 except SystemExit:
                     csdm_crashed = True
                     if not args.skip_failed_rounds:
