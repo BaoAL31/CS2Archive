@@ -1123,7 +1123,8 @@ class Pipeline:
                 "--voice-shade-demo", str(self.demo_path),
                 "--voice-shade-steam-id", self.steam_id,
                 "--voice-shade-fade", str(getattr(self.args, "voice_shade_fade", 0.3)),
-                "--voice-shade-side", "right",
+                # first-half scoreboard side is auto-detected from the demo
+                # (CT=LEFT, T=RIGHT) inside build_voice_shade_data
             ]
         r = self._run_py(concat_args, timeout=36000)
         if r.returncode != 0:
