@@ -126,6 +126,43 @@ def _notable_nicks() -> set[str]:
         return set()
 
 
+def _opponent_pros(players: list[dict], pov_steam_id: str, pov_name: str) -> list[str]:
+    """Canonical nicks (uppercased) of Recognised Pros on the opponent team.
+
+    ``players`` are demo {name, steamid, team_number} rows. The opponent team is
+    whichever team_number is *not* the POV player's. Returns the canonical pro
+    names of opponent-team members (matched by steam ID via player_accounts),
+    uppercased for the "vs DONK & MAGIXX" title, or [] when none.
+    """
+    try:
+        from faceit_names import canonical_nick, known_pro_steam_ids
+    except Exception:
+        return []
+    # Find the POV player's team.
+    pov_team = None
+    for p in players:
+        if p["steamid"] == pov_steam_id:
+            pov_team = p["team_number"]
+            break
+    if pov_team is None and pov_name:
+        for p in players:
+            if p["name"].strip().lower() == pov_name.strip().lower():
+                pov_team = p["team_number"]
+                break
+    if pov_team is None:
+        return []
+
+    pros = known_pro_steam_ids()
+    out: list[str] = []
+    for p in players:
+        if p["team_number"] == pov_team:
+            continue
+        nick = pros.get(p["steamid"])
+        if nick:
+            out.append(canonical_nick(nick).upper())
+    return out
+
+
 def _map_from_demo(demo_path: Path) -> str:
     """Best-effort map name from the demo filename or header."""
     m = re.search(r"(de_[a-z0-9]+)", demo_path.name, re.I)
@@ -137,16 +174,24 @@ def _map_from_demo(demo_path: Path) -> str:
 
 def build_title(player: str, map_name: str, notable: list[str],
                 elo: int | None = None, opp_elo: int | None = None,
-                kd: str | None = None, *, voice_comms: bool = False) -> str:
+                kd: str | None = None, *, voice_comms: bool = False,
+                opponent_pros: list[str] | None = None) -> str:
     """Title: "{player} ({kd}) {elo} ELO vs ~{opp_elo} ELOs | {map} | FACEIT CS2 POV".
 
     ``kd`` is a "kills/deaths" string (e.g. "34/11"), rendered hyphenated
     "(34-11)" to match the thumbnail style. The opponent ELO is a team
     average, signalled by "~" + plural "ELOs". When ``voice_comms`` is true a
     " + VOICE COMMS" suffix is appended.
+
+    When the opposing team contains recognised pros, ``opponent_pros`` carries
+    their canonical nicks (uppercased) and the ELO-vs-ELO portion is replaced
+    with "vs DONK & MAGIXX" (more compelling than an ELO average).
     """
     kd_part = f"({kd.replace('/', '-')}) " if kd else ""
     suffix = " + VOICE COMMS" if voice_comms else ""
+    if opponent_pros:
+        vs = " & ".join(opponent_pros)
+        return f"{player} {kd_part}vs {vs} | {map_name} | FACEIT CS2 POV{suffix}"[:100]
     if elo is not None and opp_elo is not None:
         # Opponent ELO is an average of the opposing team, so prefix with "~"
         # and pluralise "ELOs" to signal it's a team average, not one player's
@@ -264,7 +309,8 @@ def main() -> None:
         video["video_settings_source"] = args.video_settings_source
 
     title = build_title(player, map_name, notable, args.elo, args.opp_elo, args.kd,
-                        voice_comms=args.voice_comms)
+                        voice_comms=args.voice_comms,
+                        opponent_pros=_opponent_pros(players, args.steam_id, args.player))
     description = build_description(
         player, notable, args.elo, args.opp_elo,
         match_id=args.match_id.strip(), crosshair_code=args.crosshair_code.strip(),
