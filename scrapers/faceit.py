@@ -1,13 +1,16 @@
 """
 CS2Archive — FACEIT Demo Downloader (browser scrape)
 
-No FACEIT API key required. Uses a persistent, logged-in Chrome profile
-(`.sessions/faceit/`, created via `scripts/faceit/faceit_login_launcher.py`) to open the
-match room, click "Watch Demo", and capture the browser download to disk.
+No FACEIT API key required for downloads. Uses a CDP-debuggable Chrome
+(``scripts/misc/launch-debug-chrome.ps1`` → ``~/.chrome-debug``, seeded with
+cookies from the main logged-in Chrome profile) to open the match room, click
+"Watch Demo", and capture the browser download to disk. Some matches start the
+download directly from "Watch Demo"; others open a Demo 1/Demo 2 dropdown.
 
 Cloudflare blocks automation browsers, so the launched context uses the system
-Chrome channel with `--disable-blink-features=AutomationControlled` and reuses
-the authenticated profile (which already holds the cf_clearance cookie).
+Chrome channel and reuses an authenticated profile. Pages are created in the
+existing authenticated context (``browser.contexts[0]``), not ``new_page()``,
+because a brand-new context doesn't inherit the logged-in cookies.
 """
 
 from __future__ import annotations
@@ -344,24 +347,110 @@ def _resolve_match_id(room_or_id: str) -> str:
     return room_or_id.strip()
 
 def _launch_context():
-    """Launch the persistent, authenticated Chrome context (plain Playwright).
+    """Launch the authenticated Chrome context via CDP debug Chrome.
 
-    Reuses the logged-in profile (``.sessions/faceit/``). Clicks are humanized
-    via ``_human_click`` (jittered mouse path + delays) to avoid FACEIT bot
-    detection without a stealth-layer dependency.
+    Runs ``scripts/misc/launch-debug-chrome.ps1`` which seeds cookies from the
+    main logged-in Chrome profile (``Profile 2``) into ``~/.chrome-debug`` and
+    launches a CDP-debuggable Chrome on port 9223. We then connect over CDP so
+    the FACEIT room renders authenticated (Watch Demo button present) using the
+    main profile's live session — no separate FACEIT login needed.
+
+    Clicks are humanized via ``_human_click`` (jittered mouse path + delays) to
+    avoid FACEIT bot detection.
     """
     from playwright.sync_api import sync_playwright
 
+    _ensure_cdp_chrome()
+
     pw = sync_playwright().start()
-    browser = pw.chromium.launch_persistent_context(
-        user_data_dir=str(PROFILE_DIR.resolve()),
-        headless=False,
-        channel="chrome",
-        args=["--disable-blink-features=AutomationControlled"],
-        viewport={"width": 1920, "height": 1080},
-        accept_downloads=True,
-    )
+    browser = None
+    for _ in range(20):
+        try:
+            browser = pw.chromium.connect_over_cdp("http://127.0.0.1:9223")
+            browser.contexts  # verify alive
+            break
+        except Exception:
+            time.sleep(1)
+    if browser is None:
+        pw.stop()
+        raise RuntimeError("Could not connect to debug Chrome on CDP port 9223")
     return pw, browser
+
+
+def _auth_page(browser) -> Any:
+    """Return a page in the existing authenticated context.
+
+    ``browser.new_page()`` on a CDP-connected Chrome creates a page in a brand-new
+    context that does NOT share the logged-in profile's cookies — it hits the
+    FACEIT login wall. Pages must be created in ``browser.contexts[0]`` (the
+    seeded, authenticated context from launch-debug-chrome.ps1).
+    """
+    if not browser.contexts:
+        return browser.new_page()
+    ctx = browser.contexts[0]
+    if ctx.pages:
+        return ctx.pages[0]
+    return ctx.new_page()
+
+
+def _is_authenticated(page) -> bool:
+    """True if the FACEIT page shows a logged-in session (no login wall)."""
+    try:
+        body = page.inner_text("body").lower()
+    except Exception:
+        return False
+    if "log in" in body and "sign out" not in body and "log out" not in body:
+        return False
+    return True
+
+
+_CDP_PORT = 9223
+
+
+def _ensure_cdp_chrome() -> None:
+    """Launch the CDP debug Chrome (idempotent), detached so it survives.
+
+    Reuses an already-running debug Chrome on port 9223 if present. Otherwise
+    runs ``launch-debug-chrome.ps1``, which seeds cookies from the main logged-in
+    Chrome profile into ``~/.chrome-debug`` and starts Chrome (detached) on port
+    9223. Launching detached (not tied to this process) means the debug Chrome
+    stays up across runs, so subsequent downloads reconnect instantly instead of
+    relaunching a fresh browser.
+    """
+    import subprocess
+    import time
+
+    if _port_open(_CDP_PORT):
+        return
+    ps1 = Path(__file__).resolve().parent.parent / "scripts" / "misc" / "launch-debug-chrome.ps1"
+    console.print(f"[cyan]   [CDP] Launching debug Chrome (seed cookies from main profile)...[/cyan]")
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1)],
+            capture_output=True, text=True, timeout=90,
+        )
+    except Exception as e:
+        console.print(f"[yellow]   [CDP] launch-debug-chrome.ps1 failed: {e}[/yellow]")
+    # Wait for the CDP endpoint to come up.
+    for _ in range(30):
+        if _port_open(_CDP_PORT):
+            return
+        time.sleep(1)
+    console.print("[red]   [CDP] Debug Chrome did not open CDP port 9223[/red]")
+
+
+def _port_open(port: int) -> bool:
+    """True if something is listening on localhost:port."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.settimeout(1)
+        s.connect(("127.0.0.1", port))
+        return True
+    except Exception:
+        return False
+    finally:
+        s.close()
 
 def get_match_details(match_id: str) -> MatchInfo:
     """Scrape the room page for team names, map, and score (no API key)."""
@@ -370,7 +459,7 @@ def get_match_details(match_id: str) -> MatchInfo:
 
     pw, browser = _launch_context()
     try:
-        page = browser.new_page()
+        page = _auth_page(browser)
         api_url = f"https://www.faceit.com/api/match/v4/match/{match_id}"
         api_payload = {}
         def _cap(r):
@@ -572,8 +661,17 @@ def _click_demo_and_save(page, out_dir: Path, room_url: Optional[str] = None) ->
             time.sleep(3)
         return None
 
-    def _open_dropdown(attempt: int) -> bool:
-        """Click 'Watch Demo', retrying until the dropdown (Demo 1/Demo 2) appears."""
+    def _open_dropdown(attempt: int) -> str:
+        """Click 'Watch Demo'; return 'dropdown', 'direct', or ''.
+
+        Some matches (single-demo, or no multi-map dropdown) start the download
+        immediately when 'Watch Demo' is clicked. Others open a dropdown with
+        'Demo 1'/'Demo 2' to pick from. Returns:
+          - 'dropdown': a Demo 1/Demo 2 option is visible (caller clicks it)
+          - 'direct':   a download/blank page already started (caller skips the
+                        demo-option click and waits for the download)
+          - '':         neither appeared; retry/restart.
+        """
         for _ in range(3):
             try:
                 page.keyboard.press("Escape")
@@ -582,44 +680,56 @@ def _click_demo_and_save(page, out_dir: Path, room_url: Optional[str] = None) ->
                 pass
             loc = _find_demo_button(page, "watch demo") or _find_demo_button(page, "demo")
             if loc is None:
-                return False
+                return ""
             bbox = loc.first.bounding_box()
             if not bbox:
-                return False
-            console.print(f"[cyan]   [DL] Clicking 'Watch Demo' (dropdown attempt {attempt})...[/cyan]")
+                return ""
+            console.print(f"[cyan]   [DL] Clicking 'Watch Demo' (attempt {attempt})...[/cyan]")
             _human_click(page, bbox["x"] + bbox["width"] / 2, bbox["y"] + bbox["height"] / 2)
             page.wait_for_timeout(2500)
             if page.locator("text=Demo 1").count() > 0 or page.locator("text=Demo 2").count() > 0:
-                return True
-        return False
+                return "dropdown"
+            # No dropdown appeared: a single-demo match may have started the
+            # download (or opened the blank CDN page) directly from 'Watch Demo'.
+            if _download_started() is not None:
+                return "direct"
+            # A blank popup page opening is also the direct-download signal.
+            if len([pg for pg in page.context.pages[page_count_before:] if pg != page]) > 0:
+                return "direct"
+        return ""
 
     page_count_before = len(page.context.pages)
 
     for attempt in range(1, DOWNLOAD_MAX_RETRIES + 1):
         try:
-            if not _open_dropdown(attempt):
+            dropdown_state = _open_dropdown(attempt)
+            if dropdown_state == "":
                 console.print(f"[yellow]   [DL] Could not open demo dropdown (attempt {attempt}/{DOWNLOAD_MAX_RETRIES}) — restarting...[/yellow]")
                 if not _reload(page, room_url):
                     return None
                 continue
 
-            # Click the first demo option (Demo 1 preferred, else Demo 2).
-            demo_opt = page.get_by_text("Demo 1", exact=True).first
-            if demo_opt.count() == 0:
-                demo_opt = page.get_by_text("Demo 2", exact=True).first
-            if demo_opt.count() == 0:
-                console.print("[yellow]   [DL] Dropdown open but no demo option found — restarting...[/yellow]")
-                if not _reload(page, room_url):
-                    return None
-                continue
+            blank_page: Optional[Any] = None
+            if dropdown_state == "dropdown":
+                # Click the first demo option (Demo 1 preferred, else Demo 2).
+                demo_opt = page.get_by_text("Demo 1", exact=True).first
+                if demo_opt.count() == 0:
+                    demo_opt = page.get_by_text("Demo 2", exact=True).first
+                if demo_opt.count() == 0:
+                    console.print("[yellow]   [DL] Dropdown open but no demo option found — restarting...[/yellow]")
+                    if not _reload(page, room_url):
+                        return None
+                    continue
 
-            console.print(f"[cyan]   [DL] Clicking '{demo_opt.inner_text().strip()}' (attempt {attempt})...[/cyan]")
-            bb = demo_opt.bounding_box()
-            _human_click(page, bb["x"] + bb["width"] / 2, bb["y"] + bb["height"] / 2)
+                console.print(f"[cyan]   [DL] Clicking '{demo_opt.inner_text().strip()}' (attempt {attempt})...[/cyan]")
+                bb = demo_opt.bounding_box()
+                _human_click(page, bb["x"] + bb["width"] / 2, bb["y"] + bb["height"] / 2)
+            else:
+                # Direct download already started from 'Watch Demo' — wait for it.
+                console.print(f"[cyan]   [DL] Demo started directly from 'Watch Demo' (attempt {attempt})...[/cyan]")
 
             # Wait for the blank page to open (the download trigger). This can
             # take up to ~2 min for FACEIT to spin up the CDN link.
-            blank_page: Optional[Any] = None
             start = time.monotonic()
             while time.monotonic() - start < DOWNLOAD_START_TIMEOUT:
                 new_pages = [pg for pg in page.context.pages[page_count_before:]
@@ -704,7 +814,10 @@ def download_demo(match_id: str) -> DownloadResult:
         )
 
     # ── Primary: token-based Downloads API ──────────────────────────────
-    if settings.faceit_downloads_token or settings.faceit_api_key:
+    # Only attempt the Downloads API when a real FACEIT_DOWNLOADS_TOKEN is set.
+    # Falling back to the Data API key returns a 500 on every call (no Downloads
+    # scope), which just adds noise + delay before the browser scrape.
+    if settings.faceit_downloads_token:
         console.print("[cyan]   [API] Trying FACEIT Downloads API...[/cyan]")
         saved = download_demo_api(match_id)
         if saved:
@@ -793,7 +906,7 @@ def _download_demo_browser(match_id: str, match_info: MatchInfo, started) -> Dow
     try:
         pw, browser = _launch_context()
         try:
-            page = browser.new_page()
+            page = _auth_page(browser)
             api_url = f"https://www.faceit.com/api/match/v4/match/{match_id}"
             api_payload = {}
             def _cap(r):
@@ -806,6 +919,22 @@ def _download_demo_browser(match_id: str, match_info: MatchInfo, started) -> Dow
             page.goto(room_url, wait_until="domcontentloaded")
             console.print("[cyan]   [..] Waiting for Cloudflare + page load...[/cyan]")
             page.wait_for_timeout(8000)
+
+            # Auth check: the Watch Demo button only renders when logged in. If
+            # the debug Chrome isn't authenticated, give clear guidance instead
+            # of silently failing all download attempts.
+            if not _is_authenticated(page):
+                console.print(
+                    "[red]   [AUTH] FACEIT is not logged in — the Watch Demo button is hidden.[/red]"
+                )
+                console.print(
+                    "[yellow]   Fix: run `scripts/misc/launch-debug-chrome.ps1`, log into FACEIT in the "
+                    "opened Chrome, then retry.[/yellow]"
+                )
+                return DownloadResult(
+                    match=match_info, status=DownloadStatus.FAILED,
+                    started_at=started, completed_at=datetime.now(),
+                )
 
             # enrich match info from the room's match API payload (no API key)
             if api_payload:
