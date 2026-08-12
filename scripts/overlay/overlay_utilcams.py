@@ -97,6 +97,7 @@ def _load_player_throws(
     player_df = df[
         (df["thrower_steamid"] == sid)
         & (df["flight_ticks"] > 0)
+        & (df["is_renderable"] == True)  # noqa: E712  (renderer skips these too)
     ].copy()
 
     if round_start_tick > 0:
