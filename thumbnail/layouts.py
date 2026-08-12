@@ -155,16 +155,18 @@ def _draw_elo_line(
     y: int,
     font_size: int,
 ) -> None:
-    """Two-tone ELO line: favorite (higher) red, underdog white.
+    """Two-tone ELO line: POV player's ELO highlighted, opponent avg white.
 
     Layout::
 
         5512 vs ~3740s
          (ELO)
 
-    The opponent's average is shown inline as ``~<avg>s`` under the "vs", so
-    the separate ``(AVG)`` tag is dropped (its number now carries the ``~`` and
-    trailing ``s``). ``(ELO)`` stays centered under the line.
+    The POV player's ELO is always the highlighted (fav) number on the LEFT and
+    carries the ``(ELO)`` tag beneath it. The opponent's average is shown inline
+    as ``~<avg>s`` on the RIGHT (self-labelled, so no separate ``(AVG)`` tag).
+    The opponent being higher-rated does NOT swap which side is highlighted —
+    the POV player is the subject of the video.
     """
     fav_fill = (250, 90, 30, 255)     # red/orange accent
     dog_fill = (255, 255, 255, 255)
@@ -183,13 +185,9 @@ def _draw_elo_line(
     elo_tag = "(ELO)"
     opp_str = f"~{opp_elo}s"
 
-    # Determine left/right strings + which side is the opponent.
-    if elo >= opp_elo:
-        left_str, right_str = str(elo), opp_str
-        left_fill, right_fill = fav_fill, dog_fill
-    else:
-        left_str, right_str = opp_str, str(elo)
-        left_fill, right_fill = fav_fill, dog_fill
+    # POV player's ELO always on the left (highlighted); opponent avg on right.
+    left_str, right_str = str(elo), opp_str
+    left_fill, right_fill = fav_fill, dog_fill
 
     # Pad the shorter side so both numbers take equal width, keeping "vs"
     # centered exactly on ``x``.
