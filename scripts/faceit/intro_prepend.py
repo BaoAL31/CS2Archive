@@ -219,21 +219,21 @@ def compose_intro(footage: Path, intro: Path, out: Path,
         print(f"  [skip] composed segment exists: {out.name}")
         return out
 
-    fw, fh, _fps = native_res   # native footage size (e.g. 1280x960)
     w, h, fps = final_res       # final video size (e.g. 2560x1440)
     # Fade the card in over pop_in seconds, hold, fade out so the last ~pop_out
     # seconds are clean footage before the hard cut to the main video.
     fade_out_start = max(0.0, seconds_before - pop_out)
     tmp = out.with_name(out.name + ".part")
-    # Scale the (2560x1440) card down to the native footage size, overlay it,
-    # then upscale the composed segment to the final video res so the concat
-    # with the upscaled POV render is seamless.
+    # Upscale the footage to the final video res FIRST, then overlay the
+    # full-resolution (2560x1440) card on top so it stays crisp — NOT downscaled
+    # to native then re-upscaled (that's what made it look low-res).
     fc = (
-        f"[1:v]format=rgba,scale={fw}:{fh}:flags=spline,"
+        f"[0:v]scale={w}:{h}:flags=spline,setsar=1,fps={round(fps)}[base];"
+        f"[1:v]format=rgba,"
         f"fade=t=in:st=0:d={pop_in}:alpha=1,"
         f"fade=t=out:st={fade_out_start}:d={pop_out}:alpha=1[ov];"
-        f"[0:v][ov]overlay=0:0:format=auto:eof_action=pass,"
-        f"scale={w}:{h}:flags=spline,setsar=1,fps={round(fps)},format=nv12[v]"
+        f"[base][ov]overlay=0:0:format=auto:eof_action=pass,"
+        f"format=nv12[v]"
     )
     cmd = [
         FFMPEG, "-y",
