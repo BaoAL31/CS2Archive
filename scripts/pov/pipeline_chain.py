@@ -40,6 +40,10 @@ def wait_for_thumbnail(run_id: str, poll_seconds: int = 30) -> None:
 
 
 def run_pipeline(argv: list[str]) -> subprocess.Popen:
+    # Strip a leading script path if the caller passed the full command
+    # (e.g. "-- scripts/pov/pipeline.py --backlog ..." instead of just args).
+    if argv and argv[0].endswith(("pipeline.py", "scripts\\pov\\pipeline.py", "scripts/pov/pipeline.py")):
+        argv = argv[1:]
     cmd = [PY, str(PROJECT_ROOT / "scripts" / "pov" / "pipeline.py"), *argv]
     print(f"[chain] Launching: {' '.join(cmd)}")
     return subprocess.Popen(cmd, cwd=str(PROJECT_ROOT))
