@@ -1177,9 +1177,17 @@ class Pipeline:
         if self.overlay_youtube_dir is not None:
             dst = self.overlay_youtube_dir / "video.mp4"
             if dst.is_file() and dst.stat().st_size > 100_000:
-                print(f"  [skip] Overlay video already exists in "
-                      f"{self.overlay_youtube_dir.name}/video.mp4")
-                return
+                # Re-overlay if the source combined.mp4 was re-baked (e.g. a
+                # step-3 shade re-run) after this overlay was last produced;
+                # otherwise the stale shade/voice would be shipped as-is.
+                src = self.render_dir / "combined.mp4"
+                re_baked = src.is_file() and src.stat().st_mtime > dst.stat().st_mtime
+                if not re_baked:
+                    print(f"  [skip] Overlay video already exists in "
+                          f"{self.overlay_youtube_dir.name}/video.mp4")
+                    return
+                print(f"  [re-overlay] combined.mp4 is newer than the existing "
+                      f"overlay; re-running overlay_pov.py")
 
         # Work under renders/ so intermediate files (batches, sidecar)
         # don't clutter youtube/. Only copy final result to youtube/.
