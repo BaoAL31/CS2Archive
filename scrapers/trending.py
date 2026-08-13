@@ -29,6 +29,7 @@ HIGHLIGHT_CHANNELS = {
     "UCDQZcZZwv-RhxHxJpHCdmbQ": "ESL CS2 Highlights",
     "UCbWA4nLSXvfWnOS2Q4yP48A": "BLAST CS2 Highlights",
     "UCBXeecyxQv7GblaybCxQgRA": "StarLadder CS2 Highlights",
+    "UCef7TE-TfKtAHukBHfXBhvA": "EWC Extra",
 }
 
 TEAM_ALIASES = {
