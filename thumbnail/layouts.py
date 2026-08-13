@@ -237,6 +237,27 @@ def _draw_text_scrim(img: Image.Image) -> None:
     img.paste(black, (left, 0), black)
 
 
+def _draw_tournament_logo(
+    img: Image.Image,
+    logo_path: Path,
+    center_x: int,
+    center_y: int,
+    max_width: int = 320,
+) -> None:
+    """Paste a tournament logo centered over the slot where its name would print."""
+    try:
+        logo = Image.open(logo_path).convert("RGBA")
+        scale = min(1.0, max_width / logo.width)
+        w = int(logo.width * scale)
+        h = int(logo.height * scale)
+        logo = logo.resize((w, h), Image.LANCZOS)
+        base = img.convert("RGBA")
+        base.alpha_composite(logo, (int(center_x - w / 2), int(center_y - h / 2)))
+        img.paste(base.convert(img.mode), (0, 0))
+    except Exception as e:
+        print(f"  [WARN] tournament logo composite failed: {e}")
+
+
 def generate(
     bg_path: Path,
     avatar_path: Path,
@@ -248,6 +269,7 @@ def generate(
     tournament: str = "",
     stage: str = "",
     variant: str = "raw",
+    tournament_logo: Path | None = None,
 ) -> Image.Image:
     bg = load_background(bg_path)
 
@@ -275,13 +297,19 @@ def generate(
     if stage:
         lines.append((stage, FONT_SIZES["tiny"]))
     if tournament:
-        lines.append((tournament, FONT_SIZES["tiny"]))
+        if tournament_logo is not None:
+            lines.append((None, FONT_SIZES["tiny"]))  # reserved slot: logo replaces text
+        else:
+            lines.append((tournament, FONT_SIZES["tiny"]))
 
     total = sum(_line_height(s) for _, s in lines)
     current_y = text_y_center - total // 2
 
     for text, size in lines:
-        draw_text(draw, text, text_x, current_y, size, anchor="mm")
+        if text is None and tournament_logo is not None:
+            _draw_tournament_logo(bg, tournament_logo, text_x, current_y)
+        else:
+            draw_text(draw, text, text_x, current_y, size, anchor="mm")
         current_y += _line_height(size)
 
     if variant == "overlay":

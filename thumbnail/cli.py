@@ -165,6 +165,7 @@ def main() -> None:
     parser.add_argument("--demo", help="Path to .dem file (for auto background extraction)")
     parser.add_argument("--steam-id", help="Player Steam64 ID (required with --demo)")
     parser.add_argument("--tournament", "-t", help="Tournament name (e.g. IEM Atlanta 2026)")
+    parser.add_argument("--tournament-logo", help="Path to a logo image to draw over the tournament name")
     parser.add_argument(
         "--variant",
         choices=["raw", "overlay"],
@@ -233,6 +234,7 @@ def main() -> None:
         tournament=args.tournament or "",
         stage=stage,
         variant=args.variant,
+        tournament_logo=Path(args.tournament_logo) if args.tournament_logo else None,
     )
     img = img.convert("RGB")
     img.save(output_path.with_suffix(".jpg"), "JPEG", quality=95, subsampling=0)

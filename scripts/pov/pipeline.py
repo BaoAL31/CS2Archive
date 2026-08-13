@@ -84,6 +84,17 @@ REQUIRED_META_FIELDS = [
 ]
 
 
+def _tournament_logo_path(tournament: str, hf_root: str) -> Path | None:
+    """Return a logo image path for known tournaments (e.g. EWC 2026), else None."""
+    t = (tournament or "").lower()
+    h = (hf_root or "").lower()
+    if "esports world cup" in t or h == "esports_world_cup_2026" or "ewc" in h:
+        p = PROJECT_ROOT / "assets" / "tournaments" / "ewc_2026.png"
+        if p.exists():
+            return p
+    return None
+
+
 def pipeline_error(step: int, code: str, message: str) -> str:
     payload = json.dumps({
         "error": True,
@@ -239,6 +250,7 @@ class Pipeline:
         self.hltv_url = self.meta.get("hltv_url", "")
         self.steam_id = self.meta.get("steam_id", "")
         self.tournament = self.meta.get("tournament", "")
+        self.hf_root = self.meta.get("hf_root", "").strip()
 
         demo_path_str = self.meta.get("demo_path", "")
         self.demo_path = Path(demo_path_str) if demo_path_str else None
@@ -1492,6 +1504,9 @@ class Pipeline:
             cmd += ["--steam-id", self.steam_id]
         if self.tournament:
             cmd += ["--tournament", self.tournament]
+        ewc_logo = _tournament_logo_path(self.tournament, self.hf_root)
+        if ewc_logo:
+            cmd += ["--tournament-logo", str(ewc_logo)]
         cmd += ["--output", str(youtube_dir)]
 
         r = self._run_py(cmd, timeout=900)
