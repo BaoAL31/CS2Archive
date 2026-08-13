@@ -23,6 +23,7 @@ from thumbnail.generator import (
 LINE_GAP = 1.15
 ELO_TAG_SIZE_KEY = "tiny"
 ELO_TAG_GAP = 6
+LOGO_SLOT_TOP_GAP = 14  # px breathing room above the tournament logo
 
 
 def _line_height(size: int) -> int:
@@ -242,16 +243,32 @@ def _draw_tournament_logo(
     logo_path: Path,
     center_x: int,
     center_y: int,
-    max_width: int = 320,
+    max_width: int = 340,
 ) -> None:
-    """Paste a tournament logo centered over the slot where its name would print."""
+    """Paste a tournament logo centered over the slot where its name would print,
+    on a soft dark rounded panel so the (often transparent) logo stays readable
+    over a busy background. ``center_y`` is the vertical center of the logo box.
+    """
     try:
         logo = Image.open(logo_path).convert("RGBA")
         scale = min(1.0, max_width / logo.width)
         w = int(logo.width * scale)
         h = int(logo.height * scale)
         logo = logo.resize((w, h), Image.LANCZOS)
+
+        # Soft dark rounded panel behind the logo.
+        pad_x, pad_y = 22, 14
+        panel_w = w + pad_x * 2
+        panel_h = h + pad_y * 2
+        panel_left = int(center_x - panel_w / 2)
+        panel_top = int(center_y - panel_h / 2)
         base = img.convert("RGBA")
+        draw_base = ImageDraw.Draw(base)
+        draw_base.rounded_rectangle(
+            [panel_left, panel_top, panel_left + panel_w, panel_top + panel_h],
+            radius=16,
+            fill=(0, 0, 0, 170),
+        )
         base.alpha_composite(logo, (int(center_x - w / 2), int(center_y - h / 2)))
         img.paste(base.convert(img.mode), (0, 0))
     except Exception as e:
@@ -288,24 +305,27 @@ def generate(
     text_y_center = HEIGHT // 2
 
     lines = [
-        (player_name, FONT_SIZES["player"]),
-        (f"K-D: {kd}", FONT_SIZES["stat"]),
-        (f"Rating: {rating}", FONT_SIZES["stat"]),
-        (map_name, FONT_SIZES["small"]),
-        (match_detail, FONT_SIZES["small"]),
+        (player_name, FONT_SIZES["player"], 0),
+        (f"K-D: {kd}", FONT_SIZES["stat"], 0),
+        (f"Rating: {rating}", FONT_SIZES["stat"], 0),
+        (map_name, FONT_SIZES["small"], 0),
+        (match_detail, FONT_SIZES["small"], 0),
     ]
     if stage:
-        lines.append((stage, FONT_SIZES["tiny"]))
+        lines.append((stage, FONT_SIZES["tiny"], 0))
     if tournament:
         if tournament_logo is not None:
-            lines.append((None, FONT_SIZES["tiny"]))  # reserved slot: logo replaces text
+            # Reserve a taller slot with extra top spacing so the (taller) logo
+            # never touches the stage line above it.
+            lines.append((None, FONT_SIZES["tiny"], LOGO_SLOT_TOP_GAP))
         else:
-            lines.append((tournament, FONT_SIZES["tiny"]))
+            lines.append((tournament, FONT_SIZES["tiny"], 0))
 
-    total = sum(_line_height(s) for _, s in lines)
+    total = sum(_line_height(s) for _, s, _g in lines)
     current_y = text_y_center - total // 2
 
-    for text, size in lines:
+    for text, size, gap in lines:
+        current_y += gap
         if text is None and tournament_logo is not None:
             _draw_tournament_logo(bg, tournament_logo, text_x, current_y)
         else:
