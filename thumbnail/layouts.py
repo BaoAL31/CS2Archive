@@ -311,12 +311,10 @@ def generate(
         (map_name, FONT_SIZES["small"], 0),
         (match_detail, FONT_SIZES["small"], 0),
     ]
-    if stage:
-        lines.append((stage, FONT_SIZES["tiny"], 0))
     if tournament:
         if tournament_logo is not None:
             # Reserve a taller slot with extra top spacing so the (taller) logo
-            # never touches the stage line above it.
+            # never touches the match line above it.
             lines.append((None, FONT_SIZES["tiny"], LOGO_SLOT_TOP_GAP))
         else:
             lines.append((tournament, FONT_SIZES["tiny"], 0))

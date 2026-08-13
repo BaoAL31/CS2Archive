@@ -169,8 +169,6 @@ def main() -> None:
         player_parts.append(f"{rating} Rating POV")
     sections = [(" ".join(player_parts), None)]
     sections.append((f"{team_a_short} vs {team_b_short}", None))
-    if stage:
-        sections.append((stage, 1))
     sections.append((args.map, 3))
     if tournament_short:
         sections.append((tournament_short, None))
