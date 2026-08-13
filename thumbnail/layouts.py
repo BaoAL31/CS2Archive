@@ -23,7 +23,7 @@ from thumbnail.generator import (
 LINE_GAP = 1.15
 ELO_TAG_SIZE_KEY = "tiny"
 ELO_TAG_GAP = 6
-LOGO_SLOT_TOP_GAP = 14  # px breathing room above the tournament logo
+LOGO_SLOT_TOP_GAP = 26  # px breathing room above the tournament logo
 
 
 def _line_height(size: int) -> int:
