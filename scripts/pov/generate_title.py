@@ -160,7 +160,8 @@ def main() -> None:
 
     # Title sections with removable priority (None = never drop).
     # Trim priority when over YouTube's 100-char limit:
-    # 1=stage, 2=overlay-suffix, 3=map.
+    # 1=map (the only removable section left; stage + overlay suffix
+    # are no longer in the title).
     # Player / teams / tournament are always kept.
     player_parts = [args.player]
     if kd:
@@ -228,7 +229,6 @@ def main() -> None:
     ]))
 
     if args.variant == "overlay":
-        overlay_label = "W/ Inputs + Utility Cams"
         extra_overlay_tags = [
             "input overlay",
             "utility cam",
@@ -244,21 +244,13 @@ def main() -> None:
             "plus utility trajectory clips for smokes, "
             "flashes, molotovs, and other grenades."
         )
-        # Insert overlay label before map in sections (priority 2 —
-        # dropped after stage, before map).
-        map_section = next((s for s in sections if s[1] == 3), None)
-        if map_section:
-            idx = sections.index(map_section)
-            sections.insert(idx, (overlay_label, 2))
-        else:
-            sections.append((overlay_label, 2))
-        # Rebuild title with the new section
-        title = " | ".join(t for t, _ in sections)
+        # Overlay label stays in description + tags only; not in the title
+        # (it's already shown in the thumbnail).
         tags = tags + extra_overlay_tags
 
-    # Enforce YouTube's 100-char title limit for ALL variants: drop
-    # removable sections by priority (stage -> overlay-suffix -> map),
-    # then hard-truncate as a last resort. Player/teams/tournament kept.
+    # Enforce YouTube's 100-char title limit for ALL variants: drop the
+    # map section (the only removable one), then hard-truncate as a last
+    # resort. Player/teams/tournament kept.
     removable = sorted([s for s in sections if s[1] is not None],
                        key=lambda s: s[1])
     while len(title) > 100 and removable:
