@@ -205,6 +205,17 @@ def _high_priority_cards(match: Match) -> list[str]:
                   for p in root.glob("*.json")) if root.is_dir() else []
 
 
+def _child_env() -> dict[str, str]:
+    """Give direct script launches the same import path as the repo launcher."""
+    env = os.environ.copy()
+    paths = [str(ROOT / "scripts"), str(ROOT)]
+    existing = env.get("PYTHONPATH")
+    if existing:
+        paths.append(existing)
+    env["PYTHONPATH"] = os.pathsep.join(paths)
+    return env
+
+
 def _enqueue(state: State, cards: list[str]) -> None:
     queued = set(state.data["queue"])
     for card in cards:
@@ -218,7 +229,7 @@ def _run_backlog(match: Match, dry_run: bool) -> bool:
     print(f"[backlog] {' '.join(cmd)}", flush=True)
     if dry_run:
         return True
-    return subprocess.run(cmd, cwd=ROOT).returncode == 0
+    return subprocess.run(cmd, cwd=ROOT, env=_child_env()).returncode == 0
 
 
 def _run_pipeline(card: str, dry_run: bool) -> bool:
@@ -227,7 +238,7 @@ def _run_pipeline(card: str, dry_run: bool) -> bool:
     print(f"[pipeline] {' '.join(cmd)}", flush=True)
     if dry_run:
         return True
-    return subprocess.run(cmd, cwd=ROOT).returncode == 0
+    return subprocess.run(cmd, cwd=ROOT, env=_child_env()).returncode == 0
 
 
 def _retry_ready(record: dict) -> bool:
