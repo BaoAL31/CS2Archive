@@ -224,12 +224,21 @@ def _enqueue(state: State, cards: list[str]) -> None:
             queued.add(card)
 
 
-def _run_backlog(match: Match, dry_run: bool) -> bool:
+def _run_backlog(match: Match, dry_run: bool, retries: int = 3) -> bool:
     cmd = [sys.executable, str(ROOT / "scripts/pov/create_backlog.py"), match.url]
-    print(f"[backlog] {' '.join(cmd)}", flush=True)
     if dry_run:
+        print(f"[backlog] {' '.join(cmd)}", flush=True)
         return True
-    return subprocess.run(cmd, cwd=ROOT, env=_child_env()).returncode == 0
+    for attempt in range(1, retries + 1):
+        print(f"[backlog] attempt {attempt}/{retries}: {' '.join(cmd)}",
+              flush=True)
+        if subprocess.run(cmd, cwd=ROOT, env=_child_env()).returncode == 0:
+            return True
+        if attempt < retries:
+            delay = 30 * attempt
+            print(f"[backlog] failed; retrying in {delay}s", flush=True)
+            time.sleep(delay)
+    return False
 
 
 def _run_pipeline(card: str, dry_run: bool) -> bool:
@@ -298,13 +307,23 @@ async def poll_once(args, state: State) -> None:
             continue
         if not _retry_ready(record):
             continue
-        record["attempts"] += 1
-        if not _run_backlog(match, args.dry_run):
-            _schedule_retry(record, "create_backlog failed")
-            continue
         cards = _high_priority_cards(match)
+        if cards:
+            print(f"[backlog] adopting {len(cards)} existing high-priority "
+                  f"card(s) for {match.match_id}", flush=True)
+        else:
+            record["attempts"] += 1
+            if not _run_backlog(match, args.dry_run, args.backlog_retries):
+                _schedule_retry(record, "create_backlog failed")
+                state.save()
+                continue
+            cards = _high_priority_cards(match)
         if args.dry_run:
             cards = [f"backlog/{match_slug_from_url(match.url)}/high/<generated>.json"]
+        if not cards:
+            _schedule_retry(record, "create_backlog failed")
+            state.save()
+            continue
         _enqueue(state, cards)
         record["status"] = "queued"
         record["cards"] = cards
@@ -338,6 +357,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--interval", type=int, default=300,
                         help="poll interval in seconds (default: 300)")
+    parser.add_argument("--backlog-retries", type=int, default=3,
+                        help="attempt each failed backlog acquisition this many times")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--refresh-teams", action="store_true")
