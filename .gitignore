@@ -37,6 +37,9 @@ tmp_*.png
 # Vault
 vault/
 
+# Stray probe/debug logs
+.probe*.log
+
 # Listener state (HLTV match listener runtime: state, lock, transcript)
 .listener/
 
