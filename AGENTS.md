@@ -30,8 +30,6 @@ Scripts are grouped by product/concern (not a flat dump):
 
 Import bootstrap: `scripts/_pathsetup.py` (`ensure()` adds all buckets to `sys.path`).
 
-Domain glossary for the highlights product: root `CONTEXT.md`.
-
 ## Highlights (Kill Timeline) — FACEIT only
 
 Separate product from POV Archive. v1 flow: action timeline → LLM edit timeline → CSDM segment renders → single reel (per-segment avatar cut-ins + crossfades).
@@ -182,8 +180,7 @@ main.py → routing dict → commands/*.py (subparser + handle) → scrapers/*.p
 - `models.py` — Pydantic models shared across modules.
 - `thumbnail/` — thumbnail generator package (Pillow-based compositing, 1280×720 output).
 - `scripts/` — utility scripts grouped by product (`pov/`, `overlay/`, `faceit/`, `highlights/`, `upload/`, `hf/`, `misc/`) plus `scripts/_pathsetup.py`
-- `docs/` — design/context notes (`CONTEXT.md`, batching, dual-upload) and `docs/adr/`; agent reference docs in `docs/agents/`
-- `CONTEXT.md` — domain glossary for the Highlight Reel / Kill Timeline product
+- `docs/` — design/context notes (batching, dual-upload) and `docs/adr/`; agent reference docs in `docs/agents/`
 - `assets/` — static resources (map images, fonts, CS2 config files).
 - `grafipy-out/` — knowledge graph (from `/graphify`). Not project code.
 
@@ -191,7 +188,7 @@ main.py → routing dict → commands/*.py (subparser + handle) → scrapers/*.p
 
 Installed from mattpocock/skills (see `skills-lock.json`):
 - `/grill-me` — stress-test a plan via relentless questioning
-- `/grill-with-docs` — same but also updates `docs/CONTEXT.md` + ADRs
+- `/grill-with-docs` — same but also updates `docs/adr/` + ADRs
 - `/handoff` — compact session into handoff doc for next agent
 - `/caveman` — ultra-compressed mode
 - `/wikify` — generate a Karpathy-style wiki from a thesis, project, paper, or report. Extracts concepts, methods, papers, datasets, and architecture into interlinked Markdown wiki articles.

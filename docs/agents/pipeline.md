@@ -106,7 +106,7 @@ These tools sit outside the core `pipeline.py` → `upload_pending.py` flow but 
 - **Bilibili mirror** — `scripts/upload/upload_bilibili.py` uploads the same `upload_meta.json` variants to `studio.bilibili.tv` (Playwright + Chrome; tags capped at 10 chips, remainder appended to description; videos >~3.8 GB re-encoded to `video_bili.mp4`). Auth: `scripts/upload/bilibili_login.py` (one-time headed-Chrome login, saves `.bilibili_storage.json`). `scripts/upload/bili_check_session.py` verifies that session. `upload_pending.py` uploads both YouTube and Bilibili pending metas via `is_bilibili_pending`.
 - **HuggingFace demo sync** — `scripts/hf/upload_demos_to_hf.py` (parallel, resumable), `scripts/hf/upload_hf_demos.py`, `scripts/hf/upload_hf_demos_git.py` (git-lfs), and `scripts/hf/batch_upload_hf.py` (resumable IEM Cologne Major 2026 batch push) upload `.dem` files to `cs2povarchive/cs2-demos`, which backs the pipeline's `hf_root` auto-download.
 - **Shorts & scheduling** — `scripts/upload/upload_youtube_shorts.py` (Short upload with optional scheduled publish) and `scripts/upload/youtube_schedule.py` (timezone-aware wall-clock → UTC helpers used by `upload_youtube.py`).
-- **Render helpers** — `scripts/pov/crosshair_code.py` (CS2 share-code ↔ crosshair decode/encode) and `scripts/pov/cs2_minimizer.py` (minimizes the CS2 window to stop focus theft during HLAE capture).
+- **Render helpers** — `scripts/crosshair_code.py` (CS2 share-code ↔ crosshair decode/encode) and `scripts/pov/cs2_minimizer.py` (minimizes the CS2 window to stop focus theft during HLAE capture).
 
 ### Chaining pipelines (upload overlap)
 
