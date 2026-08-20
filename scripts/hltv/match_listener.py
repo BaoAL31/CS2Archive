@@ -275,7 +275,7 @@ async def poll_once(args, state: State) -> None:
     state.data["event_url"] = event_url
     if args.refresh_teams or not state.data["teams"]:
         html = await asyncio.to_thread(fetch_hltv_page_html, args.rankings_url,
-                                        headless=True)
+                                        headless=True, wait_selector=None)
         teams = parse_top_teams(html)
         if not teams:
             raise RuntimeError("HLTV rankings page contained no team names")
@@ -285,14 +285,14 @@ async def poll_once(args, state: State) -> None:
         args.refresh_teams = False
 
     event_html = await asyncio.to_thread(fetch_hltv_page_html, event_url,
-                                         headless=True)
+                                         headless=True, wait_selector=None)
     event_ids = parse_event_match_ids(event_html)
     result_links: list[Match] = []
     for offset in (0, 1):
         target_date = (datetime.now().date() - timedelta(days=offset)).isoformat()
         results_url = f"{settings.hltv_base_url}/results?date={target_date}"
         results_html = await asyncio.to_thread(fetch_hltv_page_html, results_url,
-                                                headless=True)
+                                                headless=True, wait_selector=None)
         result_links.extend(parse_match_links(results_html))
     matches = select_matches(result_links, event_ids, state.data["teams"])
     matches = list({match.match_id: match for match in matches}.values())
