@@ -37,6 +37,9 @@ tmp_*.png
 # Vault
 vault/
 
+# Listener state (HLTV match listener runtime: state, lock, transcript)
+.listener/
+
 # Pipeline state
 .pipeline/
 

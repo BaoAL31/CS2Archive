@@ -177,8 +177,10 @@ def _faceit_voice_enabled(demo_path: Path, steam_id: str) -> bool:
         from scripts.faceit.mix_team_voice import pov_team_voice_seconds
         secs = pov_team_voice_seconds(demo_path, steam_id)
     except Exception as e:  # noqa: BLE001
-        print(f"[warn] _faceit_voice_enabled: {e}; voice disabled")
-        return False
+        raise RuntimeError(
+            "FACEIT voice comms required, but voice detection failed: "
+            f"{type(e).__name__}: {e}"
+        ) from e
     return secs >= VOICE_AUTO_MIN_TEAM_SECONDS
 
 
@@ -454,13 +456,31 @@ class Pipeline:
         render_dir = self.render_dir
         combined = render_dir / "combined.mp4"
         if combined.is_file() and combined.stat().st_size > 100 * 1024 * 1024:
-            # Step 3 (concat) also done — skip both
-            print(f"  [skip] render already complete: {combined.name} "
-                  f"({combined.stat().st_size // 1024 // 1024} MB)")
-            if self.start_step <= 3:
-                self.start_step = 4
-                self.state["step"] = 4
-                save_state(self.run_id, self.state)
+            # combined.mp4 only exists after step 3 (concat) has run, so step 2
+            # (render) is complete. Step 3 (concat/scale) is ONLY complete if
+            # combined.mp4 is at the target export resolution (2560x1440).
+            # If a scale encode aborts mid-way, combined.mp4 is left at the
+            # NATIVE render resolution — treating that as "step 3 done" would
+            # skip the scale and ship an unscaled (e.g. 1280x960) video.
+            from concat_rounds import _get_resolution
+
+            FINAL_W, FINAL_H = 2560, 1440
+            w, h = _get_resolution(combined)
+            if (w, h) == (FINAL_W, FINAL_H):
+                print(f"  [skip] render + scale complete: {combined.name} "
+                      f"({combined.stat().st_size // 1024 // 1024} MB, {w}x{h})")
+                if self.start_step <= 3:
+                    self.start_step = 4
+                    self.state["step"] = 4
+                    save_state(self.run_id, self.state)
+            else:
+                # Scale incomplete — force step 3 (concat/scale) to re-run,
+                # even if stale state claimed a later step. Step 2 stays
+                # skipped (combined exists => render done).
+                print(f"  [resume] combined.mp4 is {w}x{h} (native, not scaled to "
+                      f"{FINAL_W}x{FINAL_H}) -- step 3 (concat/scale) will re-run")
+                if self.start_step != 3:
+                    self.start_step = 3
             return
         # Step 2 partial: any batch-*.mp4 ≥1MB exists → skip analyze (cheap
         # re-analyze is fine) but DO NOT skip render (filesystem-based resume
@@ -470,19 +490,14 @@ class Pipeline:
     def _voice_enabled(self) -> bool:
         """Whether voice comms (shade + comms mix) should run for this card.
 
-        Explicit flags always win. Otherwise FACEIT cards enable voice by
-        default ONLY when the demo has enough real POV-team voice (auto-detected
-        once and cached). Non-FACEIT cards default OFF.
+        Policy: FACEIT POVs always carry team voice comms (always on);
+        HLTV POVs never do (always off). Explicit flags can still force it on.
         """
         if getattr(self.args, "enable_voice_comms", False) or getattr(
             self.args, "voice_shade", False
         ):
             return True
-        if not self.is_faceit:
-            return False
-        if self._voice_cache is None:
-            self._voice_cache = _faceit_voice_enabled(self.demo_path, self.steam_id)
-        return self._voice_cache
+        return self.is_faceit
 
     def _setup_logging(self) -> Path:
         """Redirect all output (Python prints + subprocess stdout/stderr) to
@@ -632,7 +647,7 @@ class Pipeline:
         render_args = [
             "scripts/pov/render_pov.py", str(self.demo_path), self.steam_id,
             "--output", str(self.render_dir),
-            "--batches", str(getattr(self.args, "batches", 20)),
+            "--batches", str(getattr(self.args, "batches", 1)),
             "--hook-timeout", str(getattr(self.args, "hook_timeout", 150.0)),
             "--hook-retries", str(getattr(self.args, "hook_retries", 2)),
         ]
@@ -891,17 +906,21 @@ class Pipeline:
                 - int(re.match(r"batch-(\d+)-\d+\.mp4$", f.name).group(1)) + 1
                 for f in batch_files
             )
-        if actual_rounds and actual_rounds != expected_rounds:
+        # For split (p1/p2) demos the step-1 analysis only covers the part csdm
+        # analyzed (e.g. p1), so actual concat rounds legitimately exceed the
+        # analysis count. Only a *drop* (actual < expected) is an error; a
+        # higher actual count is the normal split-demo case.
+        if actual_rounds and actual_rounds < expected_rounds:
             if skip_failed:
                 print(f"  [OK] {actual_rounds} of {expected_rounds} rounds "
                       f"concat'd ({expected_rounds - actual_rounds} skipped via --skip-failed-rounds)")
             else:
                 fail(3, "CONCAT_ROUND_COUNT_MISMATCH",
-                     f"concat has {actual_rounds} rounds but csdm analysis has "
-                     f"{expected_rounds} rounds (missing/extra round clips?)")
+                     f"concat has {actual_rounds} rounds but csdm analysis expects "
+                     f"{expected_rounds} (rounds dropped during concat?)")
         else:
-            print(f"  [OK] round count: {actual_rounds} rounds match "
-                  f"analysis ({expected_rounds})")
+            print(f"  [OK] round count: {actual_rounds} rounds concat'd "
+                  f"(analysis {expected_rounds})")
 
         # Sidecar self-consistency + match against the real combined.mp4
         # duration. Catches corrupt total_duration_seconds / round offsets
@@ -1599,23 +1618,26 @@ class Pipeline:
             # (auto-detected by team-voice volume, or explicit flag).
             if self._voice_enabled():
                 titlize_args += ["--voice-comms"]
-            code = self._pov_crosshair_code()
-            if code:
-                titlize_args += ["--crosshair-code", code]
-            for flag, key in (
-                ("--viewmodel-fov", "viewmodel_fov"),
-                ("--viewmodel-offset-x", "viewmodel_offset_x"),
-                ("--viewmodel-offset-y", "viewmodel_offset_y"),
-                ("--viewmodel-offset-z", "viewmodel_offset_z"),
-                ("--viewmodel-presetpos", "viewmodel_presetpos"),
-                ("--resolution", "resolution"),
-                ("--aspect-ratio", "aspect_ratio"),
-                ("--scaling-mode", "scaling_mode"),
-                ("--video-settings-source", "video_settings_source"),
-            ):
-                val = self.meta.get(key)
-                if val is not None and val != "":
-                    titlize_args += [flag, str(val)]
+
+        # Crosshair + viewmodel + video settings are added to BOTH the HLTV and
+        # FACEIT title paths (prosettings-driven "Settings (as rendered)").
+        code = self._pov_crosshair_code()
+        if code:
+            titlize_args += ["--crosshair-code", code]
+        for flag, key in (
+            ("--viewmodel-fov", "viewmodel_fov"),
+            ("--viewmodel-offset-x", "viewmodel_offset_x"),
+            ("--viewmodel-offset-y", "viewmodel_offset_y"),
+            ("--viewmodel-offset-z", "viewmodel_offset_z"),
+            ("--viewmodel-presetpos", "viewmodel_presetpos"),
+            ("--resolution", "resolution"),
+            ("--aspect-ratio", "aspect_ratio"),
+            ("--scaling-mode", "scaling_mode"),
+            ("--video-settings-source", "video_settings_source"),
+        ):
+            val = self.meta.get(key)
+            if val is not None and val != "":
+                titlize_args += [flag, str(val)]
         if self.tournament and not self.is_faceit:
             titlize_args += ["--tournament", self.tournament]
 

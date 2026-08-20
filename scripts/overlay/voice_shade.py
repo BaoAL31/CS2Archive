@@ -370,7 +370,7 @@ def main() -> None:
                     help="scoreboard side of the POV team (default: right, "
                          "matches verified demos)")
     ap.add_argument("--fade", type=float, default=0.3, help="shade fade duration s")
-    ap.add_argument("--shade", type=float, default=0.55,
+    ap.add_argument("--shade", type=float, default=0.7,
                     help="shade opacity when not talking (0..1)")
     ap.add_argument("--native-res", default=None,
                     help="native render resolution WxH the avatar-box config is keyed to "

@@ -27,6 +27,7 @@ from _pathsetup import ensure
 ensure()
 
 from shorts import resolve_output_dir  # noqa: E402
+from shorts.make_short_meta import make_meta  # noqa: E402
 
 CSDM = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
 FFMPEG = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
@@ -318,6 +319,57 @@ def _run_csdm(config_path: Path) -> int:
     return proc.returncode
 
 
+def _run_csdm_hook_aware(config_path: Path, segments_dir: Path, label: str,
+                          hook_timeout: float, hook_retries: int) -> None:
+    """Render a CSDM short-batch with HLAE hook-failure detection + retry.
+
+    Mirrors scripts/pov/render_pov.py's hook-aware path: poll ``segments_dir``
+    for a newly-produced sequence file (the signal that HLAE actually hooked
+    CS2 and is encoding). If none appears within ``hook_timeout`` seconds, kill
+    the CS2/HLAE tree and retry, up to ``hook_retries`` times. Exits if the
+    hook never engages.
+    """
+    from render_pov import _kill_stale_processes
+
+    cmd = [CSDM, "video", "--config-file", str(config_path.resolve())]
+    for attempt in range(1, hook_retries + 1):
+        suffix = f" (attempt {attempt}/{hook_retries})" if hook_retries > 1 else ""
+        print(f"  [{label}]{suffix}...", end=" ", flush=True)
+        before_n = len(_find_sequence_files(segments_dir, 9999))
+        t0 = time.time()
+        log_path = segments_dir.parent / f".csdm_hook_attempt_{attempt}.log"
+        with open(log_path, "w", encoding="utf-8") as logf:
+            proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, text=True)
+            engaged = False
+            poll_start = time.time()
+            while time.time() - poll_start < hook_timeout:
+                if proc.poll() is not None:
+                    break
+                if len(_find_sequence_files(segments_dir, 9999)) > before_n:
+                    engaged = True
+                    break
+                time.sleep(5)
+            if not engaged:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=30)
+                except Exception:
+                    pass
+                _kill_stale_processes()
+                print(f"HOOK-FAIL (no sequence in {hook_timeout:.0f}s) - killing and retrying")
+                continue
+            proc.wait(timeout=14400)
+        print(f"OK ({time.time() - t0:.0f}s)")
+        return
+
+    print(f"[ERROR] CS2 failed to hook after {hook_retries} attempt(s) "
+          f"(no sequence produced in {hook_timeout:.0f}s).")
+    sys.exit(1)
+
+
 def _find_sequence_files(search_dir: Path, num_expected: int, shorts: list[dict] | None = None) -> list[Path]:
     import re
     seq_dirs = sorted(
@@ -411,7 +463,11 @@ def _composite_9x16(
 
     Foreground: source scaled to fit canvas (force_original_aspect_ratio=decrease).
     ``scale=1.0`` fits the source inside without cropping.
-    ``scale>1.0`` zooms in (e.g. 1.5 = source scaled to 1.5x, cropped centre to 1080).
+    ``scale>1.0`` zooms in to a consistent footprint regardless of the source
+    aspect ratio: the foreground is scaled to the same height a 16:9 source
+    would reach at that zoom (``OUT_WIDTH * scale * 9/16``), then the width is
+    centre-cropped to 1080. 4:3 black-bars players no longer blow up to fill
+    the canvas height (previously 1080×1620 vs 1080×1215 for 16:9).
 
     4:3 stretched players (e.g. donk, s1mple): the source is captured at the
     4:3 capture resolution but the player's view is *horizontally stretched*
@@ -465,12 +521,11 @@ def _composite_9x16(
         )
         fg_top = 0
     else:
+        fg_h = round(OUT_WIDTH * scale * 9 / 16)
         fg_chain = (
-            f"[fg_src]scale={round(OUT_WIDTH * scale)}:-1,"
-            f"crop={OUT_WIDTH}:ih[fg]"
+            f"[fg_src]scale=-1:{fg_h},"
+            f"crop={OUT_WIDTH}:{fg_h}[fg]"
         )
-        fg_w = round(OUT_WIDTH * scale)
-        fg_h = round(fg_w * stretched_h / stretched_w)
         fg_top = (OUT_HEIGHT - fg_h) // 2
 
     bg_chain = (
@@ -639,6 +694,11 @@ def render_shorts(
     avatar_bottom_margin: int = AVATAR_BOTTOM_MARGIN,
     avatar_outline_width: int = AVATAR_OUTLINE_WIDTH,
     rename: bool = True,
+    make_meta_on: bool = True,
+    tournament: str | None = None,
+    year: str = "2026",
+    hook_timeout: float = 150.0,
+    hook_retries: int = 2,
 ) -> Path:
     """Render all shorts from a timeline JSON.
     
@@ -726,13 +786,18 @@ def render_shorts(
             conf_path = out_dir / f"batch_{batch_idx + 1}_config.json"
             conf_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
-            t0 = time.time()
-            ret = _run_csdm(conf_path)
-            elapsed = time.time() - t0
-            if ret != 0:
-                raise RuntimeError(f"CSDM batch {batch_idx + 1} failed (exit {ret}, {elapsed:.0f}s)")
-
-            _dbg("csdm", f"batch {batch_idx + 1} rendered in {elapsed:.0f}s")
+            if hook_timeout > 0 and hook_retries > 0:
+                _run_csdm_hook_aware(
+                    conf_path, segments_dir,
+                    f"batch {batch_idx + 1}/{len(batches)}",
+                    hook_timeout, hook_retries,
+                )
+            else:
+                ret = _run_csdm(conf_path)
+                if ret != 0:
+                    raise RuntimeError(
+                        f"CSDM batch {batch_idx + 1} failed (exit {ret})")
+            _dbg("csdm", f"batch {batch_idx + 1} rendered")
 
             seq_files = _find_sequence_files(segments_dir, len(batch), batch)
             if len(seq_files) != len(batch):
@@ -785,6 +850,15 @@ def render_shorts(
         dur = _probe_duration(dst)
         _dbg("done", f"{out_name}: {w}x{h} {dur:.1f}s (pov: {short['pov_steam_id']}, type: {short['short_type']})")
 
+    # Generate YouTube-Shorts upload meta. Team/org is detected from the demo
+    # itself (scripts.shorts.detect_team) — never from memory.
+    if make_meta_on:
+        try:
+            meta = make_meta(out_dir, tournament=tournament, year=year)
+            _dbg("meta", f"wrote upload_meta_shorts.json: {meta['title']}")
+        except Exception as e:
+            _dbg("meta", f"[WARN] meta generation failed: {e}")
+
     print(f"\nDone. Shorts in {out_dir}")
     return out_dir
 
@@ -812,9 +886,23 @@ def main() -> int:
                    help=f"Clearance from the bottom edge in px (default: {AVATAR_BOTTOM_MARGIN})")
     ap.add_argument("--avatar-outline-width", type=int, default=AVATAR_OUTLINE_WIDTH,
                    help=f"White outline width around the avatar in px (default: {AVATAR_OUTLINE_WIDTH}; 0 = none)")
+    ap.add_argument("--no-meta", action="store_true",
+                   help="Skip auto-generating upload_meta_shorts.json after rendering")
+    ap.add_argument("--tournament", type=str, default=None,
+                   help="Override tournament hashtag (e.g. 'esportworldcup2026'); "
+                        "auto-detected from the demo folder otherwise")
+    ap.add_argument("--year", type=str, default="2026",
+                   help="Year suffix for the auto-detected tournament hashtag (default: 2026)")
     ap.add_argument("--no-rename", action="store_true",
                    help="Disable automatic HUD player-name rename to canonical nickname "
                         "(mirv_replace_name). Default: on.")
+    ap.add_argument("--hook-timeout", type=float, default=150.0,
+                   help="Seconds to wait for HLAE to hook CS2 and emit a sequence file "
+                        "before treating it as a hook failure (default: 150). "
+                        "0 disables hook detection.")
+    ap.add_argument("--hook-retries", type=int, default=2,
+                   help="Retries after a failed HLAE hook before giving up "
+                        "(default: 2). 0 disables hook detection.")
     args = ap.parse_args()
 
     try:
@@ -824,7 +912,9 @@ def main() -> int:
                        avatar_height=args.avatar_height,
                        avatar_bottom_margin=args.avatar_bottom_margin,
                        avatar_outline_width=args.avatar_outline_width,
-                       rename=not args.no_rename)
+                       rename=not args.no_rename, make_meta_on=not args.no_meta,
+                       tournament=args.tournament, year=args.year,
+                       hook_timeout=args.hook_timeout, hook_retries=args.hook_retries)
         return 0
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)

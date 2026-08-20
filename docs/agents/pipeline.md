@@ -45,6 +45,13 @@ python scripts/pov/pipeline.py --backlog backlog/spirit-vs-falcons-iem-cologne-m
 # 2. Separate upload pass — uploads every pending upload_meta.json under youtube/
 python scripts/upload/upload_pending.py
 ```
+`upload_pending.py` retries crashed uploads: a failed (non-zero exit) upload is
+relaunched up to `--retries N` times (default 3) with a linearly growing
+`--retry-delay` (default 10s base). `upload_youtube.py` is resumable, so a
+relaunch resumes the partial upload via the persisted `resumable_uri` instead of
+restarting. The `upload_youtube.py` process itself already retries retriable
+HTTP errors (500/502/503/504) up to 20×; the subprocess-level retry in
+`upload_pending.py` covers hard crashes (e.g. exit `4294967295`).
 
 ### Notes
 
@@ -56,7 +63,7 @@ python scripts/upload/upload_pending.py
 - **Resume rule: ALWAYS check `.pipeline/{run_id}.json` before deleting any saved progress (combined.mp4, rendered clips, etc.). The pipeline state tells you which step was last completed. Run `python scripts/pov/pipeline.py --backlog <path> --step <N>` (same backlog) to resume.
 - **Render folder per POV** — `renders/pov-{demo-stem}_{player}/` (not demo-only). Multiple POVs on the same map share the match demo folder but never share a render folder. Legacy `pov-{demo-stem}/` (no player suffix) may still exist from older runs; safe to delete after confirming youtube output.
 - **`--resume-from-round N`** — deprecated. Render now uses filesystem-based resume: existing `batch-*.mp4` files ≥1MB are automatically skipped on re-run. To re-render a specific batch, manually delete its file.
-- **`--batches N`** — number of render batches (default: 2). Rounds are divided equally across N batches; the last batch gets fewer rounds if they don't divide evenly. Each batch produces one MP4 named `batch-{start:03d}-{end:03d}.mp4`. `--batches 1` renders all rounds in a single CSDM call.
+- **`--batches N`** — number of render batches (default: 1). Rounds are divided equally across N batches; the last batch gets fewer rounds if they don't divide evenly. Each batch produces one MP4 named `batch-{start:03d}-{end:03d}.mp4`. `--batches 1` renders all rounds in a single CSDM call (recommended — minimizes flaky HLAE hook launches).
 - **`--until N`** — stop after step N (e.g. `--until 5` runs through outro, skips thumbnail/cleanup). Default: run through step 6 (thumbnail; upload handled separately by `upload_pending.py`).
 - **`--skip-failed-rounds`** — **[DANGER] NEVER set by default.** Skip round batches that fail during rendering instead of aborting the entire pipeline. Only use when a specific demo file is corrupted/incompatible (like the `100-thieves-vs-spirit-m3-dust2.dem` from BLAST Bounty 2026 Season 2 — that demo fails at round 1 with "Game error" for every player). Silently drops failed rounds, producing an incomplete POV video. Enabled per-invocation via CLI flag or the backlog entry's `pipeline_cmd` when the demo is known-broken. See backlog `skip_failed_rounds: true` entries for the canonical example.
 - **`--dual-upload`** — now the **default**: dual-upload is ON unless you pass `--raw-only`. Produces a second independent variant with the keyboard + util-cam overlay. Raw-only mode is the opt-in.

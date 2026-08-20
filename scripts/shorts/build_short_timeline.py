@@ -42,7 +42,7 @@ from faceit_names import known_pro_steam_ids  # noqa: E402
 
 _PRE_KILL_TICK_MARGIN = 320  # 5s floor before first kill (at 64 tick)
 _POST_KILL_TICK_MARGIN = 128  # 2s after last kill (at 64 tick)
-_SHORT_TICK_DURATION = 1920  # 30s target total short length (30 * 64 tick)
+_SHORT_TICK_DURATION = 1280  # 20s target total short length (20 * 64 tick)
 _CLUTCH_MIN_DURATION_TICKS = 640  # 10s of playing at a disadvantage for a clutch
 
 

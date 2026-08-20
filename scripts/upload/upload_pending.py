@@ -36,6 +36,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -183,6 +184,15 @@ def main() -> None:
         help="Also upload to bilibili.tv (same title/schedule/tags; needs "
              ".bilibili_storage.json). Resume-safe via bilibili_aid in meta.")
     parser.add_argument(
+        "--retries", type=int, default=3,
+        help="Retry a failed upload (crash/non-zero exit) up to N times "
+             "(default: 3). upload_youtube.py is resumable, so a relaunch picks "
+             "up where the failed run left off.")
+    parser.add_argument(
+        "--retry-delay", type=float, default=10.0,
+        help="Base delay in seconds before the first retry; delay grows linearly "
+             "per attempt (default: 10).")
+    parser.add_argument(
         "--check-schedule", action="store_true",
         help="Show next available YouTube publish slot and exit")
     args = parser.parse_args()
@@ -219,6 +229,7 @@ def main() -> None:
 
     ok = 0
     failed = 0
+    retried = 0
     for meta_path in pending:
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -226,13 +237,28 @@ def main() -> None:
             print(f"  [skip] could not re-read {meta_path}: {e}")
             failed += 1
             continue
-        if upload_one(meta_path, meta, args.dry_run, args.also_bilibili):
-            ok += 1
-        else:
-            if not args.dry_run:
-                failed += 1
 
-    print(f"\nDone. uploaded={ok} failed={failed} "
+        attempts = 1 + args.retries  # first try + N retries
+        uploaded_ok = False
+        for attempt in range(1, attempts + 1):
+            if upload_one(meta_path, meta, args.dry_run, args.also_bilibili):
+                uploaded_ok = True
+                break
+            if args.dry_run:
+                break
+            if attempt < attempts:
+                delay = args.retry_delay * attempt
+                print(f"  [retry] {meta_path.parent.name}: try {attempt}/{args.retries} "
+                      f"failed; retrying in {delay:.0f}s...", flush=True)
+                time.sleep(delay)
+                retried += 1
+
+        if uploaded_ok:
+            ok += 1
+        elif not args.dry_run:
+            failed += 1
+
+    print(f"\nDone. uploaded={ok} failed={failed} retried={retried} "
           f"(dry_run={args.dry_run}, also_bilibili={args.also_bilibili})")
     if failed and not args.dry_run:
         sys.exit(1)

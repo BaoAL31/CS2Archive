@@ -19,7 +19,7 @@ Usage:
                                   [--map <map>] [--tournament <name>]
                                   [--match-id <faceit_match_id>]
 
-Output: backlog/faceit/{priority}/{player}-{map}-{match_slug}.json
+Output: backlog/faceit/{date}/{priority}/{player}-{map}-{match_slug}.json
 Each card carries the pipeline fields plus: rating, kills, deaths, team,
 faceit_match_id, faceit_id, faceit_nickname.
 """
@@ -139,11 +139,14 @@ def priority_from_rating(rating: float | None) -> str:
 
 
 def _write_card(pro: dict, *, demo: Path, map_name: str, match_slug: str,
-                tournament: str, elo_fields: dict | None = None) -> Path:
+                tournament: str, elo_fields: dict | None = None,
+                match_date: str | None = None) -> Path:
+    from scripts.faceit.backlog_paths import faceit_backlog_dir, match_date_for_demo
     priority = priority_from_rating(pro["rating"])
+    match_date = match_date_for_demo(demo, match_date)
     player_key = re.sub(r"[^a-z0-9]+", "-", pro["canonical_nick"].lower()).strip("-")
     slug = f"{player_key}-{map_name.lower()}-{match_slug}"
-    backlog_dir = BACKLOG_DIR / priority
+    backlog_dir = faceit_backlog_dir(BACKLOG_DIR, match_date, priority)
     backlog_dir.mkdir(parents=True, exist_ok=True)
     backlog_file = backlog_dir / f"{slug}.json"
 
@@ -160,6 +163,7 @@ def _write_card(pro: dict, *, demo: Path, map_name: str, match_slug: str,
         "demo_path": demo_rel,
         "tournament": tournament,
         "priority": priority,
+        "match_date": match_date,
         "rating": pro["rating"],
         "kills": pro["kills"],
         "deaths": pro["deaths"],
@@ -172,7 +176,7 @@ def _write_card(pro: dict, *, demo: Path, map_name: str, match_slug: str,
         **({} if not elo_fields else elo_fields),
         "pipeline_cmd": (
             f'$env:PYTHONPATH=.; & C:/Users/jembo/anaconda3/envs/cs2archive/python.exe '
-            f'scripts/pov/pipeline.py --backlog backlog/faceit/{priority}/{slug}.json --overlay-only'
+            f'scripts/pov/pipeline.py --backlog backlog/faceit/{match_date}/{priority}/{slug}.json --overlay-only'
         ),
     }
     backlog_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")

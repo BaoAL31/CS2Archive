@@ -559,15 +559,16 @@ def _is_pbdems2(demo_path) -> bool:
 
 
 def _write_render_autoexec(cvars: list[str], rename_map: dict[str, str] | None = None) -> None:
-    # cl_chatfilters 48: hide server/system messages (16 Console + 32 Error),
-    # keep player chat. Must match assets/cs2_pov.cfg — the cfg execs this
-    # autoexec AFTER setting its own value, so this file wins.
+    # cl_chatfilters 63: hide ALL chat — cl_chatfilters is unreliable for
+    # demo/GOTV relayed admin/system lines (48 didn't catch them), so kill the
+    # chat box entirely; HUD/banners untouched. Must match assets/cs2_pov.cfg —
+    # the cfg execs this autoexec AFTER setting its own value, so this file wins.
     # Voice stays fully ON during render. These MUST be in the game's
     # autoexec.cfg (runs at launch, BEFORE the demo loads) — if set later they
     # don't apply to demo playback. tv_listen_voice_indices -1 (both halves =
     # 64-slot bitmask all-set) enables hearing + showing the talking indicator
     # for every player; tv_relaytextchat 2 shows the player text chat.
-    lines = ["crosshair 1", "cl_chatfilters 48", "snd_mvp_volume 0",
+    lines = ["crosshair 1", "cl_chatfilters 63", "snd_mvp_volume 0",
              "snd_mute_losefocus 0", "voice_enable 1", "voice_modenable 1",
              "tv_listen_voice_indices -1",
              "tv_listen_voice_indices_h -1",

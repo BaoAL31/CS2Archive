@@ -1,6 +1,6 @@
 param(
     [switch]$SeedCookies = $true,
-    [int]$Port = 9223
+    [int]$Port = 9221
 )
 
 $DebugProfile = "$env:USERPROFILE\.chrome-debug"

@@ -8,6 +8,27 @@ import re
 import sys
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+from _pathsetup import ensure
+ensure()
+from faceit_title import _crosshair_summary, _num, _viewmodel_line
+
+
+def _strip_html(text: str) -> str:
+    """Remove markup/entities and collapse whitespace from a scraped field.
+
+    HLTV scrapes can carry raw markup (e.g. the veto-box) into fields like
+    match_stage; stripping here keeps descriptions and tags clean.
+    """
+    if not text:
+        return ""
+    text = re.sub(r"<[^>]+", " ", text)
+    text = re.sub(r"[<>]+", " ", text)
+    text = re.sub(r"&[a-zA-Z0-9#]+;", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
 
 def extract_team_names(ratings_data: dict) -> tuple[str, str]:
     tables = ratings_data.get("tables", [])
@@ -123,6 +144,18 @@ def main() -> None:
         default="raw",
         help="Variant: 'raw' (default) or 'overlay' (suffix title/desc/tags)",
     )
+    parser.add_argument("--crosshair-code", default="",
+                        help="POV player's crosshair share code (from csdm analysis)")
+    parser.add_argument("--viewmodel-fov", default="", help="Viewmodel FOV as rendered")
+    parser.add_argument("--viewmodel-offset-x", default="", help="Viewmodel offset X as rendered")
+    parser.add_argument("--viewmodel-offset-y", default="", help="Viewmodel offset Y as rendered")
+    parser.add_argument("--viewmodel-offset-z", default="", help="Viewmodel offset Z as rendered")
+    parser.add_argument("--viewmodel-presetpos", default="", help="Viewmodel presetpos as rendered")
+    parser.add_argument("--resolution", default="", help="Capture resolution (e.g. 1280x960)")
+    parser.add_argument("--aspect-ratio", default="", help="Aspect ratio (e.g. 4:3)")
+    parser.add_argument("--scaling-mode", default="", help="Scaling mode (e.g. Stretched)")
+    parser.add_argument("--video-settings-source", default="",
+                        help="Source of video settings ('prosettings' gates the resolution line)")
     args = parser.parse_args()
 
     path = Path(args.ratings_json)
@@ -148,6 +181,7 @@ def main() -> None:
     kast = stats.get("kast", "").strip() if stats else ""
 
     tournament = args.tournament or ""
+    tournament = _strip_html(tournament)
     if not tournament:
         m = re.search(r"([A-Za-z\s]+20\d{2})", path.stem.replace("_", " "))
         if m:
@@ -156,6 +190,10 @@ def main() -> None:
     tournament_short = shorten_tournament(tournament)
 
     stage_raw = data.get("match_stage", "") if isinstance(data, dict) else ""
+    stage_raw = _strip_html(stage_raw)
+    # Drop the map-veto block (numbered "1. X removed …" list) HLTV appends
+    # after the stage name, so it doesn't pollute description/stage tag.
+    stage_raw = re.split(r"\s*\d+\.\s", stage_raw, maxsplit=1)[0].strip()
     stage = normalize_stage(stage_raw)
 
     # Title sections with removable priority (None = never drop).
@@ -197,6 +235,31 @@ def main() -> None:
     date_match = re.search(r"(\d{4}-\d{2}-\d{2})", str(path))
     if date_match:
         desc_lines.append(date_match.group(1))
+
+    # Settings (as rendered) — crosshair + viewmodel + resolution, mirrors the
+    # FACEIT path so HLTV POVs advertise the player's actual settings too.
+    settings: list[str] = []
+    if args.crosshair_code:
+        summary = _crosshair_summary(args.crosshair_code)
+        settings.append(f"Crosshair: {args.crosshair_code}"
+                        + (f" ({summary})" if summary else ""))
+    video = {
+        k: _num(getattr(args, k))
+        for k in ("viewmodel_fov", "viewmodel_offset_x", "viewmodel_offset_y",
+                  "viewmodel_offset_z", "viewmodel_presetpos")
+    }
+    video = {k: v for k, v in video.items() if v is not None}
+    vm = _viewmodel_line(video)
+    if vm:
+        settings.append(f"Viewmodel: {vm}")
+    if args.video_settings_source == "prosettings" and args.resolution:
+        extra = [e for e in (args.aspect_ratio, args.scaling_mode) if e]
+        settings.append(f"Resolution: {args.resolution}"
+                        + (f" ({', '.join(extra)})" if extra else ""))
+    if settings:
+        desc_lines.append("")
+        desc_lines.append("Settings (as rendered):")
+        desc_lines.extend(settings)
 
     description = "\n".join(desc_lines)
 
@@ -240,9 +303,8 @@ def main() -> None:
         ]
         description = (
             f"{description}\n\n"
-            "This version includes a real-time keyboard & mouse input overlay "
-            "plus utility trajectory clips for smokes, "
-            "flashes, molotovs, and other grenades."
+            "Real-time keyboard & mouse input overlay plus utility trajectory "
+            "clips for smokes, flashes, molotovs, and other grenades."
         )
         # Overlay label stays in description + tags only; not in the title
         # (it's already shown in the thumbnail).

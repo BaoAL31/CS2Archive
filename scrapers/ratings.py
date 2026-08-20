@@ -52,12 +52,20 @@ def parse_match_ratings_html(html: str, match_url: str = "") -> Optional[dict]:
     stage_el = soup.select_one("div.map-info-wrap ul li")
     if not stage_el:
         stage_el = soup.select_one("div.match-info-box div.text")
-    if not stage_el:
-        m = re.search(r"\*\s*(.+?(?:final|playoff|group|stage|qualifier|round|decider|match))", html, re.IGNORECASE)
+    if stage_el:
+        match_stage = stage_el.get_text(strip=True)
+    else:
+        # Fallback: scan CLEANED page text, never raw HTML, so we never
+        # capture markup (e.g. the veto-box) into match_stage.
+        clean_text = soup.get_text(" ", strip=True)
+        m = re.search(r"\*\s*(.+?(?:final|playoff|group|stage|qualifier|round|decider|match))", clean_text, re.IGNORECASE)
         if m:
             match_stage = m.group(1).strip()
-    else:
-        match_stage = stage_el.get_text(strip=True)
+    # Defensive: strip any residual markup/entities and collapse whitespace.
+    match_stage = re.sub(r"<[^>]+", " ", match_stage)
+    match_stage = re.sub(r"[<>]+", " ", match_stage)
+    match_stage = re.sub(r"&[a-zA-Z0-9#]+;", " ", match_stage)
+    match_stage = re.sub(r"\s+", " ", match_stage).strip()
 
     map_names: dict[str, str] = {}
     for el in soup.find_all("div", class_="dynamic-map-name-full"):

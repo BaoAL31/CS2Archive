@@ -19,85 +19,7 @@ console = Console(force_terminal=True)
 
 ARCHIVE_EXTENSIONS = {".rar", ".zip", ".7z"}
 MIN_ARCHIVE_BYTES = 1_000_000
-CDP_PROFILE_DIR = Path(".sessions/hltv-cdp")
-DEFAULT_PROFILE_DIR = CDP_PROFILE_DIR
-
-
-_CDP_BROWSER_CACHE: dict = {}
-_CDP_PORT = 9222
-
-
-def _kill_stale_cdp_chrome() -> None:
-    """Kill Chrome process on port 9222 if it's ours (temp profile). Doesn't touch user Chrome."""
-    import subprocess, time
-    try:
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             'netstat -ano | Select-String ":9222" | Select-String "LISTENING"'],
-            capture_output=True, text=True, timeout=10,
-        )
-        for line in r.stdout.splitlines():
-            parts = line.strip().split()
-            pid = parts[-1] if parts else ""
-            if not pid.isdigit():
-                continue
-            cmd = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 f'Get-CimInstance Win32_Process -Filter "ProcessId={pid}" | Select-Object -ExpandProperty CommandLine'],
-                capture_output=True, text=True, timeout=5,
-            )
-            if "hltv-cdp-" in cmd.stdout or "temp" in cmd.stdout.lower():
-                subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True, timeout=5)
-                time.sleep(1)
-    except Exception:
-        pass
-
-
-def _ensure_cdp_browser():
-    """Return browser handle (reused if already connected). Launches Chrome if needed."""
-    from playwright.sync_api import sync_playwright
-    import subprocess, socket, time, tempfile
-
-    cached = _CDP_BROWSER_CACHE.get("browser")
-    if cached is not None:
-        try:
-            cached.contexts  # verify alive
-            return cached
-        except Exception:
-            _CDP_BROWSER_CACHE.pop("browser", None)
-            _CDP_BROWSER_CACHE.pop("pw", None)
-
-    _kill_stale_cdp_chrome()
-
-    # Launch Chrome with CDP port + temp profile (no conflict with any running Chrome)
-    tmp_profile = Path(tempfile.mkdtemp(prefix="hltv-cdp-"))
-    subprocess.Popen(
-        [
-            "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-            f"--remote-debugging-port={_CDP_PORT}",
-            f"--user-data-dir={tmp_profile.resolve()}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-sync",
-            "--no-sandbox",
-            "about:blank",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    time.sleep(3)
-
-    pw = sync_playwright().start()
-    for _ in range(10):
-        try:
-            browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{_CDP_PORT}")
-            browser.contexts  # verify live
-            _CDP_BROWSER_CACHE["browser"] = browser
-            _CDP_BROWSER_CACHE["pw"] = pw
-            return browser
-        except Exception:
-            time.sleep(2)
-    raise RuntimeError("Could not start or connect to Chrome CDP")
+DEFAULT_PROFILE_DIR = Path(".sessions/hltv-cloak")
 
 
 def _navigate_with_retry(
@@ -130,20 +52,38 @@ def fetch_hltv_page_html(
     url: str,
     *,
     wait_selector: str = 'a[href*="/matches/"]',
-    headless: bool = False,
+    headless: bool = True,
     profile_dir: Path | None = None,
     timeout_ms: int = 60_000,
 ) -> str:
-    """Fetch an HLTV page HTML via CDP. Auto-launches Chrome if needed."""
-    browser = _ensure_cdp_browser()
-    ctx = browser.new_context()
+    """Fetch an HLTV page HTML via CloakBrowser persistent context (Cloudflare-safe).
+
+    Each call opens its own persistent context (reusing the `.sessions/hltv-cloak`
+    profile) and closes it, so no Playwright instance is shared across threads (the
+    source of the old CDP flakiness). Callers must not launch the same persistent
+    profile concurrently (Chromium profile lock) — current callers run sequentially.
+    """
+    from cloakbrowser import launch_persistent_context
+
+    profile = profile_dir or DEFAULT_PROFILE_DIR
+    profile.mkdir(parents=True, exist_ok=True)
+    ctx = launch_persistent_context(
+        str(profile.resolve()),
+        headless=headless,
+        viewport={"width": 1920, "height": 1080},
+        humanize=True,
+        channel="chrome",
+    )
     try:
         page = ctx.new_page()
         return _navigate_with_retry(
             page, url, wait_selector=wait_selector, timeout_ms=timeout_ms
         )
     finally:
-        ctx.close()
+        try:
+            ctx.close()
+        except Exception:
+            pass
 
 
 def match_slug_from_url(url: str) -> str:
@@ -221,26 +161,6 @@ def find_dem_for_map(folder: Path, map_name: str) -> Path | None:
         reverse=True,
     )
     return matches[0] if matches else None
-
-
-def _kill_chrome_on_port_9222() -> None:
-    """Kill any Chrome process listening on CDP port 9222 (frees profile lock)."""
-    import subprocess, time
-    try:
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "netstat -ano | findstr :9222"],
-            capture_output=True, text=True, timeout=10,
-        )
-        for line in r.stdout.splitlines():
-            if "LISTENING" in line:
-                parts = line.strip().split()
-                if len(parts) >= 5:
-                    subprocess.run(["taskkill", "/F", "/PID", parts[-1]],
-                                   capture_output=True, timeout=5)
-        time.sleep(1)
-    except Exception:
-        pass
 
 
 def _download_with_browser(

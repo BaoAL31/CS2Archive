@@ -491,6 +491,21 @@ def _scale_vf(w: int, h: int, scaling_mode: str = "") -> tuple[str, str]:
     return f"scale={w}:{h}:flags=spline,setsar=1,format=nv12", "stretch"
 
 
+def _scale_vf_gpu(w: int, h: int) -> str:
+    """GPU (CUDA) one-pass scale to target WxH, then hand frames to nvenc.
+
+    decode (hwaccel cuda) -> scale_cuda -> hwdownload -> nvenc. The expensive
+    upscale runs on the GPU (scale_cuda, lanczos — equal-or-better than spline),
+    so the CPU isn't pegged by the resizer. A trailing ``hwdownload,format=nv12``
+    moves the scaled frames to system memory *explicitly* before nvenc: ffmpeg's
+    implicit ``auto_scale`` cannot convert CUDA->sw, so without it ffmpeg randomly
+    inserts a CPU ``auto_scale`` (error -40) and the GPU path falls back to
+    libx264, pegging the CPU. Scaling to an exact WxH already yields SAR 1:1, so
+    no ``setsar`` filter.
+    """
+    return f"scale_cuda={w}:{h}:interp_algo=lanczos:format=nv12,hwdownload,format=nv12"
+
+
 
 def _write_filter_script(filter_complex: str) -> str:
     """Write a filter_complex string to a temp script file, return its path."""
@@ -547,8 +562,7 @@ def _encode_scaled(src: Path, dst: Path, w: int, h: int, scaling_mode: str,
     """
     src_mb = src.stat().st_size / 1024 / 1024
     vf, label = _scale_vf(w, h, scaling_mode)
-    print(f"\n  [Scale] {src_mb:.0f} MB -> {w}x{h} ({label}, spline + NVENC CQ8)...",
-          end=" ", flush=True)
+    gpu_vf = _scale_vf_gpu(w, h)
 
     if not _check_gpu_available():
         print("\n[ERROR] GPU not available — another ffmpeg process may be holding CUDA")
@@ -580,19 +594,33 @@ def _encode_scaled(src: Path, dst: Path, w: int, h: int, scaling_mode: str,
             _sh.rmtree(shade_tmp, ignore_errors=True)
             raise
 
-    cmd = list(cmd_prefix)
     if filter_complex is not None:
+        # Voice-shade composite: needs CPU frames (overlay of RGBA controls).
+        print(f"\n  [Scale] {src_mb:.0f} MB -> {w}x{h} ({label}, spline + NVENC CQ8)...",
+              end=" ", flush=True)
+        cmd = list(cmd_prefix)
         cmd += [
             "-filter_complex_script",
             _write_filter_script(filter_complex),
         ]
         cmd += ["-map", "[vout]", "-map", "0:a?", "-shortest"]
+        pix_args = ["-pix_fmt", "yuv420p"]
     else:
-        cmd += ["-vf", vf]
+        # Plain path: GPU decode -> scale_cuda -> nvenc, all in GPU memory.
+        # No -pix_fmt: forcing it inserts a CPU auto_scale that can't convert
+        # from the CUDA frames scale_cuda hands to nvenc.
+        print(f"\n  [Scale] {src_mb:.0f} MB -> {w}x{h} (GPU scale_cuda lanczos + NVENC CQ8)...",
+              end=" ", flush=True)
+        cmd = [
+            "ffmpeg", "-y", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+            "-i", str(src),
+            "-vf", gpu_vf,
+        ]
+        pix_args = []
     cmd += [
         "-c:v", "h264_nvenc", "-preset", "p7", "-b:v", "0", "-cq", "8",
         "-maxrate", "200M", "-bufsize", "400M",
-        "-profile:v", "high", "-pix_fmt", "yuv420p", "-level", "5.1",
+        "-profile:v", "high", *pix_args, "-level", "5.1",
         "-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
         "-movflags", "+faststart",
         "-c:a", "copy", str(temp),

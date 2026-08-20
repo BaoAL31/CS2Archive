@@ -123,10 +123,18 @@ def _load_player_throws(
 
 
 def _ensure_cs2util_data(demo_path: Path) -> None:
-    """Auto-extract CS2UtilArchive data if missing for this demo."""
-    if _find_demo_data_dir(demo_path) is not None:
+    """Auto-extract CS2UtilArchive data if missing for this demo.
+
+    ``input_overlay.parquet`` is a *separate* artifact from ``process_demo``
+    (which produces throws/trajectories/etc). The flight-clip renderer
+    (``render_spot_batch``) hard-fails without it, so we must generate it here
+    too — not just when the data dir is absent. Both steps are idempotent.
+    """
+    data_dir = _find_demo_data_dir(demo_path)
+    if data_dir is not None and (data_dir / "input_overlay.parquet").is_file():
         return
-    _log(f"  [extract] CS2UtilArchive data missing for {demo_path.stem} — auto-extracting...")
+    if data_dir is None:
+        _log(f"  [extract] CS2UtilArchive data missing for {demo_path.stem} — auto-extracting...")
 
     # Determine demo_id same way CS2UtilArchive does
     from scripts.demo_ids import default_demo_id_from_path
@@ -147,13 +155,27 @@ def _ensure_cs2util_data(demo_path: Path) -> None:
     if cs2_scripts not in sys.path:
         sys.path.insert(0, cs2_scripts)
 
-    from scripts.extract_utils import process_demo
-    summary = process_demo(
+    output_root = _CS2UTIL_ROOT / "results" / "auto_extracted" / "data"
+
+    if data_dir is None:
+        from scripts.extract_utils import process_demo
+        summary = process_demo(
+            str(extracted_demo_path),
+            output_dir=str(output_root),
+            demo_id=demo_id,
+        )
+        _log(f"  [extract] Done: {summary['n_throws']} throws, {summary['n_trajectories']} trajectory points")
+
+    # input_overlay.parquet is a separate per-throw button-bitmask artifact the
+    # flight-clip renderer requires. Generate it when missing (idempotent).
+    from scripts.extract_input_overlay import extract_input_overlay as _eio
+    io = _eio(
         str(extracted_demo_path),
-        output_dir=str(_CS2UTIL_ROOT / "results" / "auto_extracted" / "data"),
+        str(output_root / f"demo={demo_id}" / "throws.parquet"),
+        str(output_root),
         demo_id=demo_id,
     )
-    _log(f"  [extract] Done: {summary['n_throws']} throws, {summary['n_trajectories']} trajectory points")
+    _log(f"  [extract] input_overlay: {io.get('n_rows', 0)} rows from {io.get('n_throws', 0)} throws")
 
 
 def _build_round_frame_ranges(

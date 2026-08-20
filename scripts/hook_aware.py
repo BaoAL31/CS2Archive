@@ -29,6 +29,7 @@ _FATAL_MARKERS = (
     "steam is not running",
     "raw files not found",
     "unknown demo source",
+    "game error",
 )
 
 # Min size for a real encoded sequence/clip. A partially-written file under this

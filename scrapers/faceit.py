@@ -366,7 +366,7 @@ def _launch_context():
     browser = None
     for _ in range(20):
         try:
-            browser = pw.chromium.connect_over_cdp("http://127.0.0.1:9223")
+            browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{_CDP_PORT}")
             browser.contexts  # verify alive
             break
         except Exception:
@@ -404,7 +404,7 @@ def _is_authenticated(page) -> bool:
     return True
 
 
-_CDP_PORT = 9223
+_CDP_PORT = int(__import__("os").environ.get("FACEIT_CDP_PORT", "9221"))
 
 
 def _ensure_cdp_chrome() -> None:

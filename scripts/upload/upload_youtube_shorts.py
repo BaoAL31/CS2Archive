@@ -59,12 +59,13 @@ SOCIAL_UPLOAD_TIMEOUT_SECONDS = 1800
 
 
 def ensure_shorts_hashtag(title: str, description: str) -> tuple[str, str]:
-    """Ensure #Shorts is present for Shorts shelf discovery."""
-    title_out = title if "#shorts" in title.lower() else f"{title} #Shorts"
-    if "#shorts" in description.lower():
-        return title_out, description
-    desc = description.rstrip()
-    return title_out, f"{desc}\n\n#Shorts" if desc else "#Shorts"
+    """Return title/description unchanged.
+
+    Per docs/agents/shorts-titles.md the title must NOT contain ``#Shorts``
+    (Shorts are detected by vertical aspect ratio + duration, not the hashtag),
+    so we intentionally never append it here.
+    """
+    return title, description
 
 
 def main() -> None:

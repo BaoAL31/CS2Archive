@@ -44,16 +44,11 @@ class HLTVScraper:
 
         DEFAULT_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
         pw = await async_playwright().start()
-        # Try connecting to existing CDP Chrome first
-        try:
-            self._browser = await pw.chromium.connect_over_cdp("http://127.0.0.1:9222")
-            self._browser.contexts  # verify alive
-        except Exception:
-            self._browser = await pw.chromium.launch(
-                channel="chrome",
-                headless=self._headless,
-                ignore_default_args=["--enable-automation"],
-            )
+        self._browser = await pw.chromium.launch(
+            channel="chrome",
+            headless=self._headless,
+            ignore_default_args=["--enable-automation"],
+        )
         self._context = await self._browser.new_context(
             viewport={"width": 1920, "height": 1080},
             locale="en-US",

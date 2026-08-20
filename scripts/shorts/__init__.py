@@ -30,7 +30,9 @@ def resolve_output_dir(demo_path: str | Path, player: str | None = None) -> Path
     elif "demos/faceit" in normalized:
         output_dir = RENDERS_DIR / f"hl-{demo_stem}"
     else:
-        raise ValueError(f"resolve_output_dir: unknown demo path: {demo}")
+        # Any other demo location (e.g. CS2UtilArchive's demos/extracted) —
+        # use the demo stem so it still lands in renders/hl-{stem}/.
+        output_dir = RENDERS_DIR / f"hl-{demo_stem}"
 
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir

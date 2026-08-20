@@ -33,6 +33,11 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+
+def fail(code: str, message: str) -> None:
+    print(f"[ERR] {code}: {message}")
+    sys.exit(1)
+
 BACKLOG_DIR = PROJECT_ROOT / "backlog"
 MAP_DISPLAY = {
     "de_ancient": "Ancient", "de_mirage": "Mirage", "de_inferno": "Inferno",
@@ -207,6 +212,7 @@ def main() -> None:
     ap.add_argument("--match-id", default="",
                     help="FACEIT match id (auto-resolved from download history if omitted)")
     ap.add_argument("--priority", choices=["high", "mid", "low"], default="high")
+    ap.add_argument("--match-date", help="Match date YYYY-MM-DD (defaults to demo file date)")
     ap.add_argument("--no-elo", action="store_true",
                     help="Skip FACEIT ELO fetch (title/thumbnail omit ELO line)")
     args = ap.parse_args()
@@ -225,8 +231,11 @@ def main() -> None:
 
     match_id = args.match_id.strip() or _match_id_from_history(demo)
 
+    from scripts.faceit.backlog_paths import faceit_backlog_dir, match_date_for_demo
+    match_date = match_date_for_demo(demo, args.match_date)
     meta: dict = {
         "player": args.player,
+        "match_date": match_date,
         "map": map_name,
         "steam_id": steam_id,
         "demo_path": str(demo.relative_to(PROJECT_ROOT)).replace("\\", "/"),
@@ -251,13 +260,16 @@ def main() -> None:
             opp_txt = f"vs {elo['opp_avg_elo']} ELO avg" if "opp_avg_elo" in elo else "(opponents n/a)"
             print(f"  [OK] POV ELO: {elo['elo']} {opp_txt}")
         else:
-            print("  [WARN] ELO unavailable — title/thumbnail will omit the ELO line")
+            fail(0, "ELO_FETCH_FAILED",
+                 f"ELO fetch returned empty for POV player {steam_id}. "
+                 f"Check FACEIT_API_KEY in .env and that the player's FACEIT profile is public. "
+                 f"Use --no-elo to skip ELO (title/thumbnail will omit the ELO line).")
 
     slug = re.sub(r"[^a-z0-9]+", "-", f"{args.player}-{map_name}".lower()).strip("-")
     demo_key = re.sub(r"[^a-z0-9]+", "-", demo.stem.lower()).strip("-")
     if demo_key:
         slug = f"{slug}-{demo_key}"
-    backlog_dir = BACKLOG_DIR / "faceit" / args.priority
+    backlog_dir = faceit_backlog_dir(BACKLOG_DIR, match_date, args.priority)
     backlog_dir.mkdir(parents=True, exist_ok=True)
     backlog_file = backlog_dir / f"{slug}.json"
 

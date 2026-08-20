@@ -1,4 +1,4 @@
-import asyncio, json, sys, time
+import asyncio, argparse, json, sys, time
 from datetime import datetime, timedelta
 
 sys.path.insert(0, "scripts")
@@ -6,7 +6,7 @@ from _pathsetup import ensure
 ensure()
 from scrapers.faceit import FACEITClient
 
-HOURS = 48  # last 2 days
+HOURS = 24  # default window; override with --hours
 
 
 def load_accounts():
@@ -14,6 +14,11 @@ def load_accounts():
 
 
 async def main():
+    ap = argparse.ArgumentParser(description="Find recent pro FACEIT matches and top performers")
+    ap.add_argument("--hours", type=int, default=HOURS,
+                    help=f"look-back window in hours (default {HOURS})")
+    args = ap.parse_args()
+    hours = args.hours
     accounts = load_accounts()
     pros = {}   # nickname -> faceit_id
     pro_steam = {}
@@ -24,7 +29,7 @@ async def main():
             pro_steam[p["nickname"]] = p.get("steam_id")
     print(f"tracking {len(pros)} pros with faceit_id", flush=True)
 
-    cutoff = time.time() - HOURS * 3600
+    cutoff = time.time() - hours * 3600
     fc = FACEITClient()
 
     # Step 1: aggregate recent match_ids from every pro's history
@@ -45,7 +50,7 @@ async def main():
     await fc.close()
 
     candidates = {mid for mid, ps in match_pros.items() if len(ps) >= 1}
-    print(f"{len(candidates)} unique matches in last {HOURS}h from pro histories", flush=True)
+    print(f"{len(candidates)} unique matches in last {hours}h from pro histories", flush=True)
 
     # Step 2: fetch stats + per-pro ELO/K/D for each candidate (rate-limited + retry)
     fc = FACEITClient()
