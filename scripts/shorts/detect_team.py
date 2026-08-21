@@ -91,6 +91,9 @@ def _side_method(demo, sid: int, orgs) -> str | None:
     return ct_org if tn == _CT_TEAM_NUMBER else (
         next((d for d, _ in orgs if d != ct_org), None)
     )
+
+
+def _first_interval(demo_bytes: bytes, sid: int, orgs) -> str | None:
     """Matchinfo-interval method: which team's name-preceded block holds sid."""
     positions = {}
     for disp, raw in orgs:
@@ -154,9 +157,12 @@ def detect_pov_opponent(demo, pov_steam_id) -> tuple[str | None, str | None]:
     if not orgs:
         return (None, None)
 
-    primary = _side_method(demo, sid, orgs)
+    # Interval method is primary — it locates the steamID inside the team
+    # name-preceded block in matchinfo, which is org-anchored not side-anchored.
+    # Side (team_number + CT label) swaps at halftime and is half-sensitive.
+    primary = _first_interval(data, sid, orgs)
     if primary is None:
-        primary = _first_interval(data, sid, orgs)
+        primary = _side_method(demo, sid, orgs)
     if primary is None:
         return (None, None)
 

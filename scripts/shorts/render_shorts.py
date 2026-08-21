@@ -36,6 +36,9 @@ CFG_PATH = (_PROJECT_ROOT / "assets" / "cs2_pov.cfg").resolve()
 
 _DEFAULT_SRC_WIDTH = 1920
 _DEFAULT_SRC_HEIGHT = 1080
+# Backwards-compatible names used by older callers/tests.
+SRC_WIDTH = _DEFAULT_SRC_WIDTH
+SRC_HEIGHT = _DEFAULT_SRC_HEIGHT
 OUT_WIDTH = 1080
 OUT_HEIGHT = 1920
 CSDM_RECORD_FRAMERATE = 60
@@ -50,6 +53,74 @@ AVATAR_SOURCES = ("hltv", "faceit")
 AVATAR_DEFAULT_HEIGHT = 600
 AVATAR_BOTTOM_MARGIN = 0
 AVATAR_OUTLINE_WIDTH = 3
+
+
+def _is_gpu_busy() -> bool:
+    """Return True if GPU appears occupied by another ffmpeg/encode session.
+
+    Checks nvidia-smi compute-apps first (most reliable — shows NVENC users),
+    then falls back to tasklist/pgrep for any running ffmpeg process.
+    Any hit = treat GPU as busy -> caller should switch to CPU (libx264).
+    """
+    # 1) nvidia-smi compute apps (NVENC shows as compute)
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,process_name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            lines = [ln.strip() for ln in r.stdout.strip().splitlines() if ln.strip() and "N/A" not in ln]
+            # Only ffmpeg (or HLAE/CS2 encode) means NVENC busy — explorer/desktop
+            # always shows in this list on Windows, ignore it
+            if any("ffmpeg" in ln.lower() for ln in lines):
+                return True
+    except Exception:
+        pass
+    # 2) nvidia-smi broader gpu processes (covers newer drivers where NVENC not in compute-apps)
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        # not decisive alone, so skip — rely on tasklist fallback instead
+    except Exception:
+        pass
+    # 3) fallback: any ffmpeg process running at all (Windows tasklist / Unix pgrep)
+    try:
+        r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq ffmpeg.exe"], capture_output=True, text=True, timeout=5)
+        if "ffmpeg.exe" in r.stdout.lower():
+            return True
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["pgrep", "-x", "ffmpeg"], capture_output=True, text=True, timeout=5)
+        if r.stdout.strip():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _resolve_use_cpu(force_cpu: bool, force_gpu: bool) -> bool:
+    """Resolve encoder choice with auto-detection.
+
+    --cpu  -> always CPU, --gpu -> always GPU, else auto: GPU busy -> CPU.
+    """
+    if force_cpu and force_gpu:
+        print("[WARN] both --cpu and --gpu set — --cpu wins")
+        return True
+    if force_cpu:
+        _dbg("enc", "forced CPU (libx264) via --cpu")
+        return True
+    if force_gpu:
+        _dbg("enc", "forced GPU (h264_nvenc) via --gpu")
+        return False
+    busy = _is_gpu_busy()
+    if busy:
+        _dbg("enc", "auto: GPU busy (ffmpeg detected) -> switching to CPU (libx264)")
+        return True
+    _dbg("enc", "auto: GPU free -> using GPU (h264_nvenc)")
+    return False
 
 
 def _dbg(label: str, msg: str) -> None:
@@ -80,7 +151,19 @@ def _probe_resolution(path: Path) -> tuple[int, int]:
     return (int(parts[0]), int(parts[1]))
 
 
-def _ffmpeg_settings() -> dict:
+def _ffmpeg_settings(use_cpu: bool = False) -> dict:
+    if use_cpu:
+        return {
+            "constantRateFactor": 16,
+            "videoContainer": "mp4",
+            "videoCodec": "libx264",
+            "audioCodec": "aac",
+            "audioBitrate": 256,
+            "inputParameters": "",
+            "outputParameters": "-crf 16 -preset medium -profile:v high -pix_fmt yuv420p",
+            "customLocationEnabled": True,
+            "customExecutableLocation": FFMPEG,
+        }
     return {
         "constantRateFactor": 14,
         "videoContainer": "mp4",
@@ -226,8 +309,9 @@ def _build_csdm_config(
     src_width: int = _DEFAULT_SRC_WIDTH,
     src_height: int = _DEFAULT_SRC_HEIGHT,
     rename: bool = True,
+    use_cpu: bool = False,
 ) -> dict:
-    pov_sids = {s["pov_steam_id"] for s in shorts}
+    pov_sids = {s["pov_steam_id"] for s in shorts} | {s["pov_switch_to"] for s in shorts if "pov_switch_to" in s}
     crosshair_cache = {}
     for sid in pov_sids:
         cvars = _get_player_crosshair_cvars(sid, demo_path)
@@ -283,7 +367,7 @@ def _build_csdm_config(
             "cameras": [],
             "playerCameras": [
                 {"tick": start_tick, "playerSteamId": pov_sid, "playerName": "pov"},
-            ],
+            ] + ([{"tick": s["pov_switch_tick"], "playerSteamId": s["pov_switch_to"], "playerName": "pov_switch"}] if "pov_switch_tick" in s and "pov_switch_to" in s else []),
             "playerVoicesEnabled": False,
             "recordAudio": True,
             "deathNoticesDuration": 5,
@@ -303,7 +387,7 @@ def _build_csdm_config(
         "closeGameAfterRecording": True,
         "concatenateSequences": False,
         "trueView": False,
-        "ffmpegSettings": _ffmpeg_settings(),
+        "ffmpegSettings": _ffmpeg_settings(use_cpu=use_cpu),
         "sequences": sequences,
     }
 
@@ -409,21 +493,25 @@ def _find_sequence_files(search_dir: Path, num_expected: int, shorts: list[dict]
     return []
 
 
-def _render_kill_feed_pip(src: Path, dst: Path, src_width: int = _DEFAULT_SRC_WIDTH) -> None:
+def _render_kill_feed_pip(src: Path, dst: Path, src_width: int = _DEFAULT_SRC_WIDTH, use_cpu: bool = False) -> None:
     """Pre-render the kill-feed PiP from the source segment.
 
     Crops the top band of the source (KILLFEED_CROP_W x KILLFEED_CROP_H at
     y=0) at native resolution — no rescaling, so no resampling artifacts.
-    Encode is GPU (h264_nvenc). Single ffmpeg call; the result is fed into
-    ``_composite_9x16`` as input [1:v] so the final composite remains a
-    single encode pass.
+    Encode is GPU (h264_nvenc) or CPU (libx264) depending on *use_cpu*.
+    Single ffmpeg call; the result is fed into ``_composite_9x16`` as input
+    [1:v] so the final composite remains a single encode pass.
     """
     kf_x = src_width - KILLFEED_CROP_W
     vf = f"crop={KILLFEED_CROP_W}:{KILLFEED_CROP_H}:{kf_x}:{KILLFEED_CROP_Y}"
+    if use_cpu:
+        vcodec = ["-c:v", "libx264", "-crf", "16", "-preset", "medium"]
+    else:
+        vcodec = ["-c:v", "h264_nvenc", "-preset", "p7", "-cq", "14"]
     cmd = [
         FFMPEG, "-y", "-i", str(src),
         "-vf", vf,
-        "-c:v", "h264_nvenc", "-preset", "p7", "-cq", "14",
+        *vcodec,
         "-profile:v", "high", "-pix_fmt", "yuv420p",
         "-an",
         "-movflags", "+faststart",
@@ -455,6 +543,7 @@ def _composite_9x16(
     avatar_path: Path | None = None,
     avatar_height: int = AVATAR_DEFAULT_HEIGHT,
     avatar_bottom_margin: int = AVATAR_BOTTOM_MARGIN,
+    use_cpu: bool = False,
 ) -> None:
     """Composite a source clip into 1080x1920 via ffmpeg filter chain.
 
@@ -485,11 +574,21 @@ def _composite_9x16(
     height (``avatar_height``) with ``avatar_bottom_margin`` px of clearance
     from the bottom edge.
 
-    Encode: NVIDIA NVENC (h264_nvenc) for GPU-accelerated H.264.
-    Decode: cuda hwaccel for GPU-accelerated source decode.
+    Encode: NVIDIA NVENC (h264_nvenc) for GPU-accelerated H.264, or
+    libx264 for CPU when *use_cpu* is True (allows parallel ffmpeg
+    sessions when GPU already occupied).
+    Decode: cuda hwaccel for GPU path; CPU path uses no hwaccel.
     Audio: passthrough copy from the source.
     """
     gblur_sigma = max(1, blur_radius // 2)
+
+    # Encoder / hwaccel selection (shared by both kill_feed paths)
+    if use_cpu:
+        vcodec_composite = ["-c:v", "libx264", "-crf", "16", "-preset", "medium", "-profile:v", "high", "-pix_fmt", "yuv420p"]
+        hwaccel_prefix: list[str] = []
+    else:
+        vcodec_composite = ["-c:v", "h264_nvenc", "-preset", "p7", "-cq", "14", "-b:v", "0", "-profile:v", "high", "-pix_fmt", "yuv420p", "-level", "4.2"]
+        hwaccel_prefix = ["-hwaccel", "cuda"]
 
     # 4:3 stretched players: pre-stretch source to 16:9 horizontally so
     # bg/fg/pip all see a 16:9 source. Stretch target height = round(W_src * 9/16)
@@ -560,7 +659,7 @@ def _composite_9x16(
             pip_y = 0
 
         cmd = [
-            FFMPEG, "-y", "-hwaccel", "cuda",
+            FFMPEG, "-y", *hwaccel_prefix,
             "-i", str(src)
         ]
 
@@ -614,9 +713,7 @@ def _composite_9x16(
         cmd.extend([
             "-filter_complex", filter_str,
             "-map", "[out]", "-map", "0:a?",
-            "-c:v", "h264_nvenc", "-preset", "p7", "-cq", "14", "-b:v", "0",
-            "-profile:v", "high", "-pix_fmt", "yuv420p",
-            "-level", "4.2",
+            *vcodec_composite,
             "-c:a", "copy",
             "-movflags", "+faststart",
             str(dst),
@@ -633,18 +730,17 @@ def _composite_9x16(
             f"[bg][fg]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2[out]"
         )
         cmd = [
-            FFMPEG, "-y", "-hwaccel", "cuda", "-i", str(src),
+            FFMPEG, "-y", *hwaccel_prefix, "-i", str(src),
             "-filter_complex", vf,
             "-map", "[out]", "-map", "0:a?",
-            "-c:v", "h264_nvenc", "-preset", "p7", "-cq", "14", "-b:v", "0",
-            "-profile:v", "high", "-pix_fmt", "yuv420p",
-            "-level", "4.2",
+            *vcodec_composite,
             "-c:a", "copy",
             "-movflags", "+faststart",
             str(dst),
         ]
         if avatar_path:
-            cmd[6:6] = ["-i", str(avatar_path)]
+            fc_idx = cmd.index("-filter_complex")
+            cmd[fc_idx:fc_idx] = ["-i", str(avatar_path)]
             vf += (
                 f";[1:v]scale=-1:{avatar_height}[av];"
                 f"[out][av]overlay=(main_w-overlay_w)/2:"
@@ -678,6 +774,9 @@ def _short_output_path(out_dir: Path, short: dict, name: str | None = None) -> P
             base = f"{cnt}_clutch-{nick}-t{tick}"
         else:
             base = f"{st}-{nick}-t{tick}"
+        tags = short.get("punch_up_tags") or []
+        if tags:
+            base = f"{base}_{'_'.join(tags)}"
     return out_dir / f"{base}.mp4"
 
 
@@ -699,6 +798,7 @@ def render_shorts(
     year: str = "2026",
     hook_timeout: float = 150.0,
     hook_retries: int = 2,
+    use_cpu: bool = False,
 ) -> Path:
     """Render all shorts from a timeline JSON.
     
@@ -782,7 +882,7 @@ def render_shorts(
             batch_end = batch_start + len(batch) - 1
             _dbg("batch", f"batch {batch_idx + 1}/{len(batches)}: shorts {batch_start + 1}-{batch_end + 1}")
 
-            config = _build_csdm_config(batch, demo_path, segments_dir, src_w, src_h, rename)
+            config = _build_csdm_config(batch, demo_path, segments_dir, src_w, src_h, rename, use_cpu=use_cpu)
             conf_path = out_dir / f"batch_{batch_idx + 1}_config.json"
             conf_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
@@ -824,7 +924,7 @@ def render_shorts(
                 continue
         kf_path = segments_dir / f"{seg_file.stem}-kill_feed.mp4"
         if not kf_path.exists() or kf_path.stat().st_size < 1_048_576:
-            _render_kill_feed_pip(seg_file, kf_path, src_w)
+            _render_kill_feed_pip(seg_file, kf_path, src_w, use_cpu=use_cpu)
 
         avatar_path = None
         if avatar:
@@ -845,6 +945,7 @@ def render_shorts(
             scale=scale, kill_feed_path=kf_path, pip_scale=pip_scale,
             scaling_mode=scaling_mode, avatar_path=avatar_path,
             avatar_height=avatar_height, avatar_bottom_margin=avatar_bottom_margin,
+            use_cpu=use_cpu,
         )
         w, h = _probe_resolution(dst)
         dur = _probe_duration(dst)
@@ -903,9 +1004,28 @@ def main() -> int:
     ap.add_argument("--hook-retries", type=int, default=2,
                    help="Retries after a failed HLAE hook before giving up "
                         "(default: 2). 0 disables hook detection.")
+    ap.add_argument("--cpu", action="store_true",
+                   help="Force CPU encoder (libx264) instead of GPU (h264_nvenc + cuda).")
+    ap.add_argument("--gpu", action="store_true",
+                   help="Force GPU encoder (h264_nvenc + cuda) even if another ffmpeg is running.")
+    ap.add_argument("--no-auto", action="store_true",
+                   help="Disable auto GPU-busy detection (default: auto-detect; GPU busy -> CPU).")
     args = ap.parse_args()
 
     try:
+        if args.no_auto:
+            use_cpu = args.cpu and not args.gpu
+            if not args.cpu and not args.gpu:
+                _dbg("enc", "auto disabled (--no-auto) -> default GPU")
+                use_cpu = False
+            elif args.cpu:
+                _dbg("enc", "forced CPU via --cpu (--no-auto)")
+                use_cpu = True
+            else:
+                _dbg("enc", "forced GPU via --gpu (--no-auto)")
+                use_cpu = False
+        else:
+            use_cpu = _resolve_use_cpu(args.cpu, args.gpu)
         render_shorts(args.timeline, player=args.player, batch_size=args.batches,
                        scale=args.scale, pip_scale=args.pip_scale, composite_only=args.composite_only,
                        name=args.name, avatar=not args.no_avatar,
@@ -914,7 +1034,8 @@ def main() -> int:
                        avatar_outline_width=args.avatar_outline_width,
                        rename=not args.no_rename, make_meta_on=not args.no_meta,
                        tournament=args.tournament, year=args.year,
-                       hook_timeout=args.hook_timeout, hook_retries=args.hook_retries)
+                       hook_timeout=args.hook_timeout, hook_retries=args.hook_retries,
+                       use_cpu=use_cpu)
         return 0
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)

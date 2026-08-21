@@ -51,17 +51,35 @@ def _map_name(demo_map: str) -> str:
     return demo_map.replace("de_", "").replace("_", " ").title()
 
 
-def _make_title(nick: str, short_type: str, opp: str | None, mname: str, tournament_tag: str = "") -> str:
+def _make_title(nick: str, short_type: str, opp: str | None, mname: str, tournament_tag: str = "", clutch: str | None = None, kills: int = 0, punch_tags: list[str] | None = None) -> str:
     opp_s = opp if opp else "opponent"
     if "clutch" in short_type.lower():
-        base = f"{nick} pulls off a 1v3 CLUTCH vs {opp_s} on {mname} #cs2 #counterstrike"
+        clutch_s = clutch or "1v3"
+        base = f"{nick} pulls off a {clutch_s} CLUTCH vs {opp_s} on {mname} #cs2 #counterstrike"
     else:
-        base = f"{nick}'s 4K vs {opp_s} on {mname} #cs2 #counterstrike"
+        if punch_tags:
+            weapon = punch_tags[0].replace("_punch_up", "").upper()
+            if kills >= 5:
+                base = f"{nick}'s INSANE {weapon} ACE (5K) vs {opp_s} on {mname} #cs2 #counterstrike"
+            else:
+                base = f"{nick}'s {weapon} 4K vs {opp_s} on {mname} #cs2 #counterstrike"
+        else:
+            if kills >= 5:
+                base = f"{nick}'s INSANE ACE (5K) vs {opp_s} on {mname} #cs2 #counterstrike"
+            else:
+                base = f"{nick}'s 4K vs {opp_s} on {mname} #cs2 #counterstrike"
     return f"{base} {tournament_tag}".strip() if tournament_tag else base
 
 
-def _make_description(nick: str, pov_org: str | None, opp: str | None, mname: str, short_type: str) -> str:
-    kind = "1v3 clutch" if "clutch" in short_type.lower() else "4K"
+def _make_description(nick: str, pov_org: str | None, opp: str | None, mname: str, short_type: str, clutch: str | None = None, kills: int = 0, punch_tags: list[str] | None = None) -> str:
+    if "clutch" in short_type.lower():
+        kind = f"{clutch or '1v3'} clutch" if clutch else "1v3 clutch"
+    else:
+        kind = "ACE (5K)" if kills >= 5 else "4K"
+        if punch_tags:
+            # list punch weapons for flavor
+            weapons = ", ".join(t.replace("_punch_up","").upper() for t in punch_tags)
+            kind = f"{kind} ({weapons} punch-up)" if weapons else kind
     vs = opp if opp else "the opponent"
     org = f" ({pov_org})" if pov_org else ""
     return f"Esports World Cup 2026 highlight - {nick}{org} with the {kind} against {vs} on {mname}."
@@ -82,11 +100,14 @@ def make_meta(folder: str, tournament: str | None = None, year: str = "2026") ->
 
     vids = sorted(f for f in os.listdir(folder) if f.endswith(".mp4"))
     video = os.path.abspath(os.path.join(folder, vids[-1])) if vids else ""
+    clutch = s.get("clutch_initial_count")
+    kills = len(s.get("kill_ticks", []))
+    punch_tags = s.get("punch_up_tags") or []
 
     meta = {
         "video_path": video,
-        "title": _make_title(nick, short_type, opp_org, mname, tournament_tag),
-        "description": _make_description(nick, pov_org, opp_org, mname, short_type),
+        "title": _make_title(nick, short_type, opp_org, mname, tournament_tag, clutch=clutch, kills=kills, punch_tags=punch_tags),
+        "description": _make_description(nick, pov_org, opp_org, mname, short_type, clutch=clutch, kills=kills, punch_tags=punch_tags),
         "privacy": "private",
         "publish_at": "auto",
         "tags": _TAGS,

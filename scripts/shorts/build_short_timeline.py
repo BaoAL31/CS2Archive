@@ -152,10 +152,10 @@ def _is_punch_up(k: dict) -> bool:
 
 
 def _punch_up_tags(kills: list[dict]) -> list[str]:
-    """De-duplicated, order-preserving list of "<gun>_punch_up" tags for kills
-    where the attacker punched up (used a lower-tier weapon than the victim held).
-
-    Drives the short folder-name suffix, e.g. ``deagle_punch_up``.
+    """Order-preserving list of "<gun>_punch_up" tags, only when at least
+    two kills in the multikill punched up with that weapon. Single glock kill
+    in a 4k (e.g. 3 rifle + 1 pistol) is not a punch-up 4k — label would be
+    misleading. Drives the short folder-name suffix.
     """
     tags: list[str] = []
     for k in kills:
@@ -164,10 +164,12 @@ def _punch_up_tags(kills: list[dict]) -> list[str]:
         w = str(k.get("weapon", "") or "").strip().lower()
         if w:
             tags.append(f"{w}_punch_up")
+    from collections import Counter
+    counts = Counter(tags)
     seen: set[str] = set()
     out: list[str] = []
     for t in tags:
-        if t not in seen:
+        if t not in seen and counts[t] >= 2:
             seen.add(t)
             out.append(t)
     return out
@@ -778,6 +780,67 @@ def detect_shorts(
                     continue  # clutch team did NOT win => skip
                 win_tick = round_ends.get(roundn, 0)
                 win_event = "team_win"
+
+            # --- 2v5 special: require 4k from POV, switch to survivor if POV dies ---
+            if trigger["type"] == "2v5":
+                by_attacker: dict[str, list[dict]] = {}
+                for k in round_kills:
+                    aid = k["attacker_sid"]
+                    if aid and team_by_sid.get(aid, 0) == team:
+                        by_attacker.setdefault(aid, []).append(k)
+                best_sid = None
+                best_kills: list[dict] = []
+                for aid, ks in by_attacker.items():
+                    if len(ks) >= 4 and len(ks) > len(best_kills):
+                        best_sid = aid
+                        best_kills = ks
+                if best_sid is None:
+                    continue  # weak 2v5 (e.g. 2k) — not impressive enough
+                win_player = best_sid
+                clutch_kills = best_kills
+                clutch_kill_ticks = sorted(k["tick"] for k in clutch_kills)
+                if win_tick is None or win_tick - trigger["start_tick"] < _CLUTCH_MIN_DURATION_TICKS:
+                    continue
+                # if POV dies before round win, switch cam to surviving teammate
+                death_tick = next((k["tick"] for k in round_kills if k["victim_sid"] == win_player), None)
+                switch_to = None
+                switch_to_nick = None
+                switch_tick = None
+                if death_tick is not None and death_tick < win_tick and death_tick > trigger["start_tick"]:
+                    dead = {k["victim_sid"] for k in round_kills if k["victim_sid"]}
+                    survivors = [sid for sid, t in team_by_sid.items() if t == team and sid not in dead and sid != win_player]
+                    for k in reversed(round_kills):
+                        if k["attacker_sid"] in survivors:
+                            switch_to = k["attacker_sid"]
+                            break
+                    if switch_to is None and survivors:
+                        switch_to = survivors[0]
+                    if switch_to:
+                        switch_tick = death_tick + 64  # 1s after death
+                        switch_to_nick = nickname_by_sid.get(switch_to, "Unknown")
+                if clutch_kill_ticks:
+                    first_kill = min(clutch_kill_ticks)
+                    start_tick = min(trigger["start_tick"], first_kill - _PRE_KILL_TICK_MARGIN)
+                else:
+                    start_tick = trigger["start_tick"]
+                short = {
+                    "short_type": "clutch",
+                    "pov_steam_id": win_player,
+                    "pov_nick": nickname_by_sid.get(win_player, "Unknown"),
+                    "start_tick": start_tick,
+                    "end_tick": win_tick,
+                    "clutch_initial_count": trigger["type"],
+                    "round_win_tick": win_tick,
+                    "win_event": win_event,
+                    "kill_ticks": clutch_kill_ticks,
+                    "punch_up_tags": _punch_up_tags(clutch_kills),
+                }
+                if switch_to:
+                    short["pov_switch_tick"] = switch_tick
+                    short["pov_switch_to"] = switch_to
+                    short["pov_switch_to_nick"] = switch_to_nick
+                shorts.append(short)
+                continue
 
             win_player = _last_surviving_killer(round_kills, team, team_by_sid, win_player_hint=win_player)
 
