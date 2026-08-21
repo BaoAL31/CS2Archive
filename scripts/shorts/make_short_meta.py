@@ -5,8 +5,8 @@ never from memory. Composes a YouTube-Shorts-ready title/description and writes
 the meta file next to the short.
 
 Usage:
-    python scripts/shorts/make_short_meta.py renders/hl-*/shorts-*
-    python scripts/shorts/make_short_meta.py renders/hl-spirit-vs-big-m1-cache/shorts-4k_multikill-faveN-t81755
+    python scripts/shorts/make_short_meta.py renders/shorts/shorts-*/shorts-*
+    python scripts/shorts/make_short_meta.py renders/shorts/shorts-spirit-vs-big-m1-cache/shorts-4k_multikill-faveN-t81755
 """
 
 from __future__ import annotations
@@ -18,7 +18,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from scripts.shorts.detect_team import detect_pov_opponent
+try:
+    from scripts.shorts.detect_team import detect_pov_opponent
+except ModuleNotFoundError:
+    from shorts.detect_team import detect_pov_opponent
 
 _TAGS = ["Shorts"]
 
@@ -96,7 +99,7 @@ def make_meta(folder: str, tournament: str | None = None, year: str = "2026") ->
 
 
 def main(argv):
-    folders = argv[1:] or glob.glob("renders/hl-*/shorts-*")
+    folders = argv[1:] or glob.glob("renders/shorts/shorts-*/shorts-*")
     for f in sorted(folders):
         if not os.path.isdir(f) or not os.path.exists(os.path.join(f, "short_timeline.json")):
             continue

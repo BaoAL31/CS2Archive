@@ -23,7 +23,7 @@ def test_hltv_with_player(monkeypatch, tmp_path):
     monkeypatch.setattr("shorts.RENDERS_DIR", tmp_path / "renders")
 
     out = resolve_output_dir(demo, player="76561198000000000")
-    assert out == tmp_path / "renders" / "hl-spirit-vs-falcons-m3-nuke"
+    assert out == tmp_path / "renders" / "shorts" / "shorts-spirit-vs-falcons-m3-nuke"
     assert out.is_dir()
 
 
@@ -37,7 +37,7 @@ def test_faceit_no_player_needed(monkeypatch, tmp_path):
     monkeypatch.setattr("shorts.RENDERS_DIR", tmp_path / "renders")
 
     out = resolve_output_dir(demo)
-    assert out == tmp_path / "renders" / "hl-team-teses-vs-svnonethree"
+    assert out == tmp_path / "renders" / "shorts" / "shorts-team-teses-vs-svnonethree"
     assert out.is_dir()
 
 
@@ -51,7 +51,7 @@ def test_hltv_absolute_path(monkeypatch, tmp_path):
     monkeypatch.setattr("shorts.RENDERS_DIR", tmp_path / "renders")
 
     out = resolve_output_dir(demo, player="123456789")
-    assert "hl-match-slug-map" in str(out)
+    assert out == tmp_path / "renders" / "shorts" / "shorts-match-slug-map"
     assert out.is_dir()
 
 
@@ -66,11 +66,11 @@ def test_hltv_player_ignored(monkeypatch, tmp_path):
     monkeypatch.setattr("shorts.RENDERS_DIR", tmp_path / "renders")
 
     out = resolve_output_dir(demo)
-    assert out.name == "hl-some-map"
+    assert out.name == "shorts-some-map"
 
 
 def test_hltv_faceit_same_prefix(monkeypatch, tmp_path):
-    """Both HLTV and FACEIT use hl- prefix now."""
+    """Both HLTV and FACEIT use the shorts/shorts- layout."""
     monkeypatch.setattr("shorts.RENDERS_DIR", tmp_path / "renders")
 
     hltv_demo = tmp_path / "demos" / "hltv" / "m" / "m.dem"
@@ -82,8 +82,8 @@ def test_hltv_faceit_same_prefix(monkeypatch, tmp_path):
 
     hltv_out = resolve_output_dir(hltv_demo)
     faceit_out = resolve_output_dir(faceit_demo)
-    assert hltv_out.name.startswith("hl-")
-    assert faceit_out.name.startswith("hl-")
+    assert hltv_out.name.startswith("shorts-")
+    assert faceit_out.name.startswith("shorts-")
 
 
 def test_unknown_path_raises(monkeypatch, tmp_path):

@@ -5,9 +5,12 @@ renders for matches from the configured event when at least one team is in the
 top-20 ranking snapshot.
 
 The default event is Esports World Cup 2026. The default poll interval is five
-minutes. Only backlog cards in `backlog/<match>/high/` (rating >= 1.5) are
-queued. The worker runs one `scripts/pov/pipeline.py` process at a time and
-does not upload anything.
+minutes. Only the highest-rated high-priority card per map is queued from
+`backlog/<match>/high/` (rating >= 1.5). The worker runs one
+`scripts/pov/pipeline.py` process at a time and does not upload anything.
+After a match has demos, it also extracts Shorts timelines with
+`scripts/shorts/build_short_timeline.py`. New Shorts output lives under
+`renders/shorts/shorts-<demo-stem>/shorts-<slug>/`.
 
 ## Run
 

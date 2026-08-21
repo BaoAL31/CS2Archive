@@ -33,7 +33,12 @@ _SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from youtube_schedule import AUTO_PUBLISH_MODE, DEFAULT_PUBLISH_TZ, resolve_publish_schedule
+from youtube_schedule import (
+    AUTO_PUBLISH_MODE,
+    AUTO_PUBLISH_TIMES,
+    DEFAULT_PUBLISH_TZ,
+    resolve_publish_schedule,
+)
 
 RETRIABLE_EXCEPTIONS = (
     httplib2.HttpLib2Error, IOError, ssl.SSLError, http.client.NotConnected,
@@ -545,7 +550,7 @@ def main() -> None:
             privacy=privacy,
             start_date=start_date,
             occupied_dates=occupied_dates,
-            publish_times=["10:00", "16:30"],
+            publish_times=AUTO_PUBLISH_TIMES,
         )
 
     if publish_at_utc:

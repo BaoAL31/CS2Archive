@@ -151,6 +151,28 @@ def _is_punch_up(k: dict) -> bool:
     return at < vt
 
 
+def _punch_up_tags(kills: list[dict]) -> list[str]:
+    """De-duplicated, order-preserving list of "<gun>_punch_up" tags for kills
+    where the attacker punched up (used a lower-tier weapon than the victim held).
+
+    Drives the short folder-name suffix, e.g. ``deagle_punch_up``.
+    """
+    tags: list[str] = []
+    for k in kills:
+        if not _is_punch_up(k):
+            continue
+        w = str(k.get("weapon", "") or "").strip().lower()
+        if w:
+            tags.append(f"{w}_punch_up")
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in tags:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
 def _sid(val) -> str:
     import math
 
@@ -602,6 +624,7 @@ def detect_shorts(
                 "start_tick": start_tick,
                 "end_tick": end_tick,
                 "kill_ticks": ticks,
+                "punch_up_tags": _punch_up_tags(kills),
             })
 
     # ================================================================
@@ -684,6 +707,7 @@ def detect_shorts(
                 "end_tick": end_tick,
                 "kill_ticks": ticks,
                 "clutch_initial_count": f"{my_alive}v{enemy_alive}",
+                "punch_up_tags": _punch_up_tags(kills),
             })
 
     for roundn in all_rounds:
@@ -761,6 +785,10 @@ def detect_shorts(
                 k["tick"] for k in round_kills
                 if k["attacker_sid"] == win_player
             ]
+            clutch_kills = [
+                k for k in round_kills
+                if k["attacker_sid"] == win_player
+            ]
 
             if (
                 win_tick is not None
@@ -786,6 +814,7 @@ def detect_shorts(
                     "round_win_tick": win_tick,
                     "win_event": win_event,
                     "kill_ticks": clutch_kill_ticks,
+                    "punch_up_tags": _punch_up_tags(clutch_kills),
                 })
 
     # --- Recognised-Pro gate (drop randos) ---
@@ -961,25 +990,27 @@ def _build_short_slug(short: dict) -> str:
     nick = short.get("pov_nick", "Unknown")
     safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in nick)
     tick = short.get("start_tick", 0)
+    tags = short.get("punch_up_tags") or []
+    suffix = ("_" + "_".join(tags)) if tags else ""
     if st == "4k":
         kills = len(short.get("kill_ticks", []))
-        return f"{kills}k_multikill-{safe}-t{tick}"
+        return f"{kills}k_multikill-{safe}-t{tick}{suffix}"
     elif st == "clutch":
         cnt = short.get("clutch_initial_count", "XvX")
         kills = len(short.get("kill_ticks", []))
-        return f"{cnt}_{kills}k_clutch-{safe}-t{tick}"
+        return f"{cnt}_{kills}k_clutch-{safe}-t{tick}{suffix}"
     elif st == "1v3":
         cnt = short.get("clutch_initial_count", "1v3")
         kills = len(short.get("kill_ticks", []))
-        return f"{cnt}_{kills}k_1v3-{safe}-t{tick}"
-    return f"{st}-{safe}-t{tick}"
+        return f"{cnt}_{kills}k_1v3-{safe}-t{tick}{suffix}"
+    return f"{st}-{safe}-t{tick}{suffix}"
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build Short Timeline JSON from a demo")
     ap.add_argument("demo_path", type=Path, help="Path to .dem file")
     ap.add_argument("--player", type=str, default=None, help="Steam ID for HLTV demo output dir")
-    ap.add_argument("--output", "-o", type=Path, default=None, help="Override output base directory")
+    ap.add_argument("--output", "-o", type=Path, default=None, help="Override output base directory (default: renders/shorts/shorts-<demo>)")
     ap.add_argument(
         "--from-action-timeline", "-A",
         type=Path,

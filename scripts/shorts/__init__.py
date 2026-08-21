@@ -14,7 +14,7 @@ RENDERS_DIR = _PROJECT_ROOT / "renders"
 def resolve_output_dir(demo_path: str | Path, player: str | None = None) -> Path:
     """Return the shorts base output directory for a demo.
 
-    Both HLTV and FACEIT demos use ``renders/hl-{demo_stem}/`` (``hl-`` prefix).
+    Both HLTV and FACEIT demos use ``renders/shorts/shorts-{demo_stem}/``.
     Per-short ``shorts-{slug}/`` subdirectories are created by the caller.
 
     The ``player`` argument is accepted for backwards compatibility but ignored.
@@ -25,14 +25,9 @@ def resolve_output_dir(demo_path: str | Path, player: str | None = None) -> Path
     normalized = str(demo).replace("\\", "/")
     demo_stem = demo.stem
 
-    if "demos/hltv" in normalized:
-        output_dir = RENDERS_DIR / f"hl-{demo_stem}"
-    elif "demos/faceit" in normalized:
-        output_dir = RENDERS_DIR / f"hl-{demo_stem}"
-    else:
-        # Any other demo location (e.g. CS2UtilArchive's demos/extracted) —
-        # use the demo stem so it still lands in renders/hl-{stem}/.
-        output_dir = RENDERS_DIR / f"hl-{demo_stem}"
+    if "demos/hltv" not in normalized and "demos/faceit" not in normalized:
+        raise ValueError(f"unknown demo path: {demo}")
+    output_dir = RENDERS_DIR / "shorts" / f"shorts-{demo_stem}"
 
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir

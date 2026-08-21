@@ -48,6 +48,7 @@ class Match:
     slug: str
     team1: str
     team2: str
+    event: str = ""
 
 
 def _slug_teams(slug: str) -> tuple[str, str]:
@@ -67,9 +68,12 @@ def _canonical_match(href: str) -> tuple[str, str] | None:
 def parse_match_links(html: str, base_url: str = settings.hltv_base_url) -> list[Match]:
     """Parse unique completed-match links from a results page fixture."""
     soup = BeautifulSoup(html, "lxml")
+    results = soup.select_one(".results-holder")
+    links = results.select('a[href*="/matches/"]') if results else soup.select(
+        'a[href*="/matches/"]')
     found: list[Match] = []
     seen: set[str] = set()
-    for link in soup.select('a[href*="/matches/"]'):
+    for link in links:
         parsed = _canonical_match(link.get("href", ""))
         if not parsed:
             continue
@@ -78,12 +82,18 @@ def parse_match_links(html: str, base_url: str = settings.hltv_base_url) -> list
             continue
         seen.add(match_id)
         team1, team2 = _slug_teams(slug)
+        result = link.find_parent(class_="result-con")
+        event = ""
+        if result:
+            event_node = result.select_one(".event-name")
+            event = event_node.get_text(" ", strip=True) if event_node else ""
         found.append(Match(
             match_id=match_id,
             url=urljoin(base_url, link["href"]),
             slug=slug,
             team1=team1,
             team2=team2,
+            event=event,
         ))
     return found
 
@@ -114,12 +124,15 @@ def parse_top_teams(html: str, limit: int = 20) -> list[str]:
 
 
 def select_matches(matches: list[Match], event_ids: set[str],
-                   notable_teams: list[str]) -> list[Match]:
+                   notable_teams: list[str], event_name: str = "") -> list[Match]:
     """Keep completed event matches involving at least one notable team."""
     teams = {team.casefold() for team in notable_teams}
     selected = []
     for match in matches:
-        if match.match_id not in event_ids:
+        event_match = match.match_id in event_ids
+        if event_name and match.event:
+            event_match = match.event.casefold() == event_name.casefold()
+        if not event_match:
             continue
         if match.team1.casefold() in teams or match.team2.casefold() in teams:
             selected.append(match)
@@ -147,6 +160,7 @@ class State:
     def __init__(self, path: Path):
         self.path = path
         self.data = self._load()
+        self.data["queue"] = _sort_queue(_prune_queue(self.data.get("queue", [])))
 
     def _load(self) -> dict:
         if not self.path.exists():
@@ -201,8 +215,91 @@ class SingleInstance:
 def _high_priority_cards(match: Match) -> list[str]:
     match_slug = match_slug_from_url(match.url)
     root = ROOT / "backlog" / match_slug / "high"
-    return sorted(str(p.relative_to(ROOT)).replace("\\", "/")
-                  for p in root.glob("*.json")) if root.is_dir() else []
+    if not root.is_dir():
+        return []
+    cards = []
+    for path in sorted(root.glob("*.json")):
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        cards.append((str(path.relative_to(ROOT)).replace("\\", "/"), meta))
+    return [path for path, _ in select_highest_per_map(cards)]
+
+
+def select_highest_per_map(
+    cards: list[tuple[str, dict]],
+) -> list[tuple[str, dict]]:
+    """Select one highest-rated card for each map, deterministically."""
+    best: dict[str, tuple[str, dict]] = {}
+    for path, meta in cards:
+        map_name = str(meta.get("map", "")).strip().casefold()
+        if not map_name:
+            continue
+        try:
+            rating = float(meta.get("rating", 0))
+        except (TypeError, ValueError):
+            rating = 0.0
+        current = best.get(map_name)
+        if current is None:
+            best[map_name] = (path, meta)
+            continue
+        try:
+            current_rating = float(current[1].get("rating", 0))
+        except (TypeError, ValueError):
+            current_rating = 0.0
+        if rating > current_rating or (rating == current_rating and path < current[0]):
+            best[map_name] = (path, meta)
+    return sorted(
+        best.values(),
+        key=lambda item: (str(item[1].get("map", "")).casefold(), item[0]),
+    )
+
+
+def _prune_queue(cards: list[str]) -> list[str]:
+    groups: dict[str, list[tuple[str, dict]]] = {}
+    passthrough: list[str] = []
+    for path in cards:
+        full = ROOT / path
+        try:
+            meta = json.loads(full.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            passthrough.append(path)
+            continue
+        group = str(meta.get("hltv_url", "")).strip() or str(full.parent.parent)
+        groups.setdefault(group, []).append((path, meta))
+    selected = [
+        path
+        for group in groups.values()
+        for path, _ in select_highest_per_map(group)
+    ]
+    return passthrough + selected
+
+
+def sort_card_records(cards: list[tuple[str, dict]]) -> list[str]:
+    """Order queued cards by rating descending, then path."""
+    def rating(record: tuple[str, dict]) -> float:
+        try:
+            return float(record[1].get("rating", 0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    return [
+        path for path, _ in sorted(cards, key=lambda item: (-rating(item), item[0]))
+    ]
+
+
+def _sort_queue(cards: list[str]) -> list[str]:
+    records: list[tuple[str, dict]] = []
+    passthrough: list[str] = []
+    for path in cards:
+        try:
+            meta = json.loads((ROOT / path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            passthrough.append(path)
+            continue
+        records.append((path, meta))
+    return sort_card_records(records) + passthrough
 
 
 def _child_env() -> dict[str, str]:
@@ -222,6 +319,7 @@ def _enqueue(state: State, cards: list[str]) -> None:
         if card not in queued:
             state.data["queue"].append(card)
             queued.add(card)
+    state.data["queue"] = _sort_queue(state.data["queue"])
 
 
 def _run_backlog(match: Match, dry_run: bool, retries: int = 3) -> bool:
@@ -239,6 +337,27 @@ def _run_backlog(match: Match, dry_run: bool, retries: int = 3) -> bool:
             print(f"[backlog] failed; retrying in {delay}s", flush=True)
             time.sleep(delay)
     return False
+
+
+def _run_short_extraction(match: Match, dry_run: bool) -> bool:
+    """Extract Shorts timelines for every demo in a newly acquired match."""
+    demo_dir = ROOT / "demos" / "hltv" / match_slug_from_url(match.url)
+    demos = sorted(demo_dir.glob("*.dem"))
+    if dry_run:
+        print(f"[shorts] would extract {len(demos)} demo(s) for {match.match_id}",
+              flush=True)
+        return True
+    if not demos:
+        print(f"[shorts] no demos available for {match.match_id}", flush=True)
+        return False
+    script = ROOT / "scripts" / "shorts" / "build_short_timeline.py"
+    for demo in demos:
+        cmd = [sys.executable, str(script), str(demo)]
+        print(f"[shorts] extracting: {' '.join(cmd)}", flush=True)
+        if subprocess.run(cmd, cwd=ROOT, env=_child_env()).returncode != 0:
+            print(f"[shorts] extraction failed: {demo.name}", flush=True)
+            return False
+    return True
 
 
 def _run_pipeline(card: str, dry_run: bool) -> bool:
@@ -294,7 +413,10 @@ async def poll_once(args, state: State) -> None:
         results_html = await asyncio.to_thread(fetch_hltv_page_html, results_url,
                                                 headless=True, wait_selector=None)
         result_links.extend(parse_match_links(results_html))
-    matches = select_matches(result_links, event_ids, state.data["teams"])
+    event_slug = event_url.rstrip("/").rsplit("/", 1)[-1]
+    event_name = re.sub(r"[-_]+", " ", event_slug).casefold()
+    matches = select_matches(result_links, event_ids, state.data["teams"],
+                             event_name)
     matches = list({match.match_id: match for match in matches}.values())
     print(f"[poll] {len(matches)} notable completed event match(es)", flush=True)
 
@@ -304,6 +426,14 @@ async def poll_once(args, state: State) -> None:
             "attempts": 0, "last_error": None,
         })
         if record["status"] in {"queued", "running", "completed"}:
+            if record.get("shorts_status") != "completed":
+                if _run_short_extraction(match, args.dry_run):
+                    record["shorts_status"] = "completed"
+                    record["shorts_error"] = None
+                else:
+                    record["shorts_status"] = "retry"
+                    record["shorts_error"] = "short extraction failed"
+                state.save()
             continue
         if not _retry_ready(record):
             continue
@@ -324,6 +454,13 @@ async def poll_once(args, state: State) -> None:
             _schedule_retry(record, "create_backlog failed")
             state.save()
             continue
+        if record.get("shorts_status") != "completed":
+            if _run_short_extraction(match, args.dry_run):
+                record["shorts_status"] = "completed"
+                record["shorts_error"] = None
+            else:
+                record["shorts_status"] = "retry"
+                record["shorts_error"] = "short extraction failed"
         _enqueue(state, cards)
         record["status"] = "queued"
         record["cards"] = cards
