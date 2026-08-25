@@ -255,7 +255,7 @@ def main() -> None:
 
 def _read_meta(meta_path: Path) -> dict:
     try:
-        return json.loads(meta_path.read_text(encoding="utf-8"))
+        return json.loads(meta_path.read_text(encoding="utf-8-sig"))
     except Exception:
         return {}
 
@@ -264,7 +264,8 @@ def _write_meta(meta_path: Path, **fields) -> None:
     try:
         meta = _read_meta(meta_path)
         meta.update(fields)
-        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")  # no BOM
+
     except Exception as exc:
         print(f"  [meta] write warn: {exc}", flush=True)
 
@@ -297,6 +298,17 @@ def _run_tiktok(
         run_schedule_flow as run_tiktok_schedule_flow,
     )
     profile_dir = _UTIL_ROOT / DEFAULT_TIKTOK_PROFILE_DIR
+    # preflight: fail fast if not logged in instead of hanging on upload
+    try:
+        from social_session_check import check_tiktok
+        ok, msg = check_tiktok(profile_dir)
+        if not ok:
+            print(f"  [tiktok] {msg}", flush=True)
+            print("  [tiktok] skipping — fix login then re-run upload_pending_shorts", flush=True)
+            return
+        print(f"  [tiktok] preflight OK: {msg}", flush=True)
+    except Exception as e:
+        print(f"  [tiktok] preflight warn (continuing): {e}", flush=True)
     print("Scheduling TikTok...", flush=True)
     run_tiktok_schedule_flow(
         video_path=video,
@@ -338,6 +350,17 @@ def _run_instagram(
         run_schedule_flow as run_instagram_schedule_flow,
     )
     profile_dir = _UTIL_ROOT / DEFAULT_INSTAGRAM_PROFILE_DIR
+    # preflight: fail fast if Business Suite not logged in
+    try:
+        from social_session_check import check_instagram
+        ok, msg = check_instagram(profile_dir)
+        if not ok:
+            print(f"  [instagram] {msg}", flush=True)
+            print("  [instagram] skipping — fix login then re-run upload_pending_shorts", flush=True)
+            return
+        print(f"  [instagram] preflight OK: {msg}", flush=True)
+    except Exception as e:
+        print(f"  [instagram] preflight warn (continuing): {e}", flush=True)
     print("Scheduling Instagram Reel...", flush=True)
     run_instagram_schedule_flow(
         video_path=video,

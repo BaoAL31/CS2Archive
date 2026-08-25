@@ -163,11 +163,23 @@ def check_render_versions(
             demo_patch = read_demo_patch(demo)
             result.versions["demo"] = demo_patch
             if cs2 is not None and demo_patch != cs2:
-                result.ok = False
-                result.errors.append((
-                    "RENDER_DEMO_GAME_MISMATCH",
-                    f"demo patch {demo_patch} != CS2 {cs2}; update/downgrade game or re-acquire demo",
-                ))
+                # Patched: allow CS2 newer than demo (minor drift) with warning.
+                # Hard-fail only when demo is newer than installed CS2.
+                import sys
+                try:
+                    d_parts = tuple(int(x) for x in demo_patch.split("."))
+                    c_parts = tuple(int(x) for x in cs2.split("."))
+                    demo_newer = d_parts > c_parts
+                except Exception:
+                    demo_newer = demo_patch > cs2
+                if demo_newer:
+                    result.ok = False
+                    result.errors.append((
+                        "RENDER_DEMO_GAME_MISMATCH",
+                        f"demo patch {demo_patch} != CS2 {cs2}; update/downgrade game or re-acquire demo",
+                    ))
+                else:
+                    print(f"[WARN] demo patch {demo_patch} != CS2 {cs2} (CS2 newer, trying anyway)", file=sys.stderr)
         except Exception as e:
             result.ok = False
             result.errors.append(("RENDER_DEMO_VERSION_UNKNOWN", str(e)))

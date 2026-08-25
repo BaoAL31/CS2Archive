@@ -18,8 +18,9 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+for _p in (str(PROJECT_ROOT), str(PROJECT_ROOT / "scripts")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 os.chdir(str(PROJECT_ROOT))
 
 # Redirect HuggingFace cache to D: drive (must be set before importing huggingface_hub)
@@ -40,11 +41,9 @@ REQUIRED_META_FIELDS = [
 
 
 def get_priority(rating: float) -> str:
-    if rating >= 1.5:
-        return "high"
-    elif rating >= 1.0:
-        return "medium"
-    return "low"
+    """HLTV priority bucket (shared thresholds; HLTV folders use 'medium')."""
+    from _backlog_common import rating_bucket
+    return rating_bucket(rating, mid_name="medium", unknown="medium")
 
 
 def _resolve_demo_for_map(match_slug: str, map_name: str) -> Path:
@@ -99,15 +98,9 @@ def _resolve_steam_id(nickname: str, demo_steamids: dict[str, str] | None = None
 
 
 def _existing_avatar_path(nickname: str) -> str:
-    name = nickname.strip().lower()
-    for source in ("hltv", "faceit"):
-        folder = PROJECT_ROOT / "demos" / "avatars" / name / source
-        if folder.is_dir():
-            for ext in (".png", ".jpg", ".jpeg"):
-                p = folder / f"{name}{ext}"
-                if p.exists():
-                    return str(p.relative_to(PROJECT_ROOT)).replace("\\", "/")
-    return ""
+    """Cached avatar lookup — shared implementation in _backlog_common."""
+    from _backlog_common import find_avatar
+    return find_avatar(nickname)
 
 
 def _ensure_player_account(nickname: str, steam_id: str) -> None:
@@ -333,10 +326,37 @@ with CloakAvatarFetcher(headless=False) as fetcher:
 
 async def main() -> None:
     if len(sys.argv) < 2:
-        print(f"Usage: python {sys.argv[0]} <hltv_url>")
+        print(f"Usage: python {sys.argv[0]} <hltv_url | demos/faceit/<demo>.dem>")
         sys.exit(1)
 
-    match_url = sys.argv[1]
+    arg = sys.argv[1]
+
+    # Unified dispatcher: a .dem file routes to the FACEIT flow, an URL to
+    # the HLTV match flow.
+    from _backlog_common import detect_demo_source
+    source = detect_demo_source(arg)
+    if source == "faceit":
+        sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+        from scripts.faceit.create_faceit_match_backlog import run as run_faceit
+        demo = Path(arg).resolve()
+        print(f"[DETECT] FACEIT demo -> create_faceit_match_backlog.run({demo.name})")
+        extra = sys.argv[2:]
+        import argparse as _ap
+        ns = _ap.ArgumentParser()
+        ns.add_argument("--map", default=""); ns.add_argument("--tournament", default="")
+        ns.add_argument("--match-id", default=""); ns.add_argument("--no-elo", action="store_true")
+        ns.add_argument("--no-shorts", action="store_true")
+        opts, _unknown = ns.parse_known_args(extra)
+        run_faceit(demo, map_override=opts.map, tournament=opts.tournament,
+                   match_id_arg=opts.match_id, no_elo=opts.no_elo,
+                   no_shorts=opts.no_shorts)
+        return
+    if source == "hltv":
+        print("[ERR] HLTV .dem path given but the HLTV flow needs the match URL "
+              "(ratings scrape). Pass the hltv.org match URL instead.")
+        sys.exit(1)
+
+    match_url = arg
 
     from scrapers.hltv_acquire import match_slug_from_url, match_demo_dir
     from scrapers.ratings import get_match_ratings

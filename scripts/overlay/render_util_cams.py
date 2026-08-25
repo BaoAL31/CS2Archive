@@ -58,6 +58,15 @@ from scripts.render.batch_csdm import (
 from scripts.render.paths import util_render_slug, clip_name_for_cameras
 from scripts.build_player_manifest import build_manifest
 
+# Pip render sizing depends on displayed pip geometry (video_height + max simultaneous)
+try:
+    from overlay._common import pip_render_dimensions, PIP_MAX_SIMULTANEOUS as _DEFAULT_PIP_MAX
+    _HAS_PIP_SIZING = True
+except Exception:
+    pip_render_dimensions = None  # type: ignore
+    _DEFAULT_PIP_MAX = 3
+    _HAS_PIP_SIZING = False
+
 
 # ---------------------------------------------------------------------------
 # Phase 1: PREP — create util_cam dirs + _throw_poses.json
@@ -414,6 +423,34 @@ def _resolve_throws_parquet(
     return None, None
 
 
+def _pip_render_size(
+    video_height: int | None = None,
+    pip_max: int | None = None,
+    pip_width: int | None = None,
+    pip_height: int | None = None,
+    supersample: float = 1.0,
+) -> tuple[int, int]:
+    """Resolve pip 16:9 render dimensions.
+
+    Explicit pip_width/pip_height win (even-rounded). Otherwise derive from
+    displayed pip geometry so render res tracks PIP_MAX_SIMULTANEOUS. Only
+    used for pip rendering — main POV stays at 2560x1440.
+    """
+    if pip_width and pip_height:
+        w, h = int(pip_width), int(pip_height)
+        if w % 2 == 1:
+            w += 1
+        if h % 2 == 1:
+            h += 1
+        return w, h
+    if _HAS_PIP_SIZING and pip_render_dimensions is not None:
+        vh = int(video_height) if video_height else 1440
+        pm = int(pip_max) if pip_max is not None else _DEFAULT_PIP_MAX
+        return pip_render_dimensions(vh, pm, supersample=supersample)
+    # Fallback pre-patch default (pip waste): 1920x1080
+    return 1920, 1080
+
+
 def _render_util_cams(
     util_cams_root: Path,
     data_dir: Path,
@@ -422,6 +459,11 @@ def _render_util_cams(
     debug: bool,
     demo_id: str | None = None,
     demos_dir: Path | None = None,
+    pip_width: int | None = None,
+    pip_height: int | None = None,
+    video_height: int | None = None,
+    pip_max: int | None = None,
+    pip_supersample: float = 1.0,
 ) -> int:
     """Render util_cam dirs needing render via CS2UtilArchive render_spot_batch.
 
@@ -477,6 +519,8 @@ def _render_util_cams(
     for d in by_demo:
         by_demo[d].sort(key=lambda e: int(e.job["throw_tick"]))
 
+    rw, rh = _pip_render_size(video_height, pip_max, pip_width, pip_height, pip_supersample)
+    print(f"[render] pip render size {rw}x{rh} (video_height={video_height or 1440} pip_max={pip_max if pip_max is not None else _DEFAULT_PIP_MAX} supersample={pip_supersample:.2f})")
     options = BatchRenderOptions(
         data_dir=str(data_dir),
         demos_dir=str(demos_dir),
@@ -486,8 +530,13 @@ def _render_util_cams(
         dry_run=dry_run,
         render_profile="catalog",
         debug=debug,
-        # Per-job cameras field drives actual selection; this is the max set.
-        camera_types=("throw", "flight", "orbit", "victims"),
+        # Pip overlay only needs flight/detonate — victims are showcase-only and
+        # cause 1-tick zero-length batches (e.g. 192833) that kill the 40-spot batch.
+        # Disable victims for pip to allow partial finalize (56/56 flights succeed).
+        camera_types=("throw", "flight", "orbit"),
+        max_victim_povs=0,
+        width=rw,
+        height=rh,
     )
 
     work_dir = util_cams_root / "_batch_workdir"
@@ -588,6 +637,17 @@ def main() -> int:
                     help="Enable per-batch debug.log (CS2UtilArchive side)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Build jobs but don't render")
+    # Pip-only resolution (16:9). Explicit W/H win; otherwise auto from pip geometry.
+    ap.add_argument("--pip-width", type=int, default=None,
+                    help="Pip render width (explicit, even). Overrides auto.")
+    ap.add_argument("--pip-height", type=int, default=None,
+                    help="Pip render height (explicit, even). Overrides auto.")
+    ap.add_argument("--video-height", type=int, default=None,
+                    help="Final POV video height for pip sizing (default 1440).")
+    ap.add_argument("--pip-max", type=int, default=None,
+                    help="Max simultaneous PiPs for sizing (default PIP_MAX_SIMULTANEOUS=3).")
+    ap.add_argument("--pip-supersample", type=float, default=1.0,
+                    help="Supersample multiplier on displayed inner size (default 1.0 = 1:1, 1.2 = 20%% oversample for Lanczos).")
     args = ap.parse_args()
 
     if args.prepare_only and args.render_only:
@@ -615,9 +675,12 @@ def main() -> int:
     if args.prepare_only:
         return 0
 
-    # Phase 2: RENDER
+    # Phase 2: RENDER (pip resolution auto from displayed pip size)
     return _render_util_cams(
         util_cams_root, data_dir, args.chunk_size, args.dry_run, args.debug, args.demo_id, demos_dir,
+        pip_width=args.pip_width, pip_height=args.pip_height,
+        video_height=args.video_height, pip_max=args.pip_max,
+        pip_supersample=args.pip_supersample,
     )
 
 

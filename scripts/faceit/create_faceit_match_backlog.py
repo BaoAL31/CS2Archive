@@ -43,9 +43,14 @@ ensure()
 
 from faceit_names import avatar_path  # noqa: E402
 from create_faceit_backlog import _match_elo  # noqa: E402
+from _backlog_common import (  # noqa: E402
+    load_accounts_by_steam,
+    rating_bucket,
+    write_card,
+    rel_to_project,
+)
 
 BACKLOG_DIR = PROJECT_ROOT / "backlog" / "faceit"
-ACCOUNTS_PATH = PROJECT_ROOT / ".data" / "player_accounts.json"
 CSDM = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
 TMP_DIR = PROJECT_ROOT / "tmp"
 TMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -85,17 +90,20 @@ def _match_slug(demo: Path, match_id: str = "") -> str:
 
 
 def _load_accounts() -> dict[str, dict]:
-    """steam_id_64 -> account record for every Recognised Pro."""
-    if not ACCOUNTS_PATH.exists():
-        return {}
-    data = json.loads(ACCOUNTS_PATH.read_text(encoding="utf-8"))
-    players = data if isinstance(data, list) else data.get("players", [])
-    out: dict[str, dict] = {}
-    for p in players:
-        sid = str(p.get("steam_id") or "").strip()
-        if sid:
-            out[sid] = p
-    return out
+    """steam_id_64 -> account record for every Recognised Pro (shared)."""
+    return load_accounts_by_steam()
+
+
+def _elo_sync(demo: Path, steam_id: str) -> dict | None:
+    """Run the async ELO fetch whether or not a loop is already running
+    (unified dispatcher enters via async main; standalone entry does not)."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_match_elo(demo, steam_id))
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(asyncio.run, _match_elo(demo, steam_id)).result()
 
 
 def _csdm_json(demo: Path) -> dict:
@@ -119,23 +127,17 @@ def _csdm_json(demo: Path) -> dict:
         return json.loads(files[0].read_text(encoding="utf-8"))
 
 
+def priority_from_rating(rating: float | None) -> str:
+    """Priority bucket from the in-match rating (shared thresholds in
+    _backlog_common.rating_bucket; FACEIT buckets are high/mid/low and an
+    unknown rating queues mid)."""
+    return rating_bucket(rating, mid_name="mid", unknown="mid")
+
+
 def _round2(value) -> float | None:
     if isinstance(value, (int, float)) and value == value:  # skip NaN
         return round(float(value), 2)
     return None
-
-
-def priority_from_rating(rating: float | None) -> str:
-    """Priority bucket from the in-match rating — mirrors HLTV get_priority
-    thresholds but uses the faceit flow's bucket names (high/mid/low,
-    matching create_faceit_backlog.py --priority choices)."""
-    if rating is None:
-        return "mid"  # unknown performance -> middle of the queue
-    if rating >= 1.5:
-        return "high"
-    if rating >= 1.0:
-        return "mid"
-    return "low"
 
 
 def _write_card(pro: dict, *, demo: Path, map_name: str, match_slug: str,
@@ -146,15 +148,12 @@ def _write_card(pro: dict, *, demo: Path, map_name: str, match_slug: str,
     match_date = match_date_for_demo(demo, match_date)
     player_key = re.sub(r"[^a-z0-9]+", "-", pro["canonical_nick"].lower()).strip("-")
     slug = f"{player_key}-{map_name.lower()}-{match_slug}"
-    backlog_dir = faceit_backlog_dir(BACKLOG_DIR, match_date, priority)
+    backlog_dir = faceit_backlog_dir(BACKLOG_DIR.parent, match_date, priority)
     backlog_dir.mkdir(parents=True, exist_ok=True)
     backlog_file = backlog_dir / f"{slug}.json"
 
     av_path = avatar_path(pro["canonical_nick"])
-    try:
-        demo_rel = str(demo.relative_to(PROJECT_ROOT)).replace("\\", "/")
-    except ValueError:
-        demo_rel = str(demo).replace("\\", "/")
+    demo_rel = rel_to_project(demo)
 
     meta = {
         "player": pro["canonical_nick"],
@@ -179,25 +178,16 @@ def _write_card(pro: dict, *, demo: Path, map_name: str, match_slug: str,
             f'scripts/pov/pipeline.py --backlog backlog/faceit/{match_date}/{priority}/{slug}.json --overlay-only'
         ),
     }
-    backlog_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    write_card(meta, backlog_file)
     return backlog_file
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("demo_path", help="Path to the FACEIT .dem (e.g. demos/faceit/...)")
-    ap.add_argument("--map", default="", help="Override map name (defaults to csdm mapName)")
-    ap.add_argument("--tournament", default="", help="Event name (defaults to 'FACEIT')")
-    ap.add_argument("--match-id", default="", help="FACEIT match id for run_id (defaults to demo stem)")
-    ap.add_argument("--no-elo", action="store_true",
-                    help="Skip FACEIT ELO fetch (title/thumbnail then omit the ELO line)")
-    args = ap.parse_args()
-
-    demo = Path(args.demo_path).resolve()
-    if not demo.exists():
-        print(f"[ERR] demo not found: {demo}")
-        sys.exit(1)
-
+def run(demo: Path, *, map_override: str = "", tournament: str = "",
+        match_id_arg: str = "", no_elo: bool = False,
+        no_shorts: bool = False) -> list[Path]:
+    """Full FACEIT flow: analyze demo -> one card per Recognised Pro
+    (+ optional shorts extraction). Callable entry used by the unified
+    create_backlog.py dispatcher."""
     print(f"[FACEIT] Analyzing {demo.name} (csdm json) ...")
     try:
         data = _csdm_json(demo)
@@ -210,10 +200,10 @@ def main() -> None:
         print("[ERR] No Recognised Pros in .data/player_accounts.json")
         sys.exit(1)
 
-    map_name = args.map or _map_display(data.get("mapName", ""))
-    match_id = args.match_id.strip() or demo.stem
-    match_slug = _match_slug(demo, args.match_id)
-    tournament = args.tournament.strip() or "FACEIT"
+    map_name = map_override or _map_display(data.get("mapName", ""))
+    match_id = match_id_arg.strip() or demo.stem
+    match_slug = _match_slug(demo, match_id_arg)
+    tournament = tournament.strip() or "FACEIT"
 
     # Recognised Pros only: match demo players to accounts by steam_id_64
     # (canonical nick + faceit id come from the account record, not the demo).
@@ -253,13 +243,13 @@ def main() -> None:
     pros.sort(key=lambda x: (x["rating"] if x["rating"] is not None else -1), reverse=True)
 
     # Per-pro ELO for the POV player + opposing-team average (title/thumbnail).
-    if args.no_elo:
+    if no_elo:
         elo_by_pro: dict[str, dict] = {}
     else:
         print("[FACEIT] Fetching ELOs (POV player + opposing-team average)...")
         elo_by_pro = {}
         for pro in pros:
-            ef = asyncio.run(_match_elo(demo, pro["steam_id"]))
+            ef = _elo_sync(demo, pro["steam_id"])
             if ef:
                 elo_by_pro[pro["steam_id"]] = ef
                 print(f"  [ELO] {pro['canonical_nick']:12s} "
@@ -284,6 +274,64 @@ def main() -> None:
     if missing_avatars:
         print(f"  [HINT] No cached avatar for: {', '.join(missing_avatars)}")
         print(f"         Fetch with: python scripts/faceit/faceit_avatar.py <nick>")
+
+    # Shorts extraction (same pass over the demo): Recognised-Pros-gated,
+    # one short_timeline.json per detected short under renders/shorts/shorts-{stem}/.
+    if no_shorts:
+        return written
+    try:
+        from shorts.build_short_timeline import build_short_timeline, _build_short_slug
+        from shorts import resolve_output_dir
+
+        print("[SHORTS] Extracting short timelines (Recognised Pros only)...")
+        timeline = build_short_timeline(demo, pros_only=True)
+        dropped = timeline.get("_dropped_randos", 0)
+        shorts_list = timeline.get("shorts", [])
+        if not shorts_list:
+            suffix = f" ({dropped} non-pro short(s) filtered)" if dropped else ""
+            print(f"[SHORTS] 0 shorts detected{suffix}")
+            return written
+        base_dir = resolve_output_dir(demo)
+        written_shorts = 0
+        for short in shorts_list:
+            slug = _build_short_slug(short)
+            short_dir = base_dir / f"shorts-{slug}"
+            short_dir.mkdir(parents=True, exist_ok=True)
+            single_tl = {k: v for k, v in timeline.items() if k != "_dropped_randos"}
+            single_tl["short_count"] = 1
+            single_tl["shorts"] = [short]
+            (short_dir / "short_timeline.json").write_text(
+                json.dumps(single_tl, indent=2), encoding="utf-8")
+            written_shorts += 1
+        print(f"[SHORTS] {len(shorts_list)} shorts -> {written_shorts} files under "
+              f"{base_dir.relative_to(PROJECT_ROOT).as_posix()}"
+              + (f" ({dropped} non-pro short(s) filtered)" if dropped else ""))
+    except Exception as e:
+        print(f"[WARN] Shorts extraction failed (backlog cards unaffected): "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+    return written
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("demo_path", help="Path to the FACEIT .dem (e.g. demos/faceit/...)")
+    ap.add_argument("--map", default="", help="Override map name (defaults to csdm mapName)")
+    ap.add_argument("--tournament", default="", help="Event name (defaults to 'FACEIT')")
+    ap.add_argument("--match-id", default="", help="FACEIT match id for run_id (defaults to demo stem)")
+    ap.add_argument("--no-elo", action="store_true",
+                    help="Skip FACEIT ELO fetch (title/thumbnail then omit the ELO line)")
+    ap.add_argument("--no-shorts", action="store_true",
+                    help="Skip short-timeline extraction (default: extracts shorts "
+                         "for Recognised Pros right after the backlog cards)")
+    args = ap.parse_args()
+
+    demo = Path(args.demo_path).resolve()
+    if not demo.exists():
+        print(f"[ERR] demo not found: {demo}")
+        sys.exit(1)
+
+    run(demo, map_override=args.map, tournament=args.tournament,
+        match_id_arg=args.match_id, no_elo=args.no_elo, no_shorts=args.no_shorts)
 
 
 if __name__ == "__main__":

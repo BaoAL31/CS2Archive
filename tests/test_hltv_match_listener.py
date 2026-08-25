@@ -6,6 +6,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from hltv.match_listener import (
     State,
+    Match,
+    initialize_result_baseline,
+    _actionable_matches,
     select_highest_per_map,
     sort_card_records,
     parse_event_match_ids,
@@ -109,3 +112,18 @@ def test_queue_sorts_by_rating_descending():
         "backlog/donk.json",
         "backlog/low.json",
     ]
+
+
+def test_baseline_skips_existing_results_but_allows_later_ids(tmp_path: Path):
+    state = State(tmp_path / "listener.json")
+    existing = Match("100", "https://hltv/matches/100/alpha-vs-beta",
+                     "alpha-vs-beta", "alpha", "beta")
+    later = Match("101", "https://hltv/matches/101/gamma-vs-delta",
+                  "gamma-vs-delta", "gamma", "delta")
+    initialize_result_baseline(state, [existing])
+    assert _actionable_matches(state, [existing]) == []
+    state.data["result_baseline_ids"].append("101")
+    assert _actionable_matches(state, [later]) == []
+    unseen = Match("102", "https://hltv/matches/102/epsilon-vs-zeta",
+                   "epsilon-vs-zeta", "epsilon", "zeta")
+    assert [m.match_id for m in _actionable_matches(state, [unseen])] == ["102"]

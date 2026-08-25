@@ -40,10 +40,11 @@ except ImportError:
 
 
 DEFAULT_MODEL = "mimo-v2.5-free"
-FALLBACK_MODEL = "deepseek-v4-flash-free"
 ZEN_BASE_URL = "https://opencode.ai/zen/v1"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_FALLBACK_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+NVIDIA_FALLBACK_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"
 
 
 def _is_faceit_demo(path: Path) -> bool:
@@ -357,21 +358,27 @@ def _try_model(
     label: str,
     msg: str,
     retries: int = 3,
+    json_mode: bool = True,
+    extra_body: dict | None = None,
 ) -> str | None:
     import time
     for attempt in range(retries):
         try:
-            resp = client.chat.completions.create(
-                model=mdl,
-                messages=[
+            kwargs: dict = {
+                "model": mdl,
+                "messages": [
                     {"role": "system", "content": ZEN_SYS_MSG},
                     {"role": "user", "content": msg},
                 ],
-                temperature=0.0,
-                response_format={"type": "json_object"},
-                max_tokens=16384,
-                timeout=600,
-            )
+                "temperature": 0.0,
+                "max_tokens": 100000,
+                "timeout": 600,
+            }
+            if json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+            if extra_body:
+                kwargs["extra_body"] = extra_body
+            resp = client.chat.completions.create(**kwargs)
             return resp.choices[0].message.content.strip()
         except Exception as e:
             delay = min(5 * (2 ** attempt), 30)
@@ -380,35 +387,69 @@ def _try_model(
     return None
 
 
+def _strip_to_json(text: str) -> str:
+    """Best-effort extraction of a JSON object from raw LLM output.
+
+    Handles <think>...</think> wrappers, markdown fences, and prose around
+    the object."""
+    import re
+    s = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s, flags=re.MULTILINE).strip()
+    if s.startswith("{"):
+        return s
+    first, last = s.find("{"), s.rfind("}")
+    if first != -1 and last > first:
+        return s[first:last + 1]
+    return s
+
+
+def _normalize_segments(batch_segments: list[dict], local_kills: list[dict]) -> list[dict]:
+    """Fill missing required fields with deterministic defaults.
+
+    LLM occasionally drops end_tick/start_tick or string fields; downstream
+    shaping indexes them unguarded. Defaults derive from the segment's own
+    kill ticks (mirrors the fallback used by _synthesize_* helpers)."""
+    for seg in batch_segments:
+        if not isinstance(seg, dict):
+            continue
+        kis = [i for i in seg.get("kill_indices", []) or [] if isinstance(i, int)]
+        ticks = [local_kills[i]["tick"] for i in kis if 0 <= i < len(local_kills)]
+        if "start_tick" not in seg or seg.get("start_tick") is None:
+            seg["start_tick"] = ticks[0] if ticks else 0
+        if "end_tick" not in seg or seg.get("end_tick") is None:
+            seg["end_tick"] = ticks[-1] if ticks else seg["start_tick"]
+    return batch_segments
+
+
 def _call_llm(prompt: str, model: str = DEFAULT_MODEL, retries: int = 3) -> str:
     if openai is None:
         raise RuntimeError("openai package not installed. pip install openai")
 
-    zen_key = os.getenv("ZEN_API_KEY")
+    nv_key = os.getenv("NVIDIA_API_KEY")
     or_key = os.getenv("OPENROUTER_API_KEY")
 
-    zen_client = openai.OpenAI(base_url=ZEN_BASE_URL, api_key=zen_key) if zen_key else None
+    nv_client = openai.OpenAI(base_url=NVIDIA_BASE_URL, api_key=nv_key) if nv_key else None
     or_client = openai.OpenAI(base_url=OPENROUTER_BASE_URL, api_key=or_key) if or_key else None
 
-    if zen_client:
-        result = _try_model(zen_client, model, f"zen/{model}", prompt, retries)
-        if result is not None:
-            return result
-
-    if zen_client and model != FALLBACK_MODEL:
-        print(f"[INFO] Zen primary failed, trying fallback {FALLBACK_MODEL}...", file=sys.stderr)
-        result = _try_model(zen_client, FALLBACK_MODEL, f"zen/{FALLBACK_MODEL}", prompt, retries)
+    if nv_client:
+        # enable_thinking=False: thinking shares the max_tokens budget and starves
+        # the JSON answer -> empty content. Off = fast + reliable JSON.
+        result = _try_model(
+            nv_client, NVIDIA_FALLBACK_MODEL, "nvidia/nemotron", prompt, retries,
+            json_mode=False,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        )
         if result is not None:
             return result
 
     if or_client:
-        print(f"[INFO] Zen models failed, trying OpenRouter fallback {OPENROUTER_FALLBACK_MODEL}...", file=sys.stderr)
+        print(f"[INFO] NVIDIA failed, trying OpenRouter fallback {OPENROUTER_FALLBACK_MODEL}...", file=sys.stderr)
         result = _try_model(or_client, OPENROUTER_FALLBACK_MODEL, "openrouter/nemotron", prompt, retries)
         if result is not None:
             return result
 
     raise RuntimeError(
-        f"All models failed: Zen ({model}, {FALLBACK_MODEL}) and OpenRouter ({OPENROUTER_FALLBACK_MODEL})"
+        f"All models failed: NVIDIA ({NVIDIA_FALLBACK_MODEL}) and OpenRouter ({OPENROUTER_FALLBACK_MODEL})"
     )
 
 
@@ -1570,14 +1611,18 @@ def build_edit_timeline(
 
             prompt = _build_batch_prompt(batch, action_timeline, players, hints=last_errors)
 
+            llm_output = _call_llm(prompt, model=model, retries=2)
             try:
-                llm_output = _call_llm(prompt, model=model, retries=2)
-                batch_result = json.loads(llm_output)
-            except (json.JSONDecodeError, RuntimeError) as e:
-                print(f"[WARN] Batch {bi+1} failed ({e}), skipping", file=sys.stderr)
-                continue
+                batch_result = json.loads(_strip_to_json(llm_output))
+            except json.JSONDecodeError as e:
+                print(
+                    f"[ERROR] Batch {bi+1} returned non-JSON ({e}). "
+                    f"First 500 chars:\n{llm_output[:500]}",
+                    file=sys.stderr,
+                )
+                raise
 
-            batch_segments = batch_result.get("segments", [])
+            batch_segments = _normalize_segments(batch_result.get("segments", []), batch["kills"])
 
             # Remap local kill indices -> global indices
             global_indices = batch["global_kill_indices"]

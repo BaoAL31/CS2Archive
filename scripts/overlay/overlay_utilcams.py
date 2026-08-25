@@ -20,6 +20,8 @@ from overlay._common import (
     TICKRATE,
     _log,
     _probe_clip_duration_seconds,
+    PIP_MAX_SIMULTANEOUS,
+    pip_render_dimensions,
 )
 from scripts.render.paths import clip_name_for_cameras, util_render_slug
 
@@ -255,6 +257,11 @@ def _run_batch_util_cams_subprocess(
     util_cams_root: Path,
     chunk_size: int = 0,
     demo_data_dir_name: str | None = None,
+    video_height: int | None = None,
+    pip_max: int | None = None,
+    pip_supersample: float = 1.0,
+    pip_width: int | None = None,
+    pip_height: int | None = None,
 ) -> int:
     """Shell out to scripts/overlay/render_util_cams.py for util_cam prep + render.
 
@@ -275,19 +282,35 @@ def _run_batch_util_cams_subprocess(
         demo_id = demo_data_dir_name[len("demo="):]
     elif data_dir and data_dir.name.startswith("demo="):
         demo_id = data_dir.name[len("demo="):]
+    # Pip render size derived from displayed pip geometry (video_height + max simultaneous).
+    # Explicit pip_width/height win; otherwise auto from pip_render_dimensions.
+    if pip_width is not None and pip_height is not None:
+        rw, rh = int(pip_width), int(pip_height)
+    else:
+        vh = int(video_height) if video_height else 1440
+        pm = int(pip_max) if pip_max is not None else PIP_MAX_SIMULTANEOUS
+        rw, rh = pip_render_dimensions(vh, pm, supersample=float(pip_supersample))
     cmd = [
         sys.executable, str(script_path),
         "--util-cams-root", str(util_cams_root.resolve()),
         "--data-dir", str(data_dir.resolve()),
         "--steamid", str(steam_id),
         "--chunk-size", str(chunk_size),
+        "--pip-width", str(rw),
+        "--pip-height", str(rh),
+        "--video-height", str(int(video_height) if video_height else 1440),
     ]
+    if pip_max is not None:
+        cmd += ["--pip-max", str(int(pip_max))]
+    # Keep supersample in log but already baked into rw/rh; forward for debug
+    if float(pip_supersample) != 1.0:
+        cmd += ["--pip-supersample", str(float(pip_supersample))]
     if demo_id:
         cmd += ["--demo-id", demo_id]
     # Derive demos_dir from CS2UtilArchive project root
     demos_dir = _CS2UTIL_ROOT / "demos" / "extracted"
     cmd += ["--demos-dir", str(demos_dir.resolve())]
-    _log(f"  [flight] CMD: {' '.join(cmd)}")
+    _log(f"  [flight] CMD: {' '.join(cmd)} (pip {rw}x{rh})")
     try:
         result = subprocess.run(
             cmd, cwd=str(util_cams_root.parent.parent.parent),
@@ -540,12 +563,23 @@ def _render_throw_flight_clips(
         # batch_util_cams.py expects the PARENT (containing demo=* subdirs).
         # Pass both: parent to the subprocess, leaf to extract --demo-id.
         data_dir_parent = data_dir.parent
+        # Probe actual video height so pip sizing matches the rendered POV (1440 default).
+        _vh: int | None = None
+        if video_path is not None and video_path.is_file():
+            try:
+                import subprocess as _sp, json as _js
+                _r = _sp.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=height", "-of", "json", str(video_path)], capture_output=True, text=True, timeout=10)
+                _vh = int(_js.loads(_r.stdout)["streams"][0]["height"])
+            except Exception:
+                _vh = None
+        # Derive height from frame_count/fps fallback not needed; pip size uses vh.
         rc = _run_batch_util_cams_subprocess(
             demo_path=demo_path,
             steam_id=steam_id,
             data_dir=data_dir_parent,
             util_cams_root=util_cams_root,
             demo_data_dir_name=data_dir.name,
+            video_height=_vh,
         )
         if rc != 0:
             _log(f"  [flight] batch render FAILED (rc={rc}) — aborting flight clips")

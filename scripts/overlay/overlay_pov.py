@@ -49,6 +49,14 @@ from overlay._common import (
     TICKRATE,
     _log,
     _probe_clip_duration_seconds,
+    PIP_OUTLINE_THICKNESS,
+    PIP_CORNER_RADIUS,
+    PIP_MARGIN,
+    PIP_GAP,
+    PIP_MAX_SIMULTANEOUS,
+    _pip_body,
+    _pip_inner,
+    pip_render_dimensions,
 )
 for _p in (str(_CS2UTIL_SCRIPTS), str(_CS2UTIL_ROOT)):
     if _p not in sys.path:
@@ -93,29 +101,9 @@ from overlay.overlay_encode import (
 )
 # -- Constants -----------------------------------------------------------
 
-# --- Util PiP burn-in geometry -----------------------------------------
-# Preferred body = video_height * 2 // 5; shrinks if PIP_MAX_SIMULTANEOUS
-# stacked slots (plus gaps/margins) would not fit the frame height.
-PIP_OUTLINE_THICKNESS = 2       # Pixels. White border around each PiP (0 disables outline).
-PIP_CORNER_RADIUS = 16          # Pixels. Rounded corner radius. 0 = square corners.
-PIP_MARGIN = 12                 # Pixels. Outline-to-outline gap from video edge.
-PIP_GAP = 12                    # Pixels. Outline-to-outline gap between stacked PiPs.
-PIP_MAX_SIMULTANEOUS = 3
-
 FLIGHT_DIR_NAME = "throw_flights"
 
 OVERLAY_BATCH_PREFIX = "batch-overlay-"
-
-
-
-
-def _pip_body(video_height: int) -> int:
-    """Square PiP slot size: prefer height*2/5, shrink so max stack fits."""
-    preferred = video_height * 2 // 5
-    available = video_height - 2 * PIP_MARGIN
-    n = max(1, PIP_MAX_SIMULTANEOUS)
-    max_fit = (available - (n - 1) * PIP_GAP) // n
-    return min(preferred, max(1, max_fit))
 
 
 def _make_rounded_corner_mask(path: Path, size: int, radius: int) -> None:

@@ -389,6 +389,41 @@ def _schedule_retry(record: dict, error: str) -> None:
         time.time() + delay, timezone.utc).isoformat()
 
 
+def initialize_result_baseline(state: State, matches: list[Match]) -> None:
+    """Mark everything currently visible as historical and non-actionable."""
+    current_ids = (
+        {match.match_id for match in matches}
+        | set(state.data["matches"].keys())
+    )
+    for record in state.data["matches"].values():
+        record["status"] = "completed"
+        record["shorts_status"] = "completed"
+        record["last_error"] = None
+    for match in matches:
+        record = state.data["matches"].setdefault(match.match_id, {
+            "match": asdict(match), "status": "completed",
+            "attempts": 0, "last_error": None,
+        })
+        record["match"] = asdict(match)
+        record["status"] = "completed"
+        record["shorts_status"] = "completed"
+    state.data["result_baseline_initialized"] = True
+    state.data["result_baseline_ids"] = sorted(current_ids)
+    state.data["queue"] = []
+    state.data["baseline_at"] = _now()
+
+
+def _actionable_matches(state: State, matches: list[Match]) -> list[Match]:
+    """Return only newly appeared results or records that need retrying."""
+    known = set(state.data.get("result_baseline_ids", []))
+    return [
+        match for match in matches
+        if match.match_id not in known
+        or state.data["matches"].get(match.match_id, {}).get("status")
+        in {"retry", "discovered"}
+    ]
+
+
 async def poll_once(args, state: State) -> None:
     event_url = args.event_url
     state.data["event_url"] = event_url
@@ -419,8 +454,19 @@ async def poll_once(args, state: State) -> None:
                              event_name)
     matches = list({match.match_id: match for match in matches}.values())
     print(f"[poll] {len(matches)} notable completed event match(es)", flush=True)
+    if not state.data.get("result_baseline_initialized"):
+        initialize_result_baseline(state, matches)
+        state.save()
+        print(f"[baseline] skipped {len(matches)} existing completed match(es)",
+              flush=True)
+        return
+    actionable = _actionable_matches(state, matches)
+    state.data["result_baseline_ids"] = sorted(
+        set(state.data.get("result_baseline_ids", []))
+        | {match.match_id for match in matches}
+    )
 
-    for match in matches:
+    for match in actionable:
         record = state.data["matches"].setdefault(match.match_id, {
             "match": asdict(match), "status": "discovered",
             "attempts": 0, "last_error": None,
@@ -451,7 +497,20 @@ async def poll_once(args, state: State) -> None:
         if args.dry_run:
             cards = [f"backlog/{match_slug_from_url(match.url)}/high/<generated>.json"]
         if not cards:
-            _schedule_retry(record, "create_backlog failed")
+            # A successful backlog run can legitimately produce no high
+            # performer (all ratings below the render threshold). This is a
+            # completed no-op, not an acquisition failure.
+            record["status"] = "completed"
+            record["cards"] = []
+            record["no_high_priority_cards"] = True
+            record["last_error"] = None
+            if record.get("shorts_status") != "completed":
+                if _run_short_extraction(match, args.dry_run):
+                    record["shorts_status"] = "completed"
+                    record["shorts_error"] = None
+                else:
+                    record["shorts_status"] = "retry"
+                    record["shorts_error"] = "short extraction failed"
             state.save()
             continue
         if record.get("shorts_status") != "completed":
@@ -476,9 +535,19 @@ async def poll_once(args, state: State) -> None:
             continue
         ok = _run_pipeline(card, args.dry_run)
         if not ok:
-            print(f"[queue] pipeline failed; retaining for next poll: {card}",
-                  flush=True)
-            break
+            # HARD FAIL: never silently skip or retain for retry.
+            # Surface the pipeline's [PIPELINE_ERROR] immediately so the
+            # underlying bug (e.g. zero-length victim seq 186388->186388)
+            # gets fixed instead of looping every poll.
+            for record in state.data["matches"].values():
+                if card in record.get("cards", []):
+                    record["status"] = "failed"
+                    record["last_error"] = f"pipeline hard-failed for {card}"
+            state.save()
+            # SystemExit is BaseException, not caught by main's `except Exception`,
+            # so the listener dies and the failure is visible (no silent skip/loop).
+            print(f"[queue] HARD FAIL pipeline for {card} — fix underlying bug, not skipping", flush=True)
+            raise SystemExit(f"hard fail: pipeline failed for {card}")
         state.data["queue"].pop(0)
         for record in state.data["matches"].values():
             if card in record.get("cards", []):
@@ -496,6 +565,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="poll interval in seconds (default: 300)")
     parser.add_argument("--backlog-retries", type=int, default=3,
                         help="attempt each failed backlog acquisition this many times")
+    parser.add_argument("--pipeline-retries", type=int, default=3,
+                        help="retry a failed pipeline this many times before skipping it")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--refresh-teams", action="store_true")
@@ -509,6 +580,11 @@ async def main(args) -> None:
         print(json.dumps(state.data, indent=2))
         return
     with SingleInstance(args.state.with_suffix(".lock")):
+        # Every launch establishes a fresh edge: results already visible now
+        # are historical, while anything appearing after this launch is new.
+        state.data["result_baseline_initialized"] = False
+        state.data["queue"] = []
+        state.save()
         while True:
             try:
                 await poll_once(args, state)

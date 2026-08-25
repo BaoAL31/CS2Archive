@@ -269,7 +269,7 @@ def main() -> None:
     demo_key = re.sub(r"[^a-z0-9]+", "-", demo.stem.lower()).strip("-")
     if demo_key:
         slug = f"{slug}-{demo_key}"
-    backlog_dir = faceit_backlog_dir(BACKLOG_DIR, match_date, args.priority)
+    backlog_dir = faceit_backlog_dir(BACKLOG_DIR.parent, match_date, args.priority)
     backlog_dir.mkdir(parents=True, exist_ok=True)
     backlog_file = backlog_dir / f"{slug}.json"
 

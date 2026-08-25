@@ -70,7 +70,7 @@ def find_pending(root: Path, *, skip_tiktok: bool, skip_instagram: bool) -> list
     pending: list[Path] = []
     for meta_path in sorted(root.rglob(SHORTS_META_NAME)):
         try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta = json.loads(meta_path.read_text(encoding="utf-8-sig"))
         except Exception as e:
             print(f"  [skip] could not parse {meta_path}: {e}")
             continue
@@ -112,7 +112,7 @@ def upload_one(meta_path: Path, meta: dict, dry_run: bool, *, skip_tiktok: bool,
         return False
 
     try:
-        updated = json.loads(meta_path.read_text(encoding="utf-8"))
+        updated = json.loads(meta_path.read_text(encoding="utf-8-sig"))
     except Exception:
         updated = {}
 
@@ -159,11 +159,41 @@ def main() -> None:
         print("Nothing to upload.")
         return
 
+    # preflight: check social sessions before wasting 10min per upload
+    if pending and not args.dry_run:
+        need_tt = any(json.loads(p.read_text(encoding="utf-8-sig")).get("tiktok_status") != "scheduled" for p in pending) and not args.skip_tiktok
+        need_ig = any(json.loads(p.read_text(encoding="utf-8-sig")).get("instagram_status") != "scheduled" for p in pending) and not args.skip_instagram
+        if need_tt or need_ig:
+            try:
+                import sys as _sys
+                _util = PROJECT_ROOT.parent / "CS2UtilArchive" / "scripts"
+                if str(_util) not in _sys.path:
+                    _sys.path.insert(0, str(_util))
+                from social_session_check import check_instagram, check_tiktok
+                if need_tt:
+                    tt_profile = _util.parent / ".cloak-tiktok-profile" if (_util.parent / ".cloak-tiktok-profile").exists() else PROJECT_ROOT.parent / "CS2UtilArchive" / ".cloak-tiktok-profile"
+                    # canonical util root
+                    from pathlib import Path as _P
+                    tt_dir = _P(r"D:\Projects\CS2UtilArchive") / ".cloak-tiktok-profile"
+                    ok, msg = check_tiktok(tt_dir)
+                    print(f"[preflight tiktok] {msg}", flush=True)
+                    if not ok:
+                        print("  -> TikTok not logged in. Fix then re-run, or use --skip-tiktok", flush=True)
+                if need_ig:
+                    ig_dir = _P(r"D:\Projects\CS2UtilArchive") / ".cloak-instagram-profile"
+                    ok, msg = check_instagram(ig_dir)
+                    print(f"[preflight instagram] {msg}", flush=True)
+                    if not ok:
+                        print("  -> Instagram not logged in. Fix: python D:\\Projects\\CS2UtilArchive\\scripts\\upload_instagram_browser.py --profile-dir D:\\Projects\\CS2UtilArchive\\.cloak-instagram-profile login --isolated-profile --cloak-chrome --timeout 600", flush=True)
+                        print("  -> or skip with --skip-instagram", flush=True)
+            except Exception as e:
+                print(f"[preflight warn] {e}", flush=True)
+
     ok = 0
     failed = 0
     for meta_path in pending:
         try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta = json.loads(meta_path.read_text(encoding="utf-8-sig"))
         except Exception as e:
             print(f"  [skip] could not re-read {meta_path}: {e}")
             failed += 1

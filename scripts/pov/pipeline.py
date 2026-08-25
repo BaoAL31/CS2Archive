@@ -42,6 +42,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
 import time
 from pathlib import Path
 
@@ -544,9 +545,21 @@ class Pipeline:
                 self.state["step"] = step_num + 1
                 save_state(self.run_id, self.state)
             except Exception as e:
-                fail(step_num, f"STEP_{step_name.upper()}_EXCEPTION", f"{e}")
+                # Include traceback so the failing file/line is visible in the
+                # log — str(e) alone often hides WHERE the step blew up.
+                tb = traceback.format_exc()
+                print(tb)
+                fail(step_num, f"STEP_{step_name.upper()}_EXCEPTION",
+                     f"{e} | {tb.strip().splitlines()[-1] if tb else ''}")
 
         print(f"\n  [OK] Pipeline complete -> {self.youtube_dir}/")
+        # Video is youtube-ready (thumbnail + upload_meta written): the render
+        # folder is pure dead weight now — purge it unless opted out.
+        print("\n  [cleanup] purging render intermediates...")
+        try:
+            self._purge_render_intermediates(full=True)
+        except Exception as e:
+            print(f"  [WARN] post-run cleanup failed (non-fatal): {e}")
 
     def _run_py(self, args: list[str], **kwargs):
         env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
@@ -1257,7 +1270,18 @@ class Pipeline:
                     fail(4, "OVERLAY_NO_INPUT",
                          f"combined.mp4 missing/empty in render_dir")
                 target_dir.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(src), str(video_path))
+                # Hardlink instead of copy: combined.mp4 can be 30+ GB after
+                # the 1440p scale, and a full copy doubles disk usage (and
+                # fails outright when the disk is nearly full). Same volume
+                # => hardlink costs nothing; overlay_pov.py only READS the
+                # input and writes video.overlay.mp4 separately.
+                try:
+                    os.link(str(src), str(video_path))
+                    linked = True
+                except OSError:
+                    # Cross-volume or filesystem without hardlinks -> copy.
+                    shutil.copy2(str(src), str(video_path))
+                    linked = False
                 # Copy sidecar (round_offsets.json) alongside video.mp4
                 # overlay_pov.py looks for <video>.round_offsets.json next to video
                 sidecar_src = self.render_dir / "combined.round_offsets.json"
@@ -1265,7 +1289,8 @@ class Pipeline:
                     sidecar_dst = target_dir / "video.round_offsets.json"
                     shutil.copy2(str(sidecar_src), str(sidecar_dst))
                     print(f"  [setup] copied sidecar to {sidecar_dst.name}")
-                print(f"  [setup] copied combined.mp4 to renders/.overlay_work/ "
+                verb = "hardlinked" if linked else "copied"
+                print(f"  [setup] {verb} combined.mp4 into renders/.overlay_work/ "
                       f"for overlay_pov.py")
         if not self.demo_path or not self.demo_path.exists():
             fail(4, "OVERLAY_NO_DEMO",
@@ -1335,8 +1360,9 @@ class Pipeline:
 
         # Copy overlay result from renders/ work dir -> youtube/ variant dir
         self._copy_overlay_result_to_youtube(overlay=overlay_sidecar)
-        # Clean up renders/.overlay_work/
-        shutil.rmtree(target_dir, ignore_errors=True)
+        # Free the big mezzanine files immediately: per-round clips + native
+        # pre-scale source are dead weight once the overlay exists.
+        self._purge_render_intermediates(full=False)
 
     def _append_outro(self, youtube_dir: Path, step_num: int = 5) -> None:
         """Generate a 5s silent outro and append it to video.mp4 inside
@@ -1374,6 +1400,59 @@ class Pipeline:
         outro.unlink()
         vid_mb = video.stat().st_size / 1024 / 1024
         print(f"  [OK] Outro appended in {youtube_dir.name}/ ({vid_mb:.0f} MB)")
+
+    def _purge_render_intermediates(self, full: bool = False) -> None:
+        """Reclaim disk space by deleting render intermediates.
+
+        Disk exhaustion ([WinError 112]) during overlay was caused by keeping
+        ~50 GB of mezzanine files alive long after they were consumed:
+          - round-*.mp4 / batch-*.mp4   (per-round CSDM clips, post-concat)
+          - combined.native.mp4         (pre-scale source)
+          - .overlay_work/              (hardlinked/copied working video)
+          - combined.mp4                (scaled 1440p mezzanine)
+
+        light (full=False, end of step 4): delete everything EXCEPT
+            combined.mp4 + sidecar — those still allow a re-overlay without
+            a full re-render if a later step fails.
+        full=True (after step 6 -> video is youtube-ready): delete the whole
+            renders/pov-* folder. The finished video lives in youtube/, and
+            upload_pending.py only reads youtube/*/upload_meta.json.
+
+        Opt out with --keep-intermediates.
+        """
+        if getattr(self.args, "keep_intermediates", False):
+            return
+        if not self.render_dir.exists():
+            return
+        freed = 0
+        try:
+            if full:
+                freed = sum(f.stat().st_size for f in self.render_dir.rglob("*") if f.is_file())
+                shutil.rmtree(self.render_dir, ignore_errors=False)
+                print(f"  [cleanup] removed {self.render_dir.name}/ "
+                      f"({freed / 1e9:.1f} GB) — video is youtube-ready")
+                return
+            patterns = ("round-*.mp4", "batch-*.mp4")
+            targets: list[Path] = []
+            for pat in patterns:
+                targets.extend(self.render_dir.glob(pat))
+            native = self.render_dir / "combined.native.mp4"
+            if native.exists():
+                targets.append(native)
+            work = self.render_dir / ".overlay_work"
+            for t in targets:
+                try:
+                    freed += t.stat().st_size
+                    t.unlink()
+                except OSError:
+                    pass
+            if work.exists():
+                shutil.rmtree(work, ignore_errors=True)
+            if freed > 0:
+                print(f"  [cleanup] freed {freed / 1e9:.1f} GB of render "
+                      f"intermediates (kept combined.mp4 for re-overlay)")
+        except OSError as e:
+            print(f"  [WARN] intermediate cleanup failed (non-fatal): {e}")
 
     def step_outro(self) -> None:
         # Voice is baked into the render (voice_enable 1 + enemy muted), so no
@@ -1775,6 +1854,16 @@ def main() -> None:
              "and CS2 crashes on certain rounds. Silently drops failed batches, producing "
              "incomplete POV videos. Set per-invocation for problematic demos only. "
              "See AGENTS.md for details.",
+    )
+    parser.add_argument(
+        "--keep-intermediates",
+        dest="keep_intermediates",
+        action="store_true",
+        default=False,
+        help="Keep renders/ intermediates after the video is youtube-ready "
+             "(default: per-round clips + native source are deleted after "
+             "overlay; the whole renders/pov-* folder is deleted once the "
+             "pipeline completes step 6).",
     )
     parser.add_argument(
         "--cleanup",
