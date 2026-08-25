@@ -191,6 +191,22 @@ async def create_backlog_entry(
     _ensure_player_account(player_clean, steam_id)
     _ensure_video_settings(player_clean)
 
+    # Team + opponent from the DEMO itself (authoritative — see
+    # scripts/shorts/detect_team.py). Falls back to the HLTV ratings table
+    # only when demo detection fails, and warns on disagreement.
+    demo_team: str | None = None
+    demo_opponent: str | None = None
+    if steam_id and Path(demo_for_map).exists():
+        try:
+            from scripts.shorts.detect_team import detect_pov_opponent
+            demo_team, demo_opponent = detect_pov_opponent(str(demo_for_map), steam_id)
+        except Exception as e:
+            print(f"  [WARN] demo team detection failed for {player_clean}: {e}")
+    team_final = demo_team or team
+    if demo_team and team and demo_team.strip().lower() != team.strip().lower():
+        print(f"  [WARN] team mismatch for {player_clean}: demo says "
+              f"{demo_team!r}, HLTV ratings say {team!r} (using demo)")
+
     slug = f"{player_clean.lower()}-{map_name.lower()}-{match_slug}"
     backlog_dir = BACKLOG_DIR / match_slug / priority
     backlog_dir.mkdir(parents=True, exist_ok=True)
@@ -212,7 +228,9 @@ async def create_backlog_entry(
         "hf_root": hf_root,
         "rating": rating,
         "kd": kd,
-        "team": team,
+        "team": team_final,
+        "opponent": demo_opponent or "",
+        "team_source": "demo" if demo_team else "hltv_ratings",
         "priority": priority,
         **backlog_video_fields(player_clean),
         "pipeline_cmd": f'$env:PYTHONPATH=.; & C:/Users/jembo/anaconda3/envs/cs2archive/python.exe scripts/pov/pipeline.py --backlog backlog/{match_slug}/{priority}/{slug}.json',
