@@ -95,3 +95,6 @@ tools/**/target/
 
 # reasonix local state
 .reasonix/
+
+# CloakBrowser profile (Instagram-friendly automation)
+.cloak-instagram-profile/
