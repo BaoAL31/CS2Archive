@@ -202,45 +202,38 @@ def _match_id_from_history(demo: Path) -> str:
     return ""
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("demo_path")
-    ap.add_argument("--player", required=True)
-    ap.add_argument("--map", default="")
-    ap.add_argument("--steam-id", default="")
-    ap.add_argument("--tournament", default="")
-    ap.add_argument("--match-id", default="",
-                    help="FACEIT match id (auto-resolved from download history if omitted)")
-    ap.add_argument("--priority", choices=["high", "mid", "low"], default="high")
-    ap.add_argument("--match-date", help="Match date YYYY-MM-DD (defaults to demo file date)")
-    ap.add_argument("--no-elo", action="store_true",
-                    help="Skip FACEIT ELO fetch (title/thumbnail omit ELO line)")
-    args = ap.parse_args()
+def create_faceit_backlog(*, demo_path, player, map="", steam_id="",
+                          tournament="", match_id="", priority="high",
+                          match_date=None, no_elo=False) -> Path:
+    """Build a single-POV FACEIT backlog card.
 
-    demo = Path(args.demo_path).resolve()
+    Not a standalone entry — call via scripts/faceit/extract_backlogs.py.
+    Returns the path to the written backlog JSON.
+    """
+    demo = Path(demo_path).resolve()
     if not demo.exists():
         print(f"[ERR] demo not found: {demo}")
         sys.exit(1)
 
-    steam_id = args.steam_id or _resolve_steam_id(demo, args.player)
+    steam_id = steam_id or _resolve_steam_id(demo, player)
     if not steam_id:
-        print(f"[ERR] player '{args.player}' not found in demo")
+        print(f"[ERR] player '{player}' not found in demo")
         sys.exit(1)
 
-    map_name = args.map or _map_from_demo(demo)
+    map_name = map or _map_from_demo(demo)
 
-    match_id = args.match_id.strip() or _match_id_from_history(demo)
+    match_id = match_id.strip() or _match_id_from_history(demo)
 
     from scripts.faceit.backlog_paths import faceit_backlog_dir, match_date_for_demo
-    match_date = match_date_for_demo(demo, args.match_date)
+    match_date = match_date_for_demo(demo, match_date)
     meta: dict = {
-        "player": args.player,
+        "player": player,
         "match_date": match_date,
         "map": map_name,
         "steam_id": steam_id,
         "demo_path": str(demo.relative_to(PROJECT_ROOT)).replace("\\", "/"),
-        "tournament": args.tournament,
-        "priority": args.priority,
+        "tournament": tournament,
+        "priority": priority,
         "is_faceit": True,
     }
     if match_id:
@@ -252,7 +245,7 @@ def main() -> None:
         meta["kills"] = kills
         meta["deaths"] = deaths
 
-    if not args.no_elo:
+    if not no_elo:
         print("[FACEIT] Fetching match ELO ...")
         elo = asyncio.run(_match_elo(demo, steam_id))
         if elo:
@@ -265,11 +258,11 @@ def main() -> None:
                  f"Check FACEIT_API_KEY in .env and that the player's FACEIT profile is public. "
                  f"Use --no-elo to skip ELO (title/thumbnail will omit the ELO line).")
 
-    slug = re.sub(r"[^a-z0-9]+", "-", f"{args.player}-{map_name}".lower()).strip("-")
+    slug = re.sub(r"[^a-z0-9]+", "-", f"{player}-{map_name}".lower()).strip("-")
     demo_key = re.sub(r"[^a-z0-9]+", "-", demo.stem.lower()).strip("-")
     if demo_key:
         slug = f"{slug}-{demo_key}"
-    backlog_dir = faceit_backlog_dir(BACKLOG_DIR.parent, match_date, args.priority)
+    backlog_dir = faceit_backlog_dir(BACKLOG_DIR.parent, match_date, priority)
     backlog_dir.mkdir(parents=True, exist_ok=True)
     backlog_file = backlog_dir / f"{slug}.json"
 
@@ -279,7 +272,11 @@ def main() -> None:
     )
     backlog_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(f"[OK] Created: {backlog_file}")
+    return backlog_file
 
 
 if __name__ == "__main__":
-    main()
+    sys.stderr.write(
+        "[ERR] create_faceit_backlog.py is not a standalone entry.\n"
+        "      Use scripts/faceit/extract_backlogs.py instead.\n")
+    sys.exit(2)
