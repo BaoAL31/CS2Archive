@@ -33,11 +33,25 @@ ensure()
 
 from player_accounts import list_accounts  # noqa: E402
 from scrapers.faceit import FACEITClient  # noqa: E402
-from faceit_names import faceit_nick  # noqa: E402
+from faceit_names import known_pro_faceit_ids  # noqa: E402
 
 
 def pro_nicks() -> list[str]:
     return [a.nickname for a in list_accounts() if a.nickname]
+
+
+def _warn_unverified_accounts(fid_to_nick: dict) -> None:
+    """Log any Recognised Pro account lacking a stored faceit_id.
+
+    Those cannot be identity-verified (nickname queries are spoofable) and are
+    therefore skipped by collect().
+    """
+    known = set(fid_to_nick.values())
+    missing = [a.nickname for a in list_accounts()
+               if a.nickname and a.nickname not in known]
+    if missing:
+        print(f"[warn] {len(missing)} pro(s) skipped — no stored faceit_id "
+              f"(identity unverifiable): {', '.join(sorted(missing))}")
 
 
 def _num(val, cast):
@@ -74,9 +88,12 @@ async def collect(*, hours: int, count: int, min_pros: int,
     pre-sorted (best K/D, then ADR). ELO averages are filled for entries
     (cached per player internally).
     """
-    pros = pro_nicks()
-    if not pros:
-        raise RuntimeError("No Recognised Pros in .data/player_accounts.json")
+    fid_to_nick = known_pro_faceit_ids()
+    if not fid_to_nick:
+        raise RuntimeError(
+            "No Recognised Pros with a stored faceit_id in .data/player_accounts.json"
+        )
+    _warn_unverified_accounts(fid_to_nick)
 
     client = FACEITClient()
     try:
@@ -87,12 +104,12 @@ async def collect(*, hours: int, count: int, min_pros: int,
         if today_only:
             cutoff = today_start
 
-        for nick in pros:
-            q = faceit_nick(nick)
-            pid = await client.get_player_id(q)
-            if not pid:
-                continue
-            matches = await client.get_player_matches(pid, limit=count)
+        for fid, nick in fid_to_nick.items():
+            # NEVER resolve identity by nickname: FACEIT allows duplicate nicks,
+            # so get_player_id("donk") can return an impostor account. The stored
+            # faceit_id (curated in player_accounts.json) is the only trustworthy
+            # key — fetch the account's matches by that GUID directly.
+            matches = await client.get_player_matches(fid, limit=count)
             for m in matches:
                 if m.date and m.date < cutoff:
                     continue
