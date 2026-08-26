@@ -137,8 +137,11 @@ def extract_background_frame(demo_path: str, steam_id: str) -> Path:
             console.print("[red]  Clip render failed to hook CS2 after retries[/red]")
             sys.exit(1)
         frame_path = tmp_dir / "bg_frame.jpg"
+        # Clip spans [kill - 1s, kill]: seek to its END so the frame shows the
+        # kill moment itself, not a full second before it.
         subprocess.run(
-            ["ffmpeg", "-y", "-i", str(clip), "-vframes", "1", "-update", "1", str(frame_path)],
+            ["ffmpeg", "-y", "-loglevel", "error", "-sseof", "-0.08",
+             "-i", str(clip), "-frames:v", "1", "-update", "1", str(frame_path)],
             capture_output=True, text=True, timeout=30,
         )
 

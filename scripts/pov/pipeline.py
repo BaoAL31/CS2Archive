@@ -498,7 +498,13 @@ class Pipeline:
             self.args, "voice_shade", False
         ):
             return True
-        return self.is_faceit
+        if not self.is_faceit:
+            return False
+        # FACEIT defaults ON only when the demo actually carries enough
+        # POV-team voice (>= VOICE_AUTO_MIN_TEAM_SECONDS). Many FACEIT demos
+        # record zero team voice packets — mixing those would refuse with
+        # VOICE_COMMS_FAILED rather than emit a silent 'comms' result.
+        return _faceit_voice_enabled(self.demo_path, self.steam_id)
 
     def _setup_logging(self) -> Path:
         """Redirect all output (Python prints + subprocess stdout/stderr) to
@@ -1509,7 +1515,9 @@ class Pipeline:
                 return None
             duration = float(probe.stdout.strip())
             seek_t = max(0.5, duration * 0.40)
-            tmp = Path(tempfile.mkstemp(prefix="thumb_overlay_", suffix=".jpg")[1])
+            fd, name = tempfile.mkstemp(prefix="thumb_overlay_", suffix=".jpg")
+            os.close(fd)
+            tmp = Path(name)
             r = subprocess.run(
                 ["ffmpeg", "-y", "-loglevel", "error",
                  "-ss", f"{seek_t:.3f}", "-i", str(overlay_video),
@@ -1525,6 +1533,77 @@ class Pipeline:
             return tmp
         except Exception as e:
             print(f"  [warn] overlay frame extraction failed: {e}")
+            return None
+
+    def _extract_kill_frame(self, video_path: Path) -> Path | None:
+        """Extract a frame from an already-rendered POV video at the exact
+        moment of one of the POV player's kills.
+
+        Maps the kill's demo tick to a video timestamp via the concat sidecar
+        (``combined.round_offsets.json``: per-round recorded tick spans +
+        start offsets — ground truth from the CSDM sequence files). No CS2/
+        HLAE session needed. Returns a temp JPEG (1920x1080 pillarboxed) or
+        None when video/sidecar/analysis are unavailable or no kill lands
+        inside a recorded round span.
+        """
+        import random
+
+        try:
+            sidecar_p = self.render_dir / "combined.round_offsets.json"
+            analysis_p = self.render_dir / "csdm_analysis.json"
+            if not sidecar_p.is_file() or not analysis_p.is_file():
+                return None
+            sidecar = json.loads(sidecar_p.read_text(encoding="utf-8"))
+            offsets = sidecar.get("round_offsets") or {}
+            ticks = sidecar.get("per_round_ticks") or {}
+            durs = sidecar.get("per_round_durations") or {}
+            if not offsets or not ticks:
+                return None
+            data = json.loads(analysis_p.read_text(encoding="utf-8"))
+            kills = [k for k in data.get("kills", [])
+                     if str(k.get("killerSteamId")) == str(self.steam_id)]
+            if not kills:
+                return None
+
+            spans: list[tuple[int, int, float, float]] = []
+            for rn, span in ticks.items():
+                if rn not in offsets:
+                    continue
+                a, b = int(span[0]), int(span[1])
+                off = float(offsets[rn])
+                dur = float(durs.get(rn, 0.0))
+                if b <= a or dur <= 0:
+                    continue
+                spans.append((a, b, off, dur))
+
+            random.shuffle(kills)
+            for kill in kills:
+                tick = int(kill["tick"])
+                match = next((s for s in spans if s[0] <= tick <= s[1]), None)
+                if match is None:
+                    continue  # kill inside a cut/gap — not in rendered footage
+                a, b, off, dur = match
+                seek_t = off + (tick - a) / (b - a) * dur
+                print(f"  [bg] kill frame @ {seek_t:.2f}s (tick {tick}, "
+                      f"{kill.get('weaponName', '?')} -> {kill.get('victimName', '?')})")
+                tmp_fd, tmp_name = tempfile.mkstemp(prefix="thumb_kill_", suffix=".jpg")
+                os.close(tmp_fd)
+                tmp = Path(tmp_name)
+                r = subprocess.run(
+                    ["ffmpeg", "-y", "-loglevel", "error",
+                     "-ss", f"{seek_t:.3f}", "-i", str(video_path),
+                     "-frames:v", "1",
+                     "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,"
+                            "pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+                     str(tmp)],
+                    capture_output=True, text=True, timeout=120,
+                )
+                if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 1024:
+                    return tmp
+                tmp.unlink(missing_ok=True)
+            return None
+        except Exception as e:
+            print(f"  [warn] kill-frame extraction failed: {e}")
             return None
 
     def _generate_thumbnail(self, youtube_dir: Path, variant: str, step_num: int = 6) -> None:
@@ -1547,12 +1626,22 @@ class Pipeline:
         if self.is_faceit:
             # FACEIT path: blurred kill-frame + text, no ratings/avatar.
             # ELO lines come from the backlog card (elo / opp_avg_elo).
+            # Background: kill-moment frame pulled straight from the already-
+            # rendered POV video via the concat sidecar (no CS2 session).
+            faceit_bg: Path | None = None
+            pov_vid = youtube_dir / "video.mp4"
+            if not pov_vid.is_file():
+                pov_vid = self.render_dir / "combined.mp4"
+            if pov_vid.is_file():
+                faceit_bg = self._extract_kill_frame(pov_vid)
             cmd = [
                 "scripts/faceit/faceit_thumbnail.py", str(self.demo_path),
                 "--player", self.player,
                 "--map", self.map_name,
                 "--variant", variant,
             ]
+            if faceit_bg is not None:
+                cmd += ["--background", str(faceit_bg)]
             if self.steam_id:
                 cmd += ["--steam-id", self.steam_id]
             elo = self.meta.get("elo")
@@ -1565,6 +1654,8 @@ class Pipeline:
                 cmd += ["--kd", f"{kills}/{deaths}"]
             cmd += ["--output", str(youtube_dir)]
             r = self._run_py(cmd, timeout=900)
+            if faceit_bg is not None:
+                faceit_bg.unlink(missing_ok=True)
             if r.returncode != 0:
                 fail(step_num, "THUMBNAIL_FAILED",
                      f"faceit thumbnail exited {r.returncode} for variant={variant}")
@@ -1581,8 +1672,12 @@ class Pipeline:
         if variant == "overlay":
             overlay_vid = self._find_overlay_video()
             if overlay_vid is not None:
-                print(f"  [bg] using overlay video: {overlay_vid.name}")
-                bg_override = self._extract_overlay_frame(overlay_vid)
+                bg_override = self._extract_kill_frame(overlay_vid)
+                if bg_override is not None:
+                    print(f"  [bg] kill frame from {overlay_vid.name}")
+                else:
+                    print(f"  [bg] no sidecar/kill match — mid-video frame")
+                    bg_override = self._extract_overlay_frame(overlay_vid)
                 bg_cleanup = bg_override
             else:
                 print(f"  [bg] overlay video not found — falling back to kill-frame extraction")
