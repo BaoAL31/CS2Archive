@@ -145,6 +145,58 @@ def _detect_data(demo, sid: int) -> tuple[dict[int, str] | None, int | None]:
     return (slots if slots else None, pov_slot)
 
 
+def org_per_player(demo) -> dict[str, tuple[str, str]]:
+    """Map every player in a demo to ``(nickname, org_display)``.
+
+    Same single-tick snapshot logic as detect_pov_opponent, but for the whole
+    roster. Returns ``{steam_id: (nickname, org)}`` (orgs from folder mapping).
+    """
+    try:
+        from demoparser2 import DemoParser
+    except Exception:
+        return {}
+    orgs = orgs_from_folder(demo)
+    if len(orgs) != 2:
+        return {}
+    try:
+        df = DemoParser(str(demo)).parse_ticks(_TICK_FIELDS)
+    except Exception:
+        return {}
+    if df.empty:
+        return {}
+    for tick in df["tick"].unique()[::-1]:  # newest first
+        snp = df[df["tick"] == tick]
+        ent = snp.dropna(subset=["CCSTeam.m_iTeamNum", "CCSTeam.m_szClanTeamname"])
+        if len(ent) < 2:
+            continue
+        slots = {
+            int(k): str(v).strip()
+            for k, v in ent.groupby("CCSTeam.m_iTeamNum")[
+                "CCSTeam.m_szClanTeamname"].last().to_dict().items()
+        }
+        pl = snp.dropna(subset=["CCSPlayerController.m_iTeamNum", "steamid"])
+        out: dict[str, tuple[str, str]] = {}
+        for r in pl[
+            ["name", "steamid", "CCSPlayerController.m_iTeamNum"]
+        ].to_dict("records"):
+            s = int(r["CCSPlayerController.m_iTeamNum"])
+            if s not in slots:
+                continue
+            clan = slots[s]
+            idx = next(
+                (i for i, (d, raw) in enumerate(orgs)
+                 if _fuzzy_hit(clan, d) or _fuzzy_hit(clan, raw)),
+                None,
+            )
+            if idx is None:
+                continue
+            sid = str(int(r["steamid"]))  # uint64 already; do NOT cast via float()
+            out[sid] = (str(r["name"]).strip(), orgs[idx][0])
+        if out:
+            return out
+    return {}
+
+
 def detect_pov_opponent(demo, pov_steam_id) -> tuple[str | None, str | None]:
     """Return ``(pov_org_display, opponent_org_display)`` for a POV player.
 

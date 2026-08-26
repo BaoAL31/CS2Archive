@@ -441,6 +441,12 @@ async def main() -> None:
             demo_steamids.update(extract_steamids(str(dem)))
         except Exception as e:
             print(f"  [WARN] Failed to extract steam IDs from {dem.name}: {e}")
+        # Keep the persistent team roster in sync with every extracted demo.
+        try:
+            from scripts.shorts.team_roster import update_team_roster
+            update_team_roster(str(dem), demo_tag=dem.name)
+        except Exception as e:
+            print(f"  [WARN] Failed to update team roster from {dem.name}: {e}")
     print(f"  [OK] Resolved {len(demo_steamids)} players from demos")
 
     print(f"[AVATAR] Fetching {len(unique_players)} unique players (CloakBrowser)...")
