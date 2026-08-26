@@ -72,12 +72,12 @@ _MAP_WORDS = [
 def orgs_from_folder(demo) -> list[tuple[str, str]]:
     """Return ``[(display, raw_search), ...]`` for the two teams from the folder."""
     stem = Path(demo).stem.lower()
-    stem = re.sub(r"-m\d+-[a-z0-9]+$", "", stem)  # strip "-mN-mapname"
     stem = re.sub(r"-(p\d)$", "", stem)            # strip "-p1/-p2" split demos
     for w in _MAP_WORDS:                              # strip trailing map (single-map folders)
         if stem.endswith("-" + w):
             stem = stem[: -(len(w) + 1)]
             break
+    stem = re.sub(r"-[mp]\d+(?:-[a-z0-9]+)?$", "", stem)  # strip "-mN" / "-mN-map" / "-pN"
     if "vs" not in stem:
         return []
     a, b = stem.split("vs", 1)
