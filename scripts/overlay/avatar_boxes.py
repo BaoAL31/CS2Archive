@@ -38,18 +38,17 @@ AVATAR_BOXES = {
             (674, 717), (720, 763), (766, 809), (812, 855), (858, 901),
         ],
     },
-    # 1680x1050 (16:10 Black Bars — Jimpphat, measured at 2560x1440 then
-    # back-scaled; right block +12px vs naive 1920*0.875 due to Black Bars
-    # letterbox shift).
+    # 1680x1050 (16:10 Black Bars — Jimpphat). Measured from a native
+    # 1680x1050 HUD frame; this source is stretched to 2560x1440 afterward.
     "1680x1050": {
         "aspect": "16:10",
-        "y0": 15,
-        "y1": 63,
+        "y0": 16,
+        "y1": 64,
         "LEFT": [
-            (581, 621), (625, 667), (672, 713), (717, 758), (763, 806),
+            (551, 598), (602, 648), (654, 700), (704, 750), (756, 802),
         ],
         "RIGHT": [
-            (887, 929), (929, 975), (978, 1020), (1022, 1064), (1068, 1110),
+            (880, 926), (930, 976), (981, 1028), (1032, 1078), (1084, 1130),
         ],
     },
     # 1152x864 (4:3): detected from second-half scoreboard colored borders.

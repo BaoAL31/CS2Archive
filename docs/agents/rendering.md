@@ -21,6 +21,49 @@ Render at **2560×1440** even for 1080p-targeted uploads. YouTube allocates VP9 
 
 All scripts default to 2560×1440; per-round render and concat upscale use **h264_nvenc CQ 15** (match quality end-to-end).
 
+## Scoreboard Avatar-Box Calibration
+
+`scripts/overlay/voice_shade.py` dims/reveals the POV team's scoreboard
+avatars. Its rectangles live in `scripts/overlay/avatar_boxes.py` and must be
+measured in the player's **native render resolution**, not in the final
+2560×1440 upload: `concat_rounds.py` may stretch a 4:3 or 16:10 render.
+
+When a box is offset or clips a neighbouring avatar:
+
+1. Render one round only at the POV's native resolution, into an isolated
+   calibration directory:
+
+   ```powershell
+   $env:PYTHONPATH="."
+   & "C:\Users\jembo\anaconda3\envs\cs2archive\python.exe" scripts/pov/render_pov.py `
+     "<demo>.dem" <steam64> --rounds 1 --width <native_width> --height <native_height> `
+     --output "renders/avatar_calibration_<player>" --batches 1
+   ```
+
+2. Extract a buy-phase/match-start frame (the top HUD has all ten colored
+   frames), for example:
+
+   ```powershell
+   ffmpeg -ss 5 -i "renders/avatar_calibration_<player>\round-*.mp4" `
+     -frames:v 1 "renders/avatar_calibration_<player>\hud_calibration.png"
+   ```
+
+3. Measure each colored frame directly in that native frame. Use the
+   rectangle's outer bounds: `x0` inclusive, `x1` inclusive, `y0` inclusive,
+   `y1` inclusive. Put the five left-team ranges in `LEFT`, then the five
+   right-team ranges in `RIGHT`.
+
+4. Make a contact sheet of the ten crops before editing the config. Every
+   crop must contain exactly one full colored frame—no adjacent frame, empty
+   gap, or clipped border. Then repeat the same crop test after stretching the
+   source to the final output resolution, using the scale applied by the
+   pipeline.
+
+Do not use `detect_avatar_boxes.py` as the authority for final coordinates:
+its broad HSV mask can mistake saturated portrait artwork for a colored HUD
+border. It is a starting probe only; the rendered contact-sheet check is the
+acceptance test.
+
 ## Rounds-Only POV (full HUD, no x-ray, batch rendering)
 
 For rendering a player's POV with full HUD (radar, health, ammo) and no x-ray, in configurable batch sizes (default 3 rounds per csdm call):
