@@ -70,6 +70,8 @@ skills-lock.json
 pgdata/
 pg.log
 backlog/
+# Generated FACEIT individual-POV backlogs (root dir; scripts/faceit/ is source)
+/faceit/
 # CodeGraph index
 .codegraph/
 
