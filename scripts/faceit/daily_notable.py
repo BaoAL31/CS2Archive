@@ -2,9 +2,11 @@
 Daily FACEIT notable-match selector.
 
 Runs once per day: scrapes notable FACEIT matches (multi-pro + single-pro
-standout), ranks them, and PICKS the top N (=3) matches for the day. If the
-day's scrape cannot fill N good matches, it FALLS BACK to notable matches
-left over in the persistent pool from previous days.
+standout), expands them into per-Recognised-Pro performances, ranks those,
+and PICKS the top N (=3) player performances for the day. Each pick is a
+single pro's performance (K/D, ADR, win) weighted by their HLTV team's world
+rank (star tier). If the day's scrape cannot fill N good performances, it
+FALLS BACK to performances left over in the persistent pool from previous days.
 
 Idempotent: running twice on the same day returns the stored picks without
 re-scraping (use --force to redo the day).
@@ -42,7 +44,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from _pathsetup import ensure  # noqa: E402
 ensure()
 
-from scrape_notable import collect, _num  # noqa: E402
+from scrape_notable import collect, _num
+from hltv_ranking import fetch_team_ranking, star_bonus_for_pros  # noqa: E402
 
 STATE_FILE = ROOT / ".data" / "notable_daily.json"
 DEMO_DIR = ROOT / "demos" / "faceit"
@@ -58,36 +61,71 @@ def _best_kd(rec: dict) -> float:
     return _num(rec.get("line", {}).get("kd"), float)
 
 
-def make_candidate(rec: dict, stream: str) -> dict:
-    """Normalize a scrape record into a persistable pool/pick candidate."""
-    is_multi = stream == "multi"
-    pros = rec.get("pros", []) if is_multi else [rec.get("pro", "?")]
-    kd = _best_kd(rec)
-    weight = int(kd * 1000)
-    if is_multi:
-        weight += len(pros) * 100_000 + 1_000_000
-    else:
-        weight += 10_000  # solo standouts sort behind every multi-pro match
+WIN_BONUS = 300_000  # added to weight when the pro's team won
+
+
+def _line_won(line: dict) -> bool:
+    """Interpret a FACEIT result field as a win."""
+    r = line.get("result")
+    if r is None:
+        return False
+    if isinstance(r, str):
+        return r.strip().lower() in ("1", "1.0", "true")
+    return bool(r)
+
+
+def _perf_bonus(kd: float, won: bool) -> int:
+    """Performance weight: rewards high K/D and winning (no ELO)."""
+    return int(kd * 1000) + (WIN_BONUS if won else 0)
+
+
+def make_player_candidates(rec: dict, stream: str, ranking: dict | None = None) -> list[dict]:
+    """Expand a scrape record into one candidate per Recognised Pro performance.
+
+    Unit of selection is now a PLAYER performance (not a match). Weight =
+    HLTV star-tier bonus (player's team world rank) + performance bonus
+    (K/D + win). ELO is deliberately not used.
+    """
     date = rec.get("date")
-    cand = {
-        "match_id": rec["id"],
-        "stream": stream,
-        "map": rec.get("map", "?"),
-        "score": rec.get("score", ""),
-        "date": date.strftime("%Y-%m-%d") if date else None,
-        "pros": pros,
-        "best_kd": round(kd, 2),
-        "avg_elo": rec.get("avg_elo"),
-        "weight": weight,
-    }
-    if not is_multi:
-        cand["pro"] = rec.get("pro")
+    datestr = date.strftime("%Y-%m-%d") if date else None
+    out = []
+
+    def _build(nick: str, line: dict, match_pros: list[str]) -> dict:
+        kd = _num(line.get("kd"), float)
+        won = _line_won(line)
+        star = star_bonus_for_pros([nick], ranking)
+        perf = _perf_bonus(kd, won)
+        return {
+            "id": f"{rec['id']}:{nick}",
+            "match_id": rec["id"],
+            "player": nick,
+            "stream": stream,
+            "map": rec.get("map", "?"),
+            "score": rec.get("score", ""),
+            "date": datestr,
+            "pros": match_pros,            # match context (other pros)
+            "kd": round(kd, 2),
+            "adr": _num(line.get("adr"), float),
+            "hs": _num(line.get("hs"), float),
+            "kills": _num(line.get("kills"), int),
+            "deaths": _num(line.get("deaths"), int),
+            "won": won,
+            "star_bonus": star,
+            "perf_bonus": perf,
+            "weight": star + perf,
+        }
+
+    if stream == "multi":
+        match_pros = rec.get("pros", [])
+        for nick, line in rec.get("players", {}).items():
+            if not line:
+                continue
+            out.append(_build(nick, line, match_pros))
+    else:
         line = rec.get("line", {})
-        cand["kills"] = line.get("kills")
-        cand["deaths"] = line.get("deaths")
-        cand["adr"] = line.get("adr")
-        cand["hs"] = line.get("hs")
-    return cand
+        nick = rec.get("pro") or "?"
+        out.append(_build(nick, line, [nick]))
+    return out
 
 
 def _load_state() -> dict:
@@ -104,44 +142,45 @@ def _save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def _reason(cand: dict) -> str:
-    if cand["stream"] == "multi":
-        return f"{len(cand['pros'])} pros, best K/D {cand['best_kd']}, avg ELO {cand.get('avg_elo') or 'n/a'}"
-    return (f"solo standout {cand.get('pro')} {cand.get('kills')}/{cand.get('deaths')} "
-            f"(K/D {cand['best_kd']}, ADR {cand.get('adr')})")
+def _reason(c: dict) -> str:
+    w = "won" if c.get("won") else "lost"
+    return f"{c['player']} {c.get('kills')}/{c.get('deaths')} (K/D {c.get('kd')}, ADR {c.get('adr')}) - {w}"
 
 
 def select(state: dict, candidates: list[dict], n: int, today: str) -> tuple[list[dict], list[str], list[dict]]:
-    """Pick up to n best candidates, skipping already-used match ids.
+    """Pick up to n best player-performances, one per distinct player.
 
-    Returns (picks, newly_used_ids, survivors). Candidates include fresh
-    scrape + the persistent pool from previous days (fallback).
+    Skips already-used performance ids (persisted across days). Returns
+    (picks, newly_used_ids, survivors). Candidates include fresh scrape +
+    the persistent pool from previous days (fallback).
     """
     used = set(state.get("used", []))
-    fresh = [c for c in candidates if c["match_id"] not in used]
+    fresh = [c for c in candidates if c["id"] not in used]
     fresh.sort(key=lambda c: (-c["weight"],
                               -(datetime.strptime(c["date"], "%Y-%m-%d").timestamp()
                                 if c.get("date") else 0)))
-    picks, taken = [], set()
+    picks, taken_players = [], set()
     for c in fresh:
         if len(picks) >= n:
             break
-        if c["match_id"] in taken:
+        if c["player"] in taken_players:   # one pick per player
             continue
-        taken.add(c["match_id"])
+        taken_players.add(c["player"])
         picks.append(c)
-    new_used = list(taken)
+    picked_ids = {c["id"] for c in picks}
+    new_used = list(picked_ids)
     # survivors stay in the pool for future days
-    survivors = [c for c in candidates if c["match_id"] not in taken]
+    survivors = [c for c in candidates
+                 if c["id"] not in picked_ids and c["id"] not in used]
     return picks, new_used, survivors
 
 
 def _format_pick(c: dict) -> str:
     when = c.get("date") or "?"
-    return (f"  * {c['match_id']}\n"
-            f"      {len(c['pros'])} pro(s) {', '.join(c['pros'])} "
-            f"{c['map']} {c['score']} {when}\n"
-            f"      {_reason(c)}")
+    return (f"  * {c['player']}  [{c['match_id']}]\n"
+            f"      {c['map']} {c['score']} {c.get('date') or '?'} "
+            f"{' (w/ ' + ', '.join(p for p in c.get('pros', []) if p != c['player']) + ')' if any(p != c['player'] for p in c.get('pros', [])) else ''}\n"
+            f"      {_reason(c)}  | star={c.get('star_bonus')} perf={c.get('perf_bonus')}")
 
 
 # ---------- download + backlog (optional) ----------
@@ -238,23 +277,30 @@ def main() -> None:
     today = datetime.now().strftime("%Y-%m-%d")
     state = _load_state()
 
-    # idempotent per-day unless --force
-    if not args.force and state.get("last_day") == today and state["picks"].get(today):
-        picks = state["picks"][today]
+    # idempotent per-day unless --force; also re-run if stored picks are from
+    # the old match-level schema (no 'player' field).
+    prev = state["picks"].get(today)
+    if not args.force and state.get("last_day") == today and prev and prev[0].get("player"):
+        picks = prev
     else:
         data = asyncio.run(collect(
             hours=args.hours, count=args.count, min_pros=2,
             perf_kd=1.5, perf_adr=100.0, perf_kills=30, perf_limit=120,
             today_only=False, exclude_today=False,
         ))
-        fresh = ([make_candidate(r, "multi") for r in data["multi"]] +
-                 [make_candidate(r, "solo") for r in data["solo"]])
-        # seed the persistent pool with any fresh candidates it lacks
-        seen = {c["match_id"] for c in state["pool"]}
+        # HLTV team-world-ranking, used for star-tier weighting (cached 24h).
+        ranking = asyncio.run(fetch_team_ranking())
+        fresh = []
+        for r in data["multi"]:
+            fresh.extend(make_player_candidates(r, "multi", ranking))
+        for r in data["solo"]:
+            fresh.extend(make_player_candidates(r, "solo", ranking))
+        # Refresh the persistent pool: key on performance id (match_id:player),
+        # drop pre-schema match-level entries, add/overwrite fresh ones.
+        pool_by_id = {c["id"]: c for c in state["pool"] if c.get("id")}
         for c in fresh:
-            if c["match_id"] not in seen:
-                state["pool"].append(c)
-                seen.add(c["match_id"])
+            pool_by_id[c["id"]] = c
+        state["pool"] = list(pool_by_id.values())
 
         picks, new_used, survivors = select(state, state["pool"], args.n, today)
         # bound the fallback pool so stale entries can't accumulate forever
