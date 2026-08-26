@@ -405,13 +405,15 @@ def _extract_keyboard_states(
     Returns per_signal frame lists (0/1 per frame).
     """
     from demoparser2 import DemoParser
-    from scripts.render.usercmd_extract import _run_cli, _parse_rows, signals_from_rows, _validate_from_rows
+    from scripts.render.usercmd_extract import _run_cli, _parse_rows, signals_from_rows, _validate_from_rows, assert_extraction_sane
 
     t0 = time.time()
 
     # Corrected per-tick usercmd input (delta_data decoded correctly via the
     # vendored Rust parser — demoparser2 0.41.x misaligns usercmd_buttonstate).
     _rows = _parse_rows(_run_cli(str(demo_path), steam_id))
+    # Hard-fail on undecodable/all-zero input (schema drift after CS2 updates).
+    assert_extraction_sane(_rows)
     corrected = signals_from_rows(_rows)
     _log(f"  [usercmd] corrected signals for {len(corrected)} ticks")
     # Sanity check: extracted A/D keys vs the player's actual velocity.
