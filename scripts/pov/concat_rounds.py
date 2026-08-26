@@ -5,6 +5,11 @@ import json
 import re
 import subprocess
 import sys
+
+# 2560x1440 NVENC p7 mezzanine of a full 21-round map legitimately exceeds
+# 2 h on slower encodes — a too-tight cap kills only the python wrapper while
+# ffmpeg finishes detached, surfacing as a confusing CONCAT_FAILED.
+SCALE_TIMEOUT_S = 6 * 3600
 import tempfile
 import time
 from pathlib import Path
@@ -625,7 +630,7 @@ def _encode_scaled(src: Path, dst: Path, w: int, h: int, scaling_mode: str,
         "-movflags", "+faststart",
         "-c:a", "copy", str(temp),
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=SCALE_TIMEOUT_S)
     elapsed = time.time() - t0
     if r.returncode != 0:
         temp.unlink(missing_ok=True)
@@ -651,7 +656,7 @@ def _encode_scaled(src: Path, dst: Path, w: int, h: int, scaling_mode: str,
                 "-movflags", "+faststart",
                 "-c:a", "copy", str(temp),
             ]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=SCALE_TIMEOUT_S)
         if r.returncode != 0:
             temp.unlink(missing_ok=True)
             print(f"\n[ERROR] Scale fallback also failed: {r.stderr[-300:]}")
