@@ -15,7 +15,7 @@ Reads all POV metadata from the backlog file. Runs steps 1-6 in order (analyze �
 | 3 | concat | `python scripts/pov/concat_rounds.py <renders_folder>` |
 | **4** | **overlay** | `python scripts/overlay/overlay_pov.py --video <video.mp4> --demo <demo> --steam-id <id> [--round N]` |
 | 5 | outro | `python scripts/pov/generate_outro.py <video.mp4>` |
-| 6 | thumbnail | `python -m thumbnail <url> --player <nick> --map <map> --demo <dem> --steam-id <id>` |
+| 6 | thumbnail | `python -m thumbnail <url> --player <nick> --map <map> --video <mp4> --demo <dem> --steam-id <id>` |
 | 7 | cleanup | `python scripts/pov/cleanup_renders.py <renders_folder>` |
 
 **Uploading is a separate step.** The pipeline stops at step 6 (thumbnail) and writes `upload_meta.json` (with `youtube_id=null`, `upload_status="pending"`) for every variant. Run `python scripts/upload/upload_pending.py` afterward to upload all pending metas (it scans `youtube/*/upload_meta.json` and uploads any not yet completed). Step 4 (overlay) runs by default because dual-upload is on. To skip overlay entirely, run with `--until 3`. Raw-only mode (`--raw-only`) skips step 4 entirely — no overlay work directory or util_cams are created.
@@ -132,7 +132,7 @@ python scripts/pov/pipeline_chain.py --watch falcons-vs-mouz-m2-dust2_kyousuke_D
 
 ## Backlog Creation
 
-`python scripts/pov/create_backlog.py <hltv_url>` — downloads a match and generates prioritized backlog entries for every player/map combo.
+`python scripts/pov/create_backlog.py <hltv_url>` — downloads a match and generates prioritized backlog entries for every player/map combo. After cards are written it also extracts Recognised-Pro Shorts timelines (`--no-shorts` skips). Demos with zero qualifying shorts leave no folder under `renders/shorts/`.
 
 **Demos are downloaded automatically.** The script calls into `acquire_match()` then scrapes HLTV Rating 3.0, creating a per-player backlog card ranked by rating. It validates that the `.dem` file for each map exists on disk — if not found, it raises `FileNotFoundError` with the expected path, rather than writing a placeholder.
 
@@ -172,4 +172,4 @@ youtube/
     └── upload_meta.json    (title suffix "| Input Overlay + Utility Cam", extra tags, overlay note in description)
 ```
 
-**Overlay thumbnail background (canon):** for `variant=overlay`, the pipeline extracts a single frame from `combined.overlay.mp4` (the actual overlay video) at ~40% duration, scales to 1920×1080, and passes it to the thumbnail CLI as `--background`. The keyboard overlay and util-cam PiP are faintly visible behind the Gaussian blur — proof the variant has real overlay content. Falls back to kill-frame extraction (from raw demo) if the overlay video is missing.
+**Overlay thumbnail background:** a frame from the finished `youtube/{run_id}_overlay/video.mp4` at the densest POV killfeed tick, mapped through the concat sidecar (`video.round_offsets.json`). Same HUD/overlay as the upload, including the player's render autoexec. No CS2 session. If the sidecar cannot map a kill, falls back to a mid-video frame from that same file.

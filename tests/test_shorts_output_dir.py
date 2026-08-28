@@ -24,7 +24,7 @@ def test_hltv_with_player(monkeypatch, tmp_path):
 
     out = resolve_output_dir(demo, player="76561198000000000")
     assert out == tmp_path / "renders" / "shorts" / "shorts-spirit-vs-falcons-m3-nuke"
-    assert out.is_dir()
+    assert not out.exists()
 
 
 def test_faceit_no_player_needed(monkeypatch, tmp_path):
@@ -38,7 +38,7 @@ def test_faceit_no_player_needed(monkeypatch, tmp_path):
 
     out = resolve_output_dir(demo)
     assert out == tmp_path / "renders" / "shorts" / "shorts-team-teses-vs-svnonethree"
-    assert out.is_dir()
+    assert not out.exists()
 
 
 def test_hltv_absolute_path(monkeypatch, tmp_path):
@@ -52,7 +52,7 @@ def test_hltv_absolute_path(monkeypatch, tmp_path):
 
     out = resolve_output_dir(demo, player="123456789")
     assert out == tmp_path / "renders" / "shorts" / "shorts-match-slug-map"
-    assert out.is_dir()
+    assert not out.exists()
 
 
 def test_hltv_player_ignored(monkeypatch, tmp_path):
@@ -105,4 +105,4 @@ def test_idempotent(monkeypatch, tmp_path):
     out1 = resolve_output_dir(demo)
     out2 = resolve_output_dir(demo)
     assert out1 == out2
-    assert out1.is_dir()
+    assert not out1.exists()

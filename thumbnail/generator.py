@@ -55,6 +55,7 @@ def draw_text(
     y: int,
     font_size: int,
     anchor: str = "mm",
+    fill: tuple = TEXT_COLOR,
 ) -> None:
     font = _load_font(font_size)
     draw.text(
@@ -64,6 +65,6 @@ def draw_text(
     )
     draw.text(
         (x, y), text, font=font,
-        fill=TEXT_COLOR, anchor=anchor,
+        fill=fill, anchor=anchor,
         stroke_width=STROKE_WIDTH, stroke_fill=SHADOW_COLOR,
     )

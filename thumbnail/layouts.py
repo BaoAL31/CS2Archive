@@ -13,6 +13,7 @@ from thumbnail.generator import (
     SHADOW_COLOR,
     SHADOW_OFFSET,
     STROKE_WIDTH,
+    TEXT_COLOR,
     _load_font,
     cutout_player,
     draw_text,
@@ -299,39 +300,40 @@ def generate(
     py = HEIGHT - ph
     bg.paste(player_img, (px, py), player_img)
 
+    _draw_text_scrim(bg)
     draw = ImageDraw.Draw(bg)
 
     text_x = int(WIDTH * 0.68)
     text_y_center = HEIGHT // 2
 
-    lines = [
-        (player_name, FONT_SIZES["player"], 0),
-        (f"K-D: {kd}", FONT_SIZES["stat"], 0),
-        (f"Rating: {rating}", FONT_SIZES["stat"], 0),
-        (map_name, FONT_SIZES["small"], 0),
-        (match_detail, FONT_SIZES["small"], 0),
-    ]
-    if tournament:
-        if tournament_logo is not None:
-            # Reserve a taller slot with extra top spacing so the (taller) logo
-            # never touches the match line above it.
-            lines.append((None, FONT_SIZES["tiny"], LOGO_SLOT_TOP_GAP))
-        else:
-            lines.append((tournament, FONT_SIZES["tiny"], 0))
+    kd_fill = (239, 195, 79)       # gold — hero K-D
+    rating_fill = (92, 214, 128)   # HLTV-ish green
+    GOLD = 128
+    RATING = 62
 
-    total = sum(_line_height(s) for _, s, _g in lines)
+    match_line = match_detail.strip()
+    if map_name:
+        match_line = f"{match_line}  ·  {map_name}" if match_line else map_name
+
+    lines = [
+        (player_name, FONT_SIZES["player"], TEXT_COLOR, 0),
+        (kd, GOLD, kd_fill, 0),
+        (str(rating), RATING, rating_fill, 0),
+        (match_line, FONT_SIZES["tiny"], TEXT_COLOR, 0),
+    ]
+    if tournament_logo is not None:
+        lines.append((None, FONT_SIZES["tiny"], TEXT_COLOR, LOGO_SLOT_TOP_GAP))
+
+    total = sum(_line_height(s) for _, s, _f, _g in lines)
     current_y = text_y_center - total // 2
 
-    for text, size, gap in lines:
+    for text, size, fill, gap in lines:
         current_y += gap
         if text is None and tournament_logo is not None:
             _draw_tournament_logo(bg, tournament_logo, text_x, current_y)
         else:
-            draw_text(draw, text, text_x, current_y, size, anchor="mm")
+            draw_text(draw, text, text_x, current_y, size, anchor="mm", fill=fill)
         current_y += _line_height(size)
-
-    if variant == "overlay":
-        _draw_overlay_badge(bg)
 
     return bg
 

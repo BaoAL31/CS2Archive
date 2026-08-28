@@ -37,11 +37,12 @@ from pathlib import Path
 _ALIASES = [
     ("the-mongolz", "MongolZ", "The MongolZ"),
     ("mongolz", "MongolZ", "The MongolZ"),
-    ("natus-vincere", "NAVI", "Natus Vincere"),
-    ("natus", "NAVI", "Natus Vincere"),
-    ("vincere", "NAVI", "Natus Vincere"),
+    ("natus-vincere", "NaVi", "Natus Vincere"),
+    ("natus", "NaVi", "Natus Vincere"),
+    ("vincere", "NaVi", "Natus Vincere"),
     ("spirit", "Spirit", "Team Spirit"),
     ("fut", "FUT", "FUT Esports"),
+    ("m80", "M80", "M80"),
     ("big", "BIG", "BIG"),
     ("b8", "B8", "B8 Esports"),
 ]
@@ -70,18 +71,28 @@ _MAP_WORDS = [
 
 
 def orgs_from_folder(demo) -> list[tuple[str, str]]:
-    """Return ``[(display, raw_search), ...]`` for the two teams from the folder."""
+    """Return ``[(display, raw_search), ...]`` for the two teams from the folder.
+
+    HLTV stems look like ``natus-vincere-vs-m80-m3-inferno``. Split on ``-vs-``
+    (not the letters ``vs`` — that hits ``vincere``). Peel the map name and a
+    trailing ``-mN`` off the *second* team only, so a slug like ``m80`` is not
+    eaten as a map index.
+    """
     stem = Path(demo).stem.lower()
-    stem = re.sub(r"-(p\d)$", "", stem)            # strip "-p1/-p2" split demos
-    for w in _MAP_WORDS:                              # strip trailing map (single-map folders)
-        if stem.endswith("-" + w):
-            stem = stem[: -(len(w) + 1)]
-            break
-    stem = re.sub(r"-[mp]\d+(?:-[a-z0-9]+)?$", "", stem)  # strip "-mN" / "-mN-map" / "-pN"
-    if "vs" not in stem:
+    stem = re.sub(r"-(p\d)$", "", stem)
+    if "-vs-" not in stem:
         return []
-    a, b = stem.split("vs", 1)
-    return [_slug_to_org(a.strip("-").strip()), _slug_to_org(b.strip("-").strip())]
+    a, b = stem.split("-vs-", 1)
+    for w in _MAP_WORDS:
+        if b.endswith("-" + w):
+            b = b[: -(len(w) + 1)]
+            break
+    b = re.sub(r"-m\d+$", "", b)
+    a = a.strip("-").strip()
+    b = b.strip("-").strip()
+    if not a or not b:
+        return []
+    return [_slug_to_org(a), _slug_to_org(b)]
 
 
 def _fuzzy_hit(org_name: str, folder_token: str) -> bool:

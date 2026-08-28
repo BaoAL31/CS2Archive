@@ -4,13 +4,13 @@
 renders for matches from the configured event when at least one team is in the
 top-20 ranking snapshot.
 
-The default event is Esports World Cup 2026. The default poll interval is five
+The default event is BLAST Open Porto 2026. The default poll interval is five
 minutes. Only the highest-rated high-priority card per map is queued from
 `backlog/<match>/high/` (rating >= 1.5). The worker runs one
 `scripts/pov/pipeline.py` process at a time and does not upload anything.
-After a match has demos, it also extracts Shorts timelines with
-`scripts/shorts/build_short_timeline.py`. New Shorts output lives under
-`renders/shorts/shorts-<demo-stem>/shorts-<slug>/`.
+Shorts timelines are extracted inside `create_backlog.py` (Recognised Pros
+only, skip with `--no-shorts`). Output is written only when at least one
+short is detected: `renders/shorts/shorts-<demo-stem>/shorts-<slug>/`.
 
 ## Run
 
@@ -20,6 +20,9 @@ From the repository root:
 .\scripts\hltv\run_match_listener.ps1 -DryRun -Once
 .\scripts\hltv\run_match_listener.ps1
 ```
+
+Use `--no-rebaseline` when switching events so already-completed matches can
+still be actioned (launch normally re-baselines everything currently visible).
 
 The first command checks the filters and state flow without downloading or
 rendering. State is stored in `.listener/hltv.json`; a lock file beside it

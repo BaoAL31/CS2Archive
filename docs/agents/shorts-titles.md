@@ -10,8 +10,11 @@ instead of re-deriving the convention.
 2. **Kinds:** clutch (e.g. "1v4 Clutch", "2v5 Clutch", "ACE") or multikill
    ("4K", "5K"). Add the weapon/gun for flavour when it's distinctive (e.g.
    "AK 4K", "M4 + AK 4K").
-3. **Opponent label** (FACEIT only — opponent is a random/level-10 lobby, not
-   a pro org, so don't name a team):
+3. **Opponent label**
+   - HLTV/tournament: name the opposing **org**. If that org is HLTV **top 10**,
+     the name is required in the title (never map-only).
+   - FACEIT only — opponent is a random/level-10 lobby, not a pro org, so don't
+     name a team:
    - Opponent average ELO **≥ 3000** → put the number in the title:
      `against 3.1k ELOs`, `against 3.2K ELOs`.
    - Opponent average ELO **< 3000** → "level 10" / "level 10 faceit players".
@@ -20,12 +23,14 @@ instead of re-deriving the convention.
    if any). Never a `tags` field, never `#csgo`, never `#Shorts`, no map
    hashtags.
 5. **No em-dashes** (`—` / `\u2014`). Use a plain hyphen `-` or restructure.
-6. Vary the format — don't repeat one template for every short. Lead with the
-   player, the gun, the clutch, or a hook as fits the clip.
+6. Vary the format. For HLTV **clutches with a named org**, the title starts
+   with the situation as a question, opponent in the hook, punchline after:
+   `1v3 against NaVi? No problem for JBa`. Not `1v3? No problem for JBa against NaVi`.
 
 ## Good examples (approved / shipped-style)
 
-Real, from the current batch — all are "make it creative" wins:
+- `1v3 against NaVi? No problem for JBa #cs2 #counterstrike`
+  (HLTV clutch: `{n}v{m} against {Org}?` then `No problem for {player}`)
 
 - `kyousuke casually drops an AK ACE against 3.1k ELOs #cs2 #counterstrike`
   (5K, AK, opponent ~3.1k ELO → number in title, casual voice)

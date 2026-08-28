@@ -1536,72 +1536,28 @@ class Pipeline:
             return None
 
     def _extract_kill_frame(self, video_path: Path) -> Path | None:
-        """Extract a frame from an already-rendered POV video at the exact
-        moment of one of the POV player's kills.
-
-        Maps the kill's demo tick to a video timestamp via the concat sidecar
-        (``combined.round_offsets.json``: per-round recorded tick spans +
-        start offsets — ground truth from the CSDM sequence files). No CS2/
-        HLAE session needed. Returns a temp JPEG (1920x1080 pillarboxed) or
-        None when video/sidecar/analysis are unavailable or no kill lands
-        inside a recorded round span.
+        """Frame from the finished POV/overlay video at the densest killfeed
+        tick. Tick → seconds via the concat sidecar. No CS2.
         """
-        import random
+        from thumbnail.utils import extract_killfeed_frame
 
-        try:
-            sidecar_p = self.render_dir / "combined.round_offsets.json"
+        extra: list[Path] = []
+        analysis: Path | None = None
+        if self.render_dir:
+            extra.extend([
+                self.render_dir / "combined.round_offsets.json",
+                self.render_dir / f"{self.render_dir.name}.round_offsets.json",
+            ])
             analysis_p = self.render_dir / "csdm_analysis.json"
-            if not sidecar_p.is_file() or not analysis_p.is_file():
-                return None
-            sidecar = json.loads(sidecar_p.read_text(encoding="utf-8"))
-            offsets = sidecar.get("round_offsets") or {}
-            ticks = sidecar.get("per_round_ticks") or {}
-            durs = sidecar.get("per_round_durations") or {}
-            if not offsets or not ticks:
-                return None
-            data = json.loads(analysis_p.read_text(encoding="utf-8"))
-            kills = [k for k in data.get("kills", [])
-                     if str(k.get("killerSteamId")) == str(self.steam_id)]
-            if not kills:
-                return None
-
-            spans: list[tuple[int, int, float, float]] = []
-            for rn, span in ticks.items():
-                if rn not in offsets:
-                    continue
-                a, b = int(span[0]), int(span[1])
-                off = float(offsets[rn])
-                dur = float(durs.get(rn, 0.0))
-                if b <= a or dur <= 0:
-                    continue
-                spans.append((a, b, off, dur))
-
-            random.shuffle(kills)
-            for kill in kills:
-                tick = int(kill["tick"])
-                match = next((s for s in spans if s[0] <= tick <= s[1]), None)
-                if match is None:
-                    continue  # kill inside a cut/gap — not in rendered footage
-                a, b, off, dur = match
-                seek_t = off + (tick - a) / (b - a) * dur
-                print(f"  [bg] kill frame @ {seek_t:.2f}s (tick {tick}, "
-                      f"{kill.get('weaponName', '?')} -> {kill.get('victimName', '?')})")
-                tmp_fd, tmp_name = tempfile.mkstemp(prefix="thumb_kill_", suffix=".jpg")
-                os.close(tmp_fd)
-                tmp = Path(tmp_name)
-                r = subprocess.run(
-                    ["ffmpeg", "-y", "-loglevel", "error",
-                     "-ss", f"{seek_t:.3f}", "-i", str(video_path),
-                     "-frames:v", "1",
-                     "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,"
-                            "pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
-                     str(tmp)],
-                    capture_output=True, text=True, timeout=120,
-                )
-                if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 1024:
-                    return tmp
-                tmp.unlink(missing_ok=True)
-            return None
+            if analysis_p.is_file():
+                analysis = analysis_p
+        try:
+            return extract_killfeed_frame(
+                video_path, self.steam_id,
+                demo_path=self.demo_path,
+                extra_sidecars=extra,
+                analysis_path=analysis,
+            )
         except Exception as e:
             print(f"  [warn] kill-frame extraction failed: {e}")
             return None
@@ -1611,10 +1567,9 @@ class Pipeline:
         corresponding upload_meta.json. ``variant`` is 'raw' (default) or
         'overlay' (adds W/ INPUT OVERLAY and + UTIL CAMS badges in bottom-right).
 
-        For ``variant='overlay'``, the canonical background is a frame extracted
-        from ``combined.overlay.mp4`` (the actual overlay video) so the keyboard
-        + util-cam PiP is faintly visible behind the blur. Falls back to
-        kill-frame extraction (raw demo) if the overlay video is missing.
+        For ``variant='overlay'``, the background is a frame from the finished
+        overlay ``video.mp4`` (keyboard + util-cam already baked in) at the
+        densest POV killfeed tick, mapped via the concat sidecar. No CS2.
         """
         from cs2_minimizer import ensure_cs2_closed
 
@@ -1626,12 +1581,10 @@ class Pipeline:
         if self.is_faceit:
             # FACEIT path: blurred kill-frame + text, no ratings/avatar.
             # ELO lines come from the backlog card (elo / opp_avg_elo).
-            # Background: kill-moment frame pulled straight from the already-
-            # rendered POV video via the concat sidecar (no CS2 session).
+            # Background: kill-moment frame from the finished youtube video
+            # (overlay-only = keyboard + util cam, player's render cfg).
             faceit_bg: Path | None = None
             pov_vid = youtube_dir / "video.mp4"
-            if not pov_vid.is_file():
-                pov_vid = self.render_dir / "combined.mp4"
             if pov_vid.is_file():
                 faceit_bg = self._extract_kill_frame(pov_vid)
             cmd = [
@@ -1642,6 +1595,8 @@ class Pipeline:
             ]
             if faceit_bg is not None:
                 cmd += ["--background", str(faceit_bg)]
+            elif pov_vid.is_file():
+                cmd += ["--video", str(pov_vid)]
             if self.steam_id:
                 cmd += ["--steam-id", self.steam_id]
             elo = self.meta.get("elo")
@@ -1669,18 +1624,21 @@ class Pipeline:
 
         bg_override: Path | None = None
         bg_cleanup: Path | None = None
-        if variant == "overlay":
-            overlay_vid = self._find_overlay_video()
-            if overlay_vid is not None:
-                bg_override = self._extract_kill_frame(overlay_vid)
-                if bg_override is not None:
-                    print(f"  [bg] kill frame from {overlay_vid.name}")
-                else:
-                    print(f"  [bg] no sidecar/kill match — mid-video frame")
-                    bg_override = self._extract_overlay_frame(overlay_vid)
-                bg_cleanup = bg_override
-            else:
-                print(f"  [bg] overlay video not found — falling back to kill-frame extraction")
+        pov_vid = youtube_dir / "video.mp4"
+        if not pov_vid.is_file() and variant == "overlay":
+            found = self._find_overlay_video()
+            if found is not None:
+                pov_vid = found
+        if pov_vid.is_file():
+            bg_override = self._extract_kill_frame(pov_vid)
+            if bg_override is not None:
+                print(f"  [bg] kill frame from {pov_vid.name}")
+            elif variant == "overlay":
+                print(f"  [bg] no sidecar/kill match — mid-video frame")
+                bg_override = self._extract_overlay_frame(pov_vid)
+            bg_cleanup = bg_override
+        else:
+            print(f"  [bg] finished video not found — thumbnail needs --background")
 
         cmd = [
             "-m", "thumbnail",
@@ -1691,8 +1649,6 @@ class Pipeline:
         ]
         if bg_override is not None:
             cmd += ["--background", str(bg_override)]
-        elif self.demo_path:
-            cmd += ["--demo", str(self.demo_path)]
         if self.steam_id:
             cmd += ["--steam-id", self.steam_id]
         if self.tournament:

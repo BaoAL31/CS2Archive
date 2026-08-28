@@ -44,6 +44,12 @@ _PRE_KILL_TICK_MARGIN = 320  # 5s floor before first kill (at 64 tick)
 _POST_KILL_TICK_MARGIN = 128  # 2s after last kill (at 64 tick)
 _SHORT_TICK_DURATION = 1280  # 20s target total short length (20 * 64 tick)
 _CLUTCH_MIN_DURATION_TICKS = 640  # 10s of playing at a disadvantage for a clutch
+# CT clock expiry (and hostage-time equivalent). Surviving 1vX until the
+# timer hits zero is not a clutch.
+_CT_TIME_WIN_REASONS = frozenset({
+    "time_ran_out",
+    "RoundEndReasonHostagesNotRescued",
+})
 
 
 def _as_event_df(result):
@@ -255,6 +261,7 @@ def build_short_timeline(demo_path: Path, player: str | None = None,
     except Exception:
         victim_weapon_map = {}
 
+    winners, reasons = _winner_by_round_from_demo(parser, info, round_start, round_end_winner)
     return detect_shorts(
         demo_path=str(demo_path),
         header_map=header_map,
@@ -267,7 +274,8 @@ def build_short_timeline(demo_path: Path, player: str | None = None,
         bomb_defuse=bomb_defuse,
         bomb_explode=bomb_explode,
         victim_weapon_map=victim_weapon_map,
-        winner_by_round=_winner_by_round_from_demo(parser, info, round_start, round_end_winner),
+        winner_by_round=winners,
+        win_reason_by_round=reasons,
         pros_only=pros_only,
     )
 
@@ -277,19 +285,23 @@ def _winner_by_round_from_demo(
     info,
     round_start,
     round_end_winner,
-) -> dict[int, int]:
-    """Authoritative per-round winner (persistent team number).
+) -> tuple[dict[int, int], dict[int, str]]:
+    """Authoritative per-round winner (persistent team number) and win reason.
 
     ``round_end.winner`` carries the winning *side* ('T'/'CT'), which flips at
     halftime, while ``parse_player_info.team_number`` is the persistent team
     (stable across halves). Sample the side of every player at each round start
     to map side -> persistent team per round, then convert each round_end winner.
+
+    ``round_end.reason`` is the engine win reason (e.g. ``t_killed``,
+    ``bomb_defused``, ``time_ran_out``).
     """
     winner_by_round: dict[int, int] = {}
+    reason_by_round: dict[int, str] = {}
     if round_end_winner is None or round_end_winner.empty:
-        return winner_by_round
+        return winner_by_round, reason_by_round
     if round_start is None or round_start.empty or info is None or info.empty:
-        return winner_by_round
+        return winner_by_round, reason_by_round
 
     persist_team: dict[str, int] = {}
     for _, row in info.iterrows():
@@ -299,11 +311,11 @@ def _winner_by_round_from_demo(
 
     rs_ticks = sorted({int(t) for t in round_start["tick"].tolist() if int(t) > 1})
     if not rs_ticks:
-        return winner_by_round
+        return winner_by_round, reason_by_round
     try:
         side_snap = parser.parse_ticks(["steamid", "team_num"], ticks=rs_ticks)
     except Exception:
-        return winner_by_round
+        return winner_by_round, reason_by_round
 
     side_to_team: dict[int, dict[int, int]] = {}
     for _, row in side_snap.iterrows():
@@ -352,7 +364,10 @@ def _winner_by_round_from_demo(
         team = side_to_team.get(rs_tick, {}).get(slot)
         if team:
             winner_by_round[rn] = team
-    return winner_by_round
+        raw_reason = row.get("reason", "")
+        if raw_reason == raw_reason and raw_reason not in ("", None):
+            reason_by_round[rn] = str(raw_reason).strip()
+    return winner_by_round, reason_by_round
 
 
 def detect_shorts(
@@ -371,6 +386,7 @@ def detect_shorts(
     team_by_sid: dict[str, int] | None = None,
     nickname_by_sid: dict[str, str] | None = None,
     winner_by_round: dict[int, int] | None = None,
+    win_reason_by_round: dict[int, str] | None = None,
     kill_events: list[dict] | None = None,
     round_starts: list[tuple[int, int]] | None = None,
     first_freeze: int | None = None,
@@ -781,6 +797,9 @@ def detect_shorts(
                 win_tick = round_ends.get(roundn, 0)
                 win_event = "team_win"
 
+            if (win_reason_by_round or {}).get(roundn) in _CT_TIME_WIN_REASONS:
+                continue  # CT (or hostage) clock win is not a clutch
+
             # --- 2v5 special: require 4k from POV, switch to survivor if POV dies ---
             if trigger["type"] == "2v5":
                 by_attacker: dict[str, list[dict]] = {}
@@ -909,14 +928,63 @@ def detect_shorts(
             )
         ]
 
+    kills: list[dict] = []
+    for rn in sorted(kills_by_round):
+        for k in kills_by_round[rn]:
+            aid = str(k.get("attacker_sid") or "")
+            vid = str(k.get("victim_sid") or "")
+            kills.append({
+                "tick": k["tick"],
+                "round": k["round"],
+                "attacker_steam_id": aid,
+                "victim_steam_id": vid,
+                "weapon": k.get("weapon", ""),
+                "attacker": nickname_by_sid.get(aid, ""),
+                "victim": nickname_by_sid.get(vid, ""),
+            })
+
     return {
         "short_type": "short_timeline",
         "demo_path": demo_path,
         "map": header_map or "Unknown",
+        "tickrate": 64,
         "short_count": len(shorts),
         "_dropped_randos": dropped_randos,
         "shorts": shorts,
+        "kills": kills,
     }
+
+
+def persist_action_timeline(
+    demo_path: Path, timeline: dict, output_dir: Path | None = None,
+) -> Path:
+    """Write the kill list shorts extraction already parsed. Do not re-parse."""
+    base = output_dir or resolve_output_dir(demo_path)
+    base.mkdir(parents=True, exist_ok=True)
+    path = base / "action_timeline.json"
+    path.write_text(
+        json.dumps(
+            {
+                "demo_path": timeline.get("demo_path", str(demo_path)),
+                "map": timeline.get("map", ""),
+                "tickrate": int(timeline.get("tickrate") or 64),
+                "kills": timeline.get("kills") or [],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def short_json_payload(timeline: dict, short: dict) -> dict:
+    payload = {
+        k: v for k, v in timeline.items()
+        if k not in ("_dropped_randos", "kills")
+    }
+    payload["short_count"] = 1
+    payload["shorts"] = [short]
+    return payload
 
 
 def _round_for_tick(
@@ -1106,29 +1174,26 @@ def main() -> int:
         timeline = build_short_timeline(demo, player=args.player, pros_only=pros_only)
 
     dropped = timeline.get("_dropped_randos", 0)
-    # _dropped_randos is run-reporting only — keep it out of the persisted
-    # short_timeline.json schema.
-    timeline = {k: v for k, v in timeline.items() if k != "_dropped_randos"}
-
     shorts_list = timeline.get("shorts", [])
-    if not shorts_list:
-        suffix = f" ({dropped} non-pro short(s) filtered)" if dropped else ""
-        print(f"[OK] 0 shorts detected{suffix} (no output written)")
-        return 0
 
     if args.from_action_timeline:
         base_dir = args.output or at_path.parent
     else:
         base_dir = args.output or resolve_output_dir(demo, player=args.player)
+        persist_action_timeline(demo, timeline, output_dir=base_dir)
+
+    if not shorts_list:
+        suffix = f" ({dropped} non-pro short(s) filtered)" if dropped else ""
+        print(f"[OK] 0 shorts detected{suffix}")
+        return 0
 
     written = 0
     for short in shorts_list:
         slug = _build_short_slug(short)
         short_dir = base_dir / f"shorts-{slug}"
         short_dir.mkdir(parents=True, exist_ok=True)
-        single_tl = {**timeline, "short_count": 1, "shorts": [short]}
         out = short_dir / "short_timeline.json"
-        out.write_text(json.dumps(single_tl, indent=2), encoding="utf-8")
+        out.write_text(json.dumps(short_json_payload(timeline, short), indent=2), encoding="utf-8")
         written += 1
 
     print(f"[OK] {len(shorts_list)} shorts -> {written} files under {base_dir}"

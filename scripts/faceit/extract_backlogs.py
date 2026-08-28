@@ -38,28 +38,28 @@ def _extract_shorts(demo: Path, steam_id: str, include_all_players: bool) -> Non
     from scripts.shorts.build_short_timeline import (
         build_short_timeline,
         _build_short_slug,
+        persist_action_timeline,
+        short_json_payload,
     )
     from scripts.shorts import resolve_output_dir
 
     pros_only = not include_all_players
     timeline = build_short_timeline(demo, player=steam_id, pros_only=pros_only)
-    timeline = {k: v for k, v in timeline.items() if k != "_dropped_randos"}
+    dropped = timeline.get("_dropped_randos", 0)
     shorts = timeline.get("shorts", [])
-    if not shorts:
-        dropped = timeline.get("_dropped_randos", 0)
-        print(f"[OK] 0 shorts detected"
-              + (f" ({dropped} non-pro short(s) filtered)" if dropped else "")
-              + " (no output written)")
-        return
     base = resolve_output_dir(demo, player=steam_id)
+    persist_action_timeline(demo, timeline, output_dir=base)
+    if not shorts:
+        print(f"[OK] 0 shorts detected"
+              + (f" ({dropped} non-pro short(s) filtered)" if dropped else ""))
+        return
     written = 0
     for short in shorts:
         slug = _build_short_slug(short)
         short_dir = base / f"shorts-{slug}"
         short_dir.mkdir(parents=True, exist_ok=True)
-        single = {**timeline, "short_count": 1, "shorts": [short]}
         (short_dir / "short_timeline.json").write_text(
-            json.dumps(single, indent=2), encoding="utf-8")
+            json.dumps(short_json_payload(timeline, short), indent=2), encoding="utf-8")
         written += 1
     print(f"[OK] {len(shorts)} shorts -> {written} file(s) under {base}")
 

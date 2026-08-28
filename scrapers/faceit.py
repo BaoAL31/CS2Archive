@@ -48,6 +48,33 @@ class FACEITClient:
         self._elo_cache: dict[str, int] = {}
         self._elo_by_steam: dict[str, int] = {}
 
+    async def get_player_by_steam_id(self, steam_id: str) -> Optional[dict]:
+        """FACEIT player payload for a steam64. None if not linked / not found.
+
+        Identity is the steam64: the response is rejected unless
+        ``steam_id_64`` matches the query. Nickname lookup is never used.
+        """
+        try:
+            data = await self._request("GET", "/players", params={
+                "game": "cs2", "game_player_id": steam_id,
+            })
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return None
+            raise
+        if str(data.get("steam_id_64") or "") != str(steam_id):
+            return None
+        return data
+
+    async def get_match(self, match_id: str) -> Optional[dict]:
+        """FACEIT match payload (rosters, status). None on 404."""
+        try:
+            return await self._request("GET", f"/matches/{match_id}")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return None
+            raise
+
     async def get_elo_by_steam_id(self, steam_id: str) -> Optional[int]:
         """Current FACEIT ELO for a player, looked up by steam64.
 

@@ -6,7 +6,7 @@ downloads or renders.
 
 Examples:
     python scripts/hltv/match_listener.py --once --dry-run
-    python scripts/hltv/match_listener.py --event-url https://www.hltv.org/events/8261/esports-world-cup-2026
+    python scripts/hltv/match_listener.py --event-url https://www.hltv.org/events/8249/blast-open-porto-2026
     python scripts/hltv/match_listener.py --refresh-teams --once
 """
 
@@ -28,14 +28,16 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+_SCRIPTS = ROOT / "scripts"
+for _p in (str(ROOT), str(_SCRIPTS)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 os.chdir(ROOT)
 
 from config import settings  # noqa: E402
 from scrapers.hltv_acquire import fetch_hltv_page_html, match_slug_from_url  # noqa: E402
 
-DEFAULT_EVENT_URL = "https://www.hltv.org/events/8261/esports-world-cup-2026"
+DEFAULT_EVENT_URL = "https://www.hltv.org/events/8249/blast-open-porto-2026"
 DEFAULT_STATE = ROOT / ".listener" / "hltv.json"
 DEFAULT_RANKINGS_URL = "https://www.hltv.org/ranking/teams"
 MIN_RATING = 1.5
@@ -339,27 +341,6 @@ def _run_backlog(match: Match, dry_run: bool, retries: int = 3) -> bool:
     return False
 
 
-def _run_short_extraction(match: Match, dry_run: bool) -> bool:
-    """Extract Shorts timelines for every demo in a newly acquired match."""
-    demo_dir = ROOT / "demos" / "hltv" / match_slug_from_url(match.url)
-    demos = sorted(demo_dir.glob("*.dem"))
-    if dry_run:
-        print(f"[shorts] would extract {len(demos)} demo(s) for {match.match_id}",
-              flush=True)
-        return True
-    if not demos:
-        print(f"[shorts] no demos available for {match.match_id}", flush=True)
-        return False
-    script = ROOT / "scripts" / "shorts" / "build_short_timeline.py"
-    for demo in demos:
-        cmd = [sys.executable, str(script), str(demo)]
-        print(f"[shorts] extracting: {' '.join(cmd)}", flush=True)
-        if subprocess.run(cmd, cwd=ROOT, env=_child_env()).returncode != 0:
-            print(f"[shorts] extraction failed: {demo.name}", flush=True)
-            return False
-    return True
-
-
 def _run_pipeline(card: str, dry_run: bool) -> bool:
     cmd = [sys.executable, str(ROOT / "scripts/pov/pipeline.py"),
            "--backlog", str(ROOT / card)]
@@ -397,7 +378,6 @@ def initialize_result_baseline(state: State, matches: list[Match]) -> None:
     )
     for record in state.data["matches"].values():
         record["status"] = "completed"
-        record["shorts_status"] = "completed"
         record["last_error"] = None
     for match in matches:
         record = state.data["matches"].setdefault(match.match_id, {
@@ -406,7 +386,6 @@ def initialize_result_baseline(state: State, matches: list[Match]) -> None:
         })
         record["match"] = asdict(match)
         record["status"] = "completed"
-        record["shorts_status"] = "completed"
     state.data["result_baseline_initialized"] = True
     state.data["result_baseline_ids"] = sorted(current_ids)
     state.data["queue"] = []
@@ -472,14 +451,6 @@ async def poll_once(args, state: State) -> None:
             "attempts": 0, "last_error": None,
         })
         if record["status"] in {"queued", "running", "completed"}:
-            if record.get("shorts_status") != "completed":
-                if _run_short_extraction(match, args.dry_run):
-                    record["shorts_status"] = "completed"
-                    record["shorts_error"] = None
-                else:
-                    record["shorts_status"] = "retry"
-                    record["shorts_error"] = "short extraction failed"
-                state.save()
             continue
         if not _retry_ready(record):
             continue
@@ -504,22 +475,8 @@ async def poll_once(args, state: State) -> None:
             record["cards"] = []
             record["no_high_priority_cards"] = True
             record["last_error"] = None
-            if record.get("shorts_status") != "completed":
-                if _run_short_extraction(match, args.dry_run):
-                    record["shorts_status"] = "completed"
-                    record["shorts_error"] = None
-                else:
-                    record["shorts_status"] = "retry"
-                    record["shorts_error"] = "short extraction failed"
             state.save()
             continue
-        if record.get("shorts_status") != "completed":
-            if _run_short_extraction(match, args.dry_run):
-                record["shorts_status"] = "completed"
-                record["shorts_error"] = None
-            else:
-                record["shorts_status"] = "retry"
-                record["shorts_error"] = "short extraction failed"
         _enqueue(state, cards)
         record["status"] = "queued"
         record["cards"] = cards
@@ -571,6 +528,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--refresh-teams", action="store_true")
     parser.add_argument("--status", action="store_true")
+    parser.add_argument(
+        "--no-rebaseline",
+        action="store_true",
+        help="keep existing result_baseline_ids across launch (for event switches / catch-up)",
+    )
     return parser
 
 
@@ -580,11 +542,15 @@ async def main(args) -> None:
         print(json.dumps(state.data, indent=2))
         return
     with SingleInstance(args.state.with_suffix(".lock")):
-        # Every launch establishes a fresh edge: results already visible now
-        # are historical, while anything appearing after this launch is new.
-        state.data["result_baseline_initialized"] = False
-        state.data["queue"] = []
-        state.save()
+        # Default: every launch establishes a fresh edge — results already
+        # visible now are historical, while anything appearing after this
+        # launch is new. --no-rebaseline keeps the on-disk baseline (used
+        # when switching events so already-completed matches can still be
+        # actioned if removed from baseline_ids).
+        if not args.no_rebaseline:
+            state.data["result_baseline_initialized"] = False
+            state.data["queue"] = []
+            state.save()
         while True:
             try:
                 await poll_once(args, state)

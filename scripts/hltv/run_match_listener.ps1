@@ -17,7 +17,7 @@ if ($DryRun) { $Args += "--dry-run" }
 if ($RefreshTeams) { $Args += "--refresh-teams" }
 
 Set-Location $Root
-$env:PYTHONPATH = "."
+$env:PYTHONPATH = "$Root\scripts;$Root"
 $LogDir = Join-Path $Root ".listener"
 New-Item -ItemType Directory -Force $LogDir | Out-Null
 $Transcript = Join-Path $LogDir "listener.log"

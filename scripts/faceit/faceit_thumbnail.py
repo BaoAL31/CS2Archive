@@ -5,11 +5,12 @@ The individual FACEIT thumbnail shows player, match ELO ("3521 ELO" /
 
 Usage:
     python scripts/faceit/faceit_thumbnail.py <demo_path> --player <nick> --map <map>
-                                  [--steam-id <id>] [--elo <int>] [--opp-elo <int>]
-                                  [--variant raw|overlay] --output <youtube_dir>
+                                  [--video <mp4>] [--steam-id <id>] [--elo <int>]
+                                  [--opp-elo <int>] [--variant raw|overlay]
+                                  --output <youtube_dir>
 
-Requires CS2DemoManager (csdm) for kill-frame extraction, same as the HLTV
-thumbnail path (thumbnail.cli.extract_background_frame).
+Background comes from the finished overlay/raw video (sidecar tick map),
+never a separate CS2 clip.
 """
 
 from __future__ import annotations
@@ -25,8 +26,8 @@ from _pathsetup import ensure
 ensure()
 sys.path.insert(0, str(PROJECT_ROOT / "thumbnail"))
 
-from thumbnail.cli import extract_background_frame  # noqa: E402
 from thumbnail.layouts import generate_faceit  # noqa: E402
+from thumbnail.utils import extract_killfeed_frame  # noqa: E402
 
 
 def main() -> None:
@@ -39,7 +40,11 @@ def main() -> None:
     ap.add_argument("--opp-elo", type=int, default=None, help="Average FACEIT ELO of the opposing team")
     ap.add_argument("--kd", default=None, help="K/D line for the POV player, e.g. '38/9'")
     ap.add_argument("--background", default=None,
-                    help="Reuse a cached background frame (jpg) instead of rendering a new kill frame")
+                    help="Reuse a cached background frame (jpg) instead of extracting from --video")
+    ap.add_argument("--video", default=None,
+                    help="Finished POV mp4 (overlay/raw) to grab the killfeed frame from")
+    ap.add_argument("--sidecar", default=None,
+                    help="round_offsets JSON (defaults to <video-stem>.round_offsets.json)")
     ap.add_argument("--variant", choices=["raw", "overlay"], default="raw")
     ap.add_argument("--output", required=True, help="youtube dir to write thumbnail.jpg")
     args = ap.parse_args()
@@ -57,8 +62,11 @@ def main() -> None:
 
     if args.background:
         bg = Path(args.background)
-    elif args.steam_id:
-        bg = extract_background_frame(str(demo), args.steam_id)
+    elif args.video and args.steam_id:
+        bg = extract_killfeed_frame(
+            args.video, args.steam_id,
+            demo_path=demo, sidecar_path=args.sidecar,
+        )
     else:
         bg = None
     if bg is None or not Path(bg).exists():

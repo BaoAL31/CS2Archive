@@ -54,6 +54,8 @@ def test_4k_detected():
     assert s["start_tick"] == 680  # 5s floor (320 ticks) before first kill
     assert s["end_tick"] == 4128  # 2s padding (128 ticks) after last kill
     assert s["kill_ticks"] == [1000, 2000, 3000, 4000]
+    assert [k["tick"] for k in timeline["kills"]] == [1000, 2000, 3000, 4000]
+    assert timeline["kills"][0]["attacker_steam_id"] == "A"
 
 
 def test_4k_dynamic_prekill_caps_at_30s():
@@ -324,7 +326,62 @@ def test_mixed_timeline_coexists():
     assert "clutch" in types
 
 
-# ------------------ Tightened clutch: brief disadvantage rejected ------------------
+def test_ct_time_win_is_not_a_clutch():
+    """1v3 that only 'wins' because the clock expired is not a clutch."""
+    kill_events = [
+        {"tick": 1000, "round": 1, "attacker_sid": "T1", "victim_sid": "C5", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 1100, "round": 1, "attacker_sid": "T1", "victim_sid": "C4", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 1200, "round": 1, "attacker_sid": "T1", "victim_sid": "C3", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 1300, "round": 1, "attacker_sid": "T1", "victim_sid": "C2", "weapon": "ak47", "victim_weapon": "ak47"},
+        # C1 is 1v5 from tick 1300; round ends on the clock with CTs still alive.
+    ]
+    team_by_sid = {
+        "T1": 2, "T2": 2, "T3": 2, "T4": 2, "T5": 2,
+        "C1": 3, "C2": 3, "C3": 3, "C4": 3, "C5": 3,
+    }
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=kill_events,
+        team_by_sid=team_by_sid,
+        winner_by_round={1: 3},
+        win_reason_by_round={1: "time_ran_out"},
+        round_starts=[(500, 1)],
+        round_ends={1: 6000},
+        round_win_events={},
+    )
+    assert [s for s in result["shorts"] if s["short_type"] == "clutch"] == []
+
+
+def test_ct_elimination_team_win_still_clutch():
+    """1v3 that ends with Ts dead (t_killed) is still a clutch, even without a bomb event."""
+    kill_events = [
+        {"tick": 1000, "round": 1, "attacker_sid": "T1", "victim_sid": "C5", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 1100, "round": 1, "attacker_sid": "T1", "victim_sid": "C4", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 1200, "round": 1, "attacker_sid": "T1", "victim_sid": "C3", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 1300, "round": 1, "attacker_sid": "T1", "victim_sid": "C2", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 2000, "round": 1, "attacker_sid": "C1", "victim_sid": "T1", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 2100, "round": 1, "attacker_sid": "C1", "victim_sid": "T2", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 2200, "round": 1, "attacker_sid": "C1", "victim_sid": "T3", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 2300, "round": 1, "attacker_sid": "C1", "victim_sid": "T4", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 2400, "round": 1, "attacker_sid": "C1", "victim_sid": "T5", "weapon": "ak47", "victim_weapon": "ak47"},
+    ]
+    team_by_sid = {
+        "T1": 2, "T2": 2, "T3": 2, "T4": 2, "T5": 2,
+        "C1": 3, "C2": 3, "C3": 3, "C4": 3, "C5": 3,
+    }
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=kill_events,
+        team_by_sid=team_by_sid,
+        winner_by_round={1: 3},
+        win_reason_by_round={1: "t_killed"},
+        round_starts=[(500, 1)],
+        round_ends={1: 3000},
+        round_win_events={},
+    )
+    clutches = [s for s in result["shorts"] if s["short_type"] == "clutch"]
+    assert len(clutches) == 1
+    assert clutches[0]["pov_steam_id"] == "C1"
 
 
 def test_clutch_rejected_if_disadvantage_brief():
@@ -660,7 +717,7 @@ def test_winner_by_round_uses_tick_not_shifted_round_field():
 
     # Winner belongs to round 1, not round 2. The +1 in round_end.round must be
     # ignored so the winning persistent team (3 = P) is keyed under round 1.
-    assert result == {1: 3}
+    assert result[0] == {1: 3}
 
 
 def test_winner_by_round_respects_halftime_side_swap():
@@ -687,4 +744,4 @@ def test_winner_by_round_respects_halftime_side_swap():
 
     result = _winner_by_round_from_demo(parser, info, round_start, round_end_winner)
 
-    assert result == {1: 2, 2: 3}
+    assert result[0] == {1: 2, 2: 3}

@@ -51,6 +51,7 @@ ROSTER_PATH = _ROOT / ".data" / "team_roster.json"
 # Roster team names -> HLTV ranking team names (ranking uses canonical spelling).
 TEAM_ALIASES = {
     "NAVI": "Natus Vincere",
+    "NaVi": "Natus Vincere",
     "Furia": "FURIA",
     "NAVI Junior": "Natus Vincere",
 }

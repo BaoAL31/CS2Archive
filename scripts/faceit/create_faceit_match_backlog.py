@@ -280,28 +280,29 @@ def run(demo: Path, *, map_override: str = "", tournament: str = "",
     if no_shorts:
         return written
     try:
-        from shorts.build_short_timeline import build_short_timeline, _build_short_slug
+        from shorts.build_short_timeline import (
+            build_short_timeline, _build_short_slug,
+            persist_action_timeline, short_json_payload,
+        )
         from shorts import resolve_output_dir
 
         print("[SHORTS] Extracting short timelines (Recognised Pros only)...")
         timeline = build_short_timeline(demo, pros_only=True)
         dropped = timeline.get("_dropped_randos", 0)
         shorts_list = timeline.get("shorts", [])
+        base_dir = resolve_output_dir(demo)
+        persist_action_timeline(demo, timeline, output_dir=base_dir)
         if not shorts_list:
             suffix = f" ({dropped} non-pro short(s) filtered)" if dropped else ""
             print(f"[SHORTS] 0 shorts detected{suffix}")
             return written
-        base_dir = resolve_output_dir(demo)
         written_shorts = 0
         for short in shorts_list:
             slug = _build_short_slug(short)
             short_dir = base_dir / f"shorts-{slug}"
             short_dir.mkdir(parents=True, exist_ok=True)
-            single_tl = {k: v for k, v in timeline.items() if k != "_dropped_randos"}
-            single_tl["short_count"] = 1
-            single_tl["shorts"] = [short]
             (short_dir / "short_timeline.json").write_text(
-                json.dumps(single_tl, indent=2), encoding="utf-8")
+                json.dumps(short_json_payload(timeline, short), indent=2), encoding="utf-8")
             written_shorts += 1
         print(f"[SHORTS] {len(shorts_list)} shorts -> {written_shorts} files under "
               f"{base_dir.relative_to(PROJECT_ROOT).as_posix()}"

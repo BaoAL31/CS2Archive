@@ -1,29 +1,21 @@
 from __future__ import annotations
 
 import argparse
-import json
-import random
-import shutil
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _SCRIPTS_DIR = _PROJECT_ROOT / "scripts"
-TMP_DIR = _PROJECT_ROOT / "tmp"
-TMP_DIR.mkdir(parents=True, exist_ok=True)
 for _p in (str(_PROJECT_ROOT), str(_SCRIPTS_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
 from rich.console import Console
 
-from cs2_minimizer import CS2Park
-from hook_aware import run_csdm_hook_aware
 from thumbnail.layouts import generate
 from thumbnail.utils import (
     YOUTUBE_DIR,
+    extract_killfeed_frame,
     find_player_stats,
     find_ratings_file,
     get_avatar_path,
@@ -33,8 +25,6 @@ from thumbnail.utils import (
 )
 
 console = Console(force_terminal=True)
-CSDM = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
-FFMPEG_PATH = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
 
 
 def resolve_ratings(input_arg: str) -> tuple[Path, str]:
@@ -64,99 +54,26 @@ def build_output_dir(match_slug: str, player: str, map_name: str) -> Path:
     return out
 
 
-def extract_background_frame(demo_path: str, steam_id: str) -> Path:
-    tmp_dir = Path(tempfile.mkdtemp(prefix="thumb_bg_", dir=TMP_DIR)).resolve()
-    demo = Path(demo_path).resolve()
-    cfg = (_PROJECT_ROOT / "assets" / "cs2_pov.cfg").resolve()
-    # Park-behind (NOT minimize): a minimized CS2 window gets throttled by
-    # Windows and HLAE fails to hook it (no clip is produced). Parking it
-    # restored-but-behind lets the short kill clip render at full speed.
-    minimizer = CS2Park()
-    minimizer.start()
-    try:
-        console.print(f"  Finding kills for player...")
-        subprocess.run(
-            [CSDM, "json", str(demo), "--output-folder", str(tmp_dir)],
-            capture_output=True, text=True, timeout=300,
+def extract_background_frame(
+    video_path: str,
+    steam_id: str,
+    *,
+    demo_path: str | None = None,
+    sidecar: str | None = None,
+) -> Path:
+    dest = YOUTUBE_DIR / "bg_frame.jpg"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    frame = extract_killfeed_frame(
+        video_path, steam_id,
+        demo_path=demo_path, sidecar_path=sidecar, dest=dest,
+    )
+    if frame is None:
+        console.print(
+            "[red]  Could not map a POV kill onto the video "
+            "(need video + round_offsets sidecar + kill timeline)[/red]"
         )
-
-        json_files = list(tmp_dir.glob("*.json"))
-        if not json_files:
-            console.print("[red]  Failed to export demo data[/red]")
-            sys.exit(1)
-
-        data = json.loads(json_files[0].read_text(encoding="utf-8"))
-        kills = [
-            k for k in data.get("kills", [])
-            if k.get("killerSteamId") == steam_id
-        ]
-
-        if not kills:
-            console.print(f"[red]  No kills found for steam ID {steam_id}[/red]")
-            sys.exit(1)
-
-        kill = random.choice(kills)
-        tick = int(kill["tick"])
-        tickrate = int(data.get("tickrate", 64))
-        before = int(tickrate * 1)
-        start_tick = max(0, tick - before)
-        end_tick = tick
-
-        console.print(f"  Rendering kill at tick {tick} ({kill.get('weaponName', '?')}, {kill.get('victimName', '?')})...")
-
-        cmd = [
-            CSDM, "video", str(demo),
-            str(start_tick), str(end_tick),
-            "--focus-player", steam_id,
-            "--perspective", "player",
-            "--no-show-x-ray",
-            "--no-show-only-death-notices",
-            "--output", str(tmp_dir),
-            "--width", "1920",
-            "--height", "1080",
-            "--framerate", "30",
-            "--ffmpeg-executable-path", FFMPEG_PATH,
-            "--ffmpeg-video-codec", "h264_nvenc",
-            "--ffmpeg-crf", "15",
-            "--ffmpeg-output-parameters=-cq 15 -preset p7 -profile:v high -pix_fmt yuv420p -level 5.1",
-            "--recording-system", "HLAE",
-            "--close-game-after-recording",
-            "--cfg", str(cfg),
-        ]
-
-        # HLAE hook detection + retry: if no clip appears within hook_timeout
-        # (~2 min) the hook failed (vanilla demo viewer) and must be re-run.
-        # run_csdm_hook_aware watches tmp_dir for a new >= 1 MB .mp4 and
-        # returns None if every attempt fails to hook.
-        clip = run_csdm_hook_aware(
-            cmd, "thumbnail-clip", tmp_dir,
-            hook_timeout=120.0, hook_retries=2,
-            min_video_bytes=50 * 1024,  # a 1s kill clip can be well under 1MB
-        )
-        if clip is None:
-            console.print("[red]  Clip render failed to hook CS2 after retries[/red]")
-            sys.exit(1)
-        frame_path = tmp_dir / "bg_frame.jpg"
-        # Clip spans [kill - 1s, kill]: seek to its END so the frame shows the
-        # kill moment itself, not a full second before it.
-        subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-sseof", "-0.08",
-             "-i", str(clip), "-frames:v", "1", "-update", "1", str(frame_path)],
-            capture_output=True, text=True, timeout=30,
-        )
-
-        if not frame_path.exists():
-            console.print("[red]  Frame extraction failed[/red]")
-            sys.exit(1)
-
-        dest = YOUTUBE_DIR / "bg_frame.jpg"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(frame_path), str(dest))
-        return dest
-
-    finally:
-        minimizer.stop()
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        sys.exit(1)
+    return frame
 
 
 def main() -> None:
@@ -164,9 +81,11 @@ def main() -> None:
     parser.add_argument("input", help="Match URL or ratings JSON path")
     parser.add_argument("--player", "-p", required=True, help="Player nickname")
     parser.add_argument("--map", "-m", required=True, help="Map name (e.g. Mirage, Nuke)")
-    parser.add_argument("--background", "-b", help="Path to background frame (omit to auto-extract from demo)")
-    parser.add_argument("--demo", help="Path to .dem file (for auto background extraction)")
-    parser.add_argument("--steam-id", help="Player Steam64 ID (required with --demo)")
+    parser.add_argument("--background", "-b", help="Path to background frame (omit to extract from --video)")
+    parser.add_argument("--video", help="Finished POV mp4 (overlay/raw) to grab the killfeed frame from")
+    parser.add_argument("--sidecar", help="round_offsets JSON (defaults to <video-stem>.round_offsets.json)")
+    parser.add_argument("--demo", help="Demo path — used only to find the shorts kill timeline")
+    parser.add_argument("--steam-id", help="Player Steam64 ID (required with --video)")
     parser.add_argument("--tournament", "-t", help="Tournament name (e.g. IEM Atlanta 2026)")
     parser.add_argument("--tournament-logo", help="Path to a logo image to draw over the tournament name")
     parser.add_argument(
@@ -201,13 +120,16 @@ def main() -> None:
         if not bg_path.exists():
             console.print(f"[red]  Background frame not found: {bg_path}[/red]")
             return
-    elif args.demo and args.steam_id:
-        if not Path(args.demo).exists():
-            console.print(f"[red]  Demo not found: {args.demo}[/red]")
+    elif args.video and args.steam_id:
+        if not Path(args.video).exists():
+            console.print(f"[red]  Video not found: {args.video}[/red]")
             return
-        bg_path = extract_background_frame(args.demo, args.steam_id)
+        bg_path = extract_background_frame(
+            args.video, args.steam_id,
+            demo_path=args.demo, sidecar=args.sidecar,
+        )
     else:
-        console.print("[red]  Provide --background or --demo + --steam-id[/red]")
+        console.print("[red]  Provide --background or --video + --steam-id[/red]")
         return
 
     console.print(f"  Player: [cyan]{args.player}[/cyan]")

@@ -19,7 +19,7 @@ def resolve_output_dir(demo_path: str | Path, player: str | None = None) -> Path
 
     The ``player`` argument is accepted for backwards compatibility but ignored.
 
-    Creates the directory if it does not already exist.
+    Does not create the directory — callers mkdir when they actually write a short.
     """
     demo = Path(demo_path).resolve()
     normalized = str(demo).replace("\\", "/")
@@ -27,7 +27,4 @@ def resolve_output_dir(demo_path: str | Path, player: str | None = None) -> Path
 
     if "demos/hltv" not in normalized and "demos/faceit" not in normalized:
         raise ValueError(f"unknown demo path: {demo}")
-    output_dir = RENDERS_DIR / "shorts" / f"shorts-{demo_stem}"
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    return output_dir
+    return RENDERS_DIR / "shorts" / f"shorts-{demo_stem}"

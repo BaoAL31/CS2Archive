@@ -4,7 +4,7 @@ CS2Archive — Backlog Creator
 Downloads demos, scrapes ratings + tournament, resolves steam IDs,
 fetches avatars, and writes backlog entries as JSON.
 
-Usage: python scripts/pov/create_backlog.py <hltv_url>
+Usage: python scripts/pov/create_backlog.py <hltv_url> [--no-shorts]
 """
 
 from __future__ import annotations
@@ -342,6 +342,51 @@ with CloakAvatarFetcher(headless=False) as fetcher:
     return script
 
 
+def _extract_shorts(demos: list[Path]) -> None:
+    """Extract short timelines (Recognised Pros only) for each demo.
+
+    Mirrors the FACEIT flow in scripts/faceit/create_faceit_match_backlog.py:
+    one short_timeline.json per detected short under
+    renders/shorts/shorts-{demo_stem}/shorts-{slug}/.
+    """
+    from shorts.build_short_timeline import (
+        build_short_timeline, _build_short_slug,
+        persist_action_timeline, short_json_payload,
+    )
+    from shorts import resolve_output_dir
+
+    total = 0
+    for demo in demos:
+        demo = Path(demo)
+        try:
+            timeline = build_short_timeline(demo, pros_only=True)
+        except Exception as e:
+            print(f"  [WARN] Shorts extraction failed for {demo.name}: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+            continue
+        dropped = timeline.get("_dropped_randos", 0)
+        shorts_list = timeline.get("shorts", [])
+        base_dir = resolve_output_dir(demo)
+        persist_action_timeline(demo, timeline, output_dir=base_dir)
+        if not shorts_list:
+            suffix = f" ({dropped} non-pro short(s) filtered)" if dropped else ""
+            print(f"  [SHORTS] {demo.name}: 0 shorts{suffix}")
+            continue
+        written = 0
+        for short in shorts_list:
+            slug = _build_short_slug(short)
+            short_dir = base_dir / f"shorts-{slug}"
+            short_dir.mkdir(parents=True, exist_ok=True)
+            (short_dir / "short_timeline.json").write_text(
+                json.dumps(short_json_payload(timeline, short), indent=2), encoding="utf-8")
+            written += 1
+        total += written
+        suffix = f" ({dropped} non-pro short(s) filtered)" if dropped else ""
+        print(f"  [SHORTS] {demo.name}: {len(shorts_list)} shorts -> "
+              f"{written} files{suffix}")
+    print(f"[SHORTS] {total} short timeline(s) extracted")
+
+
 async def main() -> None:
     if len(sys.argv) < 2:
         print(f"Usage: python {sys.argv[0]} <hltv_url | demos/faceit/<demo>.dem>")
@@ -495,6 +540,10 @@ async def main() -> None:
                 avatar_rel=avatar_cache.get(nick, ""),
                 demo_steamids=demo_steamids,
             )
+
+    if "--no-shorts" not in sys.argv:
+        print("[SHORTS] Extracting short timelines (Recognised Pros only)...")
+        _extract_shorts(existing_demos)
 
     print("[OK] Backlog created")
 
