@@ -7,11 +7,31 @@ top-20 ranking snapshot.
 The default event is BLAST Open Porto 2026. The default poll interval is five
 minutes. One card per match is queued from `backlog/<match>/{high,medium}/`
 (rating >= 1.0), picked by **weight** (not raw HLTV rating). The worker runs
-one `scripts/pov/pipeline.py` process at a time and does not upload anything.
+one `scripts/pov/pipeline.py` process at a time, **up to 3 uploads per local
+calendar day** (the YouTube long-form slots). When that POV is youtube-ready,
+the listener spawns `scripts/upload/upload_youtube.py` for **that** overlay
+`upload_meta.json` in a new console, then immediately starts the next queued
+render. It does not run `upload_pending.py` (that script scans every pending
+meta under `youtube/` and can pick up leftovers / double-queue).
 Shorts timelines are extracted inside `create_backlog.py` (Recognised Pros
 only, skip with `--no-shorts`; low-demand POVs without a NAVI / Spirit /
 Vitality hook are dropped). Output is written only when at least one
 short is detected: `renders/shorts/shorts-<demo-stem>/shorts-<slug>/`.
+
+## Daily FACEIT notable (off days)
+
+The listener also reads upcoming / live matches from the event page (and the
+event matches tab when the overview has no timestamps). If the event has
+nothing today — not live, not upcoming later, and no notable result already
+posted — the day's 3 slots are filled from **daily FACEIT notables**
+(`scripts/faceit/daily_notable.py`): top weighted Recognised-Pro POVs, one per
+player and match, with the persistent pool in `.data/notable_daily.json`.
+Demos are downloaded and backlog cards built, then they go through the same
+pipeline + upload-spawn path as HLTV cards.
+
+HLTV leftover work (queued or still-discovered matches) is finished before
+FACEIT filler. FACEIT is not mixed into a tournament day just to use empty
+slots. There is no separate Windows 09:00 task.
 
 ## Weighting
 
@@ -74,9 +94,11 @@ schtasks.exe /Run /TN "CS2Archive HLTV Match Listener"
 ```
 
 The scheduled task starts the persistent process at Windows logon. If a
-pipeline fails, its card remains in the queue for the next poll. After
-successful renders, run the normal upload workflow separately:
+pipeline fails, its card remains in the queue for the next poll. Uploads run
+in a separate console as each POV becomes youtube-ready; the listener keeps
+rendering. To upload one finished POV by hand (same command the listener
+spawns):
 
 ```powershell
-python scripts/upload/upload_pending.py
+python scripts/upload/upload_youtube.py <youtube/{run_id}_overlay/video.mp4> --meta youtube/{run_id}_overlay/upload_meta.json --privacy private
 ```

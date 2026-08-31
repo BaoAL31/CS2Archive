@@ -1,20 +1,39 @@
 import json
+import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
+from datetime import datetime, timedelta
+
 from hltv.match_listener import (
     State,
     Match,
+    ScheduledMatch,
+    DAILY_UPLOAD_LIMIT,
     initialize_result_baseline,
     _actionable_matches,
     select_best_card,
     sort_card_records,
     parse_event_match_ids,
     parse_match_links,
+    parse_scheduled_matches,
     parse_top_teams,
     select_matches,
+    event_busy_on_day,
+    event_matches_url,
+    has_pending_hltv,
+    should_fill_faceit,
+    _daily,
+    _prune_queue,
+    _queue_room,
+    _slots_left,
+    _pending_upload_metas,
+    _spawn_upload_terminal,
+    _start_upload_after_pipeline,
+    _upload_cmd,
+    _youtube_run_id_for_meta,
 )
 
 
@@ -126,3 +145,250 @@ def test_baseline_skips_existing_results_but_allows_later_ids(tmp_path: Path):
     unseen = Match("102", "https://hltv/matches/102/epsilon-vs-zeta",
                    "epsilon-vs-zeta", "epsilon", "zeta")
     assert [m.match_id for m in _actionable_matches(state, [unseen])] == ["102"]
+
+
+DONK_CARD = {
+    "player": "donk",
+    "map": "Ancient",
+    "hltv_url": "https://www.hltv.org/matches/2396943/spirit-vs-furia-blast-open-porto-2026",
+    "demo_path": "demos/hltv/2396943-spirit-vs-furia-blast-open-porto/spirit-vs-furia-m1-ancient.dem",
+}
+
+
+def test_youtube_run_id_matches_pipeline_overlay_dir():
+    assert _youtube_run_id_for_meta(DONK_CARD) == (
+        "2396943_spirit-vs-furia-m1-ancient_donk_Ancient"
+    )
+
+
+def _write_pending_meta(dir_path: Path, video: Path, **extra) -> Path:
+    dir_path.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "title": "donk | Ancient",
+        "video_path": str(video),
+        "privacy": "private",
+        "upload_status": "pending",
+        "youtube_id": None,
+        **extra,
+    }
+    path = dir_path / "upload_meta.json"
+    path.write_text(json.dumps(meta), encoding="utf-8")
+    return path
+
+
+def test_pending_upload_prefers_overlay_and_skips_completed(tmp_path: Path):
+    card = "backlog/match/high/donk-ancient.json"
+    (tmp_path / card).parent.mkdir(parents=True)
+    (tmp_path / card).write_text(json.dumps(DONK_CARD), encoding="utf-8")
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"x")
+    run_id = _youtube_run_id_for_meta(DONK_CARD)
+    overlay = _write_pending_meta(tmp_path / "youtube" / f"{run_id}_overlay", video)
+    _write_pending_meta(tmp_path / "youtube" / run_id, video)
+    assert _pending_upload_metas(card, root=tmp_path) == [overlay]
+
+    overlay.write_text(json.dumps({
+        "video_path": str(video),
+        "upload_status": "completed",
+        "youtube_id": "abc",
+    }), encoding="utf-8")
+    assert _pending_upload_metas(card, root=tmp_path) == []
+
+
+def test_pending_upload_skips_missing_video(tmp_path: Path):
+    card = "backlog/match/high/donk-ancient.json"
+    (tmp_path / card).parent.mkdir(parents=True)
+    (tmp_path / card).write_text(json.dumps(DONK_CARD), encoding="utf-8")
+    run_id = _youtube_run_id_for_meta(DONK_CARD)
+    _write_pending_meta(
+        tmp_path / "youtube" / f"{run_id}_overlay",
+        tmp_path / "missing.mp4",
+    )
+    assert _pending_upload_metas(card, root=tmp_path) == []
+
+
+def test_upload_cmd_targets_this_meta_only(tmp_path: Path):
+    video = tmp_path / "video.mp4"
+    thumb = tmp_path / "thumb.png"
+    video.write_bytes(b"x")
+    thumb.write_bytes(b"y")
+    meta_path = _write_pending_meta(
+        tmp_path / "youtube" / "run_overlay", video, thumbnail_path=str(thumb)
+    )
+    cmd = _upload_cmd(meta_path)
+    assert cmd is not None
+    assert cmd[2].endswith("upload_youtube.py")
+    assert str(video) in cmd
+    assert "--meta" in cmd and str(meta_path) in cmd
+    assert "--privacy" in cmd and "private" in cmd
+    assert "--thumbnail" in cmd and str(thumb) in cmd
+    assert "upload_pending.py" not in " ".join(cmd)
+
+
+def test_spawn_upload_dry_run_does_not_popen(monkeypatch):
+    called = []
+    monkeypatch.setattr("hltv.match_listener.subprocess.Popen", lambda *a, **k: called.append((a, k)))
+    _spawn_upload_terminal(["python", "upload_youtube.py"], dry_run=True)
+    assert called == []
+
+
+def test_spawn_upload_opens_new_console(monkeypatch):
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return None
+
+    monkeypatch.setattr("hltv.match_listener.subprocess.Popen", fake_popen)
+    cmd = ["python", "-u", "scripts/upload/upload_youtube.py", "video.mp4"]
+    _spawn_upload_terminal(cmd, dry_run=False)
+    assert captured["cmd"] == cmd
+    assert captured["kwargs"].get("creationflags") == subprocess.CREATE_NEW_CONSOLE
+
+
+def test_start_upload_after_pipeline_dry_run_does_not_popen(monkeypatch):
+    called = []
+    monkeypatch.setattr("hltv.match_listener.subprocess.Popen", lambda *a, **k: called.append((a, k)))
+    _start_upload_after_pipeline("backlog/x.json", dry_run=True)
+    assert called == []
+
+
+def test_start_upload_spawns_upload_youtube_for_this_meta(monkeypatch, tmp_path: Path):
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"x")
+    meta_path = _write_pending_meta(tmp_path / "youtube" / "run_overlay", video)
+    monkeypatch.setattr(
+        "hltv.match_listener._pending_upload_metas",
+        lambda card, **k: [meta_path],
+    )
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return None
+
+    monkeypatch.setattr("hltv.match_listener.subprocess.Popen", fake_popen)
+    _start_upload_after_pipeline("backlog/x.json", dry_run=False)
+    joined = " ".join(captured["cmd"])
+    assert "upload_youtube.py" in joined
+    assert "upload_pending.py" not in joined
+    assert str(meta_path) in captured["cmd"]
+    assert str(video) in captured["cmd"]
+    assert captured["kwargs"].get("creationflags") == subprocess.CREATE_NEW_CONSOLE
+
+
+FACEIT_CARD = {
+    "player": "donk",
+    "map": "Mirage",
+    "is_faceit": True,
+    "faceit_match_id": "1-abc",
+    "demo_path": "demos/faceit/1-abc.dem",
+}
+
+
+def test_youtube_run_id_for_faceit_card():
+    assert _youtube_run_id_for_meta(FACEIT_CARD) == "1-abc_1-abc_donk_Mirage"
+
+
+def test_event_matches_url_uses_event_id():
+    assert event_matches_url(
+        "https://www.hltv.org/events/8249/blast-open-porto-2026"
+    ).endswith("/events/8249/matches")
+
+
+def test_parse_scheduled_matches_reads_upcoming_and_live():
+    noon = datetime.now().replace(hour=12, minute=0, second=0, microsecond=0)
+    unix_ms = int(noon.timestamp() * 1000)
+    html = f"""
+    <div class="upcomingMatch" data-zonedgrouping-entry-unix="{unix_ms}">
+      <a class="a-reset" href="/matches/200/alpha-vs-beta">alpha vs beta</a>
+    </div>
+    <div class="liveMatch-container">
+      <div class="matchTime matchLive">LIVE</div>
+      <a class="a-reset" href="/matches/201/gamma-vs-delta">gamma vs delta</a>
+    </div>
+    """
+    parsed = parse_scheduled_matches(html)
+    by_id = {item.match_id: item for item in parsed}
+    assert by_id["200"].unix_ms == unix_ms
+    assert by_id["200"].live is False
+    assert by_id["201"].live is True
+
+
+def test_event_busy_on_upcoming_today():
+    noon = datetime.now().replace(hour=12, minute=0, second=0, microsecond=0)
+    scheduled = [ScheduledMatch("200", unix_ms=int(noon.timestamp() * 1000))]
+    assert event_busy_on_day(scheduled, [], noon.date()) is True
+
+
+def test_event_idle_when_only_tomorrow_is_scheduled():
+    tomorrow = datetime.now() + timedelta(days=1)
+    tomorrow = tomorrow.replace(hour=12, minute=0, second=0, microsecond=0)
+    scheduled = [ScheduledMatch("200", unix_ms=int(tomorrow.timestamp() * 1000))]
+    assert event_busy_on_day(scheduled, [], datetime.now().date()) is False
+
+
+def test_event_busy_when_today_already_completed():
+    done = Match("100", "https://hltv/matches/100/a-vs-b", "a-vs-b", "a", "b")
+    assert event_busy_on_day([], [done], datetime.now().date()) is True
+
+
+def test_daily_slots_reset_on_new_day(tmp_path: Path):
+    state = State(tmp_path / "listener.json")
+    daily = _daily(state)
+    daily["completed"] = ["a", "b", "c"]
+    assert _slots_left(state) == 0
+    daily["day"] = "2000-01-01"
+    assert _slots_left(state) == DAILY_UPLOAD_LIMIT
+    assert _queue_room(state) == DAILY_UPLOAD_LIMIT
+
+
+def test_should_fill_faceit_only_on_idle_hltv_day(tmp_path: Path):
+    state = State(tmp_path / "listener.json")
+    assert should_fill_faceit(state, hltv_busy=False)
+    assert not should_fill_faceit(state, hltv_busy=True)
+    state.data["queue"] = ["backlog/match/high/donk.json"]
+    assert has_pending_hltv(state)
+    assert not should_fill_faceit(state, hltv_busy=False)
+
+
+def test_should_not_fill_faceit_twice_in_one_day(tmp_path: Path):
+    state = State(tmp_path / "listener.json")
+    _daily(state)["faceit_attempted"] = True
+    assert not should_fill_faceit(state, hltv_busy=False)
+
+
+def test_prune_keeps_one_faceit_card_per_match(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("hltv.match_listener.ROOT", tmp_path)
+    cards = []
+    for match_id, player, rating in (
+        ("m1", "donk", 1.8),
+        ("m2", "ropz", 1.7),
+        ("m3", "sh1ro", 1.6),
+        ("m1", "magixx", 1.2),
+    ):
+        rel = f"backlog/faceit/2026-09-01/high/{player}-{match_id}.json"
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "player": player,
+            "map": "Mirage",
+            "rating": rating,
+            "is_faceit": True,
+            "faceit_match_id": match_id,
+        }), encoding="utf-8")
+        cards.append(rel)
+    kept = _prune_queue(cards, indexes={
+        "ranking": {},
+        "player_demand": {},
+        "team_demand": {},
+        "highlight_players": {},
+        "fixtures": [],
+    })
+    players = {
+        json.loads((tmp_path / rel).read_text(encoding="utf-8"))["player"]
+        for rel in kept
+    }
+    assert players == {"donk", "ropz", "sh1ro"}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -274,3 +275,31 @@ def test_replay_days_uses_each_day_window_and_does_not_reuse_picks():
     assert [c["player"] for c in by_day["2026-08-25"]] == ["donk"]
     assert [c["player"] for c in by_day["2026-08-26"]] == ["sh1ro"]
     assert [c["player"] for c in by_day["2026-08-27"]] == ["m0NESY"]
+
+
+def test_day_already_picked_counts_empty_list():
+    state = {"last_day": "2026-09-01", "picks": {"2026-09-01": []}}
+    assert dn.day_already_picked(state, "2026-09-01")
+    assert not dn.day_already_picked(state, "2026-09-02")
+
+
+def test_card_for_pick_matches_player_and_match(tmp_path):
+    card_dir = tmp_path / "backlog" / "faceit" / "2026-09-01" / "high"
+    card_dir.mkdir(parents=True)
+    (card_dir / "donk-mirage-match-1.json").write_text(json.dumps({
+        "player": "donk",
+        "faceit_match_id": "match-1",
+        "faceit_nickname": "s1mpleDonk",
+        "map": "Mirage",
+    }), encoding="utf-8")
+    (card_dir / "ropz-mirage-match-1.json").write_text(json.dumps({
+        "player": "ropz",
+        "faceit_match_id": "match-1",
+        "map": "Mirage",
+    }), encoding="utf-8")
+    path = dn.card_for_pick({"match_id": "match-1", "player": "donk"}, root=tmp_path)
+    assert path is not None
+    assert path.name.startswith("donk-")
+    assert dn.rel_card_for_pick(
+        {"match_id": "match-1", "player": "donk"}, root=tmp_path
+    ) == "backlog/faceit/2026-09-01/high/donk-mirage-match-1.json"

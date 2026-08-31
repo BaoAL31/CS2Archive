@@ -4,9 +4,16 @@ Cards are scored with highlight-channel team demand, POV-channel player
 demand, org rank, and HLTV rating. One card per match is queued from
 ``backlog/<match>/{high,medium}/``.
 
+Cap is 3 uploads per local calendar day (the YouTube long-form slots).
+When the configured event has no matches today — live, upcoming, or already
+completed — the listener fills remaining slots from daily FACEIT notables.
+
 The listener is intentionally a single process and a single pipeline worker.
 It persists state in ``.listener/hltv.json`` so a restart does not repeat
-downloads or renders.
+downloads or renders. When a POV is youtube-ready, upload starts in a new
+console via ``scripts/upload/upload_youtube.py`` for that overlay meta only
+(not ``upload_pending.py``, which would scan every leftover pending file).
+The listener then pops the queue and renders the next card.
 
 Examples:
     python scripts/hltv/match_listener.py --once --dry-run
@@ -25,7 +32,7 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -33,7 +40,7 @@ from bs4 import BeautifulSoup
 
 ROOT = Path(__file__).resolve().parents[2]
 _SCRIPTS = ROOT / "scripts"
-for _p in (str(ROOT), str(_SCRIPTS)):
+for _p in (str(ROOT), str(_SCRIPTS), str(_SCRIPTS / "faceit")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 os.chdir(ROOT)
@@ -45,12 +52,22 @@ from hltv.score_cards import (  # noqa: E402
     load_indexes,
     maybe_refresh_indexes,
 )
-from scrapers.hltv_acquire import fetch_hltv_page_html, match_slug_from_url  # noqa: E402
+from scrapers.hltv_acquire import (  # noqa: E402
+    fetch_hltv_page_html,
+    match_id_from_url,
+    match_slug_from_url,
+)
+from daily_notable import (  # noqa: E402
+    download_and_backlog,
+    pick_for_day,
+    rel_card_for_pick,
+)
 
 DEFAULT_EVENT_URL = "https://www.hltv.org/events/8249/blast-open-porto-2026"
 DEFAULT_STATE = ROOT / ".listener" / "hltv.json"
 DEFAULT_RANKINGS_URL = "https://www.hltv.org/ranking/teams"
 MIN_RATING = 1.5
+DAILY_UPLOAD_LIMIT = 3
 
 
 @dataclass
@@ -61,6 +78,13 @@ class Match:
     team1: str
     team2: str
     event: str = ""
+
+
+@dataclass
+class ScheduledMatch:
+    match_id: str
+    unix_ms: int | None = None
+    live: bool = False
 
 
 def _slug_teams(slug: str) -> tuple[str, str]:
@@ -151,6 +175,89 @@ def select_matches(matches: list[Match], event_ids: set[str],
     return selected
 
 
+def event_matches_url(event_url: str, base_url: str = settings.hltv_base_url) -> str:
+    """HLTV event matches tab (upcoming + live + results for this event)."""
+    match = re.search(r"/events/(\d+)", event_url)
+    if not match:
+        return event_url
+    return f"{base_url.rstrip('/')}/events/{match.group(1)}/matches"
+
+
+def _as_unix_ms(raw: int) -> int:
+    return raw * 1000 if raw < 10_000_000_000 else raw
+
+
+def _unix_from_node(node) -> int | None:
+    for attr in ("data-zonedgrouping-entry-unix", "data-unix"):
+        raw = node.get(attr) if hasattr(node, "get") else None
+        if not raw:
+            continue
+        try:
+            return _as_unix_ms(int(raw))
+        except (TypeError, ValueError):
+            continue
+    child = node.select_one("[data-unix], [data-zonedgrouping-entry-unix]")
+    if child is not None and child is not node:
+        return _unix_from_node(child)
+    return None
+
+
+def parse_scheduled_matches(html: str) -> list[ScheduledMatch]:
+    """Parse live/upcoming matches (with start timestamps) from an event page."""
+    soup = BeautifulSoup(html, "lxml")
+    nodes = soup.select(
+        ".upcomingMatch, .liveMatch-container, a.upcoming-match, .live-match"
+    )
+    if not nodes:
+        nodes = soup.select("[data-zonedgrouping-entry-unix]")
+    found: list[ScheduledMatch] = []
+    seen: set[str] = set()
+    for node in nodes:
+        classes = " ".join(node.get("class") or [])
+        live = (
+            "liveMatch" in classes
+            or "live-match" in classes
+            or bool(node.select_one(".matchLive, .matchTime.matchLive"))
+        )
+        unix_ms = _unix_from_node(node)
+        parsed = _canonical_match(node.get("href") or "")
+        if not parsed:
+            for link in node.select('a[href*="/matches/"]'):
+                parsed = _canonical_match(link.get("href", ""))
+                if parsed:
+                    break
+        if not parsed:
+            continue
+        match_id, _slug = parsed
+        if match_id in seen:
+            continue
+        seen.add(match_id)
+        found.append(ScheduledMatch(match_id=match_id, unix_ms=unix_ms, live=live))
+    return found
+
+
+def event_busy_on_day(
+    scheduled: list[ScheduledMatch],
+    today_completed: list[Match],
+    day: date,
+) -> bool:
+    """True when the event has live, upcoming, or completed matches on ``day``."""
+    if today_completed:
+        return True
+    for item in scheduled:
+        if item.live:
+            return True
+        if item.unix_ms is None:
+            continue
+        try:
+            when = datetime.fromtimestamp(item.unix_ms / 1000).date()
+        except (OSError, OverflowError, ValueError):
+            continue
+        if when == day:
+            return True
+    return False
+
+
 def _default_state() -> dict:
     return {
         "version": 1,
@@ -161,6 +268,7 @@ def _default_state() -> dict:
         "teams_updated_at": None,
         "matches": {},
         "queue": [],
+        "daily": {"day": None, "completed": []},
     }
 
 
@@ -292,7 +400,11 @@ def _prune_queue(cards: list[str], indexes: dict | None = None) -> list[str]:
         except (OSError, json.JSONDecodeError):
             passthrough.append(path)
             continue
-        group = str(meta.get("hltv_url", "")).strip() or str(full.parent.parent)
+        group = (
+            str(meta.get("hltv_url") or "").strip()
+            or str(meta.get("faceit_match_id") or "").strip()
+            or str(full.parent.parent)
+        )
         groups.setdefault(group, []).append((path, meta))
     selected = [
         path
@@ -347,6 +459,99 @@ def _enqueue(state: State, cards: list[str], indexes: dict | None = None) -> Non
     state.data["queue"] = _sort_queue(state.data["queue"], indexes=indexes)
 
 
+def _local_day() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _daily(state: State) -> dict:
+    day = _local_day()
+    daily = state.data.setdefault("daily", {"day": None, "completed": []})
+    if daily.get("day") != day:
+        daily["day"] = day
+        daily["completed"] = []
+        daily["faceit_queued"] = []
+        daily["faceit_attempted"] = False
+    return daily
+
+
+def _slots_left(state: State) -> int:
+    return max(0, DAILY_UPLOAD_LIMIT - len(_daily(state).get("completed") or []))
+
+
+def _queue_room(state: State) -> int:
+    return max(0, _slots_left(state) - len(state.data.get("queue") or []))
+
+
+def _is_faceit_card(path: str, meta: dict | None = None) -> bool:
+    if meta and (meta.get("is_faceit") or meta.get("faceit_match_id")):
+        return True
+    return path.replace("\\", "/").startswith("backlog/faceit/")
+
+
+def has_pending_hltv(state: State) -> bool:
+    for path in state.data.get("queue") or []:
+        if not _is_faceit_card(path):
+            return True
+    for rec in (state.data.get("matches") or {}).values():
+        if rec.get("status") in {"discovered", "queued", "retry", "running"}:
+            return True
+    return False
+
+
+def should_fill_faceit(state: State, hltv_busy: bool) -> bool:
+    if hltv_busy or has_pending_hltv(state):
+        return False
+    if _slots_left(state) <= 0:
+        return False
+    daily = _daily(state)
+    if daily.get("faceit_attempted") or daily.get("faceit_queued"):
+        return False
+    if any(_is_faceit_card(path) for path in state.data.get("queue") or []):
+        return False
+    return True
+
+
+async def _maybe_queue_faceit(args, state: State, indexes: dict | None) -> None:
+    room = _queue_room(state)
+    if room <= 0:
+        return
+    daily = _daily(state)
+    if args.dry_run:
+        print("[faceit-notable] would pick daily FACEIT notables", flush=True)
+        return
+    print("[faceit-notable] no HLTV matches today; picking FACEIT notables",
+          flush=True)
+    picks = await pick_for_day(
+        n=DAILY_UPLOAD_LIMIT,
+        skip_youtube_demand=True,
+        dry_run=False,
+    )
+    missing = [pick for pick in picks if rel_card_for_pick(pick) is None]
+    if missing:
+        await asyncio.to_thread(download_and_backlog, missing)
+    cards: list[str] = []
+    for pick in picks:
+        card = rel_card_for_pick(pick)
+        if not card:
+            print(
+                f"[faceit-notable] no backlog card for {pick.get('player')} "
+                f"{pick.get('match_id')}",
+                flush=True,
+            )
+            continue
+        cards.append(card)
+        if len(cards) >= room:
+            break
+    daily["faceit_attempted"] = True
+    daily["faceit_queued"] = cards
+    if cards:
+        _enqueue(state, cards, indexes)
+        print(f"[faceit-notable] queued {len(cards)} card(s)", flush=True)
+    else:
+        print("[faceit-notable] no FACEIT cards to queue", flush=True)
+    state.save()
+
+
 def _run_backlog(match: Match, dry_run: bool, retries: int = 3) -> bool:
     cmd = [sys.executable, str(ROOT / "scripts/pov/create_backlog.py"), match.url]
     if dry_run:
@@ -371,6 +576,117 @@ def _run_pipeline(card: str, dry_run: bool) -> bool:
     if dry_run:
         return True
     return subprocess.run(cmd, cwd=ROOT, env=_child_env()).returncode == 0
+
+
+def _run_id_from_name(name: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", name)[:80].strip("_")
+
+
+def _youtube_run_id_for_meta(meta: dict) -> str | None:
+    """Same ``run_id`` pipeline.py uses for ``youtube/{run_id}_overlay/``."""
+    player = (meta.get("player") or "").strip()
+    map_name = (meta.get("map") or "").strip()
+    if not player or not map_name:
+        return None
+    demo_path = Path(meta.get("demo_path") or "")
+    is_faceit = bool(meta.get("is_faceit")) or bool(meta.get("faceit_match_id"))
+    if is_faceit:
+        match_id = meta.get("faceit_match_id") or (
+            demo_path.stem.split(" - ")[0] if demo_path.name else "faceit"
+        )
+        slug = match_id
+    else:
+        hltv_url = meta.get("hltv_url") or ""
+        match_id = match_id_from_url(hltv_url)
+        if not match_id:
+            return None
+        slug = hltv_url.rstrip("/").split("/")[-1]
+    dem_stem = demo_path.stem if demo_path.name else slug
+    return _run_id_from_name(f"{match_id}_{dem_stem}_{player}_{map_name}")
+
+
+def _is_youtube_pending(meta: dict) -> bool:
+    return not (meta.get("upload_status") == "completed" and meta.get("youtube_id"))
+
+
+def _pending_upload_metas(card: str, *, root: Path = ROOT) -> list[Path]:
+    """Overlay meta for this card, else raw. Never scans ``youtube/``."""
+    try:
+        meta = json.loads((root / card).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    run_id = _youtube_run_id_for_meta(meta)
+    if not run_id:
+        return []
+    overlay = root / "youtube" / f"{run_id}_overlay" / "upload_meta.json"
+    raw = root / "youtube" / run_id / "upload_meta.json"
+    chosen = overlay if overlay.exists() else raw
+    if not chosen.exists():
+        return []
+    try:
+        data = json.loads(chosen.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    video = data.get("video_path")
+    if not _is_youtube_pending(data):
+        return []
+    if not video or not Path(video).exists():
+        return []
+    return [chosen]
+
+
+def _upload_cmd(meta_path: Path) -> list[str] | None:
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    video = data.get("video_path")
+    if not video or not Path(video).exists():
+        return None
+    cmd = [
+        sys.executable, "-u",
+        str(ROOT / "scripts/upload/upload_youtube.py"),
+        str(video),
+        "--meta", str(meta_path),
+        "--privacy", str(data.get("privacy") or "private"),
+    ]
+    thumb = data.get("thumbnail_path")
+    if thumb and Path(thumb).exists():
+        cmd += ["--thumbnail", str(thumb)]
+    return cmd
+
+
+def _spawn_upload_terminal(cmd: list[str], dry_run: bool) -> None:
+    """Fire-and-forget: new console, listener does not wait."""
+    print(f"[upload] {' '.join(cmd)}", flush=True)
+    if dry_run:
+        return
+    env = _child_env()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    kwargs: dict = {"cwd": str(ROOT), "env": env}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+    try:
+        subprocess.Popen(cmd, **kwargs)
+    except OSError as exc:
+        print(f"[upload] spawn failed: {exc}", flush=True)
+
+
+def _start_upload_after_pipeline(card: str, dry_run: bool) -> None:
+    if dry_run:
+        print(f"[upload] would spawn upload_youtube.py for {card}", flush=True)
+        return
+    metas = _pending_upload_metas(card)
+    if not metas:
+        print(f"[upload] no pending meta for {card}", flush=True)
+        return
+    for meta_path in metas:
+        cmd = _upload_cmd(meta_path)
+        if not cmd:
+            print(f"[upload] skip (no video): {meta_path}", flush=True)
+            continue
+        _spawn_upload_terminal(cmd, dry_run=False)
 
 
 def _retry_ready(record: dict) -> bool:
@@ -429,6 +745,7 @@ def _actionable_matches(state: State, matches: list[Match]) -> list[Match]:
 async def poll_once(args, state: State) -> None:
     event_url = args.event_url
     state.data["event_url"] = event_url
+    _daily(state)
     if not args.dry_run:
         maybe_refresh_indexes(scrape=True)
     indexes = load_indexes()
@@ -446,69 +763,100 @@ async def poll_once(args, state: State) -> None:
     event_html = await asyncio.to_thread(fetch_hltv_page_html, event_url,
                                          headless=True, wait_selector=None)
     event_ids = parse_event_match_ids(event_html)
+    scheduled = parse_scheduled_matches(event_html)
+    if not any(item.live or item.unix_ms for item in scheduled):
+        tab = event_matches_url(event_url)
+        if tab != event_url:
+            tab_html = await asyncio.to_thread(
+                fetch_hltv_page_html, tab, headless=True, wait_selector=None)
+            extra = parse_scheduled_matches(tab_html)
+            if extra:
+                scheduled = extra
+            event_ids |= parse_event_match_ids(tab_html)
+    today = datetime.now().date()
+    event_slug = event_url.rstrip("/").rsplit("/", 1)[-1]
+    event_name = re.sub(r"[-_]+", " ", event_slug).casefold()
     result_links: list[Match] = []
+    today_links: list[Match] = []
     for offset in (0, 1):
-        target_date = (datetime.now().date() - timedelta(days=offset)).isoformat()
+        target_date = (today - timedelta(days=offset)).isoformat()
         results_url = f"{settings.hltv_base_url}/results?date={target_date}"
         results_html = await asyncio.to_thread(fetch_hltv_page_html, results_url,
                                                 headless=True, wait_selector=None)
-        result_links.extend(parse_match_links(results_html))
-    event_slug = event_url.rstrip("/").rsplit("/", 1)[-1]
-    event_name = re.sub(r"[-_]+", " ", event_slug).casefold()
+        parsed = parse_match_links(results_html)
+        result_links.extend(parsed)
+        if offset == 0:
+            today_links = parsed
     matches = select_matches(result_links, event_ids, state.data["teams"],
                              event_name)
     matches = list({match.match_id: match for match in matches}.values())
-    print(f"[poll] {len(matches)} notable completed event match(es)", flush=True)
+    today_matches = select_matches(
+        today_links, event_ids, state.data["teams"], event_name)
+    today_matches = list({m.match_id: m for m in today_matches}.values())
+    hltv_busy = event_busy_on_day(scheduled, today_matches, today)
+    print(
+        f"[poll] {len(matches)} notable completed event match(es); "
+        f"hltv_today={'yes' if hltv_busy else 'no'}; "
+        f"{_slots_left(state)}/{DAILY_UPLOAD_LIMIT} upload slot(s) left",
+        flush=True,
+    )
     if not state.data.get("result_baseline_initialized"):
         initialize_result_baseline(state, matches)
         state.save()
         print(f"[baseline] skipped {len(matches)} existing completed match(es)",
               flush=True)
-        return
-    actionable = _actionable_matches(state, matches)
-    state.data["result_baseline_ids"] = sorted(
-        set(state.data.get("result_baseline_ids", []))
-        | {match.match_id for match in matches}
-    )
+    else:
+        actionable = _actionable_matches(state, matches)
+        state.data["result_baseline_ids"] = sorted(
+            set(state.data.get("result_baseline_ids", []))
+            | {match.match_id for match in matches}
+        )
 
-    for match in actionable:
-        record = state.data["matches"].setdefault(match.match_id, {
-            "match": asdict(match), "status": "discovered",
-            "attempts": 0, "last_error": None,
-        })
-        if record["status"] in {"queued", "running", "completed"}:
-            continue
-        if not _retry_ready(record):
-            continue
-        cards = _candidate_cards(match, indexes)
-        if cards:
-            print(f"[backlog] adopting {len(cards)} weighted "
-                  f"card(s) for {match.match_id}", flush=True)
-        else:
-            record["attempts"] += 1
-            if not _run_backlog(match, args.dry_run, args.backlog_retries):
-                _schedule_retry(record, "create_backlog failed")
-                state.save()
+        for match in actionable:
+            record = state.data["matches"].setdefault(match.match_id, {
+                "match": asdict(match), "status": "discovered",
+                "attempts": 0, "last_error": None,
+            })
+            if record["status"] in {"queued", "running", "completed"}:
+                continue
+            if not _retry_ready(record):
+                continue
+            if _queue_room(state) <= 0:
+                print(f"[daily] {DAILY_UPLOAD_LIMIT}/day cap, "
+                      f"deferring {match.match_id}", flush=True)
                 continue
             cards = _candidate_cards(match, indexes)
-        if args.dry_run:
-            cards = [f"backlog/{match_slug_from_url(match.url)}/high/<generated>.json"]
-        if not cards:
-            # A successful backlog run can legitimately produce no high/medium
-            # performer (all ratings below 1.0). This is a completed no-op.
-            record["status"] = "completed"
-            record["cards"] = []
-            record["no_candidate_cards"] = True
+            if cards:
+                print(f"[backlog] adopting {len(cards)} weighted "
+                      f"card(s) for {match.match_id}", flush=True)
+            else:
+                record["attempts"] += 1
+                if not _run_backlog(match, args.dry_run, args.backlog_retries):
+                    _schedule_retry(record, "create_backlog failed")
+                    state.save()
+                    continue
+                cards = _candidate_cards(match, indexes)
+            if args.dry_run:
+                cards = [f"backlog/{match_slug_from_url(match.url)}/high/<generated>.json"]
+            if not cards:
+                # A successful backlog run can legitimately produce no high/medium
+                # performer (all ratings below 1.0). This is a completed no-op.
+                record["status"] = "completed"
+                record["cards"] = []
+                record["no_candidate_cards"] = True
+                record["last_error"] = None
+                state.save()
+                continue
+            _enqueue(state, cards, indexes)
+            record["status"] = "queued"
+            record["cards"] = cards
             record["last_error"] = None
             state.save()
-            continue
-        _enqueue(state, cards, indexes)
-        record["status"] = "queued"
-        record["cards"] = cards
-        record["last_error"] = None
-        state.save()
 
-    while state.data["queue"]:
+    if should_fill_faceit(state, hltv_busy):
+        await _maybe_queue_faceit(args, state, indexes)
+
+    while state.data["queue"] and _slots_left(state) > 0:
         card = state.data["queue"][0]
         if not args.dry_run and not (ROOT / card).exists():
             print(f"[queue] missing card, dropping: {card}", flush=True)
@@ -530,12 +878,17 @@ async def poll_once(args, state: State) -> None:
             # so the listener dies and the failure is visible (no silent skip/loop).
             print(f"[queue] HARD FAIL pipeline for {card} — fix underlying bug, not skipping", flush=True)
             raise SystemExit(f"hard fail: pipeline failed for {card}")
+        _start_upload_after_pipeline(card, args.dry_run)
         state.data["queue"].pop(0)
+        _daily(state).setdefault("completed", []).append(card)
         for record in state.data["matches"].values():
             if card in record.get("cards", []):
                 record.setdefault("completed_cards", []).append(card)
                 record["status"] = "completed"
         state.save()
+    if state.data["queue"] and _slots_left(state) <= 0:
+        print(f"[daily] {DAILY_UPLOAD_LIMIT} uploads used for {_local_day()}, "
+              f"holding {len(state.data['queue'])} queued card(s)", flush=True)
 
 
 def build_parser() -> argparse.ArgumentParser:

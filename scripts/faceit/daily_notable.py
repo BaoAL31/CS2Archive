@@ -1,13 +1,16 @@
 """
 Daily FACEIT notable-match selector.
 
-Runs once per day: calls `scrape_notable.collect()` (which already scores
-every Recognised-Pro performance) and PICKS the top N (=3) for the day.
-If the day's scrape cannot fill N, FALLS BACK to performances left over in
-the persistent pool from previous days.
+Picks the top N (=3) Recognised-Pro POVs for a calendar day from
+`scrape_notable.collect()`. If the day's scrape cannot fill N, falls back
+to performances left in the persistent pool from previous days.
+
+The HLTV match listener calls this on days with no tournament matches;
+it is not a Windows scheduled task. Manual CLI still works.
 
 Idempotent: running twice on the same day returns the stored picks without
-re-scraping (use --force to redo the day).
+re-scraping (use --force to redo the day). An empty pick list still counts
+as the day's run so the listener does not re-scrape every poll.
 
 State file: .data/notable_daily.json
   {
@@ -23,8 +26,6 @@ Usage:
     python scripts/faceit/daily_notable.py --json     # machine-readable picks
     python scripts/faceit/daily_notable.py --download # also download demos + build backlog
     python scripts/faceit/daily_notable.py --replay-from 2026-08-25 --replay-to 2026-08-29 --from-state
-    python scripts/faceit/daily_notable.py --install-cron [--at 09:00]
-    python scripts/faceit/daily_notable.py --remove-cron
 """
 
 from __future__ import annotations
@@ -48,9 +49,8 @@ from update_player_demand import refresh as refresh_player_demand
 
 STATE_FILE = ROOT / ".data" / "notable_daily.json"
 DEMO_DIR = ROOT / "demos" / "faceit"
-CRON_TASK = "CS2ArchiveFaceitDaily"
-DEFAULT_TIME = "09:00"
 PY = sys.executable
+DEFAULT_PICKS = 3
 
 
 # ---------- selection ----------
@@ -82,10 +82,20 @@ def _cand_day(c: dict) -> str | None:
     return str(raw)[:10]
 
 
+def day_already_picked(state: dict, today: str) -> bool:
+    """True when this calendar day already has a persisted pick run."""
+    if state.get("last_day") != today:
+        return False
+    if today not in (state.get("picks") or {}):
+        return False
+    prev = state["picks"][today]
+    return all(c.get("score_version") == SCORE_VERSION for c in prev)
+
+
 def replay_days(
     candidates: list[dict], start: str, end: str, n: int, window_hours: int = 72,
 ) -> dict[str, list[dict]]:
-    """Walk calendar days as the daily cron would: 72h lookback, one POV per
+    """Walk calendar days as the daily FACEIT notable picker would: 72h lookback, one POV per
     player and match, already-picked performance ids stay used."""
     start_d = datetime.strptime(start, "%Y-%m-%d")
     end_d = datetime.strptime(end, "%Y-%m-%d")
@@ -154,8 +164,103 @@ def _format_pick(c: dict) -> str:
     )
 
 
+def card_for_pick(pick: dict, *, root: Path = ROOT) -> Path | None:
+    """Backlog card written for this pick's player + FACEIT match id."""
+    match_id = str(pick.get("match_id") or "")
+    player = str(pick.get("player") or "").casefold()
+    if not match_id or not player:
+        return None
+    faceit = root / "backlog" / "faceit"
+    if not faceit.is_dir():
+        return None
+    for path in faceit.rglob("*.json"):
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if str(meta.get("faceit_match_id") or "") != match_id:
+            continue
+        nicks = {
+            str(meta.get("player") or "").casefold(),
+            str(meta.get("faceit_nickname") or "").casefold(),
+        }
+        if player in nicks:
+            return path
+    return None
+
+
+def rel_card_for_pick(pick: dict, *, root: Path = ROOT) -> str | None:
+    path = card_for_pick(pick, root=root)
+    if path is None:
+        return None
+    try:
+        return str(path.resolve().relative_to(root)).replace("\\", "/")
+    except ValueError:
+        return str(path).replace("\\", "/")
+
+
+async def pick_for_day(
+    n: int = DEFAULT_PICKS,
+    *,
+    today: str | None = None,
+    hours: int = 72,
+    count: int = 25,
+    force: bool = False,
+    dry_run: bool = False,
+    skip_youtube_demand: bool = False,
+) -> list[dict]:
+    """Discover and persist today's FACEIT notable picks. Idempotent per day."""
+    today = today or datetime.now().strftime("%Y-%m-%d")
+    state = _load_state()
+
+    if not force and day_already_picked(state, today):
+        return list(state["picks"].get(today) or [])
+
+    if not skip_youtube_demand:
+        try:
+            demand = refresh_player_demand(scrape=True)
+            print(
+                f"[DEMAND] {len(demand['index'])} players from "
+                f"{demand['window_videos']} videos "
+                f"(scraped {demand['scraped']} new/updated)"
+            )
+        except Exception as exc:
+            print(f"[DEMAND] skipped ({exc})")
+
+    data = await collect(
+        hours=hours, count=count, min_pros=2,
+        perf_kd=1.5, perf_adr=100.0, perf_kills=30, perf_limit=120,
+        today_only=False, exclude_today=False,
+    )
+    fresh = data["candidates"]
+    pool_by_id = {
+        c["id"]: c
+        for c in state["pool"]
+        if c.get("id") and c.get("score_version") == SCORE_VERSION
+    }
+    for c in fresh:
+        pool_by_id[c["id"]] = c
+    state["pool"] = list(pool_by_id.values())
+
+    picks, new_used, survivors = select(state, state["pool"], n, today)
+    survivors.sort(key=lambda c: -c.get("weight", 0))
+    state["pool"] = survivors[:150]
+    state["used"].extend(new_used)
+    state["picks"][today] = picks
+    state["last_day"] = today
+    if not dry_run:
+        _save_state(state)
+        print(f"[DAILY] {today}: {len(picks)} pick(s) persisted "
+              f"(pool {len(state['pool'])} remaining, "
+              f"{len(state['used'])} used total)\n")
+    else:
+        print(f"[DRY-RUN] {today}: would pick {len(picks)} (pool "
+              f"{len(state['pool'])} remaining)\n")
+    return picks
+
+
 # ---------- download + backlog (optional) ----------
-def _download_and_backlog(picks: list[dict]) -> None:
+def download_and_backlog(picks: list[dict]) -> None:
     """Best-effort: download each picked demo, then build its backlog cards."""
     from downloader import is_already_downloaded, get_download_history  # type: ignore
     from models import DemoSource  # type: ignore
@@ -195,31 +300,10 @@ def _download_and_backlog(picks: list[dict]) -> None:
             print(f"  [ERR] backlog failed: {e}")
 
 
-# ---------- cron registration ----------
-def install_cron(at: str) -> None:
-    script = str((ROOT / "scripts" / "faceit" / "daily_notable.py").resolve())
-    tr = f'"{PY}" "{script}"'
-    cmd = ["schtasks", "/Create", "/F", "/TN", CRON_TASK, "/SC", "DAILY", "/ST", at,
-           "/TR", tr, "/RL", "LIMITED"]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    print(r.stdout.strip() or r.stderr.strip() or "", flush=True)
-    print(("SUCCESS" if r.returncode == 0 else f"FAIL({r.returncode})")
-          + f" -> {CRON_TASK} daily at {at} ->\n    {tr}")
-    if r.returncode != 0:
-        sys.exit(1)
-
-
-def remove_cron() -> None:
-    r = subprocess.run(["schtasks", "/Delete", "/F", "/TN", CRON_TASK],
-                       capture_output=True, text=True)
-    print(r.stdout.strip() or r.stderr.strip() or "", flush=True)
-    print(("SUCCESS" if r.returncode == 0 else f"FAIL({r.returncode})")
-          + f" -> removed {CRON_TASK}")
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--n", type=int, default=3, help="Picks per day (default 3)")
+    ap.add_argument("--n", type=int, default=DEFAULT_PICKS,
+                    help=f"Picks per day (default {DEFAULT_PICKS})")
     ap.add_argument("--hours", type=int, default=72,
                     help="Scrape window for fresh candidates (default 72h)")
     ap.add_argument("--count", type=int, default=25, help="Matches per pro to scan")
@@ -239,19 +323,7 @@ def main() -> None:
                     help="End day for --replay-from (default: same as start)")
     ap.add_argument("--from-state", action="store_true",
                     help="Replay from rescored notable_daily.json instead of FACEIT")
-    ap.add_argument("--install-cron", action="store_true",
-                    help="Register a Windows daily scheduled task")
-    ap.add_argument("--at", default=DEFAULT_TIME, help="Cron run time HH:MM (default 09:00)")
-    ap.add_argument("--remove-cron", action="store_true",
-                    help="Remove the scheduled task")
     args = ap.parse_args()
-
-    if args.remove_cron:
-        remove_cron()
-        return
-    if args.install_cron:
-        install_cron(args.at)
-        return
 
     if args.replay_from:
         end = args.replay_to or args.replay_from
@@ -315,62 +387,11 @@ def main() -> None:
         return
 
     today = datetime.now().strftime("%Y-%m-%d")
-    state = _load_state()
-
-    if not args.skip_youtube_demand:
-        try:
-            demand = refresh_player_demand(scrape=True)
-            print(
-                f"[DEMAND] {len(demand['index'])} players from "
-                f"{demand['window_videos']} videos "
-                f"(scraped {demand['scraped']} new/updated)"
-            )
-        except Exception as exc:
-            print(f"[DEMAND] skipped ({exc})")
-
-    # idempotent per-day unless --force; also re-run if stored picks are from
-    # the old match-level schema (no 'player' field).
-    prev = state["picks"].get(today)
-    if (
-        not args.force
-        and state.get("last_day") == today
-        and prev
-        and all(c.get("score_version") == SCORE_VERSION for c in prev)
-    ):
-        picks = prev
-    else:
-        data = asyncio.run(collect(
-            hours=args.hours, count=args.count, min_pros=2,
-            perf_kd=1.5, perf_adr=100.0, perf_kills=30, perf_limit=120,
-            today_only=False, exclude_today=False,
-        ))
-        fresh = data["candidates"]
-        # Refresh the persistent pool: key on performance id (match_id:player),
-        # drop pre-schema match-level entries, add/overwrite fresh ones.
-        pool_by_id = {
-            c["id"]: c
-            for c in state["pool"]
-            if c.get("id") and c.get("score_version") == SCORE_VERSION
-        }
-        for c in fresh:
-            pool_by_id[c["id"]] = c
-        state["pool"] = list(pool_by_id.values())
-
-        picks, new_used, survivors = select(state, state["pool"], args.n, today)
-        # bound the fallback pool so stale entries can't accumulate forever
-        survivors.sort(key=lambda c: -c.get("weight", 0))
-        state["pool"] = survivors[:150]
-        state["used"].extend(new_used)
-        state["picks"][today] = picks
-        state["last_day"] = today
-        if not args.dry_run:
-            _save_state(state)
-            print(f"[DAILY] {today}: {len(picks)} pick(s) persisted "
-                  f"(pool {len(state['pool'])} remaining, "
-                  f"{len(state['used'])} used total)\n")
-        else:
-            print(f"[DRY-RUN] {today}: would pick {len(picks)} (pool "
-                  f"{len(state['pool'])} remaining)\n")
+    picks = asyncio.run(pick_for_day(
+        n=args.n, today=today, hours=args.hours, count=args.count,
+        force=args.force, dry_run=args.dry_run,
+        skip_youtube_demand=args.skip_youtube_demand,
+    ))
 
     if args.as_json:
         print(json.dumps({"day": today, "picks": picks}, indent=2, ensure_ascii=False))
@@ -386,7 +407,7 @@ def main() -> None:
                     print()
 
     if picks and args.download:
-        _download_and_backlog(picks)
+        download_and_backlog(picks)
 
 
 if __name__ == "__main__":

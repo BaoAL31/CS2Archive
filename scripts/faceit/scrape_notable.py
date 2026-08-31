@@ -4,8 +4,9 @@ FACEIT notable-match scrape.
 Discovers multi-pro lobbies and single-pro standout lines, then scores every
 Recognised-Pro performance with the market-demand weight system (YouTube
 player demand, lobby ELO, HLTV rank / 4, trio+ co-stars, bounded match
-perf). `collect()` returns those scored candidates; `daily_notable.py` only
-picks from them.
+perf). `collect()` returns those scored candidates; `daily_notable.py`
+(daily FACEIT notable) only picks from them. The HLTV match listener runs
+that picker on days with no tournament matches.
 
 Usage:
     python scripts/faceit/scrape_notable.py [--hours 48] [--count 25]
@@ -290,7 +291,7 @@ async def collect(*, hours: int, count: int, min_pros: int,
         "solo_available": int,
       }
 
-    ``candidates`` is the ranked unit `daily_notable` picks from. ``multi`` /
+    ``candidates`` is the ranked unit daily FACEIT notable picks from. ``multi`` /
     ``solo`` stay as match-level source records (ELO filled).
     """
     fid_to_nick = known_pro_faceit_ids()
