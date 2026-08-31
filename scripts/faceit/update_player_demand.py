@@ -1,4 +1,6 @@
-"""Refresh player demand weights from competitor YouTube POV scrapes.
+"""Refresh player demand weights from POV-channel YouTube scrapes.
+
+Includes the eight competitor channels plus @cs2povarchive.
 
 Keeps a deduped history (one row per video_id) under exports/pov_market/.
 Scores a rolling 180-day window, with a 14-day overlay that can raise a

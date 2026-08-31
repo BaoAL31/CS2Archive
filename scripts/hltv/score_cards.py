@@ -239,9 +239,18 @@ def load_indexes() -> dict:
 
 
 def _load_ranking_cache() -> dict[str, int]:
-    from hltv_ranking import _load_cache
+    from hltv_ranking import CACHE_PATH, _load_cache
 
-    return _load_cache() or {}
+    cached = _load_cache()
+    if cached:
+        return cached
+    if not CACHE_PATH.exists():
+        return {}
+    try:
+        payload = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload.get("teams") or {}
 
 
 def attach_scores(

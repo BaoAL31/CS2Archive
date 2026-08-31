@@ -2,7 +2,7 @@
 
 Uses the YouTube Data API v3 and upserts each run into video_history.csv
 (one row per video_id; newer captures replace older ones).
-Defaults to eight active CS2 POV competitor channels.
+Defaults to eight competitor POV channels plus @cs2povarchive.
 """
 from __future__ import annotations
 
@@ -37,6 +37,7 @@ DEFAULT_CHANNELS = (
     "https://www.youtube.com/watch?v=8GbocgSYv7w",
     "https://www.youtube.com/watch?v=G2wsicLJMnQ",
     "@cs2propovs",
+    "@cs2povarchive",
 )
 CS2_MAPS = (
     "ancient",

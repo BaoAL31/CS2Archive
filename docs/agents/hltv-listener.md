@@ -50,14 +50,17 @@ A 1.3 donk on Spirit vs FURIA outranks a 1.8 unknown on a low-demand map.
 Queue order is weight, then rating. Refresh:
 
 ```powershell
-python scripts/hltv/update_team_demand.py          # highlight channels → team stars
-python scripts/faceit/update_player_demand.py      # POV channels → individual stars
+python scripts/hltv/refresh_stars.py               # scrape + rewrite both indexes
+python scripts/hltv/refresh_stars.py --install-cron --at 12:00
 python scripts/hltv/score_cards.py backlog/<match_slug>
 ```
 
-The listener refreshes highlight demand when `.data/team_demand_index.json` is
-older than 24 hours, and POV demand when `.data/player_demand_index.json` is
-older than 7 days. `--dry-run` does not scrape YouTube.
+The daily Windows task `CS2ArchiveStarRefresh` runs at 12:00 local time and
+scrapes competitor POV channels plus `@cs2povarchive` (player stars) and the
+official highlight channels (team stars). The listener still refreshes if
+`.data/team_demand_index.json` is older than 24 hours or
+`.data/player_demand_index.json` is older than 7 days. `--dry-run` does not
+scrape YouTube.
 
 ## Run
 

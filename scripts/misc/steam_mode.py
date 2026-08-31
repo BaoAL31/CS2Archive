@@ -1,5 +1,10 @@
 """Toggle Steam online/offline mode via script.
 
+AGENTS: do NOT run this unless the user explicitly asked to change Steam
+mode. Both --offline and --online call steam.exe -shutdown first. The agent
+shell often cannot see steam.exe even when it is running — an empty
+Get-Process/tasklist is a false negative, not permission to restart Steam.
+
 HLAE's CS2 hook fails to latch when Steam is online (CS2 opens the vanilla demo
 viewer instead of recording). Running Steam in offline mode fixes it. Steam has
 no live online/offline toggle, so this restarts Steam:
