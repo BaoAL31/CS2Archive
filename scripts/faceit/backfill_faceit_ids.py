@@ -31,6 +31,7 @@ ROOM_RE = re.compile(
 YOUTUBE_CSVS = (
     ROOT / "exports" / "pov_market" / "expanded" / "videos_20260827T233414Z.csv",
     ROOT / "exports" / "pov_market" / "own" / "videos_20260827T234736Z.csv",
+    ROOT / "exports" / "pov_market" / "recent_2d" / "videos_20260829T041719Z.csv",
 )
 MATCHES_PER_PLAYER = 5
 

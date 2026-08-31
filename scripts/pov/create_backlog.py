@@ -353,7 +353,7 @@ def _extract_shorts(demos: list[Path]) -> None:
         build_short_timeline, _build_short_slug,
         persist_action_timeline, short_json_payload,
     )
-    from shorts import resolve_output_dir
+    from shorts import discard_empty_shorts_dir, resolve_output_dir
 
     total = 0
     for demo in demos:
@@ -364,14 +364,20 @@ def _extract_shorts(demos: list[Path]) -> None:
             print(f"  [WARN] Shorts extraction failed for {demo.name}: "
                   f"{type(e).__name__}: {e}", file=sys.stderr)
             continue
-        dropped = timeline.get("_dropped_randos", 0)
-        shorts_list = timeline.get("shorts", [])
+        dropped_randos = timeline.get("_dropped_randos", 0)
+        from shorts.demand_gate import (
+            filter_publishable_shorts, folder_orgs, filter_suffix,
+        )
+        shorts_list, dropped_demand = filter_publishable_shorts(
+            timeline.get("shorts", []), orgs=folder_orgs(demo),
+        )
         base_dir = resolve_output_dir(demo)
-        persist_action_timeline(demo, timeline, output_dir=base_dir)
+        suffix = filter_suffix(dropped_randos, dropped_demand)
         if not shorts_list:
-            suffix = f" ({dropped} non-pro short(s) filtered)" if dropped else ""
+            discard_empty_shorts_dir(base_dir)
             print(f"  [SHORTS] {demo.name}: 0 shorts{suffix}")
             continue
+        persist_action_timeline(demo, timeline, output_dir=base_dir)
         written = 0
         for short in shorts_list:
             slug = _build_short_slug(short)
@@ -381,7 +387,6 @@ def _extract_shorts(demos: list[Path]) -> None:
                 json.dumps(short_json_payload(timeline, short), indent=2), encoding="utf-8")
             written += 1
         total += written
-        suffix = f" ({dropped} non-pro short(s) filtered)" if dropped else ""
         print(f"  [SHORTS] {demo.name}: {len(shorts_list)} shorts -> "
               f"{written} files{suffix}")
     print(f"[SHORTS] {total} short timeline(s) extracted")

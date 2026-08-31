@@ -37,7 +37,7 @@ from _pathsetup import ensure
 
 ensure()
 
-from shorts import resolve_output_dir  # noqa: E402
+from shorts import discard_empty_shorts_dir, resolve_output_dir  # noqa: E402
 from faceit_names import known_pro_steam_ids  # noqa: E402
 
 _PRE_KILL_TICK_MARGIN = 320  # 5s floor before first kill (at 64 tick)
@@ -1180,12 +1180,16 @@ def main() -> int:
         base_dir = args.output or at_path.parent
     else:
         base_dir = args.output or resolve_output_dir(demo, player=args.player)
-        persist_action_timeline(demo, timeline, output_dir=base_dir)
 
     if not shorts_list:
+        if not args.from_action_timeline:
+            discard_empty_shorts_dir(base_dir)
         suffix = f" ({dropped} non-pro short(s) filtered)" if dropped else ""
         print(f"[OK] 0 shorts detected{suffix}")
         return 0
+
+    if not args.from_action_timeline:
+        persist_action_timeline(demo, timeline, output_dir=base_dir)
 
     written = 0
     for short in shorts_list:

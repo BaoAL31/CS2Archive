@@ -9,7 +9,7 @@ from hltv.match_listener import (
     Match,
     initialize_result_baseline,
     _actionable_matches,
-    select_highest_per_map,
+    select_best_card,
     sort_card_records,
     parse_event_match_ids,
     parse_match_links,
@@ -85,7 +85,7 @@ def test_state_round_trips_atomically(tmp_path: Path):
     assert json.loads(path.read_text())["version"] == 1
 
 
-def test_select_highest_per_map_uses_rating():
+def test_select_best_card_one_per_match():
     cards = []
     for name, map_name, rating in (
         ("low", "Ancient", 1.5),
@@ -95,9 +95,8 @@ def test_select_highest_per_map_uses_rating():
         path = Path("backlog") / f"{name}.json"
         cards.append((str(path).replace("\\", "/"),
                       {"player": name, "map": map_name, "rating": rating}))
-    assert select_highest_per_map(cards) == [
+    assert select_best_card(cards) == [
         ("backlog/best.json", {"player": "best", "map": "Ancient", "rating": 1.8}),
-        ("backlog/other.json", {"player": "other", "map": "Mirage", "rating": 1.6}),
     ]
 
 

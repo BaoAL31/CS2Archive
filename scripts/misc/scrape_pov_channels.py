@@ -1,6 +1,7 @@
 """Collect public performance metrics for competing CS2 POV channels.
 
-Uses the YouTube Data API v3 and appends each run to a historical CSV.
+Uses the YouTube Data API v3 and upserts each run into video_history.csv
+(one row per video_id; newer captures replace older ones).
 Defaults to eight active CS2 POV competitor channels.
 """
 from __future__ import annotations
@@ -384,10 +385,12 @@ async def _recent_video_ids(
     playlist_id: str,
     cutoff: datetime,
     max_videos: int,
+    skip_ids: set[str] | None = None,
 ) -> list[str]:
     ids: list[str] = []
     page_token: str | None = None
     reached_cutoff = False
+    skip_ids = skip_ids or set()
     while len(ids) < max_videos and not reached_cutoff:
         payload = await _get(
             client,
@@ -405,7 +408,10 @@ async def _recent_video_ids(
             if published < cutoff:
                 reached_cutoff = True
                 break
-            ids.append(item["contentDetails"]["videoId"])
+            video_id = item["contentDetails"]["videoId"]
+            if video_id in skip_ids:
+                continue
+            ids.append(video_id)
         page_token = payload.get("nextPageToken")
         if not page_token:
             break
@@ -489,6 +495,7 @@ async def collect(
     api_key: str,
     days: int,
     max_videos: int,
+    skip_ids: set[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     captured_at = datetime.now(timezone.utc)
     cutoff = captured_at - timedelta(days=days)
@@ -509,6 +516,7 @@ async def collect(
                 channel["uploads_playlist"],
                 cutoff,
                 max_videos,
+                skip_ids=skip_ids,
             )
             for start in range(0, len(ids), 50):
                 payload = await _get(
@@ -554,6 +562,68 @@ def _write_csv(path: Path, rows: list[dict], fieldnames: tuple[str, ...] | list[
         writer.writerows(rows)
 
 
+def load_history(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _captured_at(row: dict) -> str:
+    return str(row.get("captured_at") or "")
+
+
+def upsert_history_rows(existing: list[dict], incoming: list[dict]) -> list[dict]:
+    """Keep one row per video_id, preferring the newest capture."""
+    by_id: dict[str, dict] = {}
+    for row in existing:
+        video_id = row.get("video_id")
+        if not video_id:
+            continue
+        prev = by_id.get(video_id)
+        if prev is None or _captured_at(row) >= _captured_at(prev):
+            by_id[video_id] = row
+    for row in incoming:
+        video_id = row.get("video_id")
+        if not video_id:
+            continue
+        prev = by_id.get(video_id)
+        if prev is None or _captured_at(row) >= _captured_at(prev):
+            by_id[video_id] = row
+    rows = list(by_id.values())
+    rows.sort(key=lambda row: (row.get("published_at") or "", row.get("video_id") or ""))
+    return rows
+
+
+def write_history(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_csv(path, rows, VIDEO_FIELDS)
+
+
+def stale_video_ids(
+    rows: list[dict],
+    now: datetime,
+    refresh_days: int,
+) -> set[str]:
+    """Video IDs already stored and older than the refresh window."""
+    cutoff = now - timedelta(days=refresh_days)
+    stale: set[str] = set()
+    for row in rows:
+        video_id = row.get("video_id")
+        published = row.get("published_at")
+        if not video_id or not published:
+            continue
+        try:
+            stamp = datetime.fromisoformat(str(published).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        if stamp < cutoff:
+            stale.add(video_id)
+    return stale
+
+
 def write_outputs(outdir: Path, channels: list[dict], rows: list[dict]) -> list[Path]:
     outdir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -564,11 +634,8 @@ def write_outputs(outdir: Path, channels: list[dict], rows: list[dict]) -> list[
 
     _write_csv(videos_path, rows, VIDEO_FIELDS)
     summary_path.write_text(json.dumps(summaries, indent=2), encoding="utf-8")
-    with history_path.open("a", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.DictWriter(handle, fieldnames=VIDEO_FIELDS)
-        if handle.tell() == 0:
-            writer.writeheader()
-        writer.writerows(rows)
+    merged = upsert_history_rows(load_history(history_path), rows)
+    write_history(history_path, merged)
     return [videos_path, summary_path, history_path]
 
 

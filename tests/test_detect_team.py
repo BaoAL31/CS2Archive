@@ -26,3 +26,9 @@ def test_spirit_vs_falcons_still_parses():
     demo = "demos/hltv/x/spirit-vs-falcons-m3-nuke.dem"
     orgs = orgs_from_folder(demo)
     assert [d for d, _ in orgs] == ["Spirit", "Falcons"]
+
+
+def test_vitality_vs_inner_circle_parses():
+    demo = "demos/hltv/2396927-vitality-vs-inner-circle-blast-open-porto/vitality-vs-inner-circle-m2-cache.dem"
+    orgs = orgs_from_folder(demo)
+    assert [d for d, _ in orgs] == ["Vitality", "Inner Circle"]

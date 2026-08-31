@@ -1,4 +1,8 @@
-"""Poll HLTV results and render high-priority POVs for notable teams.
+"""Poll HLTV results and render the highest-weighted POV per match.
+
+Cards are scored with highlight-channel team demand, POV-channel player
+demand, org rank, and HLTV rating. One card per match is queued from
+``backlog/<match>/{high,medium}/``.
 
 The listener is intentionally a single process and a single pipeline worker.
 It persists state in ``.listener/hltv.json`` so a restart does not repeat
@@ -35,6 +39,12 @@ for _p in (str(ROOT), str(_SCRIPTS)):
 os.chdir(ROOT)
 
 from config import settings  # noqa: E402
+from hltv.score_cards import (  # noqa: E402
+    attach_scores,
+    format_score,
+    load_indexes,
+    maybe_refresh_indexes,
+)
 from scrapers.hltv_acquire import fetch_hltv_page_html, match_slug_from_url  # noqa: E402
 
 DEFAULT_EVENT_URL = "https://www.hltv.org/events/8249/blast-open-porto-2026"
@@ -214,51 +224,65 @@ class SingleInstance:
             pass
 
 
-def _high_priority_cards(match: Match) -> list[str]:
+def _candidate_cards(match: Match, indexes: dict | None = None) -> list[str]:
     match_slug = match_slug_from_url(match.url)
-    root = ROOT / "backlog" / match_slug / "high"
-    if not root.is_dir():
-        return []
-    cards = []
-    for path in sorted(root.glob("*.json")):
-        try:
-            meta = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+    root = ROOT / "backlog" / match_slug
+    cards: list[tuple[str, dict]] = []
+    for bucket in ("high", "medium"):
+        folder = root / bucket
+        if not folder.is_dir():
             continue
-        cards.append((str(path.relative_to(ROOT)).replace("\\", "/"), meta))
-    return [path for path, _ in select_highest_per_map(cards)]
+        for path in sorted(folder.glob("*.json")):
+            try:
+                meta = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            cards.append((str(path.relative_to(ROOT)).replace("\\", "/"), meta))
+    scored = attach_scores(
+        cards, indexes=indexes, fixture_teams=(match.team1, match.team2)
+    )
+    selected = select_best_card(scored)
+    for path, meta in selected:
+        print(
+            f"[score] {meta.get('player')} {meta.get('map')} "
+            f"{format_score(meta)} ({path})",
+            flush=True,
+        )
+    return [path for path, _ in selected]
 
 
-def select_highest_per_map(
+def _card_rank(meta: dict) -> tuple[float, float]:
+    """Higher weight, then higher rating."""
+    try:
+        weight = float(meta.get("weight") or 0)
+    except (TypeError, ValueError):
+        weight = 0.0
+    try:
+        rating = float(meta.get("rating") or 0)
+    except (TypeError, ValueError):
+        rating = 0.0
+    return (weight, rating)
+
+
+def select_best_card(
     cards: list[tuple[str, dict]],
 ) -> list[tuple[str, dict]]:
-    """Select one highest-rated card for each map, deterministically."""
-    best: dict[str, tuple[str, dict]] = {}
+    """Select the single highest-weighted card (one POV per match)."""
+    best: tuple[str, dict] | None = None
     for path, meta in cards:
-        map_name = str(meta.get("map", "")).strip().casefold()
-        if not map_name:
+        if not str(meta.get("map", "")).strip():
             continue
-        try:
-            rating = float(meta.get("rating", 0))
-        except (TypeError, ValueError):
-            rating = 0.0
-        current = best.get(map_name)
-        if current is None:
-            best[map_name] = (path, meta)
+        if best is None:
+            best = (path, meta)
             continue
-        try:
-            current_rating = float(current[1].get("rating", 0))
-        except (TypeError, ValueError):
-            current_rating = 0.0
-        if rating > current_rating or (rating == current_rating and path < current[0]):
-            best[map_name] = (path, meta)
-    return sorted(
-        best.values(),
-        key=lambda item: (str(item[1].get("map", "")).casefold(), item[0]),
-    )
+        cand = _card_rank(meta)
+        cur = _card_rank(best[1])
+        if cand > cur or (cand == cur and path < best[0]):
+            best = (path, meta)
+    return [best] if best else []
 
 
-def _prune_queue(cards: list[str]) -> list[str]:
+def _prune_queue(cards: list[str], indexes: dict | None = None) -> list[str]:
     groups: dict[str, list[tuple[str, dict]]] = {}
     passthrough: list[str] = []
     for path in cards:
@@ -273,25 +297,22 @@ def _prune_queue(cards: list[str]) -> list[str]:
     selected = [
         path
         for group in groups.values()
-        for path, _ in select_highest_per_map(group)
+        for path, _ in select_best_card(attach_scores(group, indexes=indexes))
     ]
     return passthrough + selected
 
 
 def sort_card_records(cards: list[tuple[str, dict]]) -> list[str]:
-    """Order queued cards by rating descending, then path."""
-    def rating(record: tuple[str, dict]) -> float:
-        try:
-            return float(record[1].get("rating", 0))
-        except (TypeError, ValueError):
-            return 0.0
+    """Order queued cards by weight, then rating, then path."""
+    def key(record: tuple[str, dict]) -> tuple:
+        path, meta = record
+        weight, rating = _card_rank(meta)
+        return (-weight, -rating, path)
 
-    return [
-        path for path, _ in sorted(cards, key=lambda item: (-rating(item), item[0]))
-    ]
+    return [path for path, _ in sorted(cards, key=key)]
 
 
-def _sort_queue(cards: list[str]) -> list[str]:
+def _sort_queue(cards: list[str], indexes: dict | None = None) -> list[str]:
     records: list[tuple[str, dict]] = []
     passthrough: list[str] = []
     for path in cards:
@@ -301,6 +322,8 @@ def _sort_queue(cards: list[str]) -> list[str]:
             passthrough.append(path)
             continue
         records.append((path, meta))
+    if records:
+        records = attach_scores(records, indexes=indexes)
     return sort_card_records(records) + passthrough
 
 
@@ -315,13 +338,13 @@ def _child_env() -> dict[str, str]:
     return env
 
 
-def _enqueue(state: State, cards: list[str]) -> None:
+def _enqueue(state: State, cards: list[str], indexes: dict | None = None) -> None:
     queued = set(state.data["queue"])
     for card in cards:
         if card not in queued:
             state.data["queue"].append(card)
             queued.add(card)
-    state.data["queue"] = _sort_queue(state.data["queue"])
+    state.data["queue"] = _sort_queue(state.data["queue"], indexes=indexes)
 
 
 def _run_backlog(match: Match, dry_run: bool, retries: int = 3) -> bool:
@@ -406,6 +429,9 @@ def _actionable_matches(state: State, matches: list[Match]) -> list[Match]:
 async def poll_once(args, state: State) -> None:
     event_url = args.event_url
     state.data["event_url"] = event_url
+    if not args.dry_run:
+        maybe_refresh_indexes(scrape=True)
+    indexes = load_indexes()
     if args.refresh_teams or not state.data["teams"]:
         html = await asyncio.to_thread(fetch_hltv_page_html, args.rankings_url,
                                         headless=True, wait_selector=None)
@@ -454,9 +480,9 @@ async def poll_once(args, state: State) -> None:
             continue
         if not _retry_ready(record):
             continue
-        cards = _high_priority_cards(match)
+        cards = _candidate_cards(match, indexes)
         if cards:
-            print(f"[backlog] adopting {len(cards)} existing high-priority "
+            print(f"[backlog] adopting {len(cards)} weighted "
                   f"card(s) for {match.match_id}", flush=True)
         else:
             record["attempts"] += 1
@@ -464,20 +490,19 @@ async def poll_once(args, state: State) -> None:
                 _schedule_retry(record, "create_backlog failed")
                 state.save()
                 continue
-            cards = _high_priority_cards(match)
+            cards = _candidate_cards(match, indexes)
         if args.dry_run:
             cards = [f"backlog/{match_slug_from_url(match.url)}/high/<generated>.json"]
         if not cards:
-            # A successful backlog run can legitimately produce no high
-            # performer (all ratings below the render threshold). This is a
-            # completed no-op, not an acquisition failure.
+            # A successful backlog run can legitimately produce no high/medium
+            # performer (all ratings below 1.0). This is a completed no-op.
             record["status"] = "completed"
             record["cards"] = []
-            record["no_high_priority_cards"] = True
+            record["no_candidate_cards"] = True
             record["last_error"] = None
             state.save()
             continue
-        _enqueue(state, cards)
+        _enqueue(state, cards, indexes)
         record["status"] = "queued"
         record["cards"] = cards
         record["last_error"] = None

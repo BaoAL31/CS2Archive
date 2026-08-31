@@ -132,7 +132,7 @@ python scripts/pov/pipeline_chain.py --watch falcons-vs-mouz-m2-dust2_kyousuke_D
 
 ## Backlog Creation
 
-`python scripts/pov/create_backlog.py <hltv_url>` — downloads a match and generates prioritized backlog entries for every player/map combo. After cards are written it also extracts Recognised-Pro Shorts timelines (`--no-shorts` skips). Demos with zero qualifying shorts leave no folder under `renders/shorts/`.
+`python scripts/pov/create_backlog.py <hltv_url>` — downloads a match and generates prioritized backlog entries for every player/map combo. After cards are written it also extracts Recognised-Pro Shorts timelines (`--no-shorts` skips), then drops low-demand POVs (not in the YouTube demand index, and the match/title does not name NAVI / Spirit / Vitality — Falcons does not count). `upload_pending_shorts.py` writes `upload_status=skipped` on already-rendered clips that fail the same gate. Demos with zero qualifying shorts leave no folder under `renders/shorts/`.
 
 **Demos are downloaded automatically.** The script calls into `acquire_match()` then scrapes HLTV Rating 3.0, creating a per-player backlog card ranked by rating. It validates that the `.dem` file for each map exists on disk — if not found, it raises `FileNotFoundError` with the expected path, rather than writing a placeholder.
 

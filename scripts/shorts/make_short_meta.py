@@ -16,6 +16,7 @@ import json
 import os
 import glob
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -54,6 +55,17 @@ def _tournament_hashtag(demo_path: str, year: str = "2026", override: str | None
     return ""
 
 
+def _resolve_demo(demo_path: str) -> str:
+    """Timeline paths are repo-relative; resolve them against the project root."""
+    p = Path(demo_path)
+    if p.is_file():
+        return str(p)
+    alt = Path(_ROOT) / demo_path
+    if alt.is_file():
+        return str(alt)
+    return demo_path
+
+
 def _map_name(demo_map: str) -> str:
     return demo_map.replace("de_", "").replace("_", " ").title()
 
@@ -61,6 +73,30 @@ def _map_name(demo_map: str) -> str:
 def _pick(key: str, options: tuple) -> object:
     digest = hashlib.md5(key.encode("utf-8")).hexdigest()
     return options[int(digest, 16) % len(options)]
+
+
+# Grammatical slots, not a banned-word list. Swap freely if the sentence still
+# parses. "going crazy" and "going insane" are the same skeleton; "filthy 4K"
+# is a different slot (pre-kind). Do not put kind-slot words in going-slot
+# ("going filthy") or vice versa ("insane 4K" is ok-ish; "nuclear 4K" is not).
+_ADJ = {
+    "going": (
+        "crazy", "insane", "nuclear", "unhinged", "wild", "ballistic",
+        "feral", "mental", "ham", "postal",
+    ),
+    "kind": (
+        "filthy", "nasty", "disgusting", "ridiculous", "absurd", "sick",
+        "clean", "cold",
+    ),
+    "looking": (
+        "unhinged", "insane", "crazy", "feral", "filthy", "possessed",
+    ),
+}
+
+
+def _adj(key: str, slot: str) -> str:
+    """Pick an adjective for a grammatical slot, hashed independently of format."""
+    return _pick(key + "|adj|" + slot, _ADJ[slot])
 
 
 def _is_top10_opponent(opp: str | None) -> bool:
@@ -99,7 +135,9 @@ def _gun(punch_tags: list[str] | None) -> str:
 
 
 def _make_title(nick: str, short_type: str, opp: str | None, mname: str, tournament_tag: str = "", clutch: str | None = None, kills: int = 0, punch_tags: list[str] | None = None, start_tick: int = 0) -> tuple[str, str]:
-    key = f"{nick}|{short_type}|{clutch}|{kills}|{opp}|{mname}|{punch_tags}|{start_tick}"
+    # Format hash ignores the live opponent string so filling in a top-10 org
+    # does not reshuffle the skeleton (onic stays hyphen-hook, Vitality is spliced in).
+    key = f"{nick}|{short_type}|{clutch}|{kills}|None|{mname}|{punch_tags}|{start_tick}"
     vs = _vs_bit(opp, mname, key)
     gun = _gun(punch_tags)
     gun_sp = f"{gun} " if gun else ""
@@ -116,22 +154,32 @@ def _make_title(nick: str, short_type: str, opp: str | None, mname: str, tournam
             formats = (("hook-rest", f"{clutch_s}? {rest}"),)
     elif kills >= 5:
         ace = f"{gun} ACE" if gun else "ACE"
+        going, looking, kadj = _adj(key, "going"), _adj(key, "looking"), _adj(key, "kind")
+        hook = _pick(key + "|hookshape", (
+            f"{nick} going {going} - {ace} {vs}",
+            f"{nick} looking {looking} - {ace} {vs}",
+        ))
         formats = (
             ("casual-drop", f"{nick} casually drops an {ace} {vs}"),
             ("gerund", f"{nick} dropping an {ace} {vs}"),
             ("possessive", f"{nick}'s {ace} {vs}"),
-            ("kind-lead", f"{ace} from {nick} {vs}"),
-            ("pop-off", f"{nick} popping off - {ace} {vs}"),
+            ("kind-lead", f"{kadj} {ace} from {nick} {vs}"),
+            ("hyphen-hook", hook),
             ("they-couldnt", f"{opp} couldn't stop {nick}'s ACE" if opp else f"{nick}'s {ace} {vs}"),
         )
     else:
         kind = f"{gun_sp}4K".strip()
+        going, looking, kadj = _adj(key, "going"), _adj(key, "looking"), _adj(key, "kind")
+        hook = _pick(key + "|hookshape", (
+            f"{nick} going {going} - {kind} {vs}",
+            f"{nick} looking {looking} - {kind} {vs}",
+        ))
         formats = (
             ("possessive", f"{nick}'s {kind} {vs}"),
             ("gerund", f"{nick} dropping a {kind} {vs}"),
-            ("kind-lead", f"{kind} from {nick} {vs}"),
+            ("kind-lead", f"{kadj} {kind} from {nick} {vs}"),
             ("casual-drop", f"{nick} casually drops a {kind} {vs}"),
-            ("hyphen-hook", f"{nick} going crazy - {kind} {vs}"),
+            ("hyphen-hook", hook),
             ("hook-emoji", f"{kind}? Easy for {nick} {vs}"),
         )
 
@@ -162,7 +210,7 @@ def make_meta(folder: str, tournament: str | None = None, year: str = "2026") ->
     tl_path = os.path.join(folder, "short_timeline.json")
     tl = json.load(open(tl_path, encoding="utf-8"))
     s = tl["shorts"][0]
-    demo = tl["demo_path"]
+    demo = _resolve_demo(tl["demo_path"])
     sid = s["pov_steam_id"]
     nick = s["pov_nick"]
     mname = _map_name(tl.get("map", ""))

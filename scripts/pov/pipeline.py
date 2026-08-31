@@ -1579,8 +1579,8 @@ class Pipeline:
         thumb = youtube_dir / "thumbnail.jpg"
 
         if self.is_faceit:
-            # FACEIT path: blurred kill-frame + text, no ratings/avatar.
-            # ELO lines come from the backlog card (elo / opp_avg_elo).
+            # FACEIT path: style-01 (proof_01 HTML) via faceit_thumbnail.py.
+            # ELO / K-D come from the backlog card; portraits from demos/avatars.
             # Background: kill-moment frame from the finished youtube video
             # (overlay-only = keyboard + util cam, player's render cfg).
             faceit_bg: Path | None = None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import sys
 from pathlib import Path
 
@@ -28,3 +29,20 @@ def resolve_output_dir(demo_path: str | Path, player: str | None = None) -> Path
     if "demos/hltv" not in normalized and "demos/faceit" not in normalized:
         raise ValueError(f"unknown demo path: {demo}")
     return RENDERS_DIR / "shorts" / f"shorts-{demo_stem}"
+
+
+def discard_empty_shorts_dir(base: Path) -> None:
+    """Remove ``renders/shorts/shorts-{stem}/`` when it has no per-short folders."""
+    if not base.is_dir():
+        return
+    if base.parent.name != "shorts" or not base.name.startswith("shorts-"):
+        return
+    try:
+        has_short = any(
+            p.is_dir() and p.name.startswith("shorts-") for p in base.iterdir()
+        )
+    except FileNotFoundError:
+        return
+    if has_short:
+        return
+    shutil.rmtree(base, ignore_errors=True)

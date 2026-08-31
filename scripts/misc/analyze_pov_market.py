@@ -75,24 +75,27 @@ def _group_report(rows: list[dict], key, minimum: int = 3) -> list[dict]:
 def analyze(path: Path) -> dict:
     with path.open(encoding="utf-8-sig", newline="") as handle:
         source_rows = list(csv.DictReader(handle))
+    return analyze_rows(source_rows, source=str(path))
 
+
+def analyze_rows(source_rows: list[dict], source: str = "") -> dict:
     rows = []
     excluded_fresh = 0
     excluded_short = 0
-    for source in source_rows:
-        age = _number(source.get("age_days"))
-        velocity = _number(source.get("views_per_day"))
-        duration = _number(source.get("duration_seconds")) or 0
+    for raw in source_rows:
+        age = _number(raw.get("age_days"))
+        velocity = _number(raw.get("views_per_day"))
+        duration = _number(raw.get("duration_seconds")) or 0
         if duration < 300:
             excluded_short += 1
             continue
         if age is None or velocity is None or age < 2:
             excluded_fresh += 1
             continue
-        row = dict(source)
+        row = dict(raw)
         row["age_days_num"] = age
         row["views_per_day_num"] = velocity
-        row["views_num"] = _number(source.get("views")) or 0
+        row["views_num"] = _number(raw.get("views")) or 0
         rows.append(row)
 
     by_channel: dict[str, list[dict]] = defaultdict(list)
@@ -217,7 +220,7 @@ def analyze(path: Path) -> dict:
     ]
 
     return {
-        "source": str(path),
+        "source": source,
         "method": {
             "source_videos": len(source_rows),
             "videos_analyzed": len(rows),

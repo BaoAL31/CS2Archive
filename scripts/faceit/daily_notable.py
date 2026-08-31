@@ -22,6 +22,7 @@ Usage:
     python scripts/faceit/daily_notable.py --dry-run  # report without persisting
     python scripts/faceit/daily_notable.py --json     # machine-readable picks
     python scripts/faceit/daily_notable.py --download # also download demos + build backlog
+    python scripts/faceit/daily_notable.py --replay-from 2026-08-25 --replay-to 2026-08-29 --from-state
     python scripts/faceit/daily_notable.py --install-cron [--at 09:00]
     python scripts/faceit/daily_notable.py --remove-cron
 """
@@ -42,7 +43,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from _pathsetup import ensure  # noqa: E402
 ensure()
 
-from scrape_notable import collect
+from scrape_notable import SCORE_VERSION, collect, rescore_stored
+from update_player_demand import refresh as refresh_player_demand
 
 STATE_FILE = ROOT / ".data" / "notable_daily.json"
 DEMO_DIR = ROOT / "demos" / "faceit"
@@ -69,6 +71,43 @@ def _save_state(state: dict) -> None:
 def _reason(c: dict) -> str:
     w = "won" if c.get("won") else "lost"
     return f"{c['player']} {c.get('kills')}/{c.get('deaths')} (K/D {c.get('kd')}, ADR {c.get('adr')}) - {w}"
+
+
+def _cand_day(c: dict) -> str | None:
+    raw = c.get("date")
+    if not raw:
+        return None
+    if isinstance(raw, datetime):
+        return raw.strftime("%Y-%m-%d")
+    return str(raw)[:10]
+
+
+def replay_days(
+    candidates: list[dict], start: str, end: str, n: int, window_hours: int = 72,
+) -> dict[str, list[dict]]:
+    """Walk calendar days as the daily cron would: 72h lookback, one POV per
+    player and match, already-picked performance ids stay used."""
+    start_d = datetime.strptime(start, "%Y-%m-%d")
+    end_d = datetime.strptime(end, "%Y-%m-%d")
+    used: list[str] = []
+    out: dict[str, list[dict]] = {}
+    day = start_d
+    while day <= end_d:
+        ds = day.strftime("%Y-%m-%d")
+        window_start = (day - timedelta(hours=window_hours)).strftime("%Y-%m-%d")
+        window = []
+        for c in candidates:
+            if not c.get("id"):
+                continue
+            cd = _cand_day(c)
+            if not cd or cd < window_start or cd > ds:
+                continue
+            window.append(c)
+        picks, new_used, _ = select({"used": used}, window, n, ds)
+        used.extend(new_used)
+        out[ds] = picks
+        day += timedelta(days=1)
+    return out
 
 
 def select(state: dict, candidates: list[dict], n: int, today: str) -> tuple[list[dict], list[str], list[dict]]:
@@ -192,6 +231,14 @@ def main() -> None:
                     help="Print picks as JSON only")
     ap.add_argument("--download", action="store_true",
                     help="After picking: download each demo + build backlog cards")
+    ap.add_argument("--skip-youtube-demand", action="store_true",
+                    help="Do not scrape/recompute YouTube player demand weights")
+    ap.add_argument("--replay-from", default=None, metavar="YYYY-MM-DD",
+                    help="Walk this start day through --replay-to (report only)")
+    ap.add_argument("--replay-to", default=None, metavar="YYYY-MM-DD",
+                    help="End day for --replay-from (default: same as start)")
+    ap.add_argument("--from-state", action="store_true",
+                    help="Replay from rescored notable_daily.json instead of FACEIT")
     ap.add_argument("--install-cron", action="store_true",
                     help="Register a Windows daily scheduled task")
     ap.add_argument("--at", default=DEFAULT_TIME, help="Cron run time HH:MM (default 09:00)")
@@ -206,8 +253,80 @@ def main() -> None:
         install_cron(args.at)
         return
 
+    if args.replay_from:
+        end = args.replay_to or args.replay_from
+        if args.from_state:
+            state = _load_state()
+            seen: dict[str, dict] = {}
+            for rec in list(state.get("pool") or []) + [
+                x for ps in (state.get("picks") or {}).values() for x in ps
+            ]:
+                row = rescore_stored(rec)
+                if row.get("id") and row.get("player"):
+                    seen[row["id"]] = row
+            candidates = list(seen.values())
+            print(f"[REPLAY] {len(candidates)} rescored performances from state")
+        else:
+            if not args.skip_youtube_demand:
+                try:
+                    demand = refresh_player_demand(scrape=True)
+                    print(
+                        f"[DEMAND] {len(demand['index'])} players from "
+                        f"{demand['window_videos']} videos "
+                        f"(scraped {demand['scraped']} new/updated)"
+                    )
+                except Exception as exc:
+                    print(f"[DEMAND] skipped ({exc})")
+            start_d = datetime.strptime(args.replay_from, "%Y-%m-%d")
+            as_of = datetime.strptime(end, "%Y-%m-%d").replace(
+                hour=23, minute=59, second=59,
+            )
+            hours = max(
+                args.hours,
+                int((as_of - (start_d - timedelta(days=3))).total_seconds() // 3600) + 1,
+            )
+            print(f"[REPLAY] scraping {hours}h through {end} ...")
+            data = asyncio.run(collect(
+                hours=hours, count=args.count, min_pros=2,
+                perf_kd=1.5, perf_adr=100.0, perf_kills=30, perf_limit=120,
+                today_only=False, exclude_today=False, as_of=as_of,
+            ))
+            candidates = data["candidates"]
+            print(f"[REPLAY] {len(candidates)} live-scored performances")
+        by_day = replay_days(candidates, args.replay_from, end, args.n)
+        if args.as_json:
+            print(json.dumps(
+                {d: [{"player": c["player"], "kills": c.get("kills"),
+                      "deaths": c.get("deaths"), "won": c.get("won"),
+                      "weight": c.get("weight"), "map": c.get("map"),
+                      "score": c.get("score")} for c in ps]
+                 for d, ps in by_day.items()},
+                indent=2, ensure_ascii=False,
+            ))
+            return
+        for day, picks in by_day.items():
+            print(f"\n=== {day} ({len(picks)} pick(s)) ===")
+            if not picks:
+                print("  (none)")
+                continue
+            for i, c in enumerate(picks, 1):
+                print(f"PICK {i}/{len(picks)} ({c.get('stream')})")
+                print(_format_pick(c))
+        return
+
     today = datetime.now().strftime("%Y-%m-%d")
     state = _load_state()
+
+    if not args.skip_youtube_demand:
+        try:
+            demand = refresh_player_demand(scrape=True)
+            print(
+                f"[DEMAND] {len(demand['index'])} players from "
+                f"{demand['window_videos']} videos "
+                f"(scraped {demand['scraped']} new/updated)"
+            )
+        except Exception as exc:
+            print(f"[DEMAND] skipped ({exc})")
 
     # idempotent per-day unless --force; also re-run if stored picks are from
     # the old match-level schema (no 'player' field).
@@ -216,7 +335,7 @@ def main() -> None:
         not args.force
         and state.get("last_day") == today
         and prev
-        and all(c.get("score_version") == 2 for c in prev)
+        and all(c.get("score_version") == SCORE_VERSION for c in prev)
     ):
         picks = prev
     else:
@@ -231,7 +350,7 @@ def main() -> None:
         pool_by_id = {
             c["id"]: c
             for c in state["pool"]
-            if c.get("id") and c.get("score_version") == 2
+            if c.get("id") and c.get("score_version") == SCORE_VERSION
         }
         for c in fresh:
             pool_by_id[c["id"]] = c

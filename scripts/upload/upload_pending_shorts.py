@@ -10,9 +10,9 @@ same meta file.
 
 Resume-safe: a meta whose YouTube (upload_status=completed + youtube_id),
 TikTok (tiktok_status=scheduled), and Instagram (instagram_status=scheduled)
-are all done is skipped. upload_youtube_shorts.py re-uses the committed slot
-for the already-done platforms and only fills in what's left, so re-running
-only does missing work.
+are all done is skipped. Auto-schedule occupies both daily Shorts slots on any
+date that POV already has a Short booked, so the same player is never queued
+twice on one calendar day.
 
 Usage:
     python scripts/upload/upload_pending_shorts.py              # upload all pending
@@ -44,14 +44,44 @@ DEFAULT_ROOT = PROJECT_ROOT / "renders"
 
 def _platform_pending(meta: dict) -> dict[str, bool]:
     """Which platforms still need work, keyed by name."""
-    yt_done = bool(meta.get("upload_status") == "completed" and meta.get("youtube_id"))
-    tt_done = meta.get("tiktok_status") == "scheduled"
-    ig_done = meta.get("instagram_status") == "scheduled"
+    skipped = meta.get("upload_status") == "skipped"
+    yt_done = skipped or bool(
+        meta.get("upload_status") == "completed" and meta.get("youtube_id")
+    )
+    tt_done = skipped or meta.get("tiktok_status") == "scheduled"
+    ig_done = skipped or meta.get("instagram_status") == "scheduled"
     return {
         "youtube": not yt_done,
         "tiktok": not tt_done,
         "instagram": not ig_done,
     }
+
+
+def _passes_demand(meta_path: Path, meta: dict, *, payload: dict | None = None) -> bool:
+    from shorts.demand_gate import folder_orgs, passes_shorts_demand_gate
+    from shorts_player_day import pov_nick_from_meta_path
+
+    nick = pov_nick_from_meta_path(meta_path) or ""
+    text = f"{meta.get('title') or ''} {meta.get('description') or ''}"
+    orgs: list[str] = []
+    timeline = meta_path.parent / "short_timeline.json"
+    if timeline.exists():
+        try:
+            data = json.loads(timeline.read_text(encoding="utf-8-sig"))
+            demo = data.get("demo_path")
+            if demo:
+                orgs = folder_orgs(demo)
+        except Exception:
+            pass
+    return passes_shorts_demand_gate(nick, orgs=orgs, text=text, payload=payload)
+
+
+def _mark_skipped_low_demand(meta_path: Path, meta: dict) -> None:
+    meta["upload_status"] = "skipped"
+    meta["skip_reason"] = "low_demand"
+    meta["tiktok_status"] = "skipped"
+    meta["instagram_status"] = "skipped"
+    meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 
 
 def _needs_upload(meta: dict, *, skip_tiktok: bool, skip_instagram: bool) -> bool:
@@ -191,12 +221,20 @@ def main() -> None:
 
     ok = 0
     failed = 0
+    skipped = 0
     for meta_path in pending:
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8-sig"))
         except Exception as e:
             print(f"  [skip] could not re-read {meta_path}: {e}")
             failed += 1
+            continue
+        if not _passes_demand(meta_path, meta):
+            title = (meta.get("title") or meta_path.parent.name)[:70]
+            print(f"  [skip] low-demand: {title}")
+            if not args.dry_run:
+                _mark_skipped_low_demand(meta_path, meta)
+            skipped += 1
             continue
         if upload_one(meta_path, meta, args.dry_run,
                       skip_tiktok=args.skip_tiktok, skip_instagram=args.skip_instagram):
@@ -205,7 +243,8 @@ def main() -> None:
             if not args.dry_run:
                 failed += 1
 
-    print(f"\nDone. uploaded={ok} failed={failed} (dry_run={args.dry_run})")
+    print(f"\nDone. uploaded={ok} skipped={skipped} failed={failed} "
+          f"(dry_run={args.dry_run})")
     if failed and not args.dry_run:
         sys.exit(1)
 

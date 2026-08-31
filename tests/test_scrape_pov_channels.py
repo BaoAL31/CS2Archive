@@ -200,3 +200,50 @@ def test_write_outputs_creates_snapshot_summary_and_history(tmp_path):
     with paths[2].open(encoding="utf-8-sig", newline="") as handle:
         history = list(csv.DictReader(handle))
     assert history[0]["video_id"] == "video1"
+
+
+def test_write_outputs_upserts_history_by_video_id(tmp_path):
+    channels = [
+        {
+            "channel_id": "UC1",
+            "channel": "POV",
+            "subscribers": 1000,
+            "channel_views": 50000,
+            "channel_videos": 20,
+            "uploads_playlist": "UU1",
+        }
+    ]
+    row = {field: None for field in scraper.VIDEO_FIELDS}
+    row.update(
+        {
+            "captured_at": "2026-08-28T00:00:00+00:00",
+            "channel_id": "UC1",
+            "channel": "POV",
+            "video_id": "video1",
+            "title": "donk POV",
+            "published_at": "2026-08-26T00:00:00+00:00",
+            "views": 2000,
+            "views_per_day": 1000,
+            "url": "https://www.youtube.com/watch?v=video1",
+        }
+    )
+    scraper.write_outputs(tmp_path, channels, [row])
+    updated = dict(row)
+    updated["captured_at"] = "2026-08-29T00:00:00+00:00"
+    updated["views"] = 4000
+    scraper.write_outputs(tmp_path, channels, [updated])
+
+    history_path = tmp_path / "video_history.csv"
+    with history_path.open(encoding="utf-8-sig", newline="") as handle:
+        history = list(csv.DictReader(handle))
+    assert len(history) == 1
+    assert history[0]["views"] == "4000"
+
+
+def test_stale_video_ids_skip_old_history():
+    now = datetime(2026, 8, 29, tzinfo=timezone.utc)
+    rows = [
+        {"video_id": "old", "published_at": "2026-01-01T00:00:00+00:00"},
+        {"video_id": "fresh", "published_at": "2026-08-27T00:00:00+00:00"},
+    ]
+    assert scraper.stale_video_ids(rows, now, 7) == {"old"}

@@ -50,6 +50,7 @@ from upload_youtube import (  # noqa: E402
     upload_video,
 )
 from youtube_schedule import DEFAULT_PUBLISH_TZ, resolve_publish_schedule  # noqa: E402
+from shorts_player_day import player_blocked_slots, pov_nick_from_meta_path  # noqa: E402
 
 SHORTS_META_NAME = "upload_meta_shorts.json"
 SHORTS_VIDEO_NAME = "short.mp4"
@@ -157,15 +158,25 @@ def main() -> None:
                 if occupied_dates
                 else set()
             )
-            # Reuse CS2UtilArchive's shared shorts schedule (SLOT_TIMES +
-            # find_next_upload_slot) so CS2Archive and CS2UtilArchive shorts
-            # reserve from the same slot pool and never double-book a slot.
-            from publish_schedule import find_next_upload_slot
+            # One Short per player per calendar day: if this POV already has a
+            # Short booked that date, occupy both daily slots so the next clip
+            # of theirs lands on a later day.
+            from publish_schedule import SLOT_TIMES, find_next_upload_slot
+            nick = pov_nick_from_meta_path(meta_path)
+            if nick:
+                occupied_tuples |= player_blocked_slots(
+                    Path(__file__).resolve().parents[2] / "renders",
+                    nick,
+                    publish_tz,
+                    SLOT_TIMES,
+                    exclude_meta=meta_path,
+                )
             date_str, time_str = find_next_upload_slot(occupied=occupied_tuples)
             publish_setting = f"{date_str} {time_str}"
+            extra = f" (skipping days already booked for {nick})" if nick else ""
             print(
                 f"  Auto Shorts slot (shared CS2UtilArchive schedule): "
-                f"{date_str} {time_str} ({args.timezone})",
+                f"{date_str} {time_str} ({args.timezone}){extra}",
                 flush=True,
             )
         try:

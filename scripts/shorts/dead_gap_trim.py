@@ -1,8 +1,11 @@
 """Trim dead gaps (>= GAP_MIN seconds with no kill) out of rendered shorts.
 
+Called from render_shorts after the 9:16 composite so the uploaded file is
+the trimmed cut. Standalone CLI still works for re-trimming an existing mp4.
+
 Rule: for every consecutive kill pair whose gap >= GAP_MIN, cut the middle —
-keep 2s after the previous kill, resume 5s before the next kill — and join
-the segments with a crossfade (xfade + acrossfade).
+keep KEEP_AFTER_KILL after the previous kill, resume RESUME_BEFORE_KILL
+before the next kill — and join with a crossfade.
 
 Reads kill timestamps from the short's short_timeline.json (kill_ticks +
 start_tick/end_tick at 64 tick), maps to video time via output duration.
@@ -39,7 +42,7 @@ def _ffprobe_duration(path: Path) -> float:
     return float(r.stdout.strip())
 
 
-def _kill_times(mp4: Path, tl_path: Path) -> tuple[list[float], float]:
+def _kill_times(mp4: Path, tl_path: Path) -> tuple[list[float], float, float]:
     """Kill times in video-seconds + total video duration."""
     dur = _ffprobe_duration(mp4)
     tl = json.loads(tl_path.read_text())
@@ -58,11 +61,12 @@ def _kill_times(mp4: Path, tl_path: Path) -> tuple[list[float], float]:
         if len(shorts) == 1:
             entry = shorts[0]
         else:
-            raise SystemExit(f"cannot match {mp4.name} to timeline entries")
-    tickrate = 64.0
+            raise ValueError(f"cannot match {mp4.name} to timeline entries")
+    tickrate = float(tl.get("tickrate") or 64)
     t0 = entry["start_tick"] / tickrate
     times = [k / tickrate - t0 for k in entry.get("kill_ticks") or []]
-    return sorted(times), dur
+    expected = (entry["end_tick"] - entry["start_tick"]) / tickrate
+    return sorted(times), dur, expected
 
 
 def plan_cuts(kills: list[float], dur: float) -> list[tuple[float, float]]:
@@ -100,17 +104,22 @@ def trim_video(mp4: Path, cuts: list[tuple[float, float]], out: Path) -> None:
     from moviepy import afx, vfx
 
     dur = _ffprobe_duration(mp4)
+    src = VideoFileClip(str(mp4))
+    clip_dur = float(src.duration or dur)
+    # MoviePy rejects end_time == duration (cmtry: 127.23 == 127.23).
+    end_cap = max(0.0, clip_dur - 0.04)
+
     seg_bounds: list[tuple[float, float]] = []
     prev = 0.0
     for cs, ce in cuts:
-        seg_bounds.append((prev, cs))
-        prev = ce
-    seg_bounds.append((prev, dur))
+        seg_bounds.append((prev, min(cs, end_cap)))
+        prev = min(ce, end_cap)
+    seg_bounds.append((prev, end_cap))
     seg_bounds = [(a, b) for a, b in seg_bounds if b - a > FADE_DUR * 2]
     if len(seg_bounds) <= 1:
-        raise SystemExit("nothing left to join — refusing to render")
+        src.close()
+        raise ValueError("nothing left to join — refusing to render")
 
-    src = VideoFileClip(str(mp4))
     clips = []
     n = len(seg_bounds)
     for i, (a, b) in enumerate(seg_bounds):
@@ -145,6 +154,27 @@ def trim_video(mp4: Path, cuts: list[tuple[float, float]], out: Path) -> None:
     print(f"  [OK] {out.name}: {_ffprobe_duration(out):.1f}s (was {dur:.1f}s)")
 
 
+def apply_dead_gap_trim(mp4: Path, tl_path: Path | None = None) -> bool:
+    """Replace ``mp4`` in place when a dead gap exists. Return True if rewritten."""
+    tl_path = tl_path or (mp4.parent / "short_timeline.json")
+    if not mp4.exists() or not tl_path.exists():
+        return False
+    kills, dur, expected = _kill_times(mp4, tl_path)
+    if dur + 1.5 < expected:
+        return False  # already shorter than the source window
+    cuts = _merge_adjacent(plan_cuts(kills, dur))
+    if not cuts:
+        return False
+    tmp = mp4.with_name(mp4.stem + ".__trim.tmp.mp4")
+    try:
+        trim_video(mp4, cuts, tmp)
+        tmp.replace(mp4)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+    return True
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("target", help="short mp4 or its directory")
@@ -166,7 +196,7 @@ def main() -> int:
     if not tl.exists():
         raise SystemExit(f"no short_timeline.json next to {mp4}")
 
-    kills, dur = _kill_times(mp4, tl)
+    kills, dur, _expected = _kill_times(mp4, tl)
     print(f"kills @ {[f'{k:.1f}' for k in kills]} | video {dur:.1f}s")
     cuts = _merge_adjacent(plan_cuts(kills, dur))
     if not cuts:

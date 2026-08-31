@@ -20,11 +20,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+DEMAND_INDEX_PATH = ROOT / ".data" / "player_demand_index.json"
 sys.path.insert(0, str(ROOT / "scripts"))
 from _pathsetup import ensure
 ensure()
@@ -67,25 +69,50 @@ def _is_notable_perf(line: dict, kd_min: float, adr_min: float, kills_min: int) 
     return kd >= kd_min or adr >= adr_min or kills >= kills_min
 
 
-# Channel-normalized median performance from the 3,012-video market study.
-# Missing players use the neutral 1.0 baseline. Team rank still adapts daily;
-# these values encode the observed player-specific viewer demand.
+# Channel-normalized median performance from the 3,012-video longform study
+# (n>=10, index clipped to the 1.08-1.69 band so a tiny-sample spike cannot
+# dominate ELO/star), plus a 2-day recency overlay for 100 Thieves. Missing
+# players use the neutral 1.0 baseline. Team rank still adapts daily.
 PLAYER_DEMAND_INDEX = {
     "ropz": 1.69,
+    "donk": 1.50,
+    "s1mple": 1.50,
+    "xantares": 1.44,
     "zont1x": 1.41,
-    "s1mple": 1.40,
-    "donk": 1.32,
+    "teses": 1.35,
+    "flamez": 1.32,
+    "device": 1.28,
+    "dev1ce": 1.28,
+    "nocries": 1.23,
     "m0nesy": 1.21,
+    "apex": 1.20,
+    "electronic": 1.18,
     "niko": 1.17,
+    "heavygod": 1.15,
     "kyousuke": 1.12,
+    "rain": 1.12,
+    "tn1r": 1.12,
+    "magnojez": 1.10,
     "sh1ro": 1.09,
     "zywoo": 1.08,
 }
 
 
+def load_player_demand_index() -> dict[str, float]:
+    """Live YouTube-derived index, falling back to the last researched table."""
+    if DEMAND_INDEX_PATH.exists():
+        try:
+            payload = json.loads(DEMAND_INDEX_PATH.read_text(encoding="utf-8"))
+            raw = payload.get("index", payload)
+            return {str(key).casefold(): float(value) for key, value in raw.items()}
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+    return dict(PLAYER_DEMAND_INDEX)
+
+
 def market_demand_bonus(nick: str) -> int:
     """Reward measured player demand above the neutral 1.0 market baseline."""
-    index = PLAYER_DEMAND_INDEX.get(nick.casefold(), 1.0)
+    index = load_player_demand_index().get(nick.casefold(), 1.0)
     return round(max(0.0, index - 1.0) * 250_000)
 
 
@@ -95,8 +122,15 @@ def lobby_elo_bonus(avg_elo: int | float) -> int:
 
 
 def costar_bonus(pros: list[str]) -> int:
-    """Reward trio-or-larger pro stacks; market data did not support a duo bonus."""
-    return min(max(len(set(pros)) - 2, 0) * 100_000, 300_000)
+    """Trio+ stacks help, but 300k let a 5-man CIS queue outrank a 28-9.
+
+    Recent breakout POVs are the carry (sh1ro 28-9, m0NESY 22-12), not the
+    lobby census. 40k per extra pro above a duo, capped at 120k.
+    """
+    return min(max(len(set(pros)) - 2, 0) * 40_000, 120_000)
+
+
+SCORE_VERSION = 5
 
 
 def _line_won(line: dict) -> bool:
@@ -109,13 +143,57 @@ def _line_won(line: dict) -> bool:
     return bool(r)
 
 
+def star_bonus(raw_star: int, won: bool = False, kd: float = 1.0) -> int:
+    """Org rank is who the POV is, not whether the map was won.
+
+    LIM posts ZywOo 27-18 losses; stripping Vitality star for a loss made
+    that line invisible. The 80k win chip still prefers a win. Minus-KD
+    IGLs (karrigan 10-13) still get 0 star.
+    """
+    if raw_star <= 0 or kd < 1.0:
+        return 0
+    return raw_star // 2
+
+
 def _perf_bonus(kd: float, adr: float, kills: int, won: bool) -> int:
-    """Bounded quality signal; raw kills alone did not drive market performance."""
+    """Bounded quality signal. The 80k win chip requires K/D >= 1.0."""
     kd_points = min(max(kd - 1.0, 0.0) * 40_000, 80_000)
     adr_points = min(max(adr - 70.0, 0.0) * 1_000, 50_000)
     kill_points = min(max(kills - 20, 0) * 3_000, 45_000)
-    win_points = 10_000 if won else 0
+    win_points = 80_000 if won and kd >= 1.0 else 0
     return round(kd_points + adr_points + kill_points + win_points)
+
+
+def rescore_stored(c: dict) -> dict:
+    """Rebuild current bonuses from a persisted candidate's stats."""
+    out = dict(c)
+    won = bool(c.get("won"))
+    kd = _num(c.get("kd"), float)
+    adr = _num(c.get("adr"), float)
+    kills = _num(c.get("kills"), int)
+    raw = _num(c.get("raw_star_bonus"), int)
+    if raw <= 0:
+        stored_star = _num(c.get("star_bonus"), int)
+        raw = stored_star * 4 if stored_star in (100_000, 62_500, 30_000, 15_000) else stored_star
+    nick = c.get("player") or ""
+    star = star_bonus(raw, won, kd)
+    demand = market_demand_bonus(nick)
+    elo = lobby_elo_bonus(c.get("avg_elo") or 0)
+    costars = costar_bonus(c.get("pros") or []) if won else 0
+    perf = _perf_bonus(kd, adr, kills, won)
+    out.update({
+        "raw_star_bonus": raw,
+        "star_bonus": star,
+        "market_demand_bonus": demand,
+        "lobby_elo_bonus": elo,
+        "costar_bonus": costars,
+        "perf_bonus": perf,
+        "score_version": SCORE_VERSION,
+        "weight": star + demand + elo + costars + perf,
+    })
+    if not out.get("id") and out.get("match_id") and nick:
+        out["id"] = f"{out['match_id']}:{nick}"
+    return out
 
 
 def make_player_candidates(rec: dict, stream: str, ranking: dict | None = None) -> list[dict]:
@@ -134,12 +212,10 @@ def make_player_candidates(rec: dict, stream: str, ranking: dict | None = None) 
         kills = _num(line.get("kills"), int)
         won = _line_won(line)
         raw_star = star_bonus_for_pros([nick], ranking)
-        # A player's current org is useful context, but must not outweigh their
-        # actual POV performance or cause a low-frag IGL to beat the lobby star.
-        star = raw_star // 4
+        star = star_bonus(raw_star, won, kd)
         demand = market_demand_bonus(nick)
         elo = lobby_elo_bonus(_num(rec.get("avg_elo"), float))
-        costars = costar_bonus(match_pros)
+        costars = costar_bonus(match_pros) if won else 0
         perf = _perf_bonus(kd, adr, kills, won)
         return {
             "id": f"{rec['id']}:{nick}",
@@ -157,7 +233,7 @@ def make_player_candidates(rec: dict, stream: str, ranking: dict | None = None) 
             "deaths": _num(line.get("deaths"), int),
             "won": won,
             "avg_elo": rec.get("avg_elo"),
-            "score_version": 2,
+            "score_version": SCORE_VERSION,
             "raw_star_bonus": raw_star,
             "star_bonus": star,
             "market_demand_bonus": demand,
@@ -197,7 +273,8 @@ def score_candidates(multi: list[dict], solo: list[dict], ranking: dict | None) 
 async def collect(*, hours: int, count: int, min_pros: int,
                   perf_kd: float, perf_adr: float, perf_kills: int,
                   perf_limit: int, today_only: bool = False,
-                  exclude_today: bool = False) -> dict:
+                  exclude_today: bool = False,
+                  as_of: datetime | None = None) -> dict:
     """Scrape notable FACEIT matches and score every Recognised-Pro line.
 
     Returns a dict for reporting / reuse:
@@ -227,10 +304,12 @@ async def collect(*, hours: int, count: int, min_pros: int,
     try:
         match_pros: dict[str, set] = {}
         match_meta: dict[str, dict] = {}
-        cutoff = datetime.now() - timedelta(hours=hours)
-        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        now = as_of or datetime.now()
+        cutoff = now - timedelta(hours=hours)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         if today_only:
             cutoff = today_start
+        horizon = now if as_of is not None else None
 
         for fid, nick in fid_to_nick.items():
             # NEVER resolve identity by nickname: FACEIT allows duplicate nicks,
@@ -240,6 +319,8 @@ async def collect(*, hours: int, count: int, min_pros: int,
             matches = await client.get_player_matches(fid, limit=count)
             for m in matches:
                 if m.date and m.date < cutoff:
+                    continue
+                if horizon is not None and m.date and m.date > horizon:
                     continue
                 if exclude_today and today_start is not None \
                         and m.date and m.date >= today_start:

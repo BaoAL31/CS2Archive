@@ -26,6 +26,11 @@ instead of re-deriving the convention.
 6. Vary the format. For HLTV **clutches with a named org**, the title starts
    with the situation as a question, opponent in the hook, punchline after:
    `1v3 against NaVi? No problem for JBa`. Not `1v3? No problem for JBa against NaVi`.
+7. **Adjectives rotate.** Same skeleton, different word, is a valid variant
+   (`going crazy` / `going insane` / `going nuclear`). Do not ban a word
+   family; swap any adjective that still parses in that slot. Slot-aware:
+   `going {crazy,insane,nuclear,unhinged,wild}` vs `{filthy,nasty,sick,clean} 4K`.
+   Never reuse the same adjective in a batch when the skeleton already matched.
 
 ## Good examples (approved / shipped-style)
 
@@ -45,8 +50,8 @@ instead of re-deriving the convention.
 
 ## Examples that follow the rules but are weaker
 
-- `kyousuke goes off - AK 5K for the round` — fine, but generic "goes off"
-  is less specific than naming the ELO/opponent context.
+- `kyousuke goes off - AK 5K for the round` — fine if the adjective/verb
+  rotates across the batch; weaker than naming the ELO/opponent context.
 - `kyousuke's M4 + AK 4K on Ancient` — the opponent label is missing from the
   title (only in the description), so it's incomplete per rule 3.
 

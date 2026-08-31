@@ -13,6 +13,7 @@ Operational deep-dives live in `docs/agents/`; this file is the quick reference:
 | `docs/agents/rendering.md` | CSDM/HLAE/ffmpeg rendering details |
 | `docs/agents/gotchas.md` | Full gotcha list |
 | `docs/agents/shorts-titles.md` | YouTube Short title conventions + approved examples (creative, ELO/level-10 opponent labels) |
+| `docs/agents/hltv-listener.md` | HLTV match listener, highlight/POV star weights, queue order |
 
 ## Scripts layout
 
@@ -22,6 +23,7 @@ Scripts are grouped by product/concern (not a flat dump):
 |---|---|
 | `scripts/pov/` | POV Archive pipeline (`pipeline.py`, render, concat, backlog, …) |
 | `scripts/overlay/` | Keyboard + util-cam overlay |
+| `scripts/hltv/` | HLTV match listener, highlight-channel team demand, card scoring |
 | `scripts/faceit/` | FACEIT POV helpers (titles, thumbnails, names, backlog, **daily notable selector** `daily_notable.py`) |
 | `scripts/highlights/` | Highlight Reel / Kill Timeline (Kinocut path — separate from POV) |
 | `scripts/upload/` | YouTube + Bilibili publish |
@@ -105,11 +107,13 @@ Key rules:
 
 ## Backlog Creation
 
-`python scripts/pov/create_backlog.py <hltv_url>` — downloads the match demo(s) and generates rating-ranked backlog cards for every player/map combo: `backlog/{match_slug}/{priority}/{player}-{map}-{match_slug}.json` (player, map, steam_id, demo_path, hltv_url, tournament, avatar_path, ratings_path, rating, kd, team, priority, `hf_root`). Validates each `.dem` exists on disk before writing — raises `FileNotFoundError` instead of placeholders. Same pass extracts Recognised-Pro Shorts (`--no-shorts` skips); only demos with at least one short get a folder under `renders/shorts/shorts-{demo_stem}/`. Details: `docs/agents/pipeline.md`.
+`python scripts/pov/create_backlog.py <hltv_url>` — downloads the match demo(s) and generates rating-ranked backlog cards for every player/map combo: `backlog/{match_slug}/{priority}/{player}-{map}-{match_slug}.json` (player, map, steam_id, demo_path, hltv_url, tournament, avatar_path, ratings_path, rating, kd, team, priority, `hf_root`). Validates each `.dem` exists on disk before writing — raises `FileNotFoundError` instead of placeholders. Same pass extracts Recognised-Pro Shorts (`--no-shorts` skips), then drops low-demand POVs that would burn the two daily Shorts slots (YouTube demand index, or a NAVI / Spirit / Vitality hook in the match — not Falcons); only demos with at least one remaining short get a folder under `renders/shorts/shorts-{demo_stem}/`. Pending uploads that fail the same gate are marked `skipped`. Details: `docs/agents/pipeline.md`.
 
 **FACEIT flow is split in two:** full match POVs — `scripts/faceit/create_faceit_match_backlog.py <demo_path>` analyzes the demo (`csdm json`) and creates cards **only for Recognised Pros** (`.data/player_accounts.json` by steam_id), each dropped into `backlog/faceit/{priority}/` by its in-match rating (`hltvRating2`; ≥1.5 high, ≥1.0 mid, else low — same thresholds as HLTV). No ELO; FACEIT matches are single-map so there's no per-match folder (match id stays in the filename + `faceit_match_id`). Each card carries `rating`, `kills`, `deaths`, `team`, `faceit_match_id`, `faceit_id`, `faceit_nickname`. Individual POV — `scripts/faceit/create_faceit_backlog.py <demo_path> --player <nick> --map <map>` (single card, same `backlog/faceit/{priority}/` layout) then the standard `pipeline.py`. The individual flow fetches current FACEIT ELO per demo player at creation time (`elo` + `opp_avg_elo` on the card; `--no-elo` skips) plus the player's in-match K/D (`kills`/`deaths`, computed from the demo's `player_death` events — knife round + suicides excluded, matching csdm). Its title shows **only** `"{player} ({kills}-{deaths}) | {map} | FACEIT CS2 POV` — no ELO rating, team names, tournament, or stage (pipeline reads ELO straight from the card for the description, so no API calls during render). Details: `docs/agents/pipeline.md`.
 
 **Daily notable selector (cron):** `scripts/faceit/scrape_notable.py` discovers multi-pro + single-pro standout matches and **scores every Recognised-Pro POV** (YouTube demand index, lobby ELO, HLTV rank ÷4, trio+ co-stars, bounded K/D/ADR/kills). `collect()` returns those ranked `candidates`. `scripts/faceit/daily_notable.py` is the scheduled daily job — it only calls `collect()`, then picks **3** / day (one POV per match, one per player) and falls back to a persistent pool (`.data/notable_daily.json`) when today can't fill 3. Idempotent per day (`--force` redo). `--download` also fetches each picked demo + builds backlog cards; `--install-cron [--at 09:00]` / `--remove-cron` manages the Windows scheduled task `CS2ArchiveFaceitDaily` (daily 09:00, uses the `cs2archive` conda python).
+
+**HLTV match listener:** `scripts/hltv/match_listener.py` polls completed event results and queues **one weighted card per match** from `backlog/<match>/{high,medium}/` (rating >= 1.0). Weight = highlight-channel team demand + POV-channel player demand + org rank + HLTV rating + this fixture's recent highlight views. Refresh stars with `scripts/hltv/update_team_demand.py` (BLAST/ESL/PGL/StarLadder/EWC highlights) and `scripts/faceit/update_player_demand.py` (competitor POV channels). Inspect a match with `python scripts/hltv/score_cards.py backlog/<match_slug>`. Details: `docs/agents/hltv-listener.md`.
 
 ## CLI Entry Point
 

@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from shorts import resolve_output_dir
+from shorts import discard_empty_shorts_dir, resolve_output_dir
 
 
 def test_hltv_with_player(monkeypatch, tmp_path):
@@ -94,6 +94,25 @@ def test_unknown_path_raises(monkeypatch, tmp_path):
 
     with pytest.raises(ValueError, match="unknown demo path"):
         resolve_output_dir(demo, player="123")
+
+
+def test_discard_empty_shorts_dir_removes_action_timeline_only(tmp_path):
+    base = tmp_path / "shorts" / "shorts-match"
+    base.mkdir(parents=True)
+    (base / "action_timeline.json").write_text("{}", encoding="utf-8")
+    discard_empty_shorts_dir(base)
+    assert not base.exists()
+
+
+def test_discard_empty_shorts_dir_keeps_real_shorts(tmp_path):
+    base = tmp_path / "shorts" / "shorts-match"
+    short = base / "shorts-4k_multikill-player-t1"
+    short.mkdir(parents=True)
+    (base / "action_timeline.json").write_text("{}", encoding="utf-8")
+    (short / "short_timeline.json").write_text("{}", encoding="utf-8")
+    discard_empty_shorts_dir(base)
+    assert short.is_dir()
+    assert (base / "action_timeline.json").is_file()
 
 
 def test_idempotent(monkeypatch, tmp_path):

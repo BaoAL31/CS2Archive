@@ -27,6 +27,7 @@ from _pathsetup import ensure
 ensure()
 
 from shorts import resolve_output_dir  # noqa: E402
+from shorts.dead_gap_trim import apply_dead_gap_trim  # noqa: E402
 from shorts.make_short_meta import make_meta  # noqa: E402
 
 CSDM = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
@@ -126,6 +127,16 @@ def _resolve_use_cpu(force_cpu: bool, force_gpu: bool) -> bool:
 def _dbg(label: str, msg: str) -> None:
     ts = time.strftime("%H:%M:%S")
     print(f"  [{ts}] [{label}] {msg}", flush=True)
+
+
+def _trim_dead_gaps(dst: Path, timeline_path: Path) -> None:
+    try:
+        if apply_dead_gap_trim(dst, timeline_path):
+            _dbg("trim", f"{dst.name}: dead gaps cut -> {_probe_duration(dst):.1f}s")
+        else:
+            _dbg("trim", f"{dst.name}: no dead gap to cut")
+    except Exception as e:
+        _dbg("trim", f"[WARN] {dst.name}: {e}")
 
 
 def _probe_duration(path: Path) -> float:
@@ -867,7 +878,17 @@ def render_shorts(
                 break
         if all_done:
             print(f"  [SKIP] all {len(shorts)} short(s) already rendered at "
-                  f"{OUT_WIDTH}x{OUT_HEIGHT} — nothing to do")
+                  f"{OUT_WIDTH}x{OUT_HEIGHT} — CSDM/composite skipped")
+            for short in shorts:
+                dst = _short_output_path(out_dir, short, name)
+                _trim_dead_gaps(dst, timeline_path)
+            if make_meta_on:
+                try:
+                    meta = make_meta(out_dir, tournament=tournament, year=year)
+                    _dbg("meta", f"wrote upload_meta_shorts.json: {meta['title']}")
+                except Exception as e:
+                    _dbg("meta", f"[WARN] meta generation failed: {e}")
+            print(f"\nDone. Shorts in {out_dir}")
             return out_dir
 
     if not composite_only:
@@ -921,6 +942,7 @@ def render_shorts(
             w, h = _probe_resolution(dst)
             if w == OUT_WIDTH and h == OUT_HEIGHT:
                 _dbg("composite", f"[SKIP] {out_name} already rendered at {OUT_WIDTH}x{OUT_HEIGHT}")
+                _trim_dead_gaps(dst, timeline_path)
                 continue
         kf_path = segments_dir / f"{seg_file.stem}-kill_feed.mp4"
         if not kf_path.exists() or kf_path.stat().st_size < 1_048_576:
@@ -950,6 +972,7 @@ def render_shorts(
         w, h = _probe_resolution(dst)
         dur = _probe_duration(dst)
         _dbg("done", f"{out_name}: {w}x{h} {dur:.1f}s (pov: {short['pov_steam_id']}, type: {short['short_type']})")
+        _trim_dead_gaps(dst, timeline_path)
 
     # Generate YouTube-Shorts upload meta. Team/org is detected from the demo
     # itself (scripts.shorts.detect_team) — never from memory.
