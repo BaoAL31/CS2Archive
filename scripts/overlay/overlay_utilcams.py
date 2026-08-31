@@ -23,6 +23,11 @@ from overlay._common import (
     PIP_MAX_SIMULTANEOUS,
     pip_render_dimensions,
 )
+for _p in (str(_CS2UTIL_SCRIPTS), str(_CS2UTIL_ROOT)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from scripts.demo_ids import default_demo_id_from_path
 from scripts.render.paths import clip_name_for_cameras, util_render_slug
 
 
@@ -33,27 +38,32 @@ def _cs2util_results_dir() -> Path | None:
 
 
 def _find_demo_data_dir(demo_path: Path) -> Path | None:
-    """Find CS2UtilArchive data dir for this demo (where throws.parquet lives)."""
+    """Find CS2UtilArchive data dir for this demo (where throws.parquet lives).
+
+    Match on the canonical id (HLTV match id from the parent folder + stem),
+    never on the stem as a substring. The same fixture is replayed across
+    events (``aurora-vs-m80-m2-inferno`` at EWC and Porto); a substring match
+    silently binds the older event's throws onto the new POV video.
+    Missing dir → ``None`` so the caller auto-extracts this demo.
+    """
     results = _cs2util_results_dir()
     if results is None:
         return None
-    exact = demo_path.stem
-    broad = re.sub(r"-p\d+$", "", demo_path.stem, flags=re.IGNORECASE)
-
-    # Search all project subdirs: results/*/data/demo=<name>/
-    for project_dir in results.iterdir():
+    wanted = default_demo_id_from_path(Path(demo_path))
+    hits: list[Path] = []
+    for project_dir in sorted(results.iterdir(), key=lambda p: p.name):
         if not project_dir.is_dir():
             continue
         data_dir = project_dir / "data"
         if not data_dir.is_dir():
             continue
-        for d in data_dir.iterdir():
-            if not d.is_dir() or not d.name.startswith("demo="):
-                continue
-            dn = d.name[len("demo="):]
-            if dn == exact or broad in dn:
-                return d
-    return None
+        cand = data_dir / f"demo={wanted}"
+        if cand.is_dir():
+            hits.append(cand)
+    if not hits:
+        return None
+    with_throws = [h for h in hits if (h / "throws.parquet").is_file()]
+    return (with_throws or hits)[0]
 
 
 # -- Round tick ranges ---------------------------------------------------
@@ -85,7 +95,8 @@ def _load_player_throws(
     """
     data_dir = _find_demo_data_dir(demo_path)
     if data_dir is None:
-        _log("  [throws] No CS2UtilArchive data dir found for this demo")
+        _log("  [throws] No CS2UtilArchive data dir for "
+             f"demo_id={default_demo_id_from_path(Path(demo_path))}")
         return None
 
     throws_path = data_dir / "throws.parquet"
@@ -392,6 +403,43 @@ def _scan_utility_cams_clips(video_path: Path) -> dict[str, Path]:
     return pre_rendered
 
 
+def _play_window_for_throw(
+    throw_tick: int,
+    round_tick_ranges: dict[int, tuple[int, int]],
+) -> int | None:
+    """Return the CSDM play-window round for a throw, or None if it is not in video.
+
+    CSDM skips buy/freeze and post-death; those throws have clips on disk but
+    no frame to attach a PiP to. A 2s slack before play start covers the
+    freeze margin CSDM still records.
+    """
+    for rn, (rs, re) in round_tick_ranges.items():
+        if rs <= throw_tick <= re:
+            return rn
+    slack = int(2 * TICKRATE)
+    for rn, (rs, _re) in sorted(round_tick_ranges.items()):
+        if 0 < (rs - throw_tick) <= slack:
+            return rn
+    return None
+
+
+def _count_expected_flight_clips(
+    throws: list[dict[str, Any]],
+    round_tick_ranges: dict[int, tuple[int, int]] | None,
+) -> int:
+    """Throws that must have a PiP: renderable, non-decoy, inside recorded video."""
+    n = 0
+    for t in throws:
+        if str(t.get("util_type", "")).lower() == "decoy":
+            continue
+        if round_tick_ranges and _play_window_for_throw(
+            int(t["throw_tick"]), round_tick_ranges
+        ) is None:
+            continue
+        n += 1
+    return n
+
+
 def _map_throw_tick_to_frame(
     throw_tick: int,
     round_tick_ranges: dict[int, tuple[int, int]],
@@ -406,22 +454,15 @@ def _map_throw_tick_to_frame(
     Returns None when the throw falls outside every recorded play window
     (buy/freeze cut or death cut) — caller should skip the PiP.
     """
-    for rn, (rs, re) in round_tick_ranges.items():
-        if rn not in round_frame_ranges:
-            continue
-        if rs <= throw_tick <= re:
-            fs, fe = round_frame_ranges[rn]
-            rf = (re - rs) or 1
-            return int(fs + (throw_tick - rs) / rf * (fe - fs))
-    # Within ~2s before a play window (still in freeze that CSDM trimmed):
-    # clamp to that round's first frame rather than dropping the util.
-    for rn, (rs, re) in sorted(round_tick_ranges.items()):
-        if rn not in round_frame_ranges:
-            continue
-        if 0 < (rs - throw_tick) <= int(2 * TICKRATE):
-            fs, _ = round_frame_ranges[rn]
-            return fs
-    return None
+    rn = _play_window_for_throw(throw_tick, round_tick_ranges)
+    if rn is None or rn not in round_frame_ranges:
+        return None
+    rs, re = round_tick_ranges[rn]
+    fs, fe = round_frame_ranges[rn]
+    if rs <= throw_tick <= re:
+        rf = (re - rs) or 1
+        return int(fs + (throw_tick - rs) / rf * (fe - fs))
+    return fs
 
 
 def _render_throw_flight_clips(

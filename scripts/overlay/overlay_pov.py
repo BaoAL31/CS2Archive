@@ -90,6 +90,7 @@ from overlay.overlay_utilcams import (
     _run_batch_util_cams_subprocess,
     _scan_utility_cams_clips,
     _render_throw_flight_clips,
+    _count_expected_flight_clips,
 )
 from overlay.overlay_encode import (
     _overlay_output_valid,
@@ -967,12 +968,12 @@ def run_overlay(
                  "validate/ render utility-cam overlay. Extract+analyze the "
                  "demo in CS2UtilArchive first.")
             sys.exit(1)
-        # Exclude decoys from expected count — they have no flight clip
-        # (decoy stands upright, no flight arc to chase), so the batch
-        # render can't produce a clip for them. They'd cause a false
-        # `n_clips < n_expected` failure.
-        n_expected = len([t for t in n_expected_raw
-                          if str(t.get("util_type", "")).lower() != "decoy"])
+        # Expected = throws that appear in the recorded video (same play-window
+        # filter as PiP placement). Decoys have no clip; freeze/post-death
+        # throws are not in the POV footage — counting either as "missing"
+        # false-fails after a successful util-cam render.
+        n_expected = _count_expected_flight_clips(
+            n_expected_raw, round_tick_ranges or None)
         if n_clips < n_expected:
             missing = n_expected - n_clips
             if allow_missing_util_cams:
