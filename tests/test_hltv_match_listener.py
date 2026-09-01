@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from hltv.match_listener import (
     State,
@@ -18,6 +18,7 @@ from hltv.match_listener import (
     sort_card_records,
     parse_event_match_ids,
     parse_match_links,
+    parse_results_headline_date,
     parse_scheduled_matches,
     parse_top_teams,
     select_matches,
@@ -29,6 +30,7 @@ from hltv.match_listener import (
     _prune_queue,
     _queue_room,
     _slots_left,
+    _mark_existing_backlog_done,
     _pending_upload_metas,
     _spawn_upload_terminal,
     _start_upload_after_pipeline,
@@ -61,6 +63,34 @@ def test_parse_results_ignores_sidebar_match_links():
     </div>
     """
     assert [m.match_id for m in parse_match_links(html)] == ["100"]
+
+
+def test_parse_results_headline_date():
+    assert parse_results_headline_date("Results for August 31st 2026") == date(2026, 8, 31)
+    assert parse_results_headline_date("Results for September 1st 2026") == date(2026, 9, 1)
+    assert parse_results_headline_date("Results for September 2nd 2026") == date(2026, 9, 2)
+    assert parse_results_headline_date("Results for September 3rd 2026") == date(2026, 9, 3)
+    assert parse_results_headline_date("garbage") is None
+
+
+def test_parse_match_links_keeps_only_requested_headline_dates():
+    html = """
+    <div class="results-holder">
+      <div class="standard-headline">Results for September 2nd 2026</div>
+      <div class="result-con">
+        <a href="/matches/10/new-vs-new">x</a>
+        <span class="event-name">BLAST Open Porto 2026</span>
+      </div>
+      <div class="standard-headline">Results for August 31st 2026</div>
+      <div class="result-con">
+        <a href="/matches/2396941/vitality-vs-legacy-blast-open-porto-2026">x</a>
+        <span class="event-name">BLAST Open Porto 2026</span>
+      </div>
+    </div>
+    """
+    assert [m.match_id for m in parse_match_links(html)] == ["10", "2396941"]
+    recent = parse_match_links(html, on_dates={date(2026, 9, 2), date(2026, 9, 1)})
+    assert [m.match_id for m in recent] == ["10"]
 
 
 def test_event_and_team_filter():
@@ -145,6 +175,18 @@ def test_baseline_skips_existing_results_but_allows_later_ids(tmp_path: Path):
     unseen = Match("102", "https://hltv/matches/102/epsilon-vs-zeta",
                    "epsilon-vs-zeta", "epsilon", "zeta")
     assert [m.match_id for m in _actionable_matches(state, [unseen])] == ["102"]
+
+
+def test_existing_backlog_cards_mark_match_done():
+    record = {"status": "discovered", "attempts": 0}
+    cards = ["backlog/2396941/medium/ropz-nuke.json"]
+    _mark_existing_backlog_done(record, cards)
+    assert record["status"] == "completed"
+    assert record["cards"] == cards
+    assert record["completed_cards"] == cards
+    assert record["skip_reason"] == "existing backlog"
+    _mark_existing_backlog_done(record, cards)
+    assert record["completed_cards"] == cards
 
 
 DONK_CARD = {

@@ -34,7 +34,7 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -108,15 +108,76 @@ def _canonical_match(href: str) -> tuple[str, str] | None:
     return match.group(1), match.group(2)
 
 
-def parse_match_links(html: str, base_url: str = settings.hltv_base_url) -> list[Match]:
-    """Parse unique completed-match links from a results page fixture."""
+_ORDINAL = re.compile(r"(\d+)(?:st|nd|rd|th)", re.I)
+
+
+def parse_results_headline_date(text: str) -> date | None:
+    """Parse HLTV result group titles like 'Results for August 31st 2026'."""
+    raw = re.sub(r"^results for\s+", "", (text or "").strip(), flags=re.I)
+    raw = _ORDINAL.sub(r"\1", raw)
+    try:
+        return datetime.strptime(raw, "%B %d %Y").date()
+    except ValueError:
+        return None
+
+
+def _match_from_result_con(node, base_url: str) -> Match | None:
+    link = node.select_one('a[href*="/matches/"]')
+    if link is None:
+        return None
+    parsed = _canonical_match(link.get("href", ""))
+    if not parsed:
+        return None
+    match_id, slug = parsed
+    event_node = node.select_one(".event-name")
+    team1, team2 = _slug_teams(slug)
+    return Match(
+        match_id=match_id,
+        url=urljoin(base_url, link["href"]),
+        slug=slug,
+        team1=team1,
+        team2=team2,
+        event=event_node.get_text(" ", strip=True) if event_node else "",
+    )
+
+
+def parse_match_links(
+    html: str,
+    base_url: str = settings.hltv_base_url,
+    *,
+    on_dates: set[date] | None = None,
+) -> list[Match]:
+    """Parse unique completed-match links from a results page.
+
+    HLTV ignores ``?date=`` on ``/results`` (the SPA always returns the
+    latest-results dump). Date filtering uses on-page ``.standard-headline``
+    groups such as ``Results for August 31st 2026``.
+    """
     soup = BeautifulSoup(html, "lxml")
-    results = soup.select_one(".results-holder")
-    links = results.select('a[href*="/matches/"]') if results else soup.select(
-        'a[href*="/matches/"]')
+    holder = soup.select_one(".results-holder")
     found: list[Match] = []
     seen: set[str] = set()
-    for link in links:
+    if holder is not None:
+        headline_date: date | None = None
+        for node in holder.descendants:
+            if not getattr(node, "name", None):
+                continue
+            classes = node.get("class") or []
+            if "standard-headline" in classes:
+                headline_date = parse_results_headline_date(
+                    node.get_text(" ", strip=True))
+                continue
+            if node.name != "div" or "result-con" not in classes:
+                continue
+            if on_dates is not None and headline_date not in on_dates:
+                continue
+            match = _match_from_result_con(node, base_url)
+            if match is None or match.match_id in seen:
+                continue
+            seen.add(match.match_id)
+            found.append(match)
+        return found
+    for link in soup.select('a[href*="/matches/"]'):
         parsed = _canonical_match(link.get("href", ""))
         if not parsed:
             continue
@@ -390,6 +451,19 @@ class SingleInstance:
             self.handle.close()
         except OSError:
             pass
+
+
+def _mark_existing_backlog_done(record: dict, cards: list[str]) -> None:
+    """Existing cards mean this match was already processed. Do not re-render."""
+    record["status"] = "completed"
+    record["cards"] = cards
+    done = list(record.get("completed_cards") or [])
+    for card in cards:
+        if card not in done:
+            done.append(card)
+    record["completed_cards"] = done
+    record["skip_reason"] = "existing backlog"
+    record["last_error"] = None
 
 
 def _candidate_cards(match: Match, indexes: dict | None = None) -> list[str]:
@@ -867,13 +941,15 @@ async def poll_once(args, state: State) -> None:
     today = now.date()
     event_slug = event_url.rstrip("/").rsplit("/", 1)[-1]
     event_name = re.sub(r"[-_]+", " ", event_slug).casefold()
-    result_links: list[Match] = []
-    for offset in (0, 1):
-        target_date = (today - timedelta(days=offset)).isoformat()
-        results_url = f"{settings.hltv_base_url}/results?date={target_date}"
-        results_html = await asyncio.to_thread(fetch_hltv_page_html, results_url,
-                                                headless=True, wait_selector=None)
-        result_links.extend(parse_match_links(results_html))
+    # ``?date=`` is ignored by HLTV; one /results dump, filter by headline date.
+    results_html = await asyncio.to_thread(
+        fetch_hltv_page_html,
+        f"{settings.hltv_base_url}/results",
+        headless=True,
+        wait_selector=".results-holder .result-con",
+    )
+    result_links = parse_match_links(
+        results_html, on_dates={today, today - timedelta(days=1)})
     matches = select_matches(result_links, event_ids, state.data["teams"],
                              event_name)
     matches = list({match.match_id: match for match in matches}.values())
@@ -912,15 +988,22 @@ async def poll_once(args, state: State) -> None:
                 continue
             cards = _candidate_cards(match, indexes)
             if cards:
-                print(f"[backlog] adopting {len(cards)} weighted "
-                      f"card(s) for {match.match_id}", flush=True)
-            else:
-                record["attempts"] += 1
-                if not _run_backlog(match, args.dry_run, args.backlog_retries):
-                    _schedule_retry(record, "create_backlog failed")
-                    state.save()
-                    continue
-                cards = _candidate_cards(match, indexes)
+                # Already backlogged (usually already rendered). A rebaseline
+                # plus a later results-page appearance must not queue it again.
+                print(
+                    f"[backlog] already have cards for {match.match_id}, "
+                    f"not re-rendering",
+                    flush=True,
+                )
+                _mark_existing_backlog_done(record, cards)
+                state.save()
+                continue
+            record["attempts"] += 1
+            if not _run_backlog(match, args.dry_run, args.backlog_retries):
+                _schedule_retry(record, "create_backlog failed")
+                state.save()
+                continue
+            cards = _candidate_cards(match, indexes)
             if args.dry_run:
                 cards = [f"backlog/{match_slug_from_url(match.url)}/high/<generated>.json"]
             if not cards:

@@ -6,7 +6,12 @@ top-20 ranking snapshot.
 
 The default event is BLAST Open Porto 2026. The default poll interval is five
 minutes. One card per match is queued from `backlog/<match>/{high,medium}/`
-(rating >= 1.0), picked by **weight** (not raw HLTV rating). The worker runs
+(rating >= 1.0), picked by **weight** (not raw HLTV rating). HLTV's
+`/results?date=` query is a no-op (the SPA always returns the latest-results
+dump), so the listener reads on-page date headlines and keeps only **today
+and yesterday**. Group-stage matches still sitting on that dump are ignored.
+Matches that already have backlog cards on disk are marked done and not
+rendered again. The worker runs
 one `scripts/pov/pipeline.py` process at a time, **up to 3 uploads per local
 calendar day** (the YouTube long-form slots). When that POV is youtube-ready,
 the listener spawns `scripts/upload/upload_pending.py --dir <overlay> --limit 1`
