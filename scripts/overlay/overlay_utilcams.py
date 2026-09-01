@@ -21,11 +21,12 @@ from overlay._common import (
     _log,
     _probe_clip_duration_seconds,
     PIP_MAX_SIMULTANEOUS,
+    cameras_for_util_type,
+    clip_is_done,
     pip_render_dimensions,
+    prefer_cs2util_scripts,
 )
-for _p in (str(_CS2UTIL_SCRIPTS), str(_CS2UTIL_ROOT)):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+prefer_cs2util_scripts()
 
 from scripts.demo_ids import default_demo_id_from_path
 from scripts.render.paths import clip_name_for_cameras, util_render_slug
@@ -213,26 +214,6 @@ def _build_round_frame_ranges(
     return result
 
 
-def _concat_two_clips(a: Path, b: Path, out: Path) -> None:
-    """Concat two mp4 clips (same codec/params) into one temp PiP clip."""
-    import tempfile
-    fd, listf = tempfile.mkstemp(suffix=".txt", prefix="concat_")
-    try:
-        Path(listf).write_text(
-            f"file '{a.resolve()}'\nfile '{b.resolve()}'\n", encoding="utf-8"
-        )
-        subprocess.run(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", listf,
-             "-c", "copy", str(out.resolve())],
-            check=True, capture_output=True,
-        )
-    finally:
-        try:
-            Path(listf).unlink()
-        except OSError:
-            pass
-
-
 def _rm_empty_dir(d: Path) -> None:
     """Remove *d* if it exists and contains no files (skips subdirs)."""
     if d.is_dir() and not any(d.iterdir()):
@@ -389,16 +370,24 @@ def _scan_utility_cams_clips(video_path: Path) -> dict[str, Path]:
             slug = _throw_id_file_slug(tid)
             if not slug:
                 continue
-            # Prefer flight clip; exact slug match (segment-inclusive).
             matching = [
                 m for m in mp4s
                 if slug in m.stem and m.stem.endswith(slug)
             ]
             if not matching:
                 matching = [m for m in mp4s if f"_{slug}" in m.stem or m.stem.endswith(slug)]
-            flight = [m for m in matching if m.name.startswith("flight") and "detonate" not in m.name]
-            pick = flight[0] if flight else (matching[0] if matching else None)
-            if pick is not None:
+            combined = [
+                m for m in matching
+                if "flight" in m.name and "detonate" in m.name
+            ]
+            flight = [
+                m for m in matching
+                if m.name.startswith("flight") and "detonate" not in m.name
+            ]
+            pick = combined[0] if combined else (
+                flight[0] if flight else (matching[0] if matching else None)
+            )
+            if pick is not None and clip_is_done(pick):
                 pre_rendered[tid] = pick
     return pre_rendered
 
@@ -581,25 +570,16 @@ def _render_throw_flight_clips(
         # needs_render (and never error on their missing clip downstream).
         if util_type == "decoy" or not bool(throw.get("is_renderable", True)):
             continue
-        # Smoke/fire/molotov MUST have BOTH flight + detonate clips rendered.
-        # If detonate is missing we flag needs_render so the batch subprocess
-        # re-renders it (never silently continue). flash/he only need flight.
-        if util_type in ("smoke", "fire", "molotov", "incendiary"):
-            required = ["flight", "detonate"]
-        else:
-            required = ["flight"]
-        clips_ok = all(
-            (render_dir_check / f"{clip_name_for_cameras(c, tid)}.mp4").is_file()
-            and (render_dir_check / f"{clip_name_for_cameras(c, tid)}.mp4").stat().st_size > 100_000
-            for c in required
-        )
+        cam = cameras_for_util_type(util_type)
+        expected = render_dir_check / f"{clip_name_for_cameras(cam, tid)}.mp4"
+        clips_ok = clip_is_done(expected)
         if tid in pre_rendered or clips_ok:
             continue
         needs_render = True
         break
 
     if needs_render and data_dir is not None:
-        _log(f"  [flight] Subprocess: batch_util_cams.py (batched, one CS2 launch per chunk)")
+        _log(f"  [flight] Subprocess: render_util_cams.py (batched, one CS2 launch per chunk)")
         # data_dir is the per-demo dir (e.g. demo=2395002-furia-vs-falcons-m2-anubis).
         # batch_util_cams.py expects the PARENT (containing demo=* subdirs).
         # Pass both: parent to the subprocess, leaf to extract --demo-id.
@@ -673,61 +653,17 @@ def _render_throw_flight_clips(
         start_frame = max(0, int(start_frame))
 
         throw_id = str(throw.get("throw_id", ""))
-        # util_id-keyed dir (no match id); clip name via clip_name_for_cameras,
-        # matching what render_util_cams.py / render_spot_batch wrote.
         _, uid_slug, _ = _util_slug_for_throw(throw, demo_path)
         render_dir = util_cams_root / "unnamed" / uid_slug
-
-        def _pick(preferred: Path, want_detonate: bool) -> Path:
-            """Return the EXACT preferred clip and nothing else.
-
-            For smokes/molotov that is the COMBINED ``flight_detonate`` clip
-            (throw arc + detonation in one file); for other util it is the
-            plain ``flight`` clip. There is NO directory-scan fallback: if the
-            correct clip is missing the caller must (re-)render it. We never
-            substitute a wrong clip (e.g. a standalone ``detonate`` showing a
-            static smoke with no throw) — instead we fail loudly so the missing
-            render gets fixed rather than silently shipping bad output.
-            """
-            if preferred.is_file() and preferred.stat().st_size > 100_000:
-                return preferred
-            if throw_id in pre_rendered and pre_rendered[throw_id].is_file() \
-                    and pre_rendered[throw_id].stat().st_size > 100_000:
-                return pre_rendered[throw_id]
-            _log(f"  [flight] ERROR: expected clip missing for "
-                 f"{render_dir.name}: {preferred.name}")
-            sys.exit(1)
-
-        # Smoke/fire/molotov: CS2UtilArchive renders SEPARATE ``flight``
-        # (throw arc) and ``detonate`` (settled smoke) clips — there is NO
-        # combined ``flight_detonate`` file. The PiP must show the throw arc
-        # (flight) then the detonation. We build a temp combined clip =
-        # flight + detonate (concat) so the viewer sees the grenade fly then
-        # settle. BOTH clips are REQUIRED — if either is missing we error hard
-        # (no fallback). Shipping a partial clip is the old bug.
-        if util_type in ("smoke", "fire", "molotov", "incendiary"):
-            flight_clip = render_dir / f"{clip_name_for_cameras('flight', throw_id)}.mp4"
-            detonate_clip = render_dir / f"{clip_name_for_cameras('detonate', throw_id)}.mp4"
-            if flight_clip.is_file() and flight_clip.stat().st_size > 100_000 \
-                    and detonate_clip.is_file() and detonate_clip.stat().st_size > 100_000:
-                # Concat flight -> detonate into a temp combined clip.
-                combined = render_dir / f"flight_detonate_{throw_id.replace(':', '_')}.mp4"
-                if not (combined.is_file() and combined.stat().st_size > 100_000):
-                    _concat_two_clips(flight_clip, detonate_clip, combined)
-                clip_path = combined
-            else:
-                _log(f"  [flight] ERROR: missing flight/detonate clip for {util_type} "
-                     f"throw {idx} (t{throw_tick}) flight={flight_clip.name} "
-                     f"detonate={detonate_clip.name} — must render both first")
-                sys.exit(1)
-        else:
-            # flash/he/decoy: plain flight clip.
-            clip_path = _pick(render_dir / f"{clip_name_for_cameras('flight', throw_id)}.mp4",
-                              want_detonate=False)
-
-        if not clip_path.is_file() or clip_path.stat().st_size < 100_000:
-            _log(f"  [flight] ERROR: no usable clip for {util_type} throw {idx} "
-                 f"at {clip_path.name} (t{throw_tick}) — must render it first")
+        cam = cameras_for_util_type(util_type)
+        clip_path = render_dir / f"{clip_name_for_cameras(cam, throw_id)}.mp4"
+        if not clip_is_done(clip_path) and throw_id in pre_rendered:
+            alt = pre_rendered[throw_id]
+            if clip_is_done(alt):
+                clip_path = alt
+        if not clip_is_done(clip_path):
+            _log(f"  [flight] ERROR: missing clip for {util_type} "
+                 f"throw {idx} (t{throw_tick}) expected={clip_path.name}")
             sys.exit(1)
 
         # Window: actual rendered clip length, anchored at the throw frame,

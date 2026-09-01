@@ -25,7 +25,6 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from collections import defaultdict
 from dataclasses import dataclass
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -33,9 +32,12 @@ sys.path.insert(0, str(_PROJECT_ROOT / "scripts"))
 from _pathsetup import ensure
 ensure()
 
-CSDM = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
-FFMPEG = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
-FFPROBE = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffprobe.exe"
+from config import settings
+from csdm_segments import sequence, tick_range_config
+
+CSDM = settings.csdm_cmd
+FFMPEG = settings.ffmpeg_exe
+FFPROBE = settings.ffprobe_exe
 
 CFG_PATH = (_PROJECT_ROOT / "assets" / "cs2_pov.cfg").resolve()
 
@@ -67,7 +69,7 @@ def _probe_duration(path: Path) -> float:
 
 def _is_valid_video(path: Path) -> bool:
     r = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0", str(path)],
+        [FFPROBE, "-v", "error", "-select_streams", "v:0", str(path)],
         capture_output=True, text=True, timeout=10,
     )
     return r.returncode == 0
@@ -80,7 +82,7 @@ def _encode_scaled(src: Path, dst: Path) -> None:
 
     temp = dst.with_suffix(".temp.mp4")
     cmd = [
-        "ffmpeg", "-y", "-i", str(src),
+        FFMPEG, "-y", "-i", str(src),
         "-vf", f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:flags=spline,setsar=1,format=nv12",
         "-c:v", "h264_nvenc", "-preset", "p7", "-b:v", "0", "-cq", "14",
         "-profile:v", "high", "-pix_fmt", "yuv420p", "-level", "5.1",
@@ -95,7 +97,7 @@ def _encode_scaled(src: Path, dst: Path) -> None:
         print("  [Fallback] Retrying with CPU Lanczos + libx264...")
         vf_cpu = f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:flags=lanczos,setsar=1,format=yuv420p"
         cmd = [
-            "ffmpeg", "-y", "-i", str(src),
+            FFMPEG, "-y", "-i", str(src),
             "-vf", vf_cpu,
             "-c:v", "libx264", "-crf", "15", "-preset", "slow",
             "-profile:v", "high", "-pix_fmt", "yuv420p",
@@ -125,7 +127,7 @@ def _concat_videos(file_list: list[Path], output: Path) -> Path:
             for p in file_list:
                 f.write(f"file '{p.resolve().as_posix()}'\n")
         r = subprocess.run(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst), "-c", "copy", str(output)],
+            [FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", str(lst), "-c", "copy", str(output)],
             capture_output=True, text=True, timeout=3600,
         )
         if r.returncode != 0:
@@ -218,43 +220,18 @@ def _build_csdm_config(
             "net_graph 0",
         ] + cvars
         cfg_text = "\n".join(cfg_lines) + "\n"
-
-        seq = {
-            "number": seq_num,
-            "startTick": start_tick,
-            "endTick": end_tick,
-            "cfg": cfg_text,
-            "showXRay": False,
-            "showAssists": True,
-            "showOnlyDeathNotices": False,
-            "playersOptions": [],
-            "cameras": [],
-            "playerCameras": [
-                {"tick": start_tick, "playerSteamId": pov_sid, "playerName": "pov"},
-            ],
-            "playerVoicesEnabled": False,
-            "recordAudio": True,
-            "deathNoticesDuration": 5,
-        }
-        sequences.append(seq)
+        sequences.append(sequence(seq_num, start_tick, end_tick, pov_sid, cfg_text))
         seq_num += 1
-    
-    config = {
-        "demoPath": str(demo_path.resolve()),
-        "outputFolderPath": str(output_dir.resolve()),
-        "recordingSystem": "HLAE",
-        "recordingOutput": "video",
-        "encoderSoftware": "FFmpeg",
-        "framerate": CSDM_RECORD_FRAMERATE,
-        "width": TARGET_WIDTH,
-        "height": TARGET_HEIGHT,
-        "closeGameAfterRecording": True,
-        "concatenateSequences": False,
-        "trueView": False,
-        "ffmpegSettings": _ffmpeg_settings(),
-        "sequences": sequences,
-    }
-    return config
+
+    return tick_range_config(
+        demo_path,
+        output_dir,
+        sequences,
+        width=TARGET_WIDTH,
+        height=TARGET_HEIGHT,
+        framerate=CSDM_RECORD_FRAMERATE,
+        ffmpeg_settings=_ffmpeg_settings(),
+    )
 
 
 def _ffmpeg_settings() -> dict:

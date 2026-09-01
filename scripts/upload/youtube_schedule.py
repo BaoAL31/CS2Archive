@@ -72,7 +72,7 @@ def _zone(timezone: str) -> ZoneInfo:
 
 def _parse_publish_time(publish_time: str) -> tuple[int, int]:
     parts = publish_time.strip().split(":")
-    if len(parts) != 2:
+    if len(parts) < 2:
         raise ValueError(f"Unrecognized publish time {publish_time!r} (expected HH:MM)")
     try:
         hour = int(parts[0])
@@ -90,29 +90,28 @@ def _parse_publish_times(publish_times: list[str] | str) -> list[tuple[int, int]
     return [_parse_publish_time(t) for t in publish_times]
 
 
-def _parse_publish_time(time_str: str) -> tuple[int, int]:
-    """Parse a time string like 'HH:MM' or 'HH:MM:SS' and return (hour, minute)."""
-    parts = time_str.split(':')
-    if len(parts) < 2:
-        raise ValueError(f"Invalid time format: {time_str!r}")
-    hour = int(parts[0])
-    minute = int(parts[1])
-    # ignore seconds if present
-    return hour, minute
+def _occupied_slots(occupied_dates: Iterable[str] | None) -> set[tuple[str, str]]:
+    """Parse occupied publish times from ISO ``T`` or space-separated strings.
 
-
-def next_available_publish_date(
-    start_date: date,
-    occupied_dates: Iterable[str],
-    timezone: str = DEFAULT_PUBLISH_TZ,
-) -> date:
-    """Return first unoccupied date from ``start_date`` onward."""
-    _zone(timezone)
-    occupied = {d.split("T")[0][:10] for d in occupied_dates if d}
-    candidate = start_date
-    while candidate.isoformat() in occupied:
-        candidate += timedelta(days=1)
-    return candidate
+    Date-only values occupy every configured daily slot on that date.
+    """
+    slots: set[tuple[str, str]] = set()
+    for raw in occupied_dates or []:
+        if not raw:
+            continue
+        text = str(raw).strip()
+        if "T" in text:
+            date_s, rest = text.split("T", 1)
+            slots.add((date_s[:10], rest[:5]))
+            continue
+        if " " in text:
+            date_s, rest = text.split(" ", 1)
+            slots.add((date_s[:10], rest[:5]))
+            continue
+        date_s = text[:10]
+        for hour, minute in _parse_publish_times(AUTO_PUBLISH_TIMES):
+            slots.add((date_s, f"{hour:02d}:{minute:02d}"))
+    return slots
 
 
 def parse_publish_at(publish_at: str, timezone: str = DEFAULT_PUBLISH_TZ) -> str:
@@ -162,11 +161,7 @@ def resolve_auto_publish_schedule(
     else:
         now = now.astimezone(tzinfo)
 
-    # occupied_slots has full "YYYY-MM-DDTHH:MM" strings from
-    # get_youtube_publish_dates. Check slot-by-slot so a busy 10:00
-    # doesn't block same day's 16:30.
-    occupied_slots = {(d.split("T")[0], d.split("T")[1][:5]) for d in (occupied_dates or []) if "T" in d}
-
+    occupied_slots = _occupied_slots(occupied_dates)
     candidate_date = start_date or now.date()
     while True:
         for hour, minute in times:

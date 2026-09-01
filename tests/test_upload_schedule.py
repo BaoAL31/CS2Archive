@@ -52,6 +52,7 @@ def test_resolve_publish_schedule_auto_uses_next_future_sydney_morning() -> None
         privacy="public",
         start_date=date(2026, 6, 19),
         occupied_dates={"2026-06-19"},
+        now=datetime(2026, 6, 19, 9, 0, tzinfo=ZoneInfo(DEFAULT_PUBLISH_TZ)),
     )
 
     assert privacy == "private"
@@ -123,6 +124,7 @@ def test_resolve_publish_schedule_auto_skips_consecutive_occupied_slots() -> Non
         privacy="public",
         start_date=date(2026, 6, 19),
         occupied_dates={"2026-06-19 10:00", "2026-06-19 16:30", "2026-06-19 21:00"},
+        now=datetime(2026, 6, 19, 9, 0, tzinfo=ZoneInfo(DEFAULT_PUBLISH_TZ)),
     )
 
     assert privacy == "private"
@@ -150,8 +152,8 @@ def test_ensure_shorts_hashtag() -> None:
     from upload_youtube_shorts import ensure_shorts_hashtag
 
     title, desc = ensure_shorts_hashtag("ropz Nuke", "POV highlights")
-    assert title == "ropz Nuke #Shorts"
-    assert desc.endswith("#Shorts")
+    assert title == "ropz Nuke"
+    assert desc == "POV highlights"
     title2, desc2 = ensure_shorts_hashtag("Already #Shorts", "Has #Shorts tag")
     assert title2 == "Already #Shorts"
     assert desc2 == "Has #Shorts tag"

@@ -18,7 +18,7 @@ Reads all POV metadata from the backlog file. Runs steps 1-6 in order (analyze �
 | 6 | thumbnail | `python -m thumbnail <url> --player <nick> --map <map> --video <mp4> --demo <dem> --steam-id <id>` |
 | 7 | cleanup | `python scripts/pov/cleanup_renders.py <renders_folder>` |
 
-**Uploading is a separate step.** The pipeline stops at step 6 (thumbnail) and writes `upload_meta.json` (with `youtube_id=null`, `upload_status="pending"`) for every variant. Run `python scripts/upload/upload_pending.py` afterward to upload all pending metas (it scans `youtube/*/upload_meta.json` and uploads any not yet completed). Step 4 (overlay) runs by default because dual-upload is on. To skip overlay entirely, run with `--until 3`. Raw-only mode (`--raw-only`) skips step 4 entirely — no overlay work directory or util_cams are created.
+**Uploading is a separate step.** The pipeline stops at step 6 (thumbnail) and writes `upload_meta.json` (with `youtube_id=null`, `upload_status="pending"`). Run `python scripts/upload/upload_pending.py` afterward. Step 4 (overlay) is the default product. `--raw-only` skips overlay entirely — no overlay work directory or util_cams are created. `--until 3` also stops before overlay.
 
 **Overlay step (step 4) does two things:**
 1. Extracts keyboard states via demoparser2 (full round, not sparse parquet)
@@ -66,38 +66,25 @@ HTTP errors (500/502/503/504) up to 20×; the subprocess-level retry in
 - **`--batches N`** — number of render batches (default: 1). Rounds are divided equally across N batches; the last batch gets fewer rounds if they don't divide evenly. Each batch produces one MP4 named `batch-{start:03d}-{end:03d}.mp4`. `--batches 1` renders all rounds in a single CSDM call (recommended — minimizes flaky HLAE hook launches).
 - **`--until N`** — stop after step N (e.g. `--until 5` runs through outro, skips thumbnail/cleanup). Default: run through step 6 (thumbnail; upload handled separately by `upload_pending.py`).
 - **`--skip-failed-rounds`** — **[DANGER] NEVER set by default.** Skip round batches that fail during rendering instead of aborting the entire pipeline. Only use when a specific demo file is corrupted/incompatible (like the `100-thieves-vs-spirit-m3-dust2.dem` from BLAST Bounty 2026 Season 2 — that demo fails at round 1 with "Game error" for every player). Silently drops failed rounds, producing an incomplete POV video. Enabled per-invocation via CLI flag or the backlog entry's `pipeline_cmd` when the demo is known-broken. See backlog `skip_failed_rounds: true` entries for the canonical example.
-- **`--dual-upload`** — now the **default**: dual-upload is ON unless you pass `--raw-only`. Produces a second independent variant with the keyboard + util-cam overlay. Raw-only mode is the opt-in.
-- **`--overlay-only`** — render/upload only the overlay variant. Implies `--dual-upload`'s overlay branch but skips raw video copy / raw outro / raw thumbnail. No `youtube/{run_id}/` dir created. Use when you only want the keyboard+util-cam version on the channel. State stored under `overlay_only=True` for resume. **FACEIT POVs default to overlay-only automatically** — no flag needed; `--raw-only` overrides on a fresh run.
+- **`--raw-only`** — produce `youtube/{run_id}/` with no overlay. Default is overlay-only at `youtube/{run_id}_overlay/`. State key: `skip_overlay`.
+- **`--overlay-only`** — deprecated no-op; overlay-only is already the default.
 - **`--voice-shade`** — (optional, requires FACEIT demo voice) overlay a per-player voice-activity shade on the POV team's scoreboard avatars. Each box is dimmed by default and the shade fades OUT over `--voice-shade-fade` (default 0.3s) when that teammate talks, then fades back in. Uses the demo's per-player Opus voice (decoded packet-aligned via libopus) aligned via `combined.round_offsets.json`, mapped to boxes by POV team slot order (see `scripts/overlay/avatar_boxes.py`). **The shade is applied at NATIVE resolution inside the SCALE step** (`concat_rounds.py --voice-shade-demo/steam-id/fade/side`), composited *before* the `scale=2560:1440` filter so the shade stretches together with the video and stays glued to the avatars. It is **not** applied in the overlay step — the overlay step only handles keyboard + util-cam PiP. The comms **audio** mix still runs in step 4 (`mix_team_voice.py`).
   - **Talk segments come from RAW packet activity** (`group_voice_rows` + `tick_to_time`), not decoded-PCM RMS — packet presence tracks the actual mic state, so the indicator stays lit for the full duration of each speech burst instead of turning off early on a soft word.
   - **Native source is preserved:** before the scale step overwrites `combined.mp4`, it copies it to `combined.native.mp4`. Re-running **step 3 alone** (`--step 3`) re-bakes the shade from the native copy (`[Re-bake shade] ... re-scaling from combined.native.mp4`) — so fixing the shade logic, changing `--voice-shade-fade`, or re-tuning the shade does **not** require a full re-render. The pipeline's step-3 invocation always passes the shade args, so any step-3 re-run re-bakes.
 
-### Dual-Upload (`--dual-upload`)
+### Overlay-only (default)
 
-By default (and whenever `--dual-upload` is in effect), the pipeline produces **two** separate uploads from one backlog entry:
-
-| Variant | YouTube dir | Title suffix | Thumbnail | Description |
-|---|---|---|---|---|
-| Raw | `youtube/{run_id}/` | _(none)_ | standard | standard |
-| Overlay | `youtube/{run_id}_overlay/` | `\| Input Overlay + Utility Cam` | + `W/ INPUT OVERLAY` badge top-right | + overlay note paragraph |
-
-Both variants get independent `upload_meta.json`; `upload_pending.py` records each variant's YouTube video ID in its own meta file and reserves independent publish-schedule slots.
+The pipeline produces **one** upload from a backlog entry: the keyboard + util-cam overlay at `youtube/{run_id}_overlay/` (title suffix `| Input Overlay + Utility Cam`, overlay badge on the thumbnail). `--raw-only` writes `youtube/{run_id}/` instead and skips step 4.
 
 **Data flow:**
-1. Step 3 (concat): `combined.mp4` copied to both `youtube/{run_id}/` and `youtube/{run_id}_overlay/`
-2. Step 4 (overlay): runs `overlay_pov.py` on the overlay dir's `video.mp4`; output replaces `video.mp4` in the overlay dir. Skipped in raw-only mode (`--raw-only`) so cost is zero.
-3. Step 5 (outro): appended to both `video.mp4` files
-4. Step 6 (thumbnail): two thumbnails generated, each with its own `upload_meta.json`
-5. Upload: handled by a separate `upload_pending.py` pass — both variants uploaded, each from its own `upload_meta.json`, skipped if already completed.
-6. Step 7 (cleanup): unchanged
+1. Step 3 (concat): writes `combined.mp4` in the render dir. Raw-only copies it to `youtube/{run_id}/`. Overlay-only does **not** copy combined into the youtube dir (step 4 writes the overlay there).
+2. Step 4 (overlay): `run_overlay` on a work copy of combined; result copied to `youtube/{run_id}_overlay/video.mp4`. Skipped with `--raw-only`.
+3. Step 5 (outro) + step 6 (thumbnail): one dir, one `upload_meta.json`.
+4. Upload: `upload_pending.py` (listener uses `--dir <overlay> --limit 1`).
 
-**Resume:** Upload is resume-safe: `upload_pending.py` skips any `upload_meta.json` whose `upload_status == "completed"` (youtube_id set), so re-running only uploads what's left. Re-running the pipeline with the same `--dual-upload` flag re-runs only the missing render/overlay/thumbnail work.
+**Resume:** `skip_overlay` in `.pipeline/{run_id}.json`. Legacy `overlay_only` / `dual_upload=False` still resume on the same variant. `--raw-only` always wins.
 
-**Cost:** raw-only mode (`--raw-only`) skips the ~30–60 min overlay render (20+ throws) and the extra upload. Default dual-upload adds both.
-
-**Raw-only mode (`--raw-only`):** step 4 is skipped entirely — no overlay work directory or util_cams are created. The only state key is `dual_upload=False`. Existing `youtube/{run_id}/` and `.pipeline/{run_id}.json` files are otherwise unaffected.
-
-**`--overlay-only`** is a strict subset of `--dual-upload` for the overlay branch. Resuming a failed overlay-only run with the same flag re-runs only the missing overlay work; no raw artifacts are ever produced.
+**Cost:** `--raw-only` skips the ~30–60 min overlay render (20+ throws).
 
 ### Bilibili Mirror & Other Utilities
 
@@ -110,7 +97,7 @@ These tools sit outside the core `pipeline.py` → `upload_pending.py` flow but 
 
 ### Chaining pipelines (upload overlap)
 
-Use `scripts/pov/pipeline_chain.py` to start the **next** POV when the **previous** reaches **thumbnail/upload-ready** (state `step >= 6`). Only one render (step 2) should run at a time.
+The listener renders one POV at a time. `scripts/pov/pipeline_chain.py` is a leftover manual helper (not used by the listener).
 
 **How it works:** polls `.pipeline/{run_id}.json` every 30s (`--poll`). When `"step" >= 6`, spawns `pipeline.py` with the args you pass after `--`. Does **not** read terminal output — only the state file. The pipeline stops at step 6 (thumbnail) with `upload_status="pending"`; uploading is a separate `upload_pending.py` pass that can overlap with the next POV's render.
 
@@ -154,22 +141,15 @@ The FACEIT flow is split in two:
 
 ## Output Directory Structure
 
-After completing the pipeline for a POV:
+After completing the pipeline for a POV (default overlay-only):
 ```
 youtube/
-└── {match-slug}_{player}_{map}/
-    ├── thumbnail.png       (1280×720 PNG, auto-generated)
-    ├── video.mp4           (1080p60, full match POV, concatenated rounds)
-    └── upload_meta.json    (title, description, tags, upload status, youtube_id)
+└── {run_id}_overlay/
+    ├── thumbnail.png       (1280×720 PNG, with overlay badge)
+    ├── video.mp4           (keyboard + util-cam POV)
+    └── upload_meta.json    (title suffix "| Input Overlay + Utility Cam")
 ```
 
-With `--dual-upload`, a second variant is added:
-```
-youtube/
-└── {match-slug}_{player}_{map}_overlay/
-    ├── thumbnail.png       (1280×720 PNG, with W/ INPUT OVERLAY + + UTIL CAMS badges bottom-right)
-    ├── video.mp4           (overlay-enhanced POV, same dimensions, with keyboard + util cam)
-    └── upload_meta.json    (title suffix "| Input Overlay + Utility Cam", extra tags, overlay note in description)
-```
+`--raw-only` writes `youtube/{run_id}/` instead (no overlay).
 
 **Overlay thumbnail background:** a frame from the finished `youtube/{run_id}_overlay/video.mp4` at the densest POV killfeed tick, mapped through the concat sidecar (`video.round_offsets.json`). Same HUD/overlay as the upload, including the player's render autoexec. No CS2 session. If the sidecar cannot map a kill, falls back to a mid-video frame from that same file.

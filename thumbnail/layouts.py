@@ -335,6 +335,9 @@ def generate(
             draw_text(draw, text, text_x, current_y, size, anchor="mm", fill=fill)
         current_y += _line_height(size)
 
+    if variant == "overlay":
+        _draw_overlay_badge(bg)
+
     return bg
 
 

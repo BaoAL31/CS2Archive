@@ -1,6 +1,10 @@
-# Dual-Branch YouTube Upload — Implementation Report
+# Dual-Branch YouTube Upload — Implementation Report (historical)
 
-## Feature Summary
+This document describes the dual-upload cube that has been removed.
+The live product is **one overlay variant** at `youtube/{run_id}_overlay/`.
+`--raw-only` is the debug escape hatch. See `docs/agents/pipeline.md`.
+
+## Feature Summary (obsolete)
 
 `--dual-upload` flag on `scripts/pov/pipeline.py` makes one backlog entry produce **two** independent YouTube uploads:
 

@@ -8,12 +8,31 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import time
 from pathlib import Path
 
-# -- Point at CS2UtilArchive for overlay pipeline + parquet data ----------
-_CS2UTIL_ROOT = Path(r"D:\Projects\CS2UtilArchive")
+from config import settings
+
+# Overlay kernel + throws.parquet live in the sibling CS2UtilArchive checkout.
+_CS2UTIL_ROOT = Path(settings.cs2util_root)
 _CS2UTIL_SCRIPTS = _CS2UTIL_ROOT / "scripts"
+
+
+def prefer_cs2util_scripts() -> None:
+    """Put CS2UtilArchive on sys.path so ``scripts.render`` / ``scripts.demo_ids`` resolve.
+
+    CS2Archive's own ``scripts/`` package (pov, overlay, faceit, …) must not
+    stay cached as ``sys.modules['scripts']`` or those imports miss.
+    """
+    for _p in (str(_CS2UTIL_SCRIPTS), str(_CS2UTIL_ROOT)):
+        if _p in sys.path:
+            sys.path.remove(_p)
+        sys.path.insert(0, _p)
+    cached = sys.modules.get("scripts")
+    if cached is not None and not hasattr(cached, "render") and not hasattr(cached, "demo_ids"):
+        del sys.modules["scripts"]
+
 
 TICKRATE = 64.0
 
@@ -24,6 +43,19 @@ PIP_CORNER_RADIUS = 16          # Pixels. Rounded corner radius. 0 = square corn
 PIP_MARGIN = 12                 # Pixels. Outline-to-outline gap from video edge.
 PIP_GAP = 12                    # Pixels. Outline-to-outline gap between stacked PiPs.
 PIP_MAX_SIMULTANEOUS = 3
+
+# Util-cam clip is "done" at 1 MB — same floor as CSDM sequence resume.
+MIN_CLIP_BYTES = 1_000_000
+SMOKE_CAMERAS = ("smoke", "fire", "molotov", "incendiary")
+
+
+def cameras_for_util_type(util_type: str) -> str:
+    """Canonical CS2Util camera set: combined flight+detonate for smokes."""
+    return "flight,detonate" if str(util_type).lower() in SMOKE_CAMERAS else "flight"
+
+
+def clip_is_done(path: Path, min_bytes: int = MIN_CLIP_BYTES) -> bool:
+    return path.is_file() and path.stat().st_size >= min_bytes
 
 
 def _pip_body(video_height: int, max_simultaneous: int | None = None) -> int:

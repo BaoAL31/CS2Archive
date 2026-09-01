@@ -16,6 +16,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from config import settings
+
 TMP_DIR = Path(__file__).resolve().parents[2] / "tmp"
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -26,7 +29,7 @@ def extract_steamids(demo_path: str) -> dict[str, str]:
         print(f"[red]Demo not found: {demo}[/red]")
         return {}
 
-    csdm = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
+    csdm = settings.csdm_cmd
 
     with tempfile.TemporaryDirectory(dir=TMP_DIR) as tmpdir:
         cmd = [csdm, "json", str(demo), "--output-folder", tmpdir]

@@ -29,10 +29,12 @@ ensure()
 from shorts import resolve_output_dir  # noqa: E402
 from shorts.dead_gap_trim import apply_dead_gap_trim  # noqa: E402
 from shorts.make_short_meta import make_meta  # noqa: E402
+from config import settings  # noqa: E402
+from csdm_segments import sequence, tick_range_config  # noqa: E402
 
-CSDM = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
-FFMPEG = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
-FFPROBE = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffprobe.exe"
+CSDM = settings.csdm_cmd
+FFMPEG = settings.ffmpeg_exe
+FFPROBE = settings.ffprobe_exe
 CFG_PATH = (_PROJECT_ROOT / "assets" / "cs2_pov.cfg").resolve()
 
 _DEFAULT_SRC_WIDTH = 1920
@@ -365,42 +367,28 @@ def _build_csdm_config(
                 cfg_lines.append(f'mirv_replace_name byXuid add x{pov_sid} "{nick}"')
 
         cfg_text = "\n".join(cfg_lines) + "\n"
-
-        seq = {
-            "number": seq_num,
-            "startTick": start_tick,
-            "endTick": end_tick,
-            "cfg": cfg_text,
-            "showXRay": False,
-            "showAssists": True,
-            "showOnlyDeathNotices": False,
-            "playersOptions": [],
-            "cameras": [],
-            "playerCameras": [
-                {"tick": start_tick, "playerSteamId": pov_sid, "playerName": "pov"},
-            ] + ([{"tick": s["pov_switch_tick"], "playerSteamId": s["pov_switch_to"], "playerName": "pov_switch"}] if "pov_switch_tick" in s and "pov_switch_to" in s else []),
-            "playerVoicesEnabled": False,
-            "recordAudio": True,
-            "deathNoticesDuration": 5,
-        }
-        sequences.append(seq)
+        extra = []
+        if "pov_switch_tick" in s and "pov_switch_to" in s:
+            extra.append({
+                "tick": s["pov_switch_tick"],
+                "playerSteamId": s["pov_switch_to"],
+                "playerName": "pov_switch",
+            })
+        sequences.append(sequence(
+            seq_num, start_tick, end_tick, pov_sid, cfg_text,
+            extra_player_cameras=extra or None,
+        ))
         seq_num += 1
 
-    return {
-        "demoPath": str(demo_path.resolve()),
-        "outputFolderPath": str(output_dir.resolve()),
-        "recordingSystem": "HLAE",
-        "recordingOutput": "video",
-        "encoderSoftware": "FFmpeg",
-        "framerate": CSDM_RECORD_FRAMERATE,
-        "width": src_width,
-        "height": src_height,
-        "closeGameAfterRecording": True,
-        "concatenateSequences": False,
-        "trueView": False,
-        "ffmpegSettings": _ffmpeg_settings(use_cpu=use_cpu),
-        "sequences": sequences,
-    }
+    return tick_range_config(
+        demo_path,
+        output_dir,
+        sequences,
+        width=src_width,
+        height=src_height,
+        framerate=CSDM_RECORD_FRAMERATE,
+        ffmpeg_settings=_ffmpeg_settings(use_cpu=use_cpu),
+    )
 
 
 def _run_csdm(config_path: Path) -> int:
@@ -424,7 +412,7 @@ def _run_csdm_hook_aware(config_path: Path, segments_dir: Path, label: str,
     the CS2/HLAE tree and retry, up to ``hook_retries`` times. Exits if the
     hook never engages.
     """
-    from render_pov import _kill_stale_processes
+    from hook_aware import kill_stale_processes
 
     cmd = [CSDM, "video", "--config-file", str(config_path.resolve())]
     for attempt in range(1, hook_retries + 1):
@@ -453,7 +441,7 @@ def _run_csdm_hook_aware(config_path: Path, segments_dir: Path, label: str,
                     proc.wait(timeout=30)
                 except Exception:
                     pass
-                _kill_stale_processes()
+                kill_stale_processes()
                 print(f"HOOK-FAIL (no sequence in {hook_timeout:.0f}s) - killing and retrying")
                 continue
             proc.wait(timeout=14400)

@@ -43,8 +43,10 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 from _pathsetup import ensure  # noqa: E402
 ensure()
 
-FFMPEG = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
-CSDM = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
+from config import settings  # noqa: E402
+
+FFMPEG = settings.ffmpeg_exe
+CSDM = settings.csdm_cmd
 CFG = Path(__file__).resolve().parents[2] / "assets" / "cs2_pov.cfg"
 
 # The POV render swaps the game's active autoexec.cfg to a render-specific one

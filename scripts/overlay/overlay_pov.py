@@ -44,8 +44,6 @@ ensure()
 # Shared constants/helpers live in the overlay subpackage's _common module
 # (also imported by overlay_utilcams / overlay_encode) to avoid cycles.
 from overlay._common import (
-    _CS2UTIL_ROOT,
-    _CS2UTIL_SCRIPTS,
     TICKRATE,
     _log,
     _probe_clip_duration_seconds,
@@ -57,10 +55,9 @@ from overlay._common import (
     _pip_body,
     _pip_inner,
     pip_render_dimensions,
+    prefer_cs2util_scripts,
 )
-for _p in (str(_CS2UTIL_SCRIPTS), str(_CS2UTIL_ROOT)):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+prefer_cs2util_scripts()
 
 from scripts.render.overlay_assets import (
     generate_key_assets,
@@ -849,28 +846,19 @@ def run_overlay(
         round_start_tick, _ = round_tick_ranges[first_round]
         _log(f"First round {first_round} start tick: {round_start_tick}")
 
-    # -- PBDEMS2 note ------------------------------------------------------------
-    # All CS2 demos (HLTV + FACEIT) are PBDEMS2 containers, but they DO carry usercmd
-    # input (usercmd_buttonstate_*). The old assumption that PBDEMS2 lacks input data
-    # was wrong and silently disabled the keyboard overlay on every demo. Always decode.
-    is_pbdems2 = False
-
     # -- Step 1: Keyboard states -------------------------------------------------
-    if not is_pbdems2:
-        t1 = time.time()
-        _log(f"Extracting keyboard states via demoparser2 (DEMOPARSER_TICK_FIELDS)...")
-        per_sig = _extract_keyboard_states(
-            demo_path, steam_id, frame_count, fps,
-            round_offsets=round_offsets or None,
-            round_tick_ranges=round_tick_ranges or None,
-            round_video_duration=round_video_duration or None,
-        )
-        if not per_sig or all(len(v) == 0 for v in per_sig.values()):
-            _log("[WARN] No keyboard states extracted — rendering utility-only overlay")
-            per_sig = {s: [] for s in _OVERLAY_SIGNALS}
-        _log(f"Keyboard: {len(next(iter(per_sig.values())))} frames x {len(per_sig)} signals ({time.time()-t1:.1f}s)")
-    else:
+    t1 = time.time()
+    _log(f"Extracting keyboard states via demoparser2 (DEMOPARSER_TICK_FIELDS)...")
+    per_sig = _extract_keyboard_states(
+        demo_path, steam_id, frame_count, fps,
+        round_offsets=round_offsets or None,
+        round_tick_ranges=round_tick_ranges or None,
+        round_video_duration=round_video_duration or None,
+    )
+    if not per_sig or all(len(v) == 0 for v in per_sig.values()):
+        _log("[WARN] No keyboard states extracted — rendering utility-only overlay")
         per_sig = {s: [] for s in _OVERLAY_SIGNALS}
+    _log(f"Keyboard: {len(next(iter(per_sig.values())))} frames x {len(per_sig)} signals ({time.time()-t1:.1f}s)")
 
     # -- Step 2: Generate keyboard sprite PNGs -----------------------------------
     if work_dir is not None:
@@ -885,30 +873,23 @@ def run_overlay(
         # cleanup can relocate it even if an exception fires before line below.
         output_path = video_path.with_suffix(".overlay.mp4")
         t4 = time.time()
-        if not is_pbdems2:
-            t2 = time.time()
-            _log(f"Generating key cap sprites...")
-            assets = generate_key_assets(work_dir / "sprites")
-            png_inputs = overlay_png_input_paths(assets)
-            _log(f"{len(png_inputs)} PNGs ({time.time()-t2:.1f}s)")
+        t2 = time.time()
+        _log(f"Generating key cap sprites...")
+        assets = generate_key_assets(work_dir / "sprites")
+        png_inputs = overlay_png_input_paths(assets)
+        _log(f"{len(png_inputs)} PNGs ({time.time()-t2:.1f}s)")
 
-            keyboard_fc, keyboard_out_label = build_png_overlay_filter(
-                per_sig,
-                assets=assets,
-                placement="bottom-center",
-                video_width=width,
-                video_height=height,
-                pressed_release_fade_frames=0,
-                pressed_release_fade_steps=0,
-                video_label="[0:v]",
-                png_input_offset=1,
-            )
-        else:
-            _log("[PBDEMS2] Skipping keyboard sprite generation")
-            assets = None
-            png_inputs = []
-            keyboard_fc = ""
-            keyboard_out_label = "[0:v]"
+        keyboard_fc, keyboard_out_label = build_png_overlay_filter(
+            per_sig,
+            assets=assets,
+            placement="bottom-center",
+            video_width=width,
+            video_height=height,
+            pressed_release_fade_frames=0,
+            pressed_release_fade_steps=0,
+            video_label="[0:v]",
+            png_input_offset=1,
+        )
         if not keyboard_fc:
             keyboard_fc = ""
             keyboard_out_label = "[0:v]"
@@ -1023,21 +1004,17 @@ def run_overlay(
                     }
 
                     # Rebuild keyboard filter (smaller graph per batch).
-                    if not is_pbdems2:
-                        batch_kb_fc, batch_kb_label = build_png_overlay_filter(
-                            batch_per_sig,
-                            assets=assets,
-                            placement="bottom-center",
-                            video_width=width,
-                            video_height=height,
-                            pressed_release_fade_frames=0,
-                            pressed_release_fade_steps=0,
-                            video_label="[0:v]",
-                            png_input_offset=1,
-                        )
-                    else:
-                        batch_kb_fc = ""
-                        batch_kb_label = "[0:v]"
+                    batch_kb_fc, batch_kb_label = build_png_overlay_filter(
+                        batch_per_sig,
+                        assets=assets,
+                        placement="bottom-center",
+                        video_width=width,
+                        video_height=height,
+                        pressed_release_fade_frames=0,
+                        pressed_release_fade_steps=0,
+                        video_label="[0:v]",
+                        png_input_offset=1,
+                    )
                     if not batch_kb_fc:
                         batch_kb_fc = ""
                         batch_kb_label = "[0:v]"

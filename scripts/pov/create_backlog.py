@@ -23,9 +23,8 @@ for _p in (str(PROJECT_ROOT), str(PROJECT_ROOT / "scripts")):
         sys.path.insert(0, _p)
 os.chdir(str(PROJECT_ROOT))
 
-# Redirect HuggingFace cache to D: drive (must be set before importing huggingface_hub)
-os.environ.setdefault("HF_HOME", "D:/.cache/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "D:/.cache/huggingface/hub")
+from config import apply_runtime_env
+apply_runtime_env()
 
 BACKLOG_DIR = PROJECT_ROOT / "backlog"
 
@@ -233,10 +232,9 @@ async def create_backlog_entry(
         "team_source": "demo" if demo_team else "hltv_ratings",
         "priority": priority,
         **backlog_video_fields(player_clean),
-        "pipeline_cmd": f'$env:PYTHONPATH=.; & C:/Users/jembo/anaconda3/envs/cs2archive/python.exe scripts/pov/pipeline.py --backlog backlog/{match_slug}/{priority}/{slug}.json',
     }
-
-    backlog_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    from _backlog_common import write_card
+    write_card(meta, backlog_file)
     print(f"  Created: backlog/{match_slug}/{priority}/{slug}.json")
 
 

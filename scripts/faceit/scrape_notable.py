@@ -27,7 +27,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-DEMAND_INDEX_PATH = ROOT / ".data" / "player_demand_index.json"
 sys.path.insert(0, str(ROOT / "scripts"))
 from _pathsetup import ensure
 ensure()
@@ -35,7 +34,17 @@ ensure()
 from player_accounts import list_accounts  # noqa: E402
 from scrapers.faceit import FACEITClient  # noqa: E402
 from faceit_names import known_pro_faceit_ids  # noqa: E402
-from hltv_ranking import fetch_team_ranking, star_bonus_for_pros  # noqa: E402
+from hltv_ranking import fetch_team_ranking, rank_bonus, star_bonus_for_pros  # noqa: E402
+from scoring import (  # noqa: E402
+    PLAYER_DEMAND_INDEX,
+    costar_bonus,
+    lobby_elo_bonus,
+    perf_bonus as _perf_bonus,
+    star_bonus,
+)
+import scoring as _scoring  # noqa: E402
+
+DEMAND_INDEX_PATH = _scoring.DEMAND_INDEX_PATH
 
 
 def pro_nicks() -> list[str]:
@@ -70,65 +79,26 @@ def _is_notable_perf(line: dict, kd_min: float, adr_min: float, kills_min: int) 
     return kd >= kd_min or adr >= adr_min or kills >= kills_min
 
 
-# Channel-normalized median performance from the 3,012-video longform study
-# (n>=10, index clipped to the 1.08-1.69 band so a tiny-sample spike cannot
-# dominate ELO/star), plus a 2-day recency overlay for 100 Thieves. Missing
-# players use the neutral 1.0 baseline. Team rank still adapts daily.
-PLAYER_DEMAND_INDEX = {
-    "ropz": 1.69,
-    "donk": 1.50,
-    "s1mple": 1.50,
-    "xantares": 1.44,
-    "zont1x": 1.41,
-    "teses": 1.35,
-    "flamez": 1.32,
-    "device": 1.28,
-    "dev1ce": 1.28,
-    "nocries": 1.23,
-    "m0nesy": 1.21,
-    "apex": 1.20,
-    "electronic": 1.18,
-    "niko": 1.17,
-    "heavygod": 1.15,
-    "kyousuke": 1.12,
-    "rain": 1.12,
-    "tn1r": 1.12,
-    "magnojez": 1.10,
-    "sh1ro": 1.09,
-    "zywoo": 1.08,
-}
+def is_good_faceit_pov(c: dict) -> bool:
+    """Plus-K/D win from an HLTV top-10 org (donk / kyousuke / m0NESY tier).
+
+    High K/D/ADR is not a substitute — that is usually a stomped low-ELO
+    lobby (blameF 27/9 vs ~2500). ``raw_star_bonus`` is ``rank_bonus`` for
+    the POV's org (250k at rank 10).
+    """
+    if not c.get("won"):
+        return False
+    if _num(c.get("kd"), float) < 1.0:
+        return False
+    return _num(c.get("raw_star_bonus"), int) >= rank_bonus(10)
 
 
-def load_player_demand_index() -> dict[str, float]:
-    """Live YouTube-derived index, falling back to the last researched table."""
-    if DEMAND_INDEX_PATH.exists():
-        try:
-            payload = json.loads(DEMAND_INDEX_PATH.read_text(encoding="utf-8"))
-            raw = payload.get("index", payload)
-            return {str(key).casefold(): float(value) for key, value in raw.items()}
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            pass
-    return dict(PLAYER_DEMAND_INDEX)
+def load_player_demand_index():
+    return _scoring.load_player_demand_index(DEMAND_INDEX_PATH)
 
 
 def market_demand_bonus(nick: str) -> int:
-    """Reward measured player demand above the neutral 1.0 market baseline."""
-    index = load_player_demand_index().get(nick.casefold(), 1.0)
-    return round(max(0.0, index - 1.0) * 250_000)
-
-
-def lobby_elo_bonus(avg_elo: int | float) -> int:
-    """Scale 2500-4000 average lobby ELO into a 0-300k quality signal."""
-    return round(max(0.0, min(1.0, (avg_elo - 2500) / 1500)) * 300_000)
-
-
-def costar_bonus(pros: list[str]) -> int:
-    """Trio+ stacks help, but 300k let a 5-man CIS queue outrank a 28-9.
-
-    Recent breakout POVs are the carry (sh1ro 28-9, m0NESY 22-12), not the
-    lobby census. 40k per extra pro above a duo, capped at 120k.
-    """
-    return min(max(len(set(pros)) - 2, 0) * 40_000, 120_000)
+    return _scoring.market_demand_bonus(nick, DEMAND_INDEX_PATH)
 
 
 SCORE_VERSION = 5
@@ -142,27 +112,6 @@ def _line_won(line: dict) -> bool:
     if isinstance(r, str):
         return r.strip().lower() in ("1", "1.0", "true")
     return bool(r)
-
-
-def star_bonus(raw_star: int, won: bool = False, kd: float = 1.0) -> int:
-    """Org rank is who the POV is, not whether the map was won.
-
-    LIM posts ZywOo 27-18 losses; stripping Vitality star for a loss made
-    that line invisible. The 80k win chip still prefers a win. Minus-KD
-    IGLs (karrigan 10-13) still get 0 star.
-    """
-    if raw_star <= 0 or kd < 1.0:
-        return 0
-    return raw_star // 2
-
-
-def _perf_bonus(kd: float, adr: float, kills: int, won: bool) -> int:
-    """Bounded quality signal. The 80k win chip requires K/D >= 1.0."""
-    kd_points = min(max(kd - 1.0, 0.0) * 40_000, 80_000)
-    adr_points = min(max(adr - 70.0, 0.0) * 1_000, 50_000)
-    kill_points = min(max(kills - 20, 0) * 3_000, 45_000)
-    win_points = 80_000 if won and kd >= 1.0 else 0
-    return round(kd_points + adr_points + kill_points + win_points)
 
 
 def rescore_stored(c: dict) -> dict:

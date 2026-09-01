@@ -262,6 +262,69 @@ def test_select_picks_only_one_pov_per_match():
     ]
 
 
+def test_is_good_faceit_pov_requires_top10_org():
+    donk = {
+        "player": "donk", "won": True, "kd": 1.2, "adr": 85.0, "kills": 18,
+        "raw_star_bonus": 400_000,
+    }
+    kyousuke = {
+        "player": "kyousuke", "won": True, "kd": 1.0, "adr": 70.0, "kills": 16,
+        "raw_star_bonus": 250_000,
+    }
+    blamef = {
+        "player": "blameF", "won": True, "kd": 3.0, "adr": 142.7, "kills": 27,
+        "raw_star_bonus": 60_000,
+    }
+    smash_unknown = {
+        "player": "Neityu", "won": True, "kd": 4.0, "adr": 133.3, "kills": 20,
+    }
+    minus_kd = {
+        "player": "donk", "won": True, "kd": 0.9, "adr": 90.0, "kills": 12,
+        "raw_star_bonus": 400_000,
+    }
+    assert sn.is_good_faceit_pov(donk)
+    assert sn.is_good_faceit_pov(kyousuke)
+    assert not sn.is_good_faceit_pov(blamef)
+    assert not sn.is_good_faceit_pov(smash_unknown)
+    assert not sn.is_good_faceit_pov(minus_kd)
+    assert not sn.is_good_faceit_pov({**donk, "won": False})
+
+
+def test_choose_picks_prefers_fresh_over_heavier_pool():
+    fresh = [{
+        "id": "f:neityu", "match_id": "f", "player": "Neityu",
+        "weight": 100, "date": "2026-09-01",
+        "won": True, "kd": 4.0, "adr": 133.0, "kills": 20,
+        "raw_star_bonus": 400_000,
+    }]
+    pool = [{
+        "id": "p:donk", "match_id": "p", "player": "donk",
+        "weight": 9999, "date": "2026-08-25",
+        "won": True, "kd": 3.0, "adr": 120.0, "kills": 28,
+    }]
+    picks, used = dn.choose_picks(
+        {"used": [], "pool": pool}, fresh, 1, "2026-09-01")
+    assert [p["player"] for p in picks] == ["Neityu"]
+    assert used == ["f:neityu"]
+
+
+def test_choose_picks_does_not_pad_with_pool():
+    fresh = [{
+        "id": "f:a", "match_id": "f", "player": "a",
+        "weight": 100, "date": "2026-09-01",
+        "won": True, "kd": 4.0, "adr": 133.0, "kills": 20,
+        "raw_star_bonus": 400_000,
+    }]
+    pool = [{
+        "id": "p:b", "match_id": "p", "player": "b",
+        "weight": 50, "date": "2026-08-25",
+        "won": True, "kd": 3.0, "adr": 120.0, "kills": 25,
+    }]
+    picks, _ = dn.choose_picks(
+        {"used": [], "pool": pool}, fresh, 2, "2026-09-01")
+    assert [p["player"] for p in picks] == ["a"]
+
+
 def test_replay_days_uses_each_day_window_and_does_not_reuse_picks():
     candidates = [
         {"id": "a:donk", "match_id": "a", "player": "donk", "weight": 900,
@@ -303,3 +366,16 @@ def test_card_for_pick_matches_player_and_match(tmp_path):
     assert dn.rel_card_for_pick(
         {"match_id": "match-1", "player": "donk"}, root=tmp_path
     ) == "backlog/faceit/2026-09-01/high/donk-mirage-match-1.json"
+
+
+def test_card_for_pick_finds_date_partitioned_faceit_dir(tmp_path):
+    card_dir = tmp_path / "faceit" / "2026-09-01" / "high"
+    card_dir.mkdir(parents=True)
+    (card_dir / "neityu-nuke.json").write_text(json.dumps({
+        "player": "Neityu",
+        "faceit_match_id": "1-abc",
+        "map": "Nuke",
+    }), encoding="utf-8")
+    path = dn.card_for_pick({"match_id": "1-abc", "player": "Neityu"}, root=tmp_path)
+    assert path is not None
+    assert path.name == "neityu-nuke.json"

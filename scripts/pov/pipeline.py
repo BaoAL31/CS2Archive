@@ -7,11 +7,11 @@ Auto-downloads missing demos from HuggingFace (if hf_root set) or falls back to 
 Usage:
     python scripts/pov/pipeline.py --backlog backlog/<match_slug>/<priority>/<slug>.json [--step N] [--raw-only]
 
-Steps (use --step N to start at a specific step):
+    Steps (use --step N to start at a specific step):
   1 = analyze    csdm analyze the demo
   2 = render     Render all rounds as POV clips
-  3 = concat     Concatenate rounds, copy to youtube/
-  4 = overlay    Apply input overlay + util cam (skipped unless --raw-only)
+  3 = concat     Concatenate rounds; raw-only copies combined to youtube/
+  4 = overlay    Keyboard + util cam (default product; skipped with --raw-only)
   5 = outro      Generate 5s silent outro, concat onto video.mp4
   6 = thumbnail  Generate 1280x720 thumbnail + write upload_meta.json
   7 = cleanup    Remove renders folder + pipeline state
@@ -22,14 +22,8 @@ thumbnail_path/youtube_id=None/upload_status="pending"). A separate script,
 scripts/upload/upload_pending.py, scans every upload_meta.json under youtube/ and
 uploads any that are still pending.
 
-Dual-upload (default): produces a second, independent variant with
-keyboard/utility overlay. Raw variant -> youtube/{run_id}/
-Overlay variant -> youtube/{run_id}_overlay/   (separate title, thumbnail, meta)
-
-All POVs default to overlay-only: the keyboard + util-cam variant IS the
-upload, no raw variant is produced. Pass --raw-only for just the raw variant.
-
-Raw-only (--raw-only): produce only the raw variant, skip overlay entirely.
+Default product is one overlay variant at youtube/{run_id}_overlay/.
+Pass --raw-only for youtube/{run_id}/ with no overlay.
 """
 
 from __future__ import annotations
@@ -53,15 +47,15 @@ from _pathsetup import ensure, SCRIPTS_DIR
 PROJECT_ROOT = ensure()
 
 from assign_playlist import normalize_playlist_name
-# Redirect HF cache to D: drive before importing huggingface_hub
-os.environ.setdefault("HF_HOME", "D:/.cache/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "D:/.cache/huggingface/hub")
+from config import settings, apply_runtime_env
+
+apply_runtime_env()
 from huggingface_hub import hf_hub_download
 STATE_DIR = PROJECT_ROOT / ".pipeline"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 os.chdir(str(PROJECT_ROOT))
 
-CSDM = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
+CSDM = settings.csdm_cmd
 PY = sys.executable
 
 STEPS = {
@@ -278,14 +272,8 @@ class Pipeline:
         if getattr(args, "no_cleanup", True) and self.end_step == max(STEPS.keys()):
             self.end_step = max(STEPS.keys()) - 1
 
-        # Dual-upload: when True, also process an overlay variant as a second
-        # independent upload (separate youtube dir, title, thumbnail, meta).
-        # Default False = 100% backward-compatible with existing behavior.
-        # --overlay-only implies --dual-upload's overlay branch but skips
-        # the raw variant entirely (no raw video copy, no raw outro, no
-        # raw thumbnail, no raw upload). The overlay variant IS the upload.
-
         from scrapers.hltv_acquire import match_id_from_url
+        from variant import resolve_skip_overlay, youtube_dir_name
 
         if self.is_faceit:
             # FACEIT has no HLTV url — derive match id from demo stem / meta.
@@ -298,48 +286,22 @@ class Pipeline:
             self.match_id = match_id_from_url(self.hltv_url)
         dem_stem = self.demo_path.stem if self.demo_path else slug
         self.render_dir = pov_render_dir(dem_stem, self.player)
-        self.youtube_dir = PROJECT_ROOT / "youtube" / run_id_from_name(f"{self.match_id}_{dem_stem}_{self.player}_{self.map_name}")
-
         self.run_id = run_id_from_name(f"{self.match_id}_{dem_stem}_{self.player}_{self.map_name}")
         self.state = load_state(self.run_id)
         self.state.setdefault("data", {})
         self.state["data"]["steam_id"] = self.steam_id
 
-        # Resume-safe: trust the state's prior dual_upload/overlay_only flags
-        # if set, so a resume run doesn't need to re-pass them.
-        state_dual = bool(self.state["data"].get("dual_upload"))
-        state_overlay_only = bool(self.state["data"].get("overlay_only"))
-        # Every pipeline defaults to overlay-only: the keyboard + util-cam
-        # variant IS the product (raw has no standalone audience). An explicit
-        # --raw-only (dual_upload=False) or --overlay-only still wins.
-        explicit_variant = bool(getattr(args, "overlay_only", False)) or not bool(
-            getattr(args, "dual_upload", True)
-        )
-        overlay_default = not explicit_variant
-        self.overlay_only = (
-            bool(getattr(args, "overlay_only", False))
-            or state_overlay_only
-            or overlay_default
-        )
-        # overlay_only implies dual_upload (we still want the overlay branch
-        # in steps 3-7; we just skip the raw branch).
-        self.dual_upload = bool(getattr(args, "dual_upload", False)) or state_dual or self.overlay_only
-
-        if self.dual_upload:
-            self.overlay_youtube_dir = self.youtube_dir.with_name(self.youtube_dir.name + "_overlay")
-        else:
-            self.overlay_youtube_dir = None
+        raw_only = bool(getattr(args, "raw_only", False))
+        self.skip_overlay = resolve_skip_overlay(raw_only=raw_only, state=self.state)
+        yt_name = youtube_dir_name(self.run_id, skip_overlay=self.skip_overlay)
+        self.youtube_dir = PROJECT_ROOT / "youtube" / yt_name
 
         if self.state["data"].get("demo_path"):
             self.demo_path = Path(self.state["data"]["demo_path"])
         self.state["data"]["render_dir"] = str(self.render_dir)
         self.state["data"]["youtube_dir"] = str(self.youtube_dir)
         self.state["data"]["ratings_path"] = str(self.ratings_json)
-        if self.dual_upload and self.overlay_youtube_dir is not None:
-            self.state["data"]["overlay_youtube_dir"] = str(self.overlay_youtube_dir)
-            self.state["data"]["dual_upload"] = True
-        if self.overlay_only:
-            self.state["data"]["overlay_only"] = True
+        self.state["data"]["skip_overlay"] = self.skip_overlay
         if self.avatar_path:
             self.state["data"]["avatar_path"] = str(self.avatar_path)
 
@@ -646,7 +608,7 @@ class Pipeline:
 
         nvcheck = subprocess.run(
             [
-                r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe",
+                settings.ffmpeg_exe,
                 "-y", "-f", "lavfi", "-i", "color=c=red:s=2560x1440:d=1",
                 "-c:v", "h264_nvenc", "-rc", "vbr_hq", "-b:v", "0", "-cq", "15",
                 "-preset", "p7", "-f", "null", "-",
@@ -868,7 +830,7 @@ class Pipeline:
     @staticmethod
     def _probe_duration(path: Path) -> float:
         r = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json",
+            [settings.ffprobe_exe, "-v", "quiet", "-print_format", "json",
              "-show_format", str(path)],
             capture_output=True, text=True, timeout=60,
         )
@@ -1008,79 +970,6 @@ class Pipeline:
             print(f"  [OK] duration: {actual_sec:.1f}s vs expected "
                   f"{expected_sec:.1f}s ({dur_src}; diff {diff:+.1f}s, tol +/-{tol:.1f}s")
 
-    def _expected_duration_from_demo(self, tickrate: float, round_nums: list[int] | None = None) -> float | None:
-        """Compute the player-POV rendered duration from the demo itself, as a
-        fallback when CSDM per-round sequence files are absent (single-batch
-        renders). Uses demoparser2. This is the INDEPENDENT expected duration
-        (derived from demo ticks, not the video) used to catch truncation.
-
-        CSDM `--event rounds --perspective player` renders each round from a
-        fixed lead-in before freeze-end to the player's death (+ fixed trail),
-        or to the round's end if the player survives. All phases are fixed:
-          start = round_freeze_end - 2s   (csdm --start-seconds-before default)
-          end   = player_death   + 2s    (csdm --end-seconds-after default)
-          end   = round_end       + 2s    (survived: same fixed trail)
-        Both the buy/freeze lead-in and the post-death/post-round trail are
-        fixed CSDM constants (defaults 2s), so this is EXACT (verified
-        against CSDM sequence tick ranges: r1 1146-3661, r2 5513-9302,
-        r3 10933-17148)."""
-        try:
-            import demoparser2 as dp
-        except Exception:
-            return None
-        demo = self.demo_path
-        if not demo or not Path(demo).exists():
-            return None
-        try:
-            p = dp.DemoParser(str(demo))
-            rs = p.parse_event("round_start")
-            re_ = p.parse_event("round_end")
-            fe = p.parse_event("round_freeze_end")
-            deaths = p.parse_event("player_death")
-        except Exception:
-            return None
-        if rs is None or re_ is None or len(rs) == 0:
-            return None
-        steam = str(self.steam_id)
-        # Build per-round tick ranges {round: (start, end)}.
-        ranges = {}
-        for n in range(1, len(rs) + 1):
-            try:
-                s = int(rs[rs["round"] == n]["tick"].iloc[0])
-            except Exception:
-                continue
-            end_row = re_[re_["round"] == n + 1]
-            if len(end_row) == 0:
-                continue
-            ranges[n] = (s, int(end_row["tick"].iloc[0]))
-        # Map player deaths to rounds via tick (player_death has no 'round'
-        # column, so locate each death tick inside a round's [start, end]).
-        death_by_round = {}
-        if deaths is not None and len(deaths) > 0 and "user_steamid" in deaths.columns:
-            for _, d in deaths.iterrows():
-                if str(d["user_steamid"]) != steam:
-                    continue
-                t = int(d["tick"])
-                for rn, (s, e) in ranges.items():
-                    if s <= t <= e:
-                        death_by_round[rn] = t
-                        break
-        LEAD = int(2 * tickrate)     # csdm --start-seconds-before (fixed)
-        TRAIL = int(2 * tickrate)   # csdm --end-seconds-after (fixed)
-        freeze = list(fe["tick"]) if fe is not None and len(fe) > 0 else []
-        total = 0.0
-        for n in (round_nums or list(ranges.keys())):
-            if n not in ranges:
-                continue
-            start_tick, end_tick = ranges[n]
-            fz = int(freeze[n - 1]) if 0 < n <= len(freeze) else start_tick
-            rend_start = fz - LEAD
-            dth = death_by_round.get(n)
-            rend_end = (dth if dth is not None else end_tick) + TRAIL
-            span = max(rend_end - rend_start, 0)
-            total += span / tickrate
-        return total if total > 0 else None
-
     def _expected_duration_from_analysis(self, tickrate: float, round_nums: list[int]) -> float | None:
         """Fallback expected duration from CSDM's own analysis JSON.
 
@@ -1119,10 +1008,10 @@ class Pipeline:
         large enough. An older leftover youtube video must not block a freshly
         rendered overlay (that previously dropped jump/PiP fixes).
         """
-        if self.overlay_youtube_dir is None:
-            print("  [skip] no overlay_youtube_dir configured")
+        if self.skip_overlay:
+            print("  [skip] raw-only: no overlay youtube dir")
             return
-        target = self.overlay_youtube_dir / "video.mp4"
+        target = self.youtube_dir / "video.mp4"
         if (
             target.exists()
             and target.stat().st_size > 1_000_000
@@ -1136,7 +1025,7 @@ class Pipeline:
         if not overlay.exists():
             fail(4, "OVERLAY_OUTPUT_MISSING",
                  f"overlay result not found: {overlay}")
-        self.overlay_youtube_dir.mkdir(parents=True, exist_ok=True)
+        self.youtube_dir.mkdir(parents=True, exist_ok=True)
         if target.exists():
             print(f"  [replace] outdated youtube overlay "
                   f"({target.stat().st_size / 1e9:.1f} GB) <- "
@@ -1188,30 +1077,17 @@ class Pipeline:
 
         self._validate_concat(combined, skip_failed=skip_failed)
 
-        # overlay-only: skip raw youtube dir entirely. The overlay variant
-        # becomes the only output. (Raw combined.mp4 is still produced by
-        # concat_rounds.py in render_dir; we just don't copy it to a
-        # youtube/{run_id}/ dir, never add outro/thumbnail/upload for it.)
-        if not self.overlay_only:
+        if self.skip_overlay:
             self.youtube_dir.mkdir(parents=True, exist_ok=True)
             self._copy_video_to_youtube(self.youtube_dir, combined, label="raw")
             self._copy_round_offsets(self.youtube_dir)
 
-        # Note: do NOT copy combined.mp4 to overlay_youtube_dir here.
-        # Step 4 (overlay) creates the overlay dir and writes the overlaid
-        # video. Copying the raw video here would let step 4 silently skip
-        # (or fail to produce overlay) and leave a raw video in the overlay
-        # dir that would then be uploaded under the overlay variant name.
-
     # ── Step 4: Overlay ───────────────────────────────────────────────────
 
     def step_overlay(self) -> None:
-        """Apply keyboard + util flight overlay. In dual-upload mode the
-        overlay is written into the dedicated overlay variant directory and
-        replaces video.mp4 in that dir. In raw-only mode the step is skipped
-        entirely — no overlay work directory or util_cams are created."""
+        """Apply keyboard + util flight overlay. Skipped in --raw-only mode."""
         # Skip in raw-only mode
-        if not self.dual_upload:
+        if self.skip_overlay:
             print("  [skip] Raw-only mode: overlay step disabled")
             return
 
@@ -1224,8 +1100,8 @@ class Pipeline:
 
         # Skip if the overlay variant already has a valid video (resume from
         # a previous successful run where .overlay_work was cleaned).
-        if self.overlay_youtube_dir is not None:
-            dst = self.overlay_youtube_dir / "video.mp4"
+        if not self.skip_overlay:
+            dst = self.youtube_dir / "video.mp4"
             if dst.is_file() and dst.stat().st_size > 100_000:
                 # Re-overlay if the source combined.mp4 was re-baked (e.g. a
                 # step-3 shade re-run) after this overlay was last produced;
@@ -1234,7 +1110,7 @@ class Pipeline:
                 re_baked = src.is_file() and src.stat().st_mtime > dst.stat().st_mtime
                 if not re_baked:
                     print(f"  [skip] Overlay video already exists in "
-                          f"{self.overlay_youtube_dir.name}/video.mp4")
+                          f"{self.youtube_dir.name}/video.mp4")
                     return
                 print(f"  [re-overlay] combined.mp4 is newer than the existing "
                       f"overlay; re-running overlay_pov.py")
@@ -1309,26 +1185,23 @@ class Pipeline:
 
         work_dir = self.render_dir / ".overlay_work"
         work_dir.mkdir(parents=True, exist_ok=True)
-        ov_args = [
-            "scripts/overlay/overlay_pov.py",
-            "--video", str(video_path),
-            "--demo", str(self.demo_path),
-            "--steam-id", steam_id,
-            "--batches", str(getattr(self.args, "overlay_batches", 10)),
-            "--util-cams-root", str(self.render_dir / "utility_cams"),
-            "--work-dir", str(work_dir),
-        ]
-        # Note: the voice-activity SHADE is applied in the SCALE step (step 3),
-        # not here — the shade must stretch together with the video. Step 4 only
-        # handles keyboard + util-cam PiP overlays. The comms AUDIO mix happens
-        # right after this step (below).
-        r = self._run_py(ov_args, timeout=7200, capture_output=True, text=True)
-        if r.returncode != 0:
-            if r.stdout:
-                print(r.stdout)
-            if r.stderr:
-                print("[stderr]", r.stderr[-2000:])
-            fail(4, "OVERLAY_FAILED", f"overlay_pov.py exited {r.returncode}")
+        from overlay.overlay_pov import run_overlay
+        from overlay.overlay_utilcams import _ensure_cs2util_data
+        try:
+            _ensure_cs2util_data(Path(self.demo_path))
+            run_overlay(
+                Path(video_path),
+                Path(self.demo_path),
+                steam_id,
+                None,
+                getattr(self.args, "overlay_batches", 10),
+                util_cams_root=self.render_dir / "utility_cams",
+                work_dir=work_dir,
+            )
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) else 1
+            if code:
+                fail(4, "OVERLAY_FAILED", f"overlay_pov exited {code}")
 
         overlay_sidecar = video_path.with_suffix(".overlay.mp4")
         if not overlay_sidecar.exists():
@@ -1392,7 +1265,7 @@ class Pipeline:
             list_path = f.name
 
         r = subprocess.run(
-            ["ffmpeg", "-f", "concat", "-safe", "0", "-i", list_path,
+            [settings.ffmpeg_exe, "-f", "concat", "-safe", "0", "-i", list_path,
              "-c", "copy", str(temp)],
             capture_output=True, text=True, timeout=3600,
         )
@@ -1461,12 +1334,7 @@ class Pipeline:
             print(f"  [WARN] intermediate cleanup failed (non-fatal): {e}")
 
     def step_outro(self) -> None:
-        # Voice is baked into the render (voice_enable 1 + enemy muted), so no
-        # post-render team-voice mix is needed.
-        if not self.overlay_only:
-            self._append_outro(self.youtube_dir, step_num=5)
-        if self.dual_upload and self.overlay_youtube_dir is not None:
-            self._append_outro(self.overlay_youtube_dir, step_num=5)
+        self._append_outro(self.youtube_dir, step_num=5)
 
     # ── Step 6: Thumbnail ────────────────────────────────────────────────
 
@@ -1482,8 +1350,8 @@ class Pipeline:
           3. ``renders/.../combined.overlay.mp4`` (+ legacy render-dir names)
         """
         candidates: list[Path] = []
-        if include_youtube and self.overlay_youtube_dir is not None:
-            candidates.append(self.overlay_youtube_dir / "video.mp4")
+        if include_youtube and not self.skip_overlay:
+            candidates.append(self.youtube_dir / "video.mp4")
         if self.render_dir:
             candidates.append(self.render_dir / ".overlay_work" / "video.overlay.mp4")
             candidates.append(self.render_dir / "combined.overlay.mp4")
@@ -1507,7 +1375,7 @@ class Pipeline:
         """
         try:
             probe = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                [settings.ffprobe_exe, "-v", "error", "-show_entries", "format=duration",
                  "-of", "default=noprint_wrappers=1:nokey=1", str(overlay_video)],
                 capture_output=True, text=True, timeout=60,
             )
@@ -1519,7 +1387,7 @@ class Pipeline:
             os.close(fd)
             tmp = Path(name)
             r = subprocess.run(
-                ["ffmpeg", "-y", "-loglevel", "error",
+                [settings.ffmpeg_exe, "-y", "-loglevel", "error",
                  "-ss", f"{seek_t:.3f}", "-i", str(overlay_video),
                  "-frames:v", "1",
                  "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,"
@@ -1697,12 +1565,8 @@ class Pipeline:
         self._write_upload_meta(youtube_dir, variant=variant, step_num=step_num)
 
     def step_thumbnail(self) -> None:
-        if not self.overlay_only:
-            self._generate_thumbnail(self.youtube_dir, variant="raw", step_num=6)
-        if self.dual_upload and self.overlay_youtube_dir is not None:
-            self._generate_thumbnail(
-                self.overlay_youtube_dir, variant="overlay", step_num=6,
-            )
+        variant = "raw" if self.skip_overlay else "overlay"
+        self._generate_thumbnail(self.youtube_dir, variant=variant, step_num=6)
 
     # ── Upload meta writer (runs inside thumbnail step) ────────────────
 
@@ -1714,8 +1578,7 @@ class Pipeline:
     ) -> None:
         """Generate title/desc/tags via generate_title.py and write the
         resulting upload_meta.json into ``youtube_dir``. Pass
-        ``variant='overlay'`` to suffix title/desc/tags for the dual-upload
-        overlay variant."""
+        ``variant='overlay'`` to suffix title/desc/tags for the overlay product."""
         video = youtube_dir / "video.mp4"
         thumb = youtube_dir / "thumbnail.jpg"
 
@@ -1831,18 +1694,14 @@ def main() -> None:
                         help="Stop after step N (default: 6 = thumbnail, before cleanup)")
     parser.add_argument(
         "--raw-only",
-        action="store_false",
-        dest="dual_upload",
-        help="Produce only the raw variant (no overlay, no second upload).",
+        action="store_true",
+        dest="raw_only",
+        help="Produce only the raw variant (no overlay).",
     )
-    parser.set_defaults(dual_upload=True)
     parser.add_argument(
         "--overlay-only",
         action="store_true",
-        help="Upload only the overlay variant. This is now the DEFAULT for "
-             "all POVs; the flag exists for explicitness / resume. Skips raw "
-             "video copy, raw outro, raw thumbnail, and raw upload. Use "
-             "--raw-only to force the raw-only variant instead.",
+        help="Deprecated no-op: overlay-only is the default.",
     )
     parser.add_argument(
         "--batches",

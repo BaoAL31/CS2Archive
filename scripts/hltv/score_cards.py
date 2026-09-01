@@ -34,10 +34,9 @@ from hltv.update_team_demand import (  # noqa: E402
     resolve_team_name,
 )
 from hltv_ranking import pro_team_rank, rank_bonus  # noqa: E402
-from scrape_notable import load_player_demand_index, star_bonus  # noqa: E402
+from scoring import demand_points, load_player_demand_index, star_bonus  # noqa: E402
 
 SCORE_VERSION = 1
-DEMAND_SCALE = 250_000
 HIGHLIGHT_VIEW_FLOOR = 1_000
 HIGHLIGHT_LOOKBACK_DAYS = 7
 PLAYER_DEMAND_STALE_DAYS = 7
@@ -61,10 +60,6 @@ def parse_kd_ratio(kd) -> float:
         return float(text)
     except ValueError:
         return 0.0
-
-
-def demand_points(index: float) -> int:
-    return round(max(0.0, float(index) - 1.0) * DEMAND_SCALE)
 
 
 def rating_bonus(rating: float) -> int:

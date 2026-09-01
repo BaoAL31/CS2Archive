@@ -241,6 +241,11 @@ def main() -> None:
         attempts = 1 + args.retries  # first try + N retries
         uploaded_ok = False
         for attempt in range(1, attempts + 1):
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                print(f"  [skip] could not re-read {meta_path}: {e}")
+                break
             if upload_one(meta_path, meta, args.dry_run, args.also_bilibili):
                 uploaded_ok = True
                 break

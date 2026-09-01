@@ -38,9 +38,10 @@ from shorts.render_shorts import (  # noqa: E402
     AVATAR_DIR,
     AVATAR_EXTS,
 )
+from config import settings  # noqa: E402
 
-FFMPEG = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
-FFPROBE = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffprobe.exe"
+FFMPEG = settings.ffmpeg_exe
+FFPROBE = settings.ffprobe_exe
 
 TARGET_FPS = 60
 AVATAR_DEFAULT_HEIGHT = 336      # proportional to shorts' 600px on a 1920-tall canvas

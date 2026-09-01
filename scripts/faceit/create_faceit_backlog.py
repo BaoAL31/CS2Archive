@@ -32,6 +32,11 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+from _pathsetup import ensure  # noqa: E402
+ensure()
+
+from _backlog_common import find_avatar, load_accounts_by_steam, write_card
 
 
 def fail(code: str, message: str) -> None:
@@ -244,6 +249,15 @@ def create_faceit_backlog(*, demo_path, player, map="", steam_id="",
         kills, deaths = kd_stats
         meta["kills"] = kills
         meta["deaths"] = deaths
+        meta["kd"] = f"{kills}-{deaths}"
+
+    acct = load_accounts_by_steam().get(steam_id, {})
+    faceit_id = str(acct.get("faceit_id") or "").strip()
+    if faceit_id == "-1":
+        faceit_id = ""
+    meta["faceit_id"] = faceit_id
+    meta["faceit_nickname"] = str(acct.get("faceit_nickname") or "").strip()
+    meta["avatar_path"] = find_avatar(player)
 
     if not no_elo:
         print("[FACEIT] Fetching match ELO ...")
@@ -266,11 +280,7 @@ def create_faceit_backlog(*, demo_path, player, map="", steam_id="",
     backlog_dir.mkdir(parents=True, exist_ok=True)
     backlog_file = backlog_dir / f"{slug}.json"
 
-    meta["pipeline_cmd"] = (
-        f'$env:PYTHONPATH=.; & C:/Users/jembo/anaconda3/envs/cs2archive/python.exe '
-        f'scripts/pov/pipeline.py --backlog {backlog_file.relative_to(PROJECT_ROOT).as_posix()} --overlay-only'
-    )
-    backlog_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    write_card(meta, backlog_file)
     print(f"[OK] Created: {backlog_file}")
     return backlog_file
 

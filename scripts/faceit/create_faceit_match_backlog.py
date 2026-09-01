@@ -30,9 +30,7 @@ import argparse
 import asyncio
 import json
 import re
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -41,6 +39,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 from _pathsetup import ensure  # noqa: E402
 ensure()
 
+from csdm_json import csdm_json  # noqa: E402
 from faceit_names import avatar_path  # noqa: E402
 from create_faceit_backlog import _match_elo  # noqa: E402
 from _backlog_common import (  # noqa: E402
@@ -51,9 +50,6 @@ from _backlog_common import (  # noqa: E402
 )
 
 BACKLOG_DIR = PROJECT_ROOT / "backlog" / "faceit"
-CSDM = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
-TMP_DIR = PROJECT_ROOT / "tmp"
-TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 MAP_DISPLAY = {
     "de_ancient": "Ancient", "de_mirage": "Mirage", "de_inferno": "Inferno",
@@ -107,24 +103,8 @@ def _elo_sync(demo: Path, steam_id: str) -> dict | None:
 
 
 def _csdm_json(demo: Path) -> dict:
-    """Run `csdm json` on the demo and return the parsed match export.
-
-    Same call as `extract_steamids.py` (incl. the PBDEMS2/challengermode
-    fallback). The export carries per-player `hltvRating2`, `killDeathRatio`,
-    `teamName` and the authoritative `mapName`.
-    """
-    with tempfile.TemporaryDirectory(dir=TMP_DIR) as tmpdir:
-        cmd = [CSDM, "json", str(demo), "--output-folder", tmpdir]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode != 0 and "unknown demo source" in (result.stderr or "").lower():
-            cmd += ["--source", "challengermode"]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode != 0:
-            raise RuntimeError(f"csdm json failed: {str(result.stderr)[-500:]}")
-        files = list(Path(tmpdir).glob("*.json"))
-        if not files:
-            raise RuntimeError("csdm json produced no output")
-        return json.loads(files[0].read_text(encoding="utf-8"))
+    """Run `csdm json` on the demo and return the parsed match export."""
+    return csdm_json(demo, timeout=600)
 
 
 def priority_from_rating(rating: float | None) -> str:
@@ -166,6 +146,11 @@ def _write_card(pro: dict, *, demo: Path, map_name: str, match_slug: str,
         "rating": pro["rating"],
         "kills": pro["kills"],
         "deaths": pro["deaths"],
+        "kd": (
+            f"{pro['kills']}-{pro['deaths']}"
+            if pro.get("kills") is not None and pro.get("deaths") is not None
+            else ""
+        ),
         "team": pro["team"],
         "is_faceit": True,
         "faceit_match_id": pro["faceit_match_id"],
@@ -173,10 +158,6 @@ def _write_card(pro: dict, *, demo: Path, map_name: str, match_slug: str,
         "faceit_nickname": pro["faceit_nickname"],
         "avatar_path": str(av_path.relative_to(PROJECT_ROOT)).replace("\\", "/") if av_path else "",
         **({} if not elo_fields else elo_fields),
-        "pipeline_cmd": (
-            f'$env:PYTHONPATH=.; & C:/Users/jembo/anaconda3/envs/cs2archive/python.exe '
-            f'scripts/pov/pipeline.py --backlog backlog/faceit/{match_date}/{priority}/{slug}.json --overlay-only'
-        ),
     }
     write_card(meta, backlog_file)
     return backlog_file

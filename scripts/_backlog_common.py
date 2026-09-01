@@ -89,9 +89,20 @@ def find_avatar(nickname: str) -> str:
 
 def write_card(meta: dict, backlog_file: Path) -> Path:
     """Persist one backlog card as pretty JSON."""
+    meta = dict(meta)
+    meta.setdefault("pipeline_cmd", pipeline_cmd(backlog_file))
     backlog_file.parent.mkdir(parents=True, exist_ok=True)
     backlog_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return backlog_file
+
+
+def pipeline_cmd(backlog_file: Path) -> str:
+    """Printable pipeline invocation using this interpreter, not a baked conda path."""
+    rel = rel_to_project(Path(backlog_file))
+    return (
+        f"$env:PYTHONPATH=.; & {sys.executable} "
+        f"scripts/pov/pipeline.py --backlog {rel}"
+    )
 
 
 def rel_to_project(path: Path) -> str:

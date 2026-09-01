@@ -14,14 +14,15 @@ import tempfile
 import time
 from pathlib import Path
 
-FFMPEG = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
-FFPROBE = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffprobe.exe"
-
 # Add scripts/ to sys.path so the lazy `from overlay.voice_shade import ...`
 # inside _build_shade_for_scale resolves when this script is run directly by
 # the pipeline (PYTHONPATH=.<project> only). parents[0]=scripts/pov,
 # parents[1]=scripts.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from config import settings
+
+FFMPEG = settings.ffmpeg_exe
+FFPROBE = settings.ffprobe_exe
 
 _BATCH_RE = re.compile(r"batch-(\d+)-(\d+)\.mp4$")
 _ROUND_SEQ_RE = re.compile(r"round-(\d+)-tick-(\d+)-to-(\d+)\.mp4$")
@@ -47,7 +48,7 @@ def _concat_two(a: Path, b: Path, out: Path) -> None:
             f.write(f"file '{a.resolve().as_posix()}'\n")
             f.write(f"file '{b.resolve().as_posix()}'\n")
         r = subprocess.run(
-            ["ffmpeg", "-f", "concat", "-safe", "0", "-i", str(lst),
+            [FFMPEG, "-f", "concat", "-safe", "0", "-i", str(lst),
              "-c", "copy", str(out)],
             capture_output=True, text=True, timeout=36000,
         )
@@ -451,7 +452,7 @@ def concat_rounds(folder: Path, allow_gaps: bool = False) -> Path:
 
 def _get_resolution(path: Path) -> tuple[int, int]:
     r = subprocess.run(
-        ["ffprobe", "-v", "quiet", "-print_format", "json",
+        [FFPROBE, "-v", "quiet", "-print_format", "json",
          "-show_streams", "-select_streams", "v:0", str(path)],
         capture_output=True, text=True, timeout=30,
     )
@@ -464,7 +465,7 @@ def _get_resolution(path: Path) -> tuple[int, int]:
 
 def _is_valid_video(path: Path) -> bool:
     r = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0", str(path)],
+        [FFPROBE, "-v", "error", "-select_streams", "v:0", str(path)],
         capture_output=True, text=True, timeout=10,
     )
     return r.returncode == 0
@@ -580,7 +581,7 @@ def _encode_scaled(src: Path, dst: Path, w: int, h: int, scaling_mode: str,
     filter_complex = None
     shade_ctrls: list[Path] = []
     next_input = 1
-    cmd_prefix = ["ffmpeg", "-y", "-i", str(src)]
+    cmd_prefix = [FFMPEG, "-y", "-i", str(src)]
     if shade:
         import tempfile as _tf
         shade_tmp = _tf.mkdtemp(prefix="shade_scale_")
@@ -617,7 +618,7 @@ def _encode_scaled(src: Path, dst: Path, w: int, h: int, scaling_mode: str,
         print(f"\n  [Scale] {src_mb:.0f} MB -> {w}x{h} (GPU scale_cuda lanczos + NVENC CQ8)...",
               end=" ", flush=True)
         cmd = [
-            "ffmpeg", "-y", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+            FFMPEG, "-y", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
             "-i", str(src),
             "-vf", gpu_vf,
         ]
@@ -649,7 +650,7 @@ def _encode_scaled(src: Path, dst: Path, w: int, h: int, scaling_mode: str,
         else:
             vf_cpu = vf.replace("flags=spline", "flags=lanczos")
             cmd = [
-                "ffmpeg", "-y", "-i", str(src),
+                FFMPEG, "-y", "-i", str(src),
                 "-vf", vf_cpu,
                 "-c:v", "libx264", "-crf", "15", "-preset", "slow",
                 "-profile:v", "high", "-pix_fmt", "yuv420p",

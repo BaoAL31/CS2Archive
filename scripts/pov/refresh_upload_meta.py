@@ -25,8 +25,7 @@ args.backlog = sys.argv[1]          # backlog card path
 args.step = 6
 args.until = 6
 args.no_cleanup = True
-args.dual_upload = True
-args.overlay_only = True
+args.raw_only = False
 
 p = Pipeline(args)
 target = Path(sys.argv[2])          # existing youtube/{run_id}_overlay dir

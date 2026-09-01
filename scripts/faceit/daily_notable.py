@@ -5,12 +5,13 @@ Picks the top N (=3) Recognised-Pro POVs for a calendar day from
 `scrape_notable.collect()`. If the day's scrape cannot fill N, falls back
 to performances left in the persistent pool from previous days.
 
-The HLTV match listener calls this on days with no tournament matches;
-it is not a Windows scheduled task. Manual CLI still works.
+The HLTV match listener polls this on off days (no tournament match live
+or starting within 24 hours) and queues only watchable POVs — it does not
+pad the day to 3. Manual CLI still works.
 
-Idempotent: running twice on the same day returns the stored picks without
-re-scraping (use --force to redo the day). An empty pick list still counts
-as the day's run so the listener does not re-scrape every poll.
+``pick_for_day`` is idempotent per calendar day. The listener uses
+``discover_good_povs`` instead, which re-scrapes and only returns heaters
+not already in ``used``.
 
 State file: .data/notable_daily.json
   {
@@ -44,13 +45,19 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from _pathsetup import ensure  # noqa: E402
 ensure()
 
-from scrape_notable import SCORE_VERSION, collect, rescore_stored
+from scrape_notable import (  # noqa: E402
+    SCORE_VERSION,
+    collect,
+    is_good_faceit_pov,
+    rescore_stored,
+)
 from update_player_demand import refresh as refresh_player_demand
 
 STATE_FILE = ROOT / ".data" / "notable_daily.json"
 DEMO_DIR = ROOT / "demos" / "faceit"
 PY = sys.executable
 DEFAULT_PICKS = 3
+DEFAULT_HOURS = 24
 
 
 # ---------- selection ----------
@@ -93,9 +100,10 @@ def day_already_picked(state: dict, today: str) -> bool:
 
 
 def replay_days(
-    candidates: list[dict], start: str, end: str, n: int, window_hours: int = 72,
+    candidates: list[dict], start: str, end: str, n: int,
+    window_hours: int = DEFAULT_HOURS,
 ) -> dict[str, list[dict]]:
-    """Walk calendar days as the daily FACEIT notable picker would: 72h lookback, one POV per
+    """Walk calendar days as the daily FACEIT notable picker would: 24h lookback, one POV per
     player and match, already-picked performance ids stay used."""
     start_d = datetime.strptime(start, "%Y-%m-%d")
     end_d = datetime.strptime(end, "%Y-%m-%d")
@@ -151,6 +159,70 @@ def select(state: dict, candidates: list[dict], n: int, today: str) -> tuple[lis
     return picks, new_used, survivors
 
 
+def choose_picks(
+    state: dict, fresh: list[dict], n: int, today: str,
+) -> tuple[list[dict], list[str]]:
+    """Take up to n watchable POVs from this scrape. Do not pad with leftovers."""
+    good = [c for c in fresh if is_good_faceit_pov(c)]
+    picks, new_used, _ = select(state, good, n, today)
+    return picks, new_used
+
+
+def remember_picks(picks: list[dict]) -> None:
+    """Record queued POVs so later scrapes do not repeat them."""
+    if not picks:
+        return
+    state = _load_state()
+    today = datetime.now().strftime("%Y-%m-%d")
+    used = state.setdefault("used", [])
+    for pick in picks:
+        pid = pick.get("id")
+        if pid and pid not in used:
+            used.append(pid)
+    existing = list(state.setdefault("picks", {}).get(today) or [])
+    have = {c.get("id") for c in existing}
+    for pick in picks:
+        if pick.get("id") and pick["id"] not in have:
+            existing.append(pick)
+    state["picks"][today] = existing
+    state["last_day"] = today
+    _save_state(state)
+
+
+async def discover_good_povs(
+    n: int = DEFAULT_PICKS,
+    *,
+    hours: int = DEFAULT_HOURS,
+    count: int = 25,
+    skip_youtube_demand: bool = True,
+) -> list[dict]:
+    """Scrape the lookback window and return unused watchable POVs (up to n)."""
+    state = _load_state()
+    if not skip_youtube_demand:
+        try:
+            demand = refresh_player_demand(scrape=True)
+            print(
+                f"[DEMAND] {len(demand['index'])} players from "
+                f"{demand['window_videos']} videos "
+                f"(scraped {demand['scraped']} new/updated)"
+            )
+        except Exception as exc:
+            print(f"[DEMAND] skipped ({exc})")
+    data = await collect(
+        hours=hours, count=count, min_pros=2,
+        perf_kd=1.5, perf_adr=100.0, perf_kills=30, perf_limit=120,
+        today_only=False, exclude_today=False,
+    )
+    today = datetime.now().strftime("%Y-%m-%d")
+    picks, _, _ = select(
+        {"used": state.get("used") or []},
+        [c for c in data["candidates"] if is_good_faceit_pov(c)],
+        n,
+        today,
+    )
+    return picks
+
+
 def _format_pick(c: dict) -> str:
     when = c.get("date") or "?"
     return (
@@ -170,22 +242,22 @@ def card_for_pick(pick: dict, *, root: Path = ROOT) -> Path | None:
     player = str(pick.get("player") or "").casefold()
     if not match_id or not player:
         return None
-    faceit = root / "backlog" / "faceit"
-    if not faceit.is_dir():
-        return None
-    for path in faceit.rglob("*.json"):
-        try:
-            meta = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+    for faceit in (root / "faceit", root / "backlog" / "faceit"):
+        if not faceit.is_dir():
             continue
-        if str(meta.get("faceit_match_id") or "") != match_id:
-            continue
-        nicks = {
-            str(meta.get("player") or "").casefold(),
-            str(meta.get("faceit_nickname") or "").casefold(),
-        }
-        if player in nicks:
-            return path
+        for path in faceit.rglob("*.json"):
+            try:
+                meta = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if str(meta.get("faceit_match_id") or "") != match_id:
+                continue
+            nicks = {
+                str(meta.get("player") or "").casefold(),
+                str(meta.get("faceit_nickname") or "").casefold(),
+            }
+            if player in nicks:
+                return path
     return None
 
 
@@ -203,7 +275,7 @@ async def pick_for_day(
     n: int = DEFAULT_PICKS,
     *,
     today: str | None = None,
-    hours: int = 72,
+    hours: int = DEFAULT_HOURS,
     count: int = 25,
     force: bool = False,
     dry_run: bool = False,
@@ -233,16 +305,23 @@ async def pick_for_day(
         today_only=False, exclude_today=False,
     )
     fresh = data["candidates"]
-    pool_by_id = {
-        c["id"]: c
-        for c in state["pool"]
+    old_pool = [
+        c for c in state["pool"]
         if c.get("id") and c.get("score_version") == SCORE_VERSION
-    }
+    ]
+    picks, new_used = choose_picks(
+        {"used": state.get("used") or [], "pool": old_pool},
+        fresh, n, today,
+    )
+    pool_by_id = {c["id"]: c for c in old_pool}
     for c in fresh:
         pool_by_id[c["id"]] = c
-    state["pool"] = list(pool_by_id.values())
-
-    picks, new_used, survivors = select(state, state["pool"], n, today)
+    picked_ids = {c["id"] for c in picks}
+    used = set(state.get("used") or [])
+    survivors = [
+        c for c in pool_by_id.values()
+        if c["id"] not in picked_ids and c["id"] not in used
+    ]
     survivors.sort(key=lambda c: -c.get("weight", 0))
     state["pool"] = survivors[:150]
     state["used"].extend(new_used)
@@ -275,11 +354,16 @@ def download_and_backlog(picks: list[dict]) -> None:
             try:
                 r = subprocess.run(
                     [PY, str(ROOT / "main.py"), "faceit", "match", mid],
-                    cwd=str(ROOT), timeout=1800, capture_output=True, text=True)
-                print("\n".join(r.stdout.splitlines()[-4:]))
+                    cwd=str(ROOT), timeout=1800, capture_output=True,
+                    text=True, encoding="utf-8", errors="replace")
+                out = r.stdout or ""
+                if out:
+                    print("\n".join(out.splitlines()[-4:]))
+                if r.returncode != 0:
+                    err = (r.stderr or "").strip().splitlines()[-1:] or ["download failed"]
+                    print(f"  [ERR] download exited {r.returncode}: {err[0]}")
             except Exception as e:
                 print(f"  [ERR] download failed: {e}")
-                continue
             demo = is_already_downloaded(mid, DemoSource.FACEIT)
         if demo is None:
             # fallback: newest .dem (history may lag the browser scrape)
@@ -291,10 +375,18 @@ def download_and_backlog(picks: list[dict]) -> None:
             continue
         print(f"  [BACKLOG] {demo.name}")
         try:
+            map_name = str(c.get("map") or "").replace("de_", "").strip()
+            if map_name:
+                map_name = map_name[0].upper() + map_name[1:]
+            cmd = [
+                PY, str(ROOT / "scripts/faceit/extract_backlogs.py"),
+                str(demo), "--player", str(c.get("player") or ""),
+                "--match-id", mid, "--no-shorts",
+            ]
+            if map_name:
+                cmd += ["--map", map_name]
             r = subprocess.run(
-                [PY, str(ROOT / "scripts/faceit/create_faceit_match_backlog.py"),
-                 str(demo), "--match-id", mid],
-                cwd=str(ROOT), timeout=1200, capture_output=True, text=True)
+                cmd, cwd=str(ROOT), timeout=1200, capture_output=True, text=True)
             print("\n".join(r.stdout.splitlines()[-6:]))
         except Exception as e:
             print(f"  [ERR] backlog failed: {e}")
@@ -304,8 +396,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--n", type=int, default=DEFAULT_PICKS,
                     help=f"Picks per day (default {DEFAULT_PICKS})")
-    ap.add_argument("--hours", type=int, default=72,
-                    help="Scrape window for fresh candidates (default 72h)")
+    ap.add_argument("--hours", type=int, default=DEFAULT_HOURS,
+                    help=f"Scrape window for fresh candidates (default {DEFAULT_HOURS}h)")
     ap.add_argument("--count", type=int, default=25, help="Matches per pro to scan")
     ap.add_argument("--force", action="store_true",
                     help="Re-scrape even if today already has picks")

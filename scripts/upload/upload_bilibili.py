@@ -32,9 +32,11 @@ PROJECT_ROOT = _SCRIPTS_DIR.parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
+from config import settings  # noqa: E402
+
 STORAGE = PROJECT_ROOT / ".bilibili_storage.json"
 SHOTS = PROJECT_ROOT / "tmp" / "bili_shots"
-FFMPEG = Path(r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe")
+FFMPEG = Path(settings.ffmpeg_exe)
 MAX_BILI_BYTES = int(3.8 * 1024**3)  # studio rejects ~4 GB+
 BILI_TAG_LIMIT = 10
 

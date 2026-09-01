@@ -21,7 +21,12 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from config import settings
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+FFMPEG = settings.ffmpeg_exe
+FFPROBE = settings.ffprobe_exe
 FONT_PATH = PROJECT_ROOT / "assets" / "fonts" / "Montserrat-Bold.ttf"
 DURATION = 5
 
@@ -32,7 +37,7 @@ def _get_font(size: int) -> ImageFont.FreeTypeFont:
 
 def get_video_info(path: Path) -> tuple[int, int, float]:
     r = subprocess.run(
-        ["ffprobe", "-v", "quiet", "-print_format", "json",
+        [FFPROBE, "-v", "quiet", "-print_format", "json",
          "-show_streams", "-select_streams", "v:0", str(path)],
         capture_output=True, text=True, timeout=30,
     )
@@ -110,7 +115,7 @@ def main() -> None:
 
         print(f"  Encoding {DURATION}s silent outro to {out_path.name}...", end=" ", flush=True)
         r = subprocess.run(
-            ["ffmpeg", "-y", "-loop", "1", "-i", str(frame_path),
+            [FFMPEG, "-y", "-loop", "1", "-i", str(frame_path),
              "-c:v", "libx264", "-t", str(DURATION),
              "-r", str(fps),
              "-pix_fmt", "yuv420p",

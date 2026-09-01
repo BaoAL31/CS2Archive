@@ -41,11 +41,16 @@ import sys
 import time
 from pathlib import Path
 
-# Point at CS2UtilArchive (sibling project, mirrors overlay_pov.py setup)
-_CS2UTIL_ROOT = Path(r"D:\Projects\CS2Archive").parent / "CS2UtilArchive"
-for _p in (str(_CS2UTIL_ROOT / "scripts"), str(_CS2UTIL_ROOT)):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from overlay._common import (  # noqa: E402
+    cameras_for_util_type,
+    clip_is_done,
+    pip_render_dimensions,
+    PIP_MAX_SIMULTANEOUS as _DEFAULT_PIP_MAX,
+    prefer_cs2util_scripts,
+)
+_HAS_PIP_SIZING = True
+prefer_cs2util_scripts()
 
 import pandas as pd
 
@@ -57,15 +62,6 @@ from scripts.render.batch_csdm import (
 )
 from scripts.render.paths import util_render_slug, clip_name_for_cameras
 from scripts.build_player_manifest import build_manifest
-
-# Pip render sizing depends on displayed pip geometry (video_height + max simultaneous)
-try:
-    from overlay._common import pip_render_dimensions, PIP_MAX_SIMULTANEOUS as _DEFAULT_PIP_MAX
-    _HAS_PIP_SIZING = True
-except Exception:
-    pip_render_dimensions = None  # type: ignore
-    _DEFAULT_PIP_MAX = 3
-    _HAS_PIP_SIZING = False
 
 
 # ---------------------------------------------------------------------------
@@ -131,9 +127,9 @@ def _prepare_util_cams(
         # A util_id group needs render if ANY of its throws lacks a clip.
         needs: list[dict] = []
         for entry in grp:
-            cam = entry.get("cameras") or _cameras_for_type(entry.get("util_type", ""))
+            cam = entry.get("cameras") or cameras_for_util_type(entry.get("util_type", ""))
             clip = util_dir / f"{clip_name_for_cameras(cam, entry['throw_id'])}.mp4"
-            if not (clip.is_file() and clip.stat().st_size > 1_000_000):
+            if not clip_is_done(clip):
                 needs.append(entry)
         if not needs:
             skipped += 1
@@ -182,7 +178,7 @@ def _discover_util_cams(util_cams_root: Path) -> list[Path]:
         needs_render = False
         for tid in throw_map:
             clip = util_dir / f"{clip_name_for_cameras(cam, tid)}.mp4"
-            if not (clip.is_file() and clip.stat().st_size > 1_000_000):
+            if not clip_is_done(clip):
                 needs_render = True
                 break
         if needs_render:
@@ -225,13 +221,26 @@ def _find_demo_for_id(util_cams_root: Path, demo_id: str) -> Path:
 
 
 def _cameras_for_type(util_type: str) -> str:
-    """Canonical camera set per util type (matches CS2UtilArchive)."""
-    return "flight,detonate" if str(util_type).lower() in ("smoke", "fire", "molotov", "incendiary") else "flight"
+    return cameras_for_util_type(util_type)
+
+
+def _require_map(value, *, context: str) -> str:
+    if value is None:
+        raise ValueError(f"map is required to build util_id ({context})")
+    if isinstance(value, float) and math.isnan(value):
+        raise ValueError(f"map is required to build util_id ({context})")
+    name = str(value).strip()
+    if not name or name.lower() == "nan":
+        raise ValueError(f"map is required to build util_id ({context})")
+    return name
 
 
 def _util_id_for_row(row: dict) -> str:
     """util_id = map:type:side:land_x_land_y_land_z (no match id)."""
-    map_name = str(row.get("map") or row.get("map_name") or "de_anubis")
+    map_name = _require_map(
+        row.get("map") or row.get("map_name"),
+        context=str(row.get("throw_id") or row.get("util_type") or "row"),
+    )
     util_type = str(row.get("util_type", "")).lower()
     side = str(row.get("thrower_side", "T") or "T").upper()
     lx = float(row.get("land_x", 0) or 0)
@@ -243,7 +252,10 @@ def _util_id_for_row(row: dict) -> str:
 def _util_id_for_entry(entry: dict, map_by_throw: dict[str, str]) -> str:
     """util_id for a manifest entry (map resolved from throws.parquet)."""
     tid = str(entry["throw_id"])
-    map_name = map_by_throw.get(tid) or "de_anubis"
+    map_name = _require_map(
+        map_by_throw.get(tid) or entry.get("map") or entry.get("map_name"),
+        context=tid,
+    )
     util_type = str(entry.get("util_type", "")).lower()
     side = str(entry.get("thrower_side", "T") or "T").upper()
     land = entry.get("land_pos") or entry.get("release_pos") or [0, 0, 0]
@@ -255,7 +267,10 @@ def _build_poses_json(grp: list[dict], demo_id: str) -> dict:
     """Aggregate throws in a util_id group into one _throw_poses.json."""
     data: dict = {
         "_throws": {},
-        "_cameras": (grp[0].get("cameras") or "flight"),
+        "_cameras": (
+            grp[0].get("cameras")
+            or cameras_for_util_type(grp[0].get("util_type", ""))
+        ),
         "_demo_id": demo_id,
     }
     for i, entry in enumerate(grp, start=1):
@@ -292,7 +307,7 @@ def _build_job(util_dir: Path, throw_id: str, throws_df: pd.DataFrame, util_cams
         except Exception:
             demo_id = ""
     util_id = _util_id_for_row(row)
-    cameras = row.get("cameras") or _cameras_for_type(row.get("util_type", ""))
+    cameras = row.get("cameras") or cameras_for_util_type(row.get("util_type", ""))
 
     demo_path = str(_find_demo_for_id(util_cams_root, demo_id))
     if not Path(demo_path).is_file():

@@ -9,24 +9,27 @@ minutes. One card per match is queued from `backlog/<match>/{high,medium}/`
 (rating >= 1.0), picked by **weight** (not raw HLTV rating). The worker runs
 one `scripts/pov/pipeline.py` process at a time, **up to 3 uploads per local
 calendar day** (the YouTube long-form slots). When that POV is youtube-ready,
-the listener spawns `scripts/upload/upload_youtube.py` for **that** overlay
-`upload_meta.json` in a new console, then immediately starts the next queued
-render. It does not run `upload_pending.py` (that script scans every pending
-meta under `youtube/` and can pick up leftovers / double-queue).
+the listener spawns `scripts/upload/upload_pending.py --dir <overlay> --limit 1`
+for **that** overlay folder in a new console, then immediately starts the next
+render. `--dir` keeps the scan inside the POV's youtube folder so leftover
+pending metas are not picked up.
 Shorts timelines are extracted inside `create_backlog.py` (Recognised Pros
 only, skip with `--no-shorts`; low-demand POVs without a NAVI / Spirit /
 Vitality hook are dropped). Output is written only when at least one
 short is detected: `renders/shorts/shorts-<demo-stem>/shorts-<slug>/`.
 
-## Daily FACEIT notable (off days)
+## FACEIT notables (off days)
 
 The listener also reads upcoming / live matches from the event page (and the
-event matches tab when the overview has no timestamps). If the event has
-nothing today — not live, not upcoming later, and no notable result already
-posted — the day's 3 slots are filled from **daily FACEIT notables**
-(`scripts/faceit/daily_notable.py`): top weighted Recognised-Pro POVs, one per
-player and match, with the persistent pool in `.data/notable_daily.json`.
-Demos are downloaded and backlog cards built, then they go through the same
+event matches tab when the overview has no timestamps). If nothing is live
+and nothing starts in the next 24 hours, it **keeps polling FACEIT** (same
+loop as HLTV, 15-minute scrape cooldown) for watchable Recognised-Pro POVs
+from the last 24 hours. A POV qualifies only if it is a **plus-K/D win**
+from an HLTV **top-10 org** (donk / kyousuke / m0NESY tier). High K/D or
+ADR against a weaker lobby does not qualify. Those are queued as they appear, one
+player/match, up to the remaining daily slots. Weak leftover games are
+not used to pad the day to 3.
+Demos are downloaded and a single-POV backlog card is built, then the same
 pipeline + upload-spawn path as HLTV cards.
 
 HLTV leftover work (queued or still-discovered matches) is finished before
@@ -103,5 +106,5 @@ rendering. To upload one finished POV by hand (same command the listener
 spawns):
 
 ```powershell
-python scripts/upload/upload_youtube.py <youtube/{run_id}_overlay/video.mp4> --meta youtube/{run_id}_overlay/upload_meta.json --privacy private
+python scripts/upload/upload_pending.py --dir youtube/{run_id}_overlay --limit 1
 ```

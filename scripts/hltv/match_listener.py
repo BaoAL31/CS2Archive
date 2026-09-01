@@ -5,14 +5,16 @@ demand, org rank, and HLTV rating. One card per match is queued from
 ``backlog/<match>/{high,medium}/``.
 
 Cap is 3 uploads per local calendar day (the YouTube long-form slots).
-When the configured event has no matches today — live, upcoming, or already
-completed — the listener fills remaining slots from daily FACEIT notables.
+When the configured event has nothing live and nothing starting in the
+next 24 hours, the listener keeps polling FACEIT for watchable POVs
+(plus-K/D win from an HLTV top-10 org). It queues those as they appear, up
+to the remaining daily slots, and does not pad with weak games.
 
 The listener is intentionally a single process and a single pipeline worker.
 It persists state in ``.listener/hltv.json`` so a restart does not repeat
 downloads or renders. When a POV is youtube-ready, upload starts in a new
-console via ``scripts/upload/upload_youtube.py`` for that overlay meta only
-(not ``upload_pending.py``, which would scan every leftover pending file).
+console via ``scripts/upload/upload_pending.py --dir <overlay> --limit 1``
+so leftover pending metas under ``youtube/`` are not picked up.
 The listener then pops the queue and renders the next card.
 
 Examples:
@@ -32,7 +34,7 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -58,9 +60,11 @@ from scrapers.hltv_acquire import (  # noqa: E402
     match_slug_from_url,
 )
 from daily_notable import (  # noqa: E402
+    DEFAULT_HOURS,
+    discover_good_povs,
     download_and_backlog,
-    pick_for_day,
     rel_card_for_pick,
+    remember_picks,
 )
 
 DEFAULT_EVENT_URL = "https://www.hltv.org/events/8249/blast-open-porto-2026"
@@ -68,6 +72,8 @@ DEFAULT_STATE = ROOT / ".listener" / "hltv.json"
 DEFAULT_RANKINGS_URL = "https://www.hltv.org/ranking/teams"
 MIN_RATING = 1.5
 DAILY_UPLOAD_LIMIT = 3
+FACEIT_HORIZON = timedelta(hours=24)
+FACEIT_SCRAPE_INTERVAL = timedelta(minutes=15)
 
 
 @dataclass
@@ -85,6 +91,7 @@ class ScheduledMatch:
     match_id: str
     unix_ms: int | None = None
     live: bool = False
+    slug: str = ""
 
 
 def _slug_teams(slug: str) -> tuple[str, str]:
@@ -202,6 +209,23 @@ def _unix_from_node(node) -> int | None:
     return None
 
 
+def _is_live(node) -> bool:
+    """True when HLTV marks the fixture live.
+
+    The matches tab reuses class ``matchLive`` on star-rating chips, so that
+    class is not a live signal. Prefer the ``live`` attribute on
+    ``.match-wrapper``; fall back to the older live-container / live-time
+    markup.
+    """
+    wrapper = node if node.get("live") is not None else node.select_one("[live]")
+    if wrapper is not None and wrapper.get("live") is not None:
+        return str(wrapper.get("live")).strip().lower() in {"true", "1", "yes"}
+    classes = " ".join(node.get("class") or [])
+    if "liveMatch" in classes or "live-match" in classes:
+        return True
+    return bool(node.select_one(".matchTime.matchLive"))
+
+
 def parse_scheduled_matches(html: str) -> list[ScheduledMatch]:
     """Parse live/upcoming matches (with start timestamps) from an event page."""
     soup = BeautifulSoup(html, "lxml")
@@ -213,12 +237,6 @@ def parse_scheduled_matches(html: str) -> list[ScheduledMatch]:
     found: list[ScheduledMatch] = []
     seen: set[str] = set()
     for node in nodes:
-        classes = " ".join(node.get("class") or [])
-        live = (
-            "liveMatch" in classes
-            or "live-match" in classes
-            or bool(node.select_one(".matchLive, .matchTime.matchLive"))
-        )
         unix_ms = _unix_from_node(node)
         parsed = _canonical_match(node.get("href") or "")
         if not parsed:
@@ -228,34 +246,76 @@ def parse_scheduled_matches(html: str) -> list[ScheduledMatch]:
                     break
         if not parsed:
             continue
-        match_id, _slug = parsed
+        match_id, slug = parsed
         if match_id in seen:
             continue
         seen.add(match_id)
-        found.append(ScheduledMatch(match_id=match_id, unix_ms=unix_ms, live=live))
+        found.append(ScheduledMatch(
+            match_id=match_id, unix_ms=unix_ms, live=_is_live(node), slug=slug))
     return found
 
 
-def event_busy_on_day(
+def _scheduled_when(item: ScheduledMatch) -> datetime | None:
+    if item.unix_ms is None:
+        return None
+    try:
+        return datetime.fromtimestamp(item.unix_ms / 1000)
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def upcoming_within(
     scheduled: list[ScheduledMatch],
-    today_completed: list[Match],
-    day: date,
-) -> bool:
-    """True when the event has live, upcoming, or completed matches on ``day``."""
-    if today_completed:
-        return True
+    now: datetime | None = None,
+    horizon: timedelta = FACEIT_HORIZON,
+) -> list[ScheduledMatch]:
+    """Live matches, plus timed fixtures at or before ``now + horizon``."""
+    now = now or datetime.now()
+    until = now + horizon
+    found: list[ScheduledMatch] = []
     for item in scheduled:
         if item.live:
-            return True
-        if item.unix_ms is None:
+            found.append(item)
             continue
-        try:
-            when = datetime.fromtimestamp(item.unix_ms / 1000).date()
-        except (OSError, OverflowError, ValueError):
+        when = _scheduled_when(item)
+        if when is not None and now <= when <= until:
+            found.append(item)
+    return found
+
+
+def event_busy(
+    scheduled: list[ScheduledMatch],
+    now: datetime | None = None,
+) -> bool:
+    """True when the event is live or a match starts within 24h."""
+    return bool(upcoming_within(scheduled, now=now))
+
+
+def format_scheduled(
+    scheduled: list[ScheduledMatch],
+    now: datetime | None = None,
+    limit: int = 6,
+) -> str:
+    """Human-readable upcoming/live fixtures for the poll log."""
+    now = now or datetime.now()
+    rows: list[tuple[datetime, str]] = []
+    undated: list[str] = []
+    for item in scheduled:
+        label = item.slug or item.match_id
+        if item.live:
+            rows.append((now, f"{label} LIVE"))
             continue
-        if when == day:
-            return True
-    return False
+        when = _scheduled_when(item)
+        if when is None:
+            undated.append(label)
+            continue
+        hours = (when - now).total_seconds() / 3600
+        rows.append((when, f"{label} {when:%Y-%m-%d %H:%M} ({hours:+.1f}h)"))
+    rows.sort(key=lambda row: row[0])
+    parts = [text for _when, text in rows[:limit]]
+    if undated:
+        parts.append(f"{len(undated)} undated")
+    return "; ".join(parts) if parts else "none"
 
 
 def _default_state() -> dict:
@@ -485,7 +545,8 @@ def _queue_room(state: State) -> int:
 def _is_faceit_card(path: str, meta: dict | None = None) -> bool:
     if meta and (meta.get("is_faceit") or meta.get("faceit_match_id")):
         return True
-    return path.replace("\\", "/").startswith("backlog/faceit/")
+    norm = path.replace("\\", "/")
+    return norm.startswith("backlog/faceit/") or norm.startswith("faceit/")
 
 
 def has_pending_hltv(state: State) -> bool:
@@ -498,16 +559,22 @@ def has_pending_hltv(state: State) -> bool:
     return False
 
 
-def should_fill_faceit(state: State, hltv_busy: bool) -> bool:
+def should_poll_faceit(state: State, hltv_busy: bool,
+                       now: datetime | None = None) -> bool:
     if hltv_busy or has_pending_hltv(state):
         return False
     if _slots_left(state) <= 0:
         return False
-    daily = _daily(state)
-    if daily.get("faceit_attempted") or daily.get("faceit_queued"):
-        return False
-    if any(_is_faceit_card(path) for path in state.data.get("queue") or []):
-        return False
+    now = now or datetime.now()
+    last = _daily(state).get("faceit_last_scrape")
+    if last:
+        try:
+            when = datetime.fromisoformat(last)
+        except ValueError:
+            when = None
+        else:
+            if now - when < FACEIT_SCRAPE_INTERVAL:
+                return False
     return True
 
 
@@ -516,20 +583,41 @@ async def _maybe_queue_faceit(args, state: State, indexes: dict | None) -> None:
     if room <= 0:
         return
     daily = _daily(state)
+    daily["faceit_last_scrape"] = datetime.now().isoformat()
     if args.dry_run:
-        print("[faceit-notable] would pick daily FACEIT notables", flush=True)
+        print("[faceit-notable] would scrape FACEIT for watchable POVs",
+              flush=True)
+        state.save()
         return
-    print("[faceit-notable] no HLTV matches today; picking FACEIT notables",
-          flush=True)
-    picks = await pick_for_day(
-        n=DAILY_UPLOAD_LIMIT,
-        skip_youtube_demand=True,
-        dry_run=False,
+    print(
+        f"[faceit-notable] no HLTV match in the next 24h; "
+        f"scraping last {DEFAULT_HOURS}h for watchable POVs "
+        f"({room} slot(s))",
+        flush=True,
     )
+    picks = await discover_good_povs(
+        n=room,
+        hours=DEFAULT_HOURS,
+        skip_youtube_demand=True,
+    )
+    if not picks:
+        print("[faceit-notable] no watchable FACEIT POVs this scrape",
+              flush=True)
+        state.save()
+        return
+    for pick in picks:
+        print(
+            f"[faceit-notable] pick {pick.get('player')} "
+            f"{pick.get('kills')}/{pick.get('deaths')} "
+            f"K/D {pick.get('kd')} ADR {pick.get('adr')} "
+            f"{pick.get('map')} [{pick.get('match_id')}]",
+            flush=True,
+        )
     missing = [pick for pick in picks if rel_card_for_pick(pick) is None]
     if missing:
         await asyncio.to_thread(download_and_backlog, missing)
     cards: list[str] = []
+    queued_picks: list[dict] = []
     for pick in picks:
         card = rel_card_for_pick(pick)
         if not card:
@@ -540,13 +628,19 @@ async def _maybe_queue_faceit(args, state: State, indexes: dict | None) -> None:
             )
             continue
         cards.append(card)
+        queued_picks.append(pick)
         if len(cards) >= room:
             break
-    daily["faceit_attempted"] = True
-    daily["faceit_queued"] = cards
+    remember_picks(queued_picks)
+    queued = list(daily.get("faceit_queued") or [])
+    for card in cards:
+        if card not in queued:
+            queued.append(card)
+    daily["faceit_queued"] = queued
     if cards:
         _enqueue(state, cards, indexes)
-        print(f"[faceit-notable] queued {len(cards)} card(s)", flush=True)
+        print(f"[faceit-notable] queued {len(cards)} watchable card(s)",
+              flush=True)
     else:
         print("[faceit-notable] no FACEIT cards to queue", flush=True)
     state.save()
@@ -645,14 +739,10 @@ def _upload_cmd(meta_path: Path) -> list[str] | None:
         return None
     cmd = [
         sys.executable, "-u",
-        str(ROOT / "scripts/upload/upload_youtube.py"),
-        str(video),
-        "--meta", str(meta_path),
-        "--privacy", str(data.get("privacy") or "private"),
+        str(ROOT / "scripts/upload/upload_pending.py"),
+        "--dir", str(meta_path.parent),
+        "--limit", "1",
     ]
-    thumb = data.get("thumbnail_path")
-    if thumb and Path(thumb).exists():
-        cmd += ["--thumbnail", str(thumb)]
     return cmd
 
 
@@ -675,7 +765,7 @@ def _spawn_upload_terminal(cmd: list[str], dry_run: bool) -> None:
 
 def _start_upload_after_pipeline(card: str, dry_run: bool) -> None:
     if dry_run:
-        print(f"[upload] would spawn upload_youtube.py for {card}", flush=True)
+        print(f"[upload] would spawn upload_pending.py for {card}", flush=True)
         return
     metas = _pending_upload_metas(card)
     if not metas:
@@ -773,33 +863,28 @@ async def poll_once(args, state: State) -> None:
             if extra:
                 scheduled = extra
             event_ids |= parse_event_match_ids(tab_html)
-    today = datetime.now().date()
+    now = datetime.now()
+    today = now.date()
     event_slug = event_url.rstrip("/").rsplit("/", 1)[-1]
     event_name = re.sub(r"[-_]+", " ", event_slug).casefold()
     result_links: list[Match] = []
-    today_links: list[Match] = []
     for offset in (0, 1):
         target_date = (today - timedelta(days=offset)).isoformat()
         results_url = f"{settings.hltv_base_url}/results?date={target_date}"
         results_html = await asyncio.to_thread(fetch_hltv_page_html, results_url,
                                                 headless=True, wait_selector=None)
-        parsed = parse_match_links(results_html)
-        result_links.extend(parsed)
-        if offset == 0:
-            today_links = parsed
+        result_links.extend(parse_match_links(results_html))
     matches = select_matches(result_links, event_ids, state.data["teams"],
                              event_name)
     matches = list({match.match_id: match for match in matches}.values())
-    today_matches = select_matches(
-        today_links, event_ids, state.data["teams"], event_name)
-    today_matches = list({m.match_id: m for m in today_matches}.values())
-    hltv_busy = event_busy_on_day(scheduled, today_matches, today)
+    hltv_busy = event_busy(scheduled, now)
     print(
         f"[poll] {len(matches)} notable completed event match(es); "
-        f"hltv_today={'yes' if hltv_busy else 'no'}; "
+        f"hltv_next_24h={'yes' if hltv_busy else 'no'}; "
         f"{_slots_left(state)}/{DAILY_UPLOAD_LIMIT} upload slot(s) left",
         flush=True,
     )
+    print(f"[schedule] {format_scheduled(scheduled, now)}", flush=True)
     if not state.data.get("result_baseline_initialized"):
         initialize_result_baseline(state, matches)
         state.save()
@@ -853,7 +938,7 @@ async def poll_once(args, state: State) -> None:
             record["last_error"] = None
             state.save()
 
-    if should_fill_faceit(state, hltv_busy):
+    if should_poll_faceit(state, hltv_busy):
         await _maybe_queue_faceit(args, state, indexes)
 
     while state.data["queue"] and _slots_left(state) > 0:

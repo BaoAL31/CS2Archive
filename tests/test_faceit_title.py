@@ -10,7 +10,7 @@ import faceit_title as ft  # noqa: E402
 
 def test_title_with_kd_and_elo():
     t = ft.build_title("donk", "Mirage", [], 5512, 3470, "34/11")
-    assert t == "donk (34-11) 5512 ELO vs 3470 ELO | Mirage | FACEIT CS2 POV"
+    assert t == "donk (34-11) 5512 ELO vs ~3470 ELOs | Mirage | FACEIT CS2 POV"
 
 
 def test_title_with_kd_no_elo():
@@ -20,7 +20,7 @@ def test_title_with_kd_no_elo():
 
 def test_title_elo_kept_no_kd():
     t = ft.build_title("donk", "Mirage", [], 5512, 3470, None)
-    assert t == "donk 5512 ELO vs 3470 ELO | Mirage | FACEIT CS2 POV"
+    assert t == "donk 5512 ELO vs ~3470 ELOs | Mirage | FACEIT CS2 POV"
 
 
 def test_title_no_kd_no_elo():

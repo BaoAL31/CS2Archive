@@ -92,12 +92,10 @@ def test_csdm_subprocess_called(tmp_path):
     }
     timeline_path.write_text(json.dumps(timeline))
 
-    mock_subprocess = MagicMock()
-    mock_subprocess.return_value.returncode = 0
     mock_seq_view = MagicMock()
     mock_seq_view.return_value = []
 
-    with patch("subprocess.run", mock_subprocess), \
+    with patch("shorts.render_shorts._run_csdm_hook_aware") as mock_hook, \
          patch("shorts.render_shorts._get_player_crosshair_cvars", return_value=[]), \
          patch("shorts.render_shorts._find_sequence_files", mock_seq_view), \
          patch("shorts.render_shorts._composite_9x16") as mock_composite:
@@ -106,11 +104,7 @@ def test_csdm_subprocess_called(tmp_path):
         except RuntimeError:
             pass  # no sequence files found is expected after CSDM mock
 
-    csdm_calls = [
-        c for c in mock_subprocess.call_args_list
-        if "csdm.cmd" in str(c.args[0]) or ("video" in str(c.args[0]) and "--config-file" in str(c.args[0]))
-    ]
-    assert len(csdm_calls) >= 1
+    assert mock_hook.called
 
 
 # ------------------------------------------------------------

@@ -17,11 +17,15 @@ from _pathsetup import ensure
 ensure()
 
 from cs2_minimizer import CS2Park
+from config import settings, apply_runtime_env
+from hook_aware import kill_stale_processes as _kill_stale_processes
 
-CSDM = r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd"
-FFMPEG_PATH = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
-GAME_CFG = Path(r"D:\Steam\steamapps\common\Counter-Strike Global Offensive\game\csgo\cfg")
-CFG_BACKUP_DIR = Path(r"D:\Projects\CS2UtilArchive\cs2_config_backup")
+apply_runtime_env()
+
+CSDM = settings.csdm_cmd
+FFMPEG_PATH = settings.ffmpeg_exe
+GAME_CFG = Path(settings.cs2_cfg_dir)
+CFG_BACKUP_DIR = Path(settings.cs2util_root) / "cs2_config_backup"
 
 # Source-of-truth personal cfgs live OUTSIDE Steam folder (Steam flags them).
 # Render writes to GAME_CFG/autoexec.cfg during rendering; finally restores from backup.
@@ -31,11 +35,8 @@ AUTOEXEC_PERSONAL_BACKUP = CFG_BACKUP_DIR / "autoexec_personal_backup.cfg"
 AUTOEXEC_MAIN = GAME_CFG / "autoexec.cfg"  # active cfg CS2 reads on startup
 RENDER_CROSSHAIR_CFG = GAME_CFG / "render_crosshair.cfg"
 
-os.environ["HF_HOME"] = "D:/.cache/huggingface"
-os.environ["HF_HUB_CACHE"] = "D:/.cache/huggingface/hub"
-
 HF_REPO_DEFAULT = "cs2povarchive/cs2-demos"
-HF_CACHE_DIR = Path(os.environ["HF_HOME"])
+HF_CACHE_DIR = Path(settings.hf_home)
 
 
 def _ensure_demo(demo_path_str: str, hf_root: str = "",
@@ -385,147 +386,68 @@ def _finish_csdm(cmd: list[str], label: str, expected: Path | None,
     sys.exit(1)
 
 
-def _existing_sequences(output_dir: Path) -> set[str]:
-    """Identifiers of already-complete sequence videos in output_dir.
-
-    Handles both CSDM output layouts:
-      - New (3.20+):  N-sequence/video.mp4 directories under output_dir.
-      - Old:          sequence-{i}-tick-{A}-to-{B}.mp4 in output_dir root.
-    Returns a set of relative-path identifiers for videos >= 1 MB, so a newly
-    appearing (growing) file is seen as a change vs the captured `before` set.
-    """
-    found: set[str] = set()
-
-    for seq_dir in output_dir.glob("*-sequence"):
-        if not seq_dir.is_dir():
-            continue
-        video = seq_dir / "video.mp4"
-        if video.is_file() and video.stat().st_size >= 1_048_576:
-            found.add(str(video.relative_to(output_dir)))
-
-    for p in output_dir.glob("sequence-*-tick-*-to-*.mp4"):
-        if p.is_file() and p.stat().st_size >= 1_048_576:
-            found.add(p.name)
-
-    return found
-
-
-def _new_sequence_appeared(output_dir: Path, before: set[str]) -> bool:
-    now = _existing_sequences(output_dir)
-    return now - before != set()
-
-
-def _purge_partial_sequences(output_dir: Path) -> None:
-    """Remove partial sequence outputs from a killed/aborted attempt.
-
-    Deletes N-sequence/video.mp4 dirs (new format) and sequence-*.mp4 (old
-    format). These are the raw CSDM outputs that would otherwise be mistaken
-    for newly-engaged work on the next retry (same relative path), and would
-    mask a genuine hook failure. Already-renamed round_*.mp4 files are left
-    untouched.
-    """
-    for seq_dir in output_dir.glob("*-sequence"):
-        if seq_dir.is_dir():
-            shutil.rmtree(seq_dir, ignore_errors=True)
-    for p in output_dir.glob("sequence-*-tick-*-to-*.mp4"):
-        try:
-            p.unlink()
-        except OSError:
-            pass
-
-
 def _run_csdm_hook_aware(cmd: list[str], label: str, expected: Path | None,
                          output_dir: Path, hook_timeout: float,
                          hook_retries: int) -> Path | None:
-    """Run csdm with hook detection + retry.
+    """Wrap ``hook_aware.run_csdm_hook_aware``; keep challengermode + expected copy."""
+    from hook_aware import list_videos, run_csdm_hook_aware
 
-    Watches output_dir for a new >=1 MB sequence file; the vanilla-viewer hook
-    failure never produces one, so we kill CS2/HLAE and retry. Returns the video
-    Path on success, or exits after exhausting retries.
-    """
-    for attempt in range(1, hook_retries + 1):
-        attempt_suffix = f" (attempt {attempt}/{hook_retries})" if hook_retries > 1 else ""
-        print(f"  [{label}]{attempt_suffix}...", end=" ", flush=True)
-        t0 = time.time()
+    extra = max(0, int(hook_retries) - 1)
 
-        # Each attempt renders from a clean slate: purge any partial sequences
-        # left by a killed/aborted attempt, then re-baseline what counts as
-        # "new". round_*.mp4 from completed batches are preserved.
-        _purge_partial_sequences(output_dir)
-        before = _existing_sequences(output_dir)
+    def pick_output(od: Path, before: set[str]):
+        if expected is not None and expected.is_file() and expected.stat().st_size >= 1_048_576:
+            return expected
+        videos = list_videos(od) - before
+        if not videos:
+            return None
+        return max((od / v for v in videos), key=lambda p: p.stat().st_mtime)
 
-        log_path = output_dir / f".csdm_hook_attempt_{attempt}.log"
-        with open(log_path, "w", encoding="utf-8") as logf:
-            proc = subprocess.Popen(
-                cmd, stdout=logf, stderr=subprocess.STDOUT, text=True,
-            )
+    def _once(c: list[str], lab: str) -> Path | None:
+        return run_csdm_hook_aware(
+            c, lab, output_dir,
+            hook_timeout=hook_timeout,
+            hook_retries=extra,
+            pick_output=pick_output,
+        )
 
-            # Poll for the hook to engage (a new sequence file appears) or the
-            # process to exit on its own.
-            engaged = False
-            poll_start = time.time()
-            while time.time() - poll_start < hook_timeout:
-                if proc.poll() is not None:
-                    break  # csdm exited on its own
-                if _new_sequence_appeared(output_dir, before):
-                    engaged = True
-                    break
-                time.sleep(5)
-
-            if not engaged:
-                if proc.poll() is not None:
-                    # csdm exited early without producing a sequence. That's
-                    # usually a hook failure too (e.g. CS2 opened the vanilla
-                    # viewer and exited) — retry, unless a known-fatal error.
-                    log_tail = ""
-                    try:
-                        log_tail = log_path.read_text(encoding="utf-8", errors="replace")
-                    except Exception:
-                        pass
-                    fatal = any(m in log_tail.lower() for m in (
-                        "steam is not running", "raw files not found",
-                        "unknown demo source"))
-                    if fatal:
-                        # Let the normal completion path report it accurately.
-                        proc.wait(timeout=14400)
-                    else:
-                        print("HOOK-FAIL (exited early, no sequence) - killing and retrying")
-                        _kill_stale_processes()
-                        continue
-                else:
-                    # Still running but no sequence -> hook failed (vanilla viewer).
-                    print(f"HOOK-FAIL (no sequence in {hook_timeout:.0f}s) - killing and retrying")
-                    _kill_stale_processes()
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                    proc.wait()
-                    continue
-
-            proc.wait(timeout=14400)
-
-        err = ""
-        try:
-            err = log_path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
-
-        # Challengermode re-run: restart the whole (hook-aware) command.
-        if "unknown demo source" in err.lower() and "--source" not in cmd:
+    newest = _once(cmd, label)
+    if newest is None and "--source" not in cmd:
+        tail = ""
+        logs = sorted(output_dir.glob(".csdm_hook_attempt_*.log"))
+        if logs:
+            try:
+                tail = logs[-1].read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                pass
+        low = tail.lower()
+        if "unknown demo source" in low:
             cmd = cmd + ["--source", "challengermode"]
-            before = _existing_sequences(output_dir)
-            continue
-
-        try:
-            return _finish_csdm(cmd, label, expected, time.time() - t0,
-                                proc.returncode, err)
-        except SystemExit:
-            raise
-
-    print(f"[ERROR] CS2 failed to hook after {hook_retries} attempt(s) "
-          f"(no sequence produced in {hook_timeout:.0f}s).")
-    sys.exit(1)
+            newest = _once(cmd, f"{label} (challengermode)")
+        elif "steam is not running" in low:
+            print("FAILED - Steam is not running.")
+            sys.exit(1)
+        elif "raw files not found" in low:
+            print("FAILED - HLAE produced no video (check absolute --output; see AGENTS.md).")
+            sys.exit(1)
+    if newest is None:
+        print(f"[ERROR] CS2 failed to hook after {hook_retries} attempt(s) "
+              f"(no sequence produced in {hook_timeout:.0f}s).")
+        sys.exit(1)
+    if expected is not None and newest != expected:
+        for _ in range(10):
+            try:
+                shutil.copy2(str(newest), str(expected))
+                newest = expected
+                break
+            except PermissionError:
+                time.sleep(1)
+        else:
+            print("FAILED (could not copy video, file locked)")
+            sys.exit(1)
+    if newest.stat().st_size < 1_048_576:
+        print("[ERROR] Video too small")
+        sys.exit(1)
+    return newest
 
 
 def _get_player_crosshair(steam_id: str, demo_parts: list[str]) -> list[str]:
@@ -547,15 +469,6 @@ def _get_player_crosshair(steam_id: str, demo_parts: list[str]) -> list[str]:
                         cvars = crosshair_to_convars(decode_crosshair(code))
                         return cvars
     return []
-
-
-def _is_pbdems2(demo_path) -> bool:
-    """PBDEMS2 demos (FACEIT/PGL/BLAST) record per-player voice chat."""
-    try:
-        with open(demo_path, "rb") as f:
-            return f.read(7) == b"PBDEMS2"
-    except OSError:
-        return False
 
 
 def _write_render_autoexec(cvars: list[str], rename_map: dict[str, str] | None = None) -> None:
@@ -626,63 +539,6 @@ def _swap_autoexec(src: Path) -> None:
         print(f"  [ERROR] Swap source missing: {src}")
 
 
-# Image names of every process the render pipeline spawns. Killing the whole
-# tree (taskkill /t) is essential — csdm launches HLAE which launches ffmpeg,
-# and a plain /im kill leaves the children (especially ffmpeg) running.
-_RENDER_PROCESS_NAMES = ("cs2.exe", "HLAE.exe", "ffmpeg.exe", "csdm.exe", "csdm.cmd")
-
-
-def _taskkill_tree(image_name: str) -> bool:
-    """Force-kill a process image and its entire tree. Returns True if it ran."""
-    try:
-        r = subprocess.run(
-            ["taskkill", "/f", "/t", "/im", image_name],
-            capture_output=True, text=True, timeout=15,
-        )
-        return r.returncode == 0
-    except Exception:
-        return False
-
-
-def _process_running(image_name: str) -> bool:
-    """True if any process with this image name is still alive."""
-    try:
-        r = subprocess.run(
-            ["tasklist", "/fi", f"IMAGENAME eq {image_name}"],
-            capture_output=True, text=True, timeout=15,
-        )
-        out = r.stdout or ""
-        return image_name.lower() in out.lower() and "no tasks" not in out.lower()
-    except Exception:
-        return True  # assume alive on failure so we retry the kill
-
-
-def _kill_stale_processes() -> None:
-    """Kill every process left over from a previous render.
-
-    Kills the whole process tree for each render binary (cs2, HLAE, ffmpeg, csdm),
-    then polls tasklist and re-kills any survivors until they are gone (or a few
-    retries elapse). ffmpeg and HLAE often linger after a crashed batch, so they
-    are explicitly included and verified.
-    """
-    for name in _RENDER_PROCESS_NAMES:
-        _taskkill_tree(name)
-
-    # Give taskkill a beat, then hunt down anything that survived.
-    for _ in range(6):
-        survivors = [n for n in _RENDER_PROCESS_NAMES if _process_running(n)]
-        if not survivors:
-            break
-        time.sleep(0.5)
-        for n in survivors:
-            _taskkill_tree(n)
-
-    remaining = [n for n in _RENDER_PROCESS_NAMES if _process_running(n)]
-    if remaining:
-        print(f"  [WARN] could not kill: {', '.join(remaining)}")
-    time.sleep(1)
-
-
 def _check_nvenc() -> None:
     import subprocess, time
     cmd = [FFMPEG_PATH, "-y", "-f", "lavfi", "-i", "color=c=red:s=2560x1440:d=1",
@@ -736,8 +592,6 @@ def main() -> None:
                         help="Remote folder name on HF (derived from demo path parent if omitted).")
     parser.add_argument("--match-id", default="",
                         help="HLTV match ID for HF path prefix (e.g. 2395002). Required when hf_root set and local demo missing.")
-    parser.add_argument("--overlay", action="store_true",
-                        help="Apply input overlay + util cam trajectory after render.")
     parser.add_argument("--player", default="",
                         help="Player nickname for prosettings viewmodel lookup.")
     parser.add_argument("--rename", default="",
@@ -1058,25 +912,6 @@ def main() -> None:
             sys.exit(1)
 
         print(f"\nDone. {total_rendered} round(s) in {num_batches} batch(es) at {output_dir}")
-
-        if args.overlay:
-            # Run overlay on the rendered output
-            vid = next((p for p in sorted(output_dir.glob("*.mp4"))
-                        if p.stat().st_size >= 1_048_576), None)
-            if vid is None or not vid.exists():
-                print(f"[WARN] --overlay set but no video found: {vid}")
-            else:
-                round_arg = []
-                if args.rounds:
-                    # Use first round number for tick offset
-                    r = args.rounds.split(",")[0].split("-")[0]
-                    round_arg = ["--round", r]
-                subprocess.run([
-                    sys.executable, "scripts/overlay/overlay_pov.py",
-                    "--video", str(vid),
-                    "--demo", demo_path,
-                    "--steam-id", args.steam_id,
-                ] + round_arg, timeout=7200)
     finally:
         _swap_autoexec(AUTOEXEC_PERSONAL)
         print(f"  Swapped {AUTOEXEC_PERSONAL.name} -> {AUTOEXEC_MAIN.name} (restored)")

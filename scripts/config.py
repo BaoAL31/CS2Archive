@@ -4,9 +4,13 @@ CS2Archive — Central Configuration
 All paths, API endpoints, rate limits, and shared settings.
 """
 
+from __future__ import annotations
+
+import os
 from pathlib import Path
-from pydantic_settings import BaseSettings
+
 from pydantic import Field
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
@@ -19,6 +23,24 @@ class Settings(BaseSettings):
 
     # ── Paths ─────────────────────────────────────────────────────────────
     demo_storage_dir: Path = Field(default=Path("./demos"), description="Root directory for downloaded demos")
+    csdm_cmd: str = Field(
+        default=r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csdm.cmd",
+        description="cs-demo-manager CLI (csdm.cmd)",
+    )
+    ffmpeg_exe: str = Field(
+        default=r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe",
+    )
+    ffprobe_exe: str = Field(
+        default=r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffprobe.exe",
+    )
+    cs2_cfg_dir: Path = Field(
+        default=Path(r"D:\Steam\steamapps\common\Counter-Strike Global Offensive\game\csgo\cfg"),
+    )
+    cs2util_root: Path = Field(
+        default=Path(r"D:\Projects\CS2UtilArchive"),
+        description="Sibling CS2UtilArchive checkout (overlay kernel + throws.parquet)",
+    )
+    hf_home: Path = Field(default=Path(r"D:/.cache/huggingface"))
 
     # ── FACEIT ───────────────────────────────────────────────────────────
     faceit_data_api_base: str = "https://open.faceit.com/data/v4"
@@ -64,6 +86,10 @@ class Settings(BaseSettings):
         return path
 
     @property
+    def hf_hub_cache(self) -> Path:
+        return self.hf_home / "hub"
+
+    @property
     def has_faceit_key(self) -> bool:
         return bool(self.faceit_api_key and self.faceit_api_key != "your_data_api_key_here")
 
@@ -74,3 +100,9 @@ class Settings(BaseSettings):
 
 # Singleton settings instance
 settings = Settings()
+
+
+def apply_runtime_env() -> None:
+    """Point HuggingFace caches at the configured drive before hub imports."""
+    os.environ.setdefault("HF_HOME", str(settings.hf_home))
+    os.environ.setdefault("HF_HUB_CACHE", str(settings.hf_hub_cache))

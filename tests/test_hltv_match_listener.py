@@ -21,10 +21,10 @@ from hltv.match_listener import (
     parse_scheduled_matches,
     parse_top_teams,
     select_matches,
-    event_busy_on_day,
+    event_busy,
     event_matches_url,
     has_pending_hltv,
-    should_fill_faceit,
+    should_poll_faceit,
     _daily,
     _prune_queue,
     _queue_room,
@@ -217,12 +217,12 @@ def test_upload_cmd_targets_this_meta_only(tmp_path: Path):
     )
     cmd = _upload_cmd(meta_path)
     assert cmd is not None
-    assert cmd[2].endswith("upload_youtube.py")
-    assert str(video) in cmd
-    assert "--meta" in cmd and str(meta_path) in cmd
-    assert "--privacy" in cmd and "private" in cmd
-    assert "--thumbnail" in cmd and str(thumb) in cmd
-    assert "upload_pending.py" not in " ".join(cmd)
+    assert cmd[2].endswith("upload_pending.py")
+    assert "--dir" in cmd and str(meta_path.parent) in cmd
+    assert "--limit" in cmd and "1" in cmd
+    joined = " ".join(cmd)
+    assert "upload_youtube.py" not in joined
+    assert "upload_pending.py" in joined
 
 
 def test_spawn_upload_dry_run_does_not_popen(monkeypatch):
@@ -254,7 +254,7 @@ def test_start_upload_after_pipeline_dry_run_does_not_popen(monkeypatch):
     assert called == []
 
 
-def test_start_upload_spawns_upload_youtube_for_this_meta(monkeypatch, tmp_path: Path):
+def test_start_upload_spawns_upload_pending_for_this_meta(monkeypatch, tmp_path: Path):
     video = tmp_path / "video.mp4"
     video.write_bytes(b"x")
     meta_path = _write_pending_meta(tmp_path / "youtube" / "run_overlay", video)
@@ -272,10 +272,10 @@ def test_start_upload_spawns_upload_youtube_for_this_meta(monkeypatch, tmp_path:
     monkeypatch.setattr("hltv.match_listener.subprocess.Popen", fake_popen)
     _start_upload_after_pipeline("backlog/x.json", dry_run=False)
     joined = " ".join(captured["cmd"])
-    assert "upload_youtube.py" in joined
-    assert "upload_pending.py" not in joined
-    assert str(meta_path) in captured["cmd"]
-    assert str(video) in captured["cmd"]
+    assert "upload_pending.py" in joined
+    assert "upload_youtube.py" not in joined
+    assert str(meta_path.parent) in captured["cmd"]
+    assert "--limit" in captured["cmd"]
     assert captured["kwargs"].get("creationflags") == subprocess.CREATE_NEW_CONSOLE
 
 
@@ -314,25 +314,64 @@ def test_parse_scheduled_matches_reads_upcoming_and_live():
     by_id = {item.match_id: item for item in parsed}
     assert by_id["200"].unix_ms == unix_ms
     assert by_id["200"].live is False
+    assert by_id["200"].slug == "alpha-vs-beta"
     assert by_id["201"].live is True
 
 
-def test_event_busy_on_upcoming_today():
-    noon = datetime.now().replace(hour=12, minute=0, second=0, microsecond=0)
-    scheduled = [ScheduledMatch("200", unix_ms=int(noon.timestamp() * 1000))]
-    assert event_busy_on_day(scheduled, [], noon.date()) is True
+def test_parse_scheduled_matches_ignores_rating_matchlive_class():
+    html = """
+    <div data-zonedgrouping-entry-unix="1788530400000">
+      <div class="match-wrapper" live="false" data-match-id="2396947">
+        <a href="/matches/2396947/falcons-vs-g2-blast-open-porto-2026">
+          <div class="match-rating matchLive"></div>
+          <div class="match-time" data-unix="1788530400000">00:00</div>
+        </a>
+      </div>
+    </div>
+    """
+    parsed = parse_scheduled_matches(html)
+    assert len(parsed) == 1
+    assert parsed[0].live is False
+    assert parsed[0].unix_ms == 1788530400000
 
 
-def test_event_idle_when_only_tomorrow_is_scheduled():
-    tomorrow = datetime.now() + timedelta(days=1)
-    tomorrow = tomorrow.replace(hour=12, minute=0, second=0, microsecond=0)
-    scheduled = [ScheduledMatch("200", unix_ms=int(tomorrow.timestamp() * 1000))]
-    assert event_busy_on_day(scheduled, [], datetime.now().date()) is False
+def test_parse_scheduled_matches_reads_live_attribute():
+    html = """
+    <div data-zonedgrouping-entry-unix="1788530400000">
+      <div class="match-wrapper" live="true">
+        <a href="/matches/201/gamma-vs-delta">gamma vs delta</a>
+      </div>
+    </div>
+    """
+    parsed = parse_scheduled_matches(html)
+    assert parsed[0].live is True
 
 
-def test_event_busy_when_today_already_completed():
-    done = Match("100", "https://hltv/matches/100/a-vs-b", "a-vs-b", "a", "b")
-    assert event_busy_on_day([], [done], datetime.now().date()) is True
+def test_event_busy_when_match_starts_within_24h():
+    now = datetime(2026, 9, 1, 20, 39)
+    soon = now + timedelta(hours=18)
+    scheduled = [ScheduledMatch("200", unix_ms=int(soon.timestamp() * 1000))]
+    assert event_busy(scheduled, now) is True
+
+
+def test_event_idle_when_next_match_is_beyond_24h():
+    now = datetime(2026, 9, 1, 20, 39)
+    later = now + timedelta(hours=25)
+    scheduled = [ScheduledMatch("200", unix_ms=int(later.timestamp() * 1000))]
+    assert event_busy(scheduled, now) is False
+
+
+def test_event_busy_when_live_even_if_unscheduled():
+    now = datetime(2026, 9, 1, 20, 39)
+    scheduled = [ScheduledMatch("200", live=True)]
+    assert event_busy(scheduled, now) is True
+
+
+def test_event_idle_when_only_completed_results_remain():
+    now = datetime(2026, 9, 1, 20, 39)
+    later = now + timedelta(hours=48)
+    scheduled = [ScheduledMatch("200", unix_ms=int(later.timestamp() * 1000))]
+    assert event_busy(scheduled, now) is False
 
 
 def test_daily_slots_reset_on_new_day(tmp_path: Path):
@@ -345,19 +384,30 @@ def test_daily_slots_reset_on_new_day(tmp_path: Path):
     assert _queue_room(state) == DAILY_UPLOAD_LIMIT
 
 
-def test_should_fill_faceit_only_on_idle_hltv_day(tmp_path: Path):
+def test_should_poll_faceit_only_on_idle_hltv_day(tmp_path: Path):
     state = State(tmp_path / "listener.json")
-    assert should_fill_faceit(state, hltv_busy=False)
-    assert not should_fill_faceit(state, hltv_busy=True)
+    assert should_poll_faceit(state, hltv_busy=False)
+    assert not should_poll_faceit(state, hltv_busy=True)
     state.data["queue"] = ["backlog/match/high/donk.json"]
     assert has_pending_hltv(state)
-    assert not should_fill_faceit(state, hltv_busy=False)
+    assert not should_poll_faceit(state, hltv_busy=False)
 
 
-def test_should_not_fill_faceit_twice_in_one_day(tmp_path: Path):
+def test_should_poll_faceit_again_when_slots_remain(tmp_path: Path):
     state = State(tmp_path / "listener.json")
-    _daily(state)["faceit_attempted"] = True
-    assert not should_fill_faceit(state, hltv_busy=False)
+    daily = _daily(state)
+    daily["completed"] = ["faceit/2026-09-01/high/neityu-nuke.json"]
+    daily["faceit_queued"] = daily["completed"]
+    assert _slots_left(state) == DAILY_UPLOAD_LIMIT - 1
+    assert should_poll_faceit(state, hltv_busy=False)
+
+
+def test_should_not_scrape_faceit_inside_cooldown(tmp_path: Path):
+    state = State(tmp_path / "listener.json")
+    now = datetime(2026, 9, 1, 21, 0)
+    _daily(state)["faceit_last_scrape"] = now.isoformat()
+    assert not should_poll_faceit(state, hltv_busy=False, now=now + timedelta(minutes=5))
+    assert should_poll_faceit(state, hltv_busy=False, now=now + timedelta(minutes=16))
 
 
 def test_prune_keeps_one_faceit_card_per_match(tmp_path: Path, monkeypatch):

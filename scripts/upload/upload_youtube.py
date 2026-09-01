@@ -343,8 +343,8 @@ def upload_video(
             meta["publish_at_utc"] = publish_at_utc
         with open(mp, "w") as f:
             json.dump(meta, f, indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  [WARN] failed to write youtube_id into meta: {e}", flush=True)
 
     # Clean up legacy session file if it exists
     try:
@@ -366,6 +366,11 @@ def upload_video(
             print(f"  Thumbnail failed: {e}", flush=True)
 
     return video_id
+
+
+def youtube_upload_completed(meta: dict) -> bool:
+    """True when this meta already has a finished YouTube object."""
+    return bool(meta.get("youtube_id") and meta.get("upload_status") == "completed")
 
 
 def _update_thumbnail(youtube, video_id: str, thumb_path: str) -> None:
@@ -506,6 +511,8 @@ def main() -> None:
         )
         print(f"  Bilibili aid={aid}", flush=True)
 
+    yt_done = youtube_upload_completed(meta)
+
     if args.bilibili_only:
         try:
             _run_bilibili()
@@ -513,6 +520,20 @@ def main() -> None:
         except Exception as e:
             print(f"[ERROR] bilibili upload failed: {e}", flush=True)
             sys.exit(1)
+        return
+
+    if yt_done:
+        print(
+            f"  [skip] YouTube already completed id={meta.get('youtube_id')}",
+            flush=True,
+        )
+        if args.also_bilibili:
+            try:
+                _run_bilibili()
+            except Exception as e:
+                print(f"[ERROR] bilibili upload failed: {e}", flush=True)
+                sys.exit(1)
+        print("Done!", flush=True)
         return
 
     print("Authenticating with Google...", flush=True)
@@ -576,6 +597,12 @@ def main() -> None:
         # publishAt (already in meta via upload_video). Resume case needs no
         # call — upload_video recorded the session-committed time directly.
         _record_publish_meta(meta_file_path, publish_tz, publish_at_utc)
+    if args.also_bilibili:
+        try:
+            _run_bilibili()
+        except Exception as e:
+            print(f"[ERROR] bilibili upload failed: {e}", flush=True)
+            sys.exit(1)
     print("Done!", flush=True)
 
 
