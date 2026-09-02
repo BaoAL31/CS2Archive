@@ -275,9 +275,10 @@ def run(demo: Path, *, map_override: str = "", tournament: str = "",
         )
         shorts_list, dropped_demand = filter_publishable_shorts(
             timeline.get("shorts", []), orgs=folder_orgs(demo),
+            source="faceit",
         )
         base_dir = resolve_output_dir(demo)
-        suffix = filter_suffix(dropped_randos, dropped_demand)
+        suffix = filter_suffix(dropped_randos, dropped_demand, source="faceit")
         if not shorts_list:
             discard_empty_shorts_dir(base_dir)
             print(f"[SHORTS] 0 shorts detected{suffix}")

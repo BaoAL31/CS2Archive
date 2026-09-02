@@ -366,8 +366,29 @@ def _extract_shorts(demos: list[Path]) -> None:
         from shorts.demand_gate import (
             filter_publishable_shorts, folder_orgs, filter_suffix,
         )
+        shorts = list(timeline.get("shorts") or [])
+        opp_cache: dict[str, tuple[str | None, str | None]] = {}
+        try:
+            from shorts.detect_team import detect_pov_opponent
+        except Exception:
+            detect_pov_opponent = None  # type: ignore
+        if detect_pov_opponent:
+            for short in shorts:
+                sid = str(short.get("pov_steam_id") or "")
+                if not sid:
+                    continue
+                if sid not in opp_cache:
+                    try:
+                        opp_cache[sid] = detect_pov_opponent(demo, sid)
+                    except Exception:
+                        opp_cache[sid] = (None, None)
+                pov, opp = opp_cache[sid]
+                if pov and not short.get("pov_team"):
+                    short["pov_team"] = pov
+                if opp and not short.get("opponent"):
+                    short["opponent"] = opp
         shorts_list, dropped_demand = filter_publishable_shorts(
-            timeline.get("shorts", []), orgs=folder_orgs(demo),
+            shorts, orgs=folder_orgs(demo),
         )
         base_dir = resolve_output_dir(demo)
         suffix = filter_suffix(dropped_randos, dropped_demand)

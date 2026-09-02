@@ -109,6 +109,26 @@ def refresh(*, scrape: bool = True) -> int:
     except Exception as exc:
         failed += 1
         print(f"[TEAM] failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+    try:
+        from shorts.fit_partial_stars import (
+            DAILY_NEW_MATCHES,
+            harvest_allstar,
+            listener_holds_cloak,
+            refresh_partial_stars,
+        )
+        if scrape and not listener_holds_cloak():
+            print(f"[SHORTS] Allstar harvest (max {DAILY_NEW_MATCHES} unseen match pages)")
+            harvest_allstar(max_matches=DAILY_NEW_MATCHES)
+        elif scrape:
+            print("[SHORTS] skip Allstar harvest: listener holds CloakBrowser")
+        stars = refresh_partial_stars(fetch_views=scrape)
+        print(
+            f"[SHORTS] Partial stars intercept={stars['intercept']:.3f} "
+            f"rows={stars.get('_rows', 0)}"
+        )
+    except Exception as exc:
+        failed += 1
+        print(f"[SHORTS] failed: {type(exc).__name__}: {exc}", file=sys.stderr)
     return failed
 
 

@@ -1,9 +1,7 @@
 """Gate which Recognised-Pro Shorts are worth a daily upload slot.
 
-Recognised-Pro status is too wide: r1nkle/z4KR clips take the two Shorts
-slots and die at <10 views. Keep a clip if the POV has measured YouTube
-demand, or the match/title names NAVI, Spirit, or Vitality (the orgs that
-actually rescue an unknown POV on this channel).
+HLTV cuts use Candidate score (Partial stars). FACEIT still uses the player
+index / NAVI-Spirit-Vitality hook until FACEIT scoring reuses the same model.
 """
 from __future__ import annotations
 
@@ -13,6 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 DEMAND_PATH = ROOT / ".data" / "player_demand_index.json"
+STARS_PATH = ROOT / ".data" / "partial_stars.json"
 
 SHORTS_INDEX_FLOOR = 1.0
 SHORTS_MIN_VIDEOS = 8
@@ -42,6 +41,36 @@ def _load_payload() -> dict:
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def load_partial_stars(path: Path | None = None) -> dict:
+    dest = path or STARS_PATH
+    if not dest.is_file():
+        return {"intercept": 0.0, "player": {}, "opponent": {}, "stage": {}, "kind": {}}
+    try:
+        data = json.loads(dest.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {"intercept": 0.0, "player": {}, "opponent": {}, "stage": {}, "kind": {}}
+    return data if isinstance(data, dict) else {}
+
+
+def candidate_score(short: dict, stars: dict, *, orgs: list[str] | None = None) -> float:
+    """Intercept + player + opponent + stage + every active kind. Missing add 0."""
+    from shorts.clip_observation import kinds_from_cut, opponent_of_cut
+
+    intercept = float(stars.get("intercept") or 0)
+    sid = str(short.get("pov_steam_id") or "")
+    player = float((stars.get("player") or {}).get(sid) or 0) if sid else 0.0
+    opp_canon = opponent_of_cut(short, orgs)
+    opponent = float((stars.get("opponent") or {}).get(opp_canon) or 0) if opp_canon else 0.0
+    stage = short.get("stage")
+    stage_star = float((stars.get("stage") or {}).get(stage) or 0) if stage else 0.0
+    kinds = short.get("kinds")
+    if not isinstance(kinds, (list, tuple)):
+        kinds = kinds_from_cut(short)
+    kind_table = stars.get("kind") or {}
+    kind_sum = sum(float(kind_table.get(k) or 0) for k in kinds)
+    return intercept + player + opponent + stage_star + kind_sum
 
 
 def _player_qualifies(nick: str, payload: dict) -> bool:
@@ -110,26 +139,44 @@ def filter_publishable_shorts(
     *,
     orgs: list[str] | None = None,
     payload: dict | None = None,
+    source: str = "hltv",
+    stars: dict | None = None,
 ) -> tuple[list[dict], int]:
     """Keep shorts that pass the demand gate. Returns (kept, dropped_count)."""
-    kept: list[dict] = []
+    if source == "faceit":
+        kept: list[dict] = []
+        dropped = 0
+        for short in shorts:
+            if passes_shorts_demand_gate(
+                str(short.get("pov_nick") or ""),
+                orgs=orgs,
+                opponent=short.get("opponent"),
+                payload=payload,
+            ):
+                kept.append(short)
+            else:
+                dropped += 1
+        return kept, dropped
+
+    table = stars if stars is not None else load_partial_stars()
+    intercept = float(table.get("intercept") or 0)
+    scored: list[tuple[float, dict]] = []
     dropped = 0
     for short in shorts:
-        if passes_shorts_demand_gate(
-            str(short.get("pov_nick") or ""),
-            orgs=orgs,
-            payload=payload,
-        ):
-            kept.append(short)
+        score = candidate_score(short, table, orgs=orgs)
+        if score > intercept:
+            scored.append((score, short))
         else:
             dropped += 1
-    return kept, dropped
+    scored.sort(key=lambda item: -item[0])
+    return [short for _, short in scored], dropped
 
 
-def filter_suffix(dropped_randos: int, dropped_demand: int) -> str:
+def filter_suffix(dropped_randos: int, dropped_demand: int, *, source: str = "hltv") -> str:
     bits = []
     if dropped_randos:
         bits.append(f"{dropped_randos} non-pro")
     if dropped_demand:
-        bits.append(f"{dropped_demand} low-demand")
+        label = "low-demand" if source == "faceit" else "slot-floor"
+        bits.append(f"{dropped_demand} {label}")
     return f" ({', '.join(bits)} filtered)" if bits else ""

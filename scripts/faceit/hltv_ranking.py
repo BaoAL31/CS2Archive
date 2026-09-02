@@ -49,11 +49,21 @@ RANKING_TEAM_NAMES = [
 ROSTER_PATH = _ROOT / ".data" / "team_roster.json"
 
 # Roster team names -> HLTV ranking team names (ranking uses canonical spelling).
+# Shorts spellings fold through this table too (CONTEXT: do not fork a second file).
 TEAM_ALIASES = {
     "NAVI": "Natus Vincere",
     "NaVi": "Natus Vincere",
+    "navi": "Natus Vincere",
+    "natusvincere": "Natus Vincere",
     "Furia": "FURIA",
+    "furia": "FURIA",
     "NAVI Junior": "Natus Vincere",
+    "MongolZ": "The MongolZ",
+    "mongolz": "The MongolZ",
+    "themongolz": "The MongolZ",
+    "NIP": "Ninjas in Pyjamas",
+    "nip": "Ninjas in Pyjamas",
+    "ninjasinpyjamas": "Ninjas in Pyjamas",
 }
 
 # Manual overrides (canonical nick -> HLTV ranking team). Wins over the roster;

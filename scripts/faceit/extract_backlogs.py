@@ -51,11 +51,11 @@ def _extract_shorts(demo: Path, steam_id: str, include_all_players: bool) -> Non
     if pros_only:
         from shorts.demand_gate import filter_publishable_shorts, folder_orgs
         shorts, dropped_demand = filter_publishable_shorts(
-            shorts, orgs=folder_orgs(demo),
+            shorts, orgs=folder_orgs(demo), source="faceit",
         )
     from shorts.demand_gate import filter_suffix
     base = resolve_output_dir(demo, player=steam_id)
-    suffix = filter_suffix(dropped_randos, dropped_demand)
+    suffix = filter_suffix(dropped_randos, dropped_demand, source="faceit")
     if not shorts:
         discard_empty_shorts_dir(base)
         print(f"[OK] 0 shorts detected{suffix}")

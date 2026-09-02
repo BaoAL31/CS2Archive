@@ -57,31 +57,57 @@ def _platform_pending(meta: dict) -> dict[str, bool]:
     }
 
 
-def _passes_demand(meta_path: Path, meta: dict, *, payload: dict | None = None) -> bool:
-    from shorts.demand_gate import folder_orgs, passes_shorts_demand_gate
+def _shorts_source(demo) -> str:
+    path = str(demo or "").replace("\\", "/").lower()
+    if "demos/faceit/" in path:
+        return "faceit"
+    return "hltv"
+
+
+def _passes_demand(meta_path: Path, meta: dict, *, payload: dict | None = None, stars: dict | None = None) -> bool:
+    from shorts.demand_gate import (
+        folder_orgs,
+        filter_publishable_shorts,
+        passes_shorts_demand_gate,
+    )
     from shorts_player_day import pov_nick_from_meta_path
 
     nick = pov_nick_from_meta_path(meta_path) or ""
     text = f"{meta.get('title') or ''} {meta.get('description') or ''}"
     orgs: list[str] = []
+    shorts: list[dict] = []
+    demo = ""
     timeline = meta_path.parent / "short_timeline.json"
     if timeline.exists():
         try:
             data = json.loads(timeline.read_text(encoding="utf-8-sig"))
-            demo = data.get("demo_path")
+            demo = data.get("demo_path") or ""
             if demo:
                 orgs = folder_orgs(demo)
+            shorts = list(data.get("shorts") or [])
         except Exception:
             pass
-    return passes_shorts_demand_gate(nick, orgs=orgs, text=text, payload=payload)
+    source = _shorts_source(demo)
+    if source == "faceit":
+        return passes_shorts_demand_gate(nick, orgs=orgs, text=text, payload=payload)
+    if not shorts:
+        shorts = [{"pov_nick": nick}]
+    kept, _dropped = filter_publishable_shorts(
+        shorts, orgs=orgs, source="hltv", stars=stars,
+    )
+    return bool(kept)
 
 
-def _mark_skipped_low_demand(meta_path: Path, meta: dict) -> None:
+def _mark_skipped(meta_path: Path, meta: dict, reason: str) -> None:
     meta["upload_status"] = "skipped"
-    meta["skip_reason"] = "low_demand"
+    meta["skip_reason"] = reason
     meta["tiktok_status"] = "skipped"
     meta["instagram_status"] = "skipped"
     meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+
+
+def _mark_skipped_low_demand(meta_path: Path, meta: dict) -> None:
+    _mark_skipped(meta_path, meta, "low_demand")
 
 
 def _needs_upload(meta: dict, *, skip_tiktok: bool, skip_instagram: bool) -> bool:
@@ -231,9 +257,18 @@ def main() -> None:
             continue
         if not _passes_demand(meta_path, meta):
             title = (meta.get("title") or meta_path.parent.name)[:70]
-            print(f"  [skip] low-demand: {title}")
+            source = "hltv"
+            timeline = meta_path.parent / "short_timeline.json"
+            if timeline.exists():
+                try:
+                    demo = json.loads(timeline.read_text(encoding="utf-8-sig")).get("demo_path")
+                    source = _shorts_source(demo)
+                except Exception:
+                    pass
+            reason = "low_demand" if source == "faceit" else "slot_floor"
+            print(f"  [skip] {reason}: {title}")
             if not args.dry_run:
-                _mark_skipped_low_demand(meta_path, meta)
+                _mark_skipped(meta_path, meta, reason)
             skipped += 1
             continue
         if upload_one(meta_path, meta, args.dry_run,
