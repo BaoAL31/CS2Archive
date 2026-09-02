@@ -30,8 +30,9 @@ event matches tab when the overview has no timestamps). If nothing is live
 and nothing starts in the next 24 hours, it **keeps polling FACEIT** (same
 loop as HLTV, 15-minute scrape cooldown) for watchable Recognised-Pro POVs
 from the last 24 hours. A POV qualifies only if it is a **plus-K/D win**
-from an HLTV **top-10 org** (donk / kyousuke / m0NESY tier). High K/D or
-ADR against a weaker lobby does not qualify. Those are queued as they appear, one
+from a player on the YouTube **demand index** (>= 1.0). Org rank is not
+required. High K/D or ADR from a name with no measured demand does not
+qualify. Those are queued as they appear, one
 player/match, up to the remaining daily slots. Weak leftover games are
 not used to pad the day to 3.
 Demos are downloaded and a single-POV backlog card is built, then the same

@@ -117,6 +117,18 @@ def save_state(run_id: str, state: dict) -> None:
     (STATE_DIR / f"{run_id}.json").write_text(json.dumps(state, indent=2))
 
 
+def _minimize_cs2() -> None:
+    """Load CS2Archive's minimizer, not CS2UtilArchive's shadowed module."""
+    import importlib.util
+    path = Path(__file__).resolve().parents[1] / "cs2_minimizer.py"
+    spec = importlib.util.spec_from_file_location("_cs2archive_cs2_minimizer", path)
+    if spec is None or spec.loader is None:
+        return
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod.ensure_cs2_closed()
+
+
 def run_id_from_name(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "_", name)[:80].strip("_")
 
@@ -602,9 +614,7 @@ class Pipeline:
         except RenderVersionError as e:
             fail(2, e.code, e.message)
 
-        from cs2_minimizer import ensure_cs2_closed
-
-        ensure_cs2_closed()
+        _minimize_cs2()
 
         nvcheck = subprocess.run(
             [
@@ -1439,9 +1449,7 @@ class Pipeline:
         overlay ``video.mp4`` (keyboard + util-cam already baked in) at the
         densest POV killfeed tick, mapped via the concat sidecar. No CS2.
         """
-        from cs2_minimizer import ensure_cs2_closed
-
-        ensure_cs2_closed()
+        _minimize_cs2()
 
         youtube_dir.mkdir(parents=True, exist_ok=True)
         thumb = youtube_dir / "thumbnail.jpg"

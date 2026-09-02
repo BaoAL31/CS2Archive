@@ -34,7 +34,7 @@ ensure()
 from player_accounts import list_accounts  # noqa: E402
 from scrapers.faceit import FACEITClient  # noqa: E402
 from faceit_names import known_pro_faceit_ids  # noqa: E402
-from hltv_ranking import fetch_team_ranking, rank_bonus, star_bonus_for_pros  # noqa: E402
+from hltv_ranking import fetch_team_ranking, star_bonus_for_pros  # noqa: E402
 from scoring import (  # noqa: E402
     PLAYER_DEMAND_INDEX,
     costar_bonus,
@@ -79,18 +79,24 @@ def _is_notable_perf(line: dict, kd_min: float, adr_min: float, kills_min: int) 
     return kd >= kd_min or adr >= adr_min or kills >= kills_min
 
 
-def is_good_faceit_pov(c: dict) -> bool:
-    """Plus-K/D win from an HLTV top-10 org (donk / kyousuke / m0NESY tier).
+FACEIT_DEMAND_FLOOR = 1.0
 
-    High K/D/ADR is not a substitute — that is usually a stomped low-ELO
-    lobby (blameF 27/9 vs ~2500). ``raw_star_bonus`` is ``rank_bonus`` for
-    the POV's org (250k at rank 10).
+
+def is_good_faceit_pov(c: dict) -> bool:
+    """Plus-K/D win from a player on the YouTube demand index (>= 1.0).
+
+    Org rank is not a qualifier. Smash lines from names with no measured
+    demand (blameF 27/9 vs ~2500) stay out.
     """
     if not c.get("won"):
         return False
     if _num(c.get("kd"), float) < 1.0:
         return False
-    return _num(c.get("raw_star_bonus"), int) >= rank_bonus(10)
+    nick = (c.get("player") or "").casefold()
+    if not nick:
+        return False
+    index = load_player_demand_index().get(nick)
+    return index is not None and float(index) >= FACEIT_DEMAND_FLOOR
 
 
 def load_player_demand_index():

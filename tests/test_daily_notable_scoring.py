@@ -262,14 +262,13 @@ def test_select_picks_only_one_pov_per_match():
     ]
 
 
-def test_is_good_faceit_pov_requires_top10_org():
+def test_is_good_faceit_pov_requires_player_demand():
     donk = {
         "player": "donk", "won": True, "kd": 1.2, "adr": 85.0, "kills": 18,
-        "raw_star_bonus": 400_000,
     }
-    kyousuke = {
-        "player": "kyousuke", "won": True, "kd": 1.0, "adr": 70.0, "kills": 16,
-        "raw_star_bonus": 250_000,
+    s1mple = {
+        "player": "s1mple", "won": True, "kd": 1.4, "adr": 96.2, "kills": 28,
+        "raw_star_bonus": 0,
     }
     blamef = {
         "player": "blameF", "won": True, "kd": 3.0, "adr": 142.7, "kills": 27,
@@ -280,10 +279,9 @@ def test_is_good_faceit_pov_requires_top10_org():
     }
     minus_kd = {
         "player": "donk", "won": True, "kd": 0.9, "adr": 90.0, "kills": 12,
-        "raw_star_bonus": 400_000,
     }
     assert sn.is_good_faceit_pov(donk)
-    assert sn.is_good_faceit_pov(kyousuke)
+    assert sn.is_good_faceit_pov(s1mple)
     assert not sn.is_good_faceit_pov(blamef)
     assert not sn.is_good_faceit_pov(smash_unknown)
     assert not sn.is_good_faceit_pov(minus_kd)
@@ -292,10 +290,9 @@ def test_is_good_faceit_pov_requires_top10_org():
 
 def test_choose_picks_prefers_fresh_over_heavier_pool():
     fresh = [{
-        "id": "f:neityu", "match_id": "f", "player": "Neityu",
+        "id": "f:s1mple", "match_id": "f", "player": "s1mple",
         "weight": 100, "date": "2026-09-01",
         "won": True, "kd": 4.0, "adr": 133.0, "kills": 20,
-        "raw_star_bonus": 400_000,
     }]
     pool = [{
         "id": "p:donk", "match_id": "p", "player": "donk",
@@ -304,25 +301,24 @@ def test_choose_picks_prefers_fresh_over_heavier_pool():
     }]
     picks, used = dn.choose_picks(
         {"used": [], "pool": pool}, fresh, 1, "2026-09-01")
-    assert [p["player"] for p in picks] == ["Neityu"]
-    assert used == ["f:neityu"]
+    assert [p["player"] for p in picks] == ["s1mple"]
+    assert used == ["f:s1mple"]
 
 
 def test_choose_picks_does_not_pad_with_pool():
     fresh = [{
-        "id": "f:a", "match_id": "f", "player": "a",
+        "id": "f:s1mple", "match_id": "f", "player": "s1mple",
         "weight": 100, "date": "2026-09-01",
         "won": True, "kd": 4.0, "adr": 133.0, "kills": 20,
-        "raw_star_bonus": 400_000,
     }]
     pool = [{
-        "id": "p:b", "match_id": "p", "player": "b",
+        "id": "p:donk", "match_id": "p", "player": "donk",
         "weight": 50, "date": "2026-08-25",
         "won": True, "kd": 3.0, "adr": 120.0, "kills": 25,
     }]
     picks, _ = dn.choose_picks(
         {"used": [], "pool": pool}, fresh, 2, "2026-09-01")
-    assert [p["player"] for p in picks] == ["a"]
+    assert [p["player"] for p in picks] == ["s1mple"]
 
 
 def test_replay_days_uses_each_day_window_and_does_not_reuse_picks():

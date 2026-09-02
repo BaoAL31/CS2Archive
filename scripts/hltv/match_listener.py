@@ -7,7 +7,8 @@ demand, org rank, and HLTV rating. One card per match is queued from
 Cap is 3 uploads per local calendar day (the YouTube long-form slots).
 When the configured event has nothing live and nothing starting in the
 next 24 hours, the listener keeps polling FACEIT for watchable POVs
-(plus-K/D win from an HLTV top-10 org). It queues those as they appear, up
+(plus-K/D win from a player on the YouTube demand index). It queues those
+as they appear, up
 to the remaining daily slots, and does not pad with weak games.
 
 The listener is intentionally a single process and a single pipeline worker.

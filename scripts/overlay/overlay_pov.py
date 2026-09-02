@@ -403,7 +403,13 @@ def _extract_keyboard_states(
     Returns per_signal frame lists (0/1 per frame).
     """
     from demoparser2 import DemoParser
-    from scripts.render.usercmd_extract import _run_cli, _parse_rows, signals_from_rows, _validate_from_rows, assert_extraction_sane
+    from scripts.usercmd_extract import (
+        _parse_rows,
+        _run_cli,
+        _validate_from_rows,
+        assert_extraction_sane,
+        signals_from_rows,
+    )
 
     t0 = time.time()
 
