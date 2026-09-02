@@ -80,3 +80,12 @@ def test_match_page_stage_comes_from_info_box_not_round():
     <div class="highlights">M1R7 | latto — ACE</div>
     """
     assert match_stage_from_html(html) == "Grand Final"
+
+
+def test_match_page_stage_is_the_star_sentence_not_the_veto():
+    html = """
+    <div class="padding">* Group B lower bracket final. Winner advances to quarter-finals,
+    losing team is eliminated.</div>
+    <div class="standard-box veto-box"><div>1. FUT removed Inferno</div></div>
+    """
+    assert match_stage_from_html(html) == "Group B lower bracket final"

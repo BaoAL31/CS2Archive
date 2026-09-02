@@ -85,6 +85,39 @@ def test_youtube_views_refresh_by_stored_video_id():
     assert updated[1]["views"] == 50
 
 
+def test_stored_clips_take_stage_from_row_match_stage(tmp_path: Path):
+    from shorts.fit_partial_stars import observations_from_allstar_jsonl
+
+    jsonl = tmp_path / "obs.jsonl"
+    jsonl.write_text(json.dumps({
+        "match_id": "1",
+        "match_stage": "Quarter-final",
+        "clips": [{
+            "source": "allstar",
+            "clip_id": "c1",
+            "steamid": "1",
+            "kinds": ["ace"],
+            "stage": None,
+            "views": 100,
+        }],
+    }) + "\n", encoding="utf-8")
+    rows = observations_from_allstar_jsonl(jsonl)
+    assert rows[0]["stage"] == "playoff"
+
+
+def test_known_stages_fill_empty_match_rows():
+    from shorts.scrape_allstar_hltv import apply_known_stages
+
+    rows = [
+        {"match_id": "1", "slug": "a-vs-b-x", "match_stage": None},
+        {"match_id": "2", "slug": "c-vs-d-x", "match_stage": "Grand final"},
+    ]
+    n = apply_known_stages(rows, {"a-vs-b-x": "Swiss round"})
+    assert n == 1
+    assert rows[0]["match_stage"] == "Swiss round"
+    assert rows[1]["match_stage"] == "Grand final"
+
+
 def test_refresh_writes_stars_without_deleting_observation_store(tmp_path: Path):
     jsonl = tmp_path / "obs.jsonl"
     jsonl.write_text(json.dumps({

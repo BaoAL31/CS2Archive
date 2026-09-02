@@ -152,6 +152,31 @@ def _make_title(nick: str, short_type: str, opp: str | None, mname: str, tournam
         else:
             rest = f"{nick} {nk} clutch on {mname}" if nk else f"{nick} clutch on {mname}"
             formats = (("hook-rest", f"{clutch_s}? {rest}"),)
+    elif short_type == "wallbang":
+        formats = (
+            ("kind-lead", f"{nick} wallbang {vs}"),
+            ("possessive", f"{nick}'s wallbang {vs}"),
+        )
+    elif short_type == "knife":
+        formats = (
+            ("kind-lead", f"{nick} knife kill {vs}"),
+            ("possessive", f"{nick}'s knife kill {vs}"),
+        )
+    elif short_type == "defuse":
+        formats = (
+            ("kind-lead", f"{nick} clutch defuse {vs}"),
+            ("possessive", f"{nick}'s clutch defuse {vs}"),
+        )
+    elif short_type == "perfect_shots":
+        formats = (
+            ("kind-lead", f"{nick} perfect shots {vs}"),
+            ("possessive", f"{nick}'s perfect shots {vs}"),
+        )
+    elif short_type == "flick":
+        formats = (
+            ("kind-lead", f"{nick} flick {vs}"),
+            ("possessive", f"{nick}'s flick {vs}"),
+        )
     elif kills >= 5:
         ace = f"{gun} ACE" if gun else "ACE"
         going, looking, kadj = _adj(key, "going"), _adj(key, "looking"), _adj(key, "kind")
@@ -195,6 +220,16 @@ def _make_title(nick: str, short_type: str, opp: str | None, mname: str, tournam
 def _make_description(nick: str, pov_org: str | None, opp: str | None, mname: str, short_type: str, clutch: str | None = None, kills: int = 0, punch_tags: list[str] | None = None) -> str:
     if "clutch" in short_type.lower():
         kind = f"{clutch or '1v3'} clutch" if clutch else "1v3 clutch"
+    elif short_type == "wallbang":
+        kind = "wallbang"
+    elif short_type == "knife":
+        kind = "knife kill"
+    elif short_type == "defuse":
+        kind = "clutch defuse"
+    elif short_type == "perfect_shots":
+        kind = "perfect shots"
+    elif short_type == "flick":
+        kind = "flick"
     else:
         kind = "ACE" if kills >= 5 else "4K"
         if punch_tags:

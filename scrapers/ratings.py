@@ -17,6 +17,12 @@ from config import settings
 console = Console(force_terminal=True)
 
 _HLTV_PLAYER_PATH = re.compile(r"/player/\d+/[^/?#]+", re.IGNORECASE)
+_STAGE_STAR = re.compile(r"\*\s*([^*]{3,120}?)\.")
+_STAGE_HINT = re.compile(
+    r"grand final|quarter|semi|playoff|final|swiss|opening|group|"
+    r"round of|stage \d|3rd place|decider",
+    re.I,
+)
 
 
 def _normalize_hltv_player_url(href: str | None) -> str | None:
@@ -41,6 +47,42 @@ def _hltv_player_url_from_row(row) -> str | None:
     return None
 
 
+def _clean_stage_text(text: str) -> str:
+    text = re.sub(r"<[^>]+", " ", text or "")
+    text = re.sub(r"[<>]+", " ", text)
+    text = re.sub(r"&[a-zA-Z0-9#]+;", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.split(r"\s+\d+\.\s", text, maxsplit=1)[0].strip()
+    if ". " in text:
+        text = text.split(". ", 1)[0].strip()
+    return text
+
+
+def extract_match_stage(html: str) -> str:
+    """Event stage from an HLTV match page (group / playoff / grand final).
+
+    Live pages use ``* Grand final. Winner advances…``. Older markup used
+    ``div.match-info-box`` / ``div.map-info-wrap``. Map names and veto lists
+    are not stages.
+    """
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "lxml")
+    for sel in ("div.match-info-box div.text", "div.map-info-wrap ul li"):
+        el = soup.select_one(sel)
+        if not el:
+            continue
+        text = _clean_stage_text(el.get_text(strip=True))
+        if text and _STAGE_HINT.search(text):
+            return text
+    for blob in (html, soup.get_text(" ", strip=True)):
+        for m in _STAGE_STAR.finditer(blob):
+            cand = _clean_stage_text(m.group(1))
+            if cand and _STAGE_HINT.search(cand):
+                return cand
+    return ""
+
+
 def parse_match_ratings_html(html: str, match_url: str = "") -> Optional[dict]:
     """Parse HLTV match page HTML for all player ratings and stats."""
     soup = BeautifulSoup(html, "lxml")
@@ -48,24 +90,7 @@ def parse_match_ratings_html(html: str, match_url: str = "") -> Optional[dict]:
     match_name_el = soup.select_one(".match-header-title")
     match_name = match_name_el.get_text(strip=True) if match_name_el else "Unknown Match"
 
-    match_stage = ""
-    stage_el = soup.select_one("div.map-info-wrap ul li")
-    if not stage_el:
-        stage_el = soup.select_one("div.match-info-box div.text")
-    if stage_el:
-        match_stage = stage_el.get_text(strip=True)
-    else:
-        # Fallback: scan CLEANED page text, never raw HTML, so we never
-        # capture markup (e.g. the veto-box) into match_stage.
-        clean_text = soup.get_text(" ", strip=True)
-        m = re.search(r"\*\s*(.+?(?:final|playoff|group|stage|qualifier|round|decider|match))", clean_text, re.IGNORECASE)
-        if m:
-            match_stage = m.group(1).strip()
-    # Defensive: strip any residual markup/entities and collapse whitespace.
-    match_stage = re.sub(r"<[^>]+", " ", match_stage)
-    match_stage = re.sub(r"[<>]+", " ", match_stage)
-    match_stage = re.sub(r"&[a-zA-Z0-9#]+;", " ", match_stage)
-    match_stage = re.sub(r"\s+", " ", match_stage).strip()
+    match_stage = extract_match_stage(html)
 
     map_names: dict[str, str] = {}
     for el in soup.find_all("div", class_="dynamic-map-name-full"):

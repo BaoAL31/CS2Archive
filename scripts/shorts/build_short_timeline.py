@@ -1,12 +1,15 @@
 """Build a Short Timeline from any CS2 demo (HLTV or FACEIT).
 
-Detects three Short types:
+Detects Short types:
   - **4K** : 4+ kills by same attacker in a single round (incl. 5-kill aces).
   - **Clutch** : team wins from 2v4 or worse (1v3, 1v4, 1v5, 2v4, 2v5).
   - **1v3** : exactly 3 kills in a single round while at a 1v3-or-worse numbers
-    disadvantage, where at least 2 of those kills "punch up" (killed with a
-    lower-tier weapon than the victim held). Unlike 4K, the round does NOT need
-    to be won.
+    disadvantage, where at least 2 of those kills "punch up".
+  - **wallbang** : rifle/AWP kill with penetrated >= 1.
+  - **knife** : punch-up (rifle victim), round-winning last kill, or last-alive Zeus.
+  - **defuse** : clutch defuse — kit completes in 1v1 or while Ts outnumber CTs.
+  - **perfect_shots** : 2–4 gun kills whose fire count ≈ kill count (5 stays ACE).
+  - **flick** : gun kill with a fast yaw snap in the 0.5s before the shot (not quickscope).
 
 By default only shorts whose POV player is a Recognised Pro
 (``.data/player_accounts.json``) are kept — randos are dropped
@@ -117,6 +120,416 @@ _WEAPON_TIER: dict[str, int] = {
 
 def _weapon_tier(weapon: str) -> int:
     return _WEAPON_TIER.get(weapon.strip().lower(), -1)
+
+
+def _is_wallbang_rifle(weapon: str) -> bool:
+    """Rifles and snipers (tier 4). Pistols through a box are not a wallbang Short."""
+    return _weapon_tier(weapon) >= 4
+
+
+_JUNK_MELEE = frozenset({
+    "world", "c4", "planted_c4", "tablet", "axe", "hammer", "wrench", "spanner",
+})
+
+
+def _is_knife_or_zeus(weapon: str) -> bool:
+    w = str(weapon or "").strip().lower()
+    if w in ("zeus", "zeus x27"):
+        return True
+    if "knife" in w:
+        return True
+    if w in _WEAPON_TIER and _WEAPON_TIER[w] == 0 and w not in _JUNK_MELEE:
+        return True
+    return False
+
+
+def _is_zeus(weapon: str) -> bool:
+    return str(weapon or "").strip().lower() in ("zeus", "zeus x27")
+
+
+def _one_kill_window(tick: int) -> tuple[int, int]:
+    end_tick = tick + _POST_KILL_TICK_MARGIN
+    start_tick = min(
+        end_tick - _SHORT_TICK_DURATION,
+        tick - _PRE_KILL_TICK_MARGIN,
+    )
+    return start_tick, end_tick
+
+
+def _last_alive_on_team(
+    attacker_sid: str,
+    tick: int,
+    rkills: list[dict],
+    team_by_sid: dict[str, int],
+) -> bool:
+    team = team_by_sid.get(attacker_sid)
+    if team is None:
+        return False
+    teammates = [
+        sid for sid, t in team_by_sid.items()
+        if t == team and sid != attacker_sid
+    ]
+    if not teammates:
+        return False
+    dead = {k["victim_sid"] for k in rkills if k["tick"] <= tick and k["victim_sid"]}
+    return all(sid in dead for sid in teammates)
+
+
+def _keep_knife_zeus(
+    k: dict,
+    rkills: list[dict],
+    winner: int | None,
+    team_by_sid: dict[str, int],
+) -> bool:
+    if not _is_knife_or_zeus(str(k.get("weapon", "") or "")):
+        return False
+    # Punch-up here means a rifle/sniper victim, not Zeus vs a pistol.
+    if _weapon_tier(str(k.get("victim_weapon", "") or "")) >= 4:
+        return True
+    aid = k["attacker_sid"]
+    last_tick = max((x["tick"] for x in rkills), default=-1)
+    if k["tick"] == last_tick and winner is not None and team_by_sid.get(aid) == winner:
+        return True
+    if _is_zeus(str(k.get("weapon", "") or "")) and _last_alive_on_team(
+        aid, k["tick"], rkills, team_by_sid,
+    ):
+        return True
+    return False
+
+
+_SMOKE_RADIUS = 160.0
+_SMOKE_LIFE_TICKS = 18 * 64  # CS2 smoke lifetime ~18s
+
+
+def _as_bool(val) -> bool:
+    if val is True or val is False:
+        return val
+    try:
+        if val != val:  # NaN
+            return False
+    except Exception:
+        pass
+    return bool(val)
+
+
+def _health_at(val) -> int:
+    try:
+        if val is None:
+            return 100
+        n = int(val)
+    except (TypeError, ValueError):
+        return 100
+    return n
+
+
+def _alive_counts(
+    sid: str,
+    tick: int,
+    rkills: list[dict],
+    team_by_sid: dict[str, int],
+) -> tuple[int, int]:
+    """Alive teammates, alive enemies at ``tick`` (from the round's deaths)."""
+    team = team_by_sid.get(sid)
+    if team is None:
+        return 0, 0
+    dead = {k["victim_sid"] for k in rkills if k["tick"] <= tick and k["victim_sid"]}
+    mine = sum(1 for s, t in team_by_sid.items() if t == team and t >= 2 and s not in dead)
+    enemy = sum(1 for s, t in team_by_sid.items() if t != team and t >= 2 and s not in dead)
+    return mine, enemy
+
+
+def _keep_defuse(
+    ev: dict,
+    rkills: list[dict],
+    team_by_sid: dict[str, int],
+) -> bool:
+    """Kit completes in 1v1, or while Ts still outnumber CTs."""
+    if _as_bool(ev.get("aborted")):
+        return False
+    mine, enemy = _alive_counts(
+        str(ev.get("player_sid") or ""),
+        int(ev.get("tick") or 0),
+        rkills,
+        team_by_sid,
+    )
+    return mine >= 1 and enemy >= 1 and (enemy > mine or mine == 1)
+
+
+def _is_gun_kill(k: dict) -> bool:
+    w = str(k.get("weapon", "") or "")
+    if _is_knife_or_zeus(w):
+        return False
+    t = _weapon_tier(w)
+    return 1 <= t <= 4
+
+
+def _fire_count_in_window(
+    player_sid: str,
+    t0: int,
+    t1: int,
+    fires_by_player: dict[str, list[dict]],
+) -> int:
+    return sum(1 for f in fires_by_player.get(player_sid, []) if t0 <= int(f["tick"]) <= t1)
+
+
+def _perfect_fire_kills(kills: list[dict], fires_by_player: dict[str, list[dict]]) -> bool:
+    """2–4 gun kills whose fire count in the window is kills or kills+1."""
+    n = len(kills)
+    if n < 2 or n > 4:
+        return False
+    if not fires_by_player:
+        return False
+    if any(not _is_gun_kill(k) for k in kills):
+        return False
+    aid = str(kills[0].get("attacker_sid") or "")
+    if not aid:
+        return False
+    ticks = [int(k["tick"]) for k in kills]
+    t0 = min(ticks) - _PRE_KILL_TICK_MARGIN
+    t1 = max(ticks)
+    fc = _fire_count_in_window(aid, t0, t1, fires_by_player)
+    return n <= fc <= n + 1
+
+
+def _xyz(row) -> tuple[float, float, float] | None:
+    try:
+        x = row.get("x") if row.get("x") is not None else row.get("X")
+        y = row.get("y") if row.get("y") is not None else row.get("Y")
+        z = row.get("z") if row.get("z") is not None else row.get("Z")
+        if x is None or y is None or z is None:
+            return None
+        return (float(x), float(y), float(z))
+    except (TypeError, ValueError):
+        return None
+
+
+def _in_active_smoke(pos: tuple[float, float, float], tick: int, smokes: list[dict]) -> bool:
+    px, py, pz = pos
+    r2 = _SMOKE_RADIUS * _SMOKE_RADIUS
+    for s in smokes:
+        if int(s["start"]) > tick or int(s["end"]) < tick:
+            continue
+        dx = px - s["x"]
+        dy = py - s["y"]
+        dz = pz - s["z"]
+        if dx * dx + dy * dy + dz * dz <= r2:
+            return True
+    return False
+
+
+def _collect_weapon_fires(parser, first_freeze: int | None) -> list[dict]:
+    fires: list[dict] = []
+    try:
+        df = _as_event_df(parser.parse_event("weapon_fire"))
+    except Exception:
+        return fires
+    if df is None or df.empty:
+        return fires
+    for _, row in df.iterrows():
+        tick = int(row["tick"])
+        if first_freeze is not None and tick < first_freeze:
+            continue
+        sid = _sid(row.get("user_steamid"))
+        if not sid:
+            continue
+        fires.append({
+            "tick": tick,
+            "player_sid": sid,
+            "weapon": str(row.get("weapon", "") or ""),
+        })
+    return fires
+
+
+def _collect_flick_kills(parser, deaths, first_freeze: int | None) -> set[tuple[str, int]]:
+    """Gun-kill ticks whose aim window is a flick. Empty if ticks are missing."""
+    from shorts.flick import PRE_TICKS, is_flick
+
+    out: set[tuple[str, int]] = set()
+    if deaths is None or getattr(deaths, "empty", True):
+        return out
+    by_attacker: dict[str, list[int]] = {}
+    for _, row in deaths.iterrows():
+        tick = int(row["tick"])
+        if first_freeze is not None and tick < first_freeze:
+            continue
+        aid = _sid(row.get("attacker_steamid"))
+        if not aid:
+            continue
+        if not _is_gun_kill({"weapon": str(row.get("weapon", "") or "")}):
+            continue
+        by_attacker.setdefault(aid, []).append(tick)
+    if not by_attacker:
+        return out
+    for aid, kill_ticks in by_attacker.items():
+        needed = {t for tick in kill_ticks for t in range(tick - PRE_TICKS, tick + 1)}
+        try:
+            tdf = None
+            try:
+                tdf = parser.parse_ticks(
+                    ["pitch", "yaw"],
+                    ticks=sorted(needed),
+                    players=[int(aid)],
+                )
+            except (TypeError, ValueError):
+                tdf = None
+            if tdf is None or getattr(tdf, "empty", True):
+                tdf = parser.parse_ticks(["pitch", "yaw"], ticks=sorted(needed))
+        except Exception:
+            continue
+        if tdf is None or getattr(tdf, "empty", True):
+            continue
+        samples: dict[int, tuple[float, float]] = {}
+        for _, row in tdf.iterrows():
+            sid = _sid(row.get("steamid"))
+            if sid and sid != aid:
+                continue
+            try:
+                samples[int(row["tick"])] = (float(row["yaw"]), float(row["pitch"]))
+            except (TypeError, ValueError):
+                continue
+        for tick in kill_ticks:
+            window = [t for t in range(tick - PRE_TICKS, tick + 1) if t in samples]
+            if len(window) < 10:
+                continue
+            yaw = [samples[t][0] for t in window]
+            pitch = [samples[t][1] for t in window]
+            if is_flick(yaw, pitch):
+                out.add((aid, tick))
+    return out
+
+
+def _collect_smokes(parser) -> list[dict]:
+    smokes: list[dict] = []
+    try:
+        det = _as_event_df(parser.parse_event("smokegrenade_detonate"))
+    except Exception:
+        return smokes
+    if det is None or det.empty:
+        return smokes
+    expires: list[tuple[int, float, float, float]] = []
+    try:
+        exp = _as_event_df(parser.parse_event("smokegrenade_expired"))
+    except Exception:
+        exp = None
+    if exp is not None and not exp.empty:
+        for _, row in exp.iterrows():
+            pos = _xyz(row)
+            if pos is None:
+                continue
+            expires.append((int(row["tick"]), pos[0], pos[1], pos[2]))
+    for _, row in det.iterrows():
+        pos = _xyz(row)
+        if pos is None:
+            continue
+        start = int(row["tick"])
+        end = start + _SMOKE_LIFE_TICKS
+        best = None
+        best_d = None
+        for et, ex, ey, ez in expires:
+            if et < start:
+                continue
+            dx, dy, dz = pos[0] - ex, pos[1] - ey, pos[2] - ez
+            d = dx * dx + dy * dy + dz * dz
+            if d > _SMOKE_RADIUS * _SMOKE_RADIUS:
+                continue
+            if best_d is None or d < best_d:
+                best_d = d
+                best = et
+        if best is not None:
+            end = best
+        smokes.append({"x": pos[0], "y": pos[1], "z": pos[2], "start": start, "end": end})
+    return smokes
+
+
+def _collect_defuse_events(parser, first_freeze: int | None) -> list[dict]:
+    """Join bomb_defused with begin/abort, HP/spotted, and smoke at that tick."""
+    try:
+        defused = _as_event_df(parser.parse_event("bomb_defused"))
+    except Exception:
+        return []
+    if defused is None or defused.empty:
+        return []
+    try:
+        begin = _as_event_df(parser.parse_event("bomb_begindefuse"))
+    except Exception:
+        begin = None
+    try:
+        abort = _as_event_df(parser.parse_event("bomb_abortdefuse"))
+    except Exception:
+        abort = None
+
+    begins: list[tuple[int, str]] = []
+    if begin is not None and not begin.empty:
+        for _, row in begin.iterrows():
+            sid = _sid(row.get("user_steamid"))
+            if sid:
+                begins.append((int(row["tick"]), sid))
+    aborts: list[tuple[int, str]] = []
+    if abort is not None and not abort.empty:
+        for _, row in abort.iterrows():
+            sid = _sid(row.get("user_steamid"))
+            if sid:
+                aborts.append((int(row["tick"]), sid))
+
+    ticks = sorted({int(t) for t in defused["tick"].tolist()})
+    snap_by: dict[tuple[int, str], dict] = {}
+    try:
+        snap = parser.parse_ticks(["health", "spotted", "X", "Y", "Z"], ticks=ticks)
+        for _, row in snap.iterrows():
+            sid = _sid(row.get("steamid"))
+            if not sid:
+                continue
+            snap_by[(int(row["tick"]), sid)] = row
+    except Exception:
+        snap_by = {}
+
+    smokes = _collect_smokes(parser)
+    out: list[dict] = []
+    for _, row in defused.iterrows():
+        tick = int(row["tick"])
+        if first_freeze is not None and tick < first_freeze:
+            continue
+        sid = _sid(row.get("user_steamid"))
+        if not sid:
+            continue
+        last_begin = max((t for t, s in begins if s == sid and t <= tick), default=None)
+        aborted = False
+        if last_begin is not None:
+            aborted = any(
+                s == sid and last_begin < t < tick for t, s in aborts
+            )
+        elif any(s == sid and t < tick for t, s in aborts):
+            aborted = True
+        st = snap_by.get((tick, sid))
+        health = 100
+        spotted = True
+        in_smoke = False
+        if st is not None:
+            health = _health_at(st.get("health"))
+            spotted = _as_bool(st.get("spotted"))
+            pos = _xyz(st)
+            if pos is not None:
+                in_smoke = _in_active_smoke(pos, tick, smokes)
+        out.append({
+            "tick": tick,
+            "player_sid": sid,
+            "begin_tick": last_begin if last_begin is not None else tick - _PRE_KILL_TICK_MARGIN,
+            "aborted": aborted,
+            "health": health,
+            "spotted": spotted,
+            "in_smoke": in_smoke,
+        })
+    return out
+
+
+def _penetrated_count(val) -> int:
+    try:
+        if val is None:
+            return 0
+        n = int(val)
+    except (TypeError, ValueError):
+        return 0
+    return n if n > 0 else 0
 
 
 def _meets_tier_criterion(kills: list[dict]) -> bool:
@@ -261,6 +674,13 @@ def build_short_timeline(demo_path: Path, player: str | None = None,
     except Exception:
         victim_weapon_map = {}
 
+    first_freeze = None
+    if freeze_end is not None and not freeze_end.empty:
+        first_freeze = int(freeze_end["tick"].min())
+    defuse_events = _collect_defuse_events(parser, first_freeze)
+    weapon_fires = _collect_weapon_fires(parser, first_freeze)
+    flick_kills = _collect_flick_kills(parser, deaths, first_freeze)
+
     winners, reasons = _winner_by_round_from_demo(parser, info, round_start, round_end_winner)
     return detect_shorts(
         demo_path=str(demo_path),
@@ -276,6 +696,9 @@ def build_short_timeline(demo_path: Path, player: str | None = None,
         victim_weapon_map=victim_weapon_map,
         winner_by_round=winners,
         win_reason_by_round=reasons,
+        defuse_events=defuse_events,
+        weapon_fires=weapon_fires,
+        flick_kills=flick_kills,
         pros_only=pros_only,
     )
 
@@ -394,9 +817,12 @@ def detect_shorts(
     round_ends: dict[int, int] | None = None,
     round_win_events: dict[int, list[dict]] | None = None,
     victim_weapon_map: dict[tuple[int, str], str] | None = None,
+    defuse_events: list[dict] | None = None,
+    weapon_fires: list[dict] | None = None,
+    flick_kills: set[tuple[str, int]] | None = None,
     pros_only: bool = True,
 ) -> dict:
-    """Detect 4K and Clutch Shorts from parsed or synthetic events.
+    """Detect 4K, Clutch, wallbang, knife/Zeus, defuse, perfect-shot, and flick Shorts.
 
     Accepts either pandas DataFrames (from demoparser2) or plain Python
     dicts/lists for easy unit testing without a real demo file.
@@ -529,6 +955,7 @@ def detect_shorts(
                 "victim_sid": str(ev.get("victim_sid", "")),
                 "weapon": str(ev.get("weapon", "")),
                 "victim_weapon": str(ev.get("victim_weapon", "")),
+                "penetrated": _penetrated_count(ev.get("penetrated")),
             })
     elif deaths is not None and not deaths.empty:
         kills_by_round = {}
@@ -560,6 +987,7 @@ def detect_shorts(
                 "victim_sid": victim_sid,
                 "weapon": weapon,
                 "victim_weapon": victim_weapon,
+                "penetrated": _penetrated_count(row.get("penetrated")),
             })
     else:
         kills_by_round = {}
@@ -585,6 +1013,12 @@ def detect_shorts(
                     "player_sid": _sid(row.get("user_steamid")),
                 })
         round_win_events = _rwe
+
+    fires_by_player: dict[str, list[dict]] = {}
+    for f in weapon_fires or []:
+        sid = str(f.get("player_sid") or "")
+        if sid:
+            fires_by_player.setdefault(sid, []).append(f)
 
     # ================================================================
     # 4K DETECTION
@@ -629,6 +1063,9 @@ def detect_shorts(
                 continue  # multikill team must win the round
             if not _meets_tier_criterion(kills):
                 continue
+            # Four clean taps belong to perfect_shots, not 4K. Five stays ACE.
+            if len(kills) == 4 and _perfect_fire_kills(kills, fires_by_player):
+                continue
             ticks = sorted(k["tick"] for k in kills)
             end_tick = ticks[-1] + _POST_KILL_TICK_MARGIN
             start_tick = min(
@@ -643,6 +1080,139 @@ def detect_shorts(
                 "end_tick": end_tick,
                 "kill_ticks": ticks,
                 "punch_up_tags": _punch_up_tags(kills),
+            })
+
+    # ================================================================
+    # WALLBANG DETECTION (rifle/AWP through at least one object)
+    # ================================================================
+    for _rn, rkills in sorted(kills_by_round.items()):
+        if _rn <= 0:
+            continue
+        for k in rkills:
+            if _penetrated_count(k.get("penetrated")) < 1:
+                continue
+            if not _is_wallbang_rifle(str(k.get("weapon", "") or "")):
+                continue
+            aid = k["attacker_sid"]
+            if not aid:
+                continue
+            tick = int(k["tick"])
+            start_tick, end_tick = _one_kill_window(tick)
+            shorts.append({
+                "short_type": "wallbang",
+                "pov_steam_id": aid,
+                "pov_nick": nickname_by_sid.get(aid, "Unknown"),
+                "start_tick": start_tick,
+                "end_tick": end_tick,
+                "kill_ticks": [tick],
+                "punch_up_tags": [],
+            })
+
+    # ================================================================
+    # KNIFE / ZEUS (punch-up, round-winning last kill, or last-alive Zeus)
+    # ================================================================
+    for _rn, rkills in sorted(kills_by_round.items()):
+        if _rn <= 0:
+            continue
+        _winner = _round_winner(_rn)
+        for k in rkills:
+            if not _keep_knife_zeus(k, rkills, _winner, team_by_sid):
+                continue
+            aid = k["attacker_sid"]
+            if not aid:
+                continue
+            tick = int(k["tick"])
+            start_tick, end_tick = _one_kill_window(tick)
+            shorts.append({
+                "short_type": "knife",
+                "pov_steam_id": aid,
+                "pov_nick": nickname_by_sid.get(aid, "Unknown"),
+                "start_tick": start_tick,
+                "end_tick": end_tick,
+                "kill_ticks": [tick],
+                "punch_up_tags": _punch_up_tags([k]),
+            })
+
+    # ================================================================
+    # DEFUSE (1v1 kit, or Ts outnumber CTs)
+    # ================================================================
+    for ev in defuse_events or []:
+        tick = int(ev["tick"])
+        rn = int(ev.get("round") or _round_for_tick(tick, round_starts, first_freeze) or 0)
+        if rn <= 0:
+            continue
+        if not _keep_defuse(ev, kills_by_round.get(rn, []), team_by_sid):
+            continue
+        aid = str(ev.get("player_sid") or "")
+        if not aid:
+            continue
+        begin = int(ev.get("begin_tick") or tick - _PRE_KILL_TICK_MARGIN)
+        start_tick = begin - _PRE_KILL_TICK_MARGIN
+        end_tick = tick + _POST_KILL_TICK_MARGIN
+        shorts.append({
+            "short_type": "defuse",
+            "pov_steam_id": aid,
+            "pov_nick": nickname_by_sid.get(aid, "Unknown"),
+            "start_tick": start_tick,
+            "end_tick": end_tick,
+            "kill_ticks": [],
+            "punch_up_tags": [],
+        })
+
+    # ================================================================
+    # PERFECT SHOTS (2–4 gun kills, fire count ≈ kill count)
+    # ================================================================
+    for _rn, rkills in sorted(kills_by_round.items()):
+        if _rn <= 0:
+            continue
+        by_attacker: dict[str, list[dict]] = {}
+        for k in rkills:
+            aid = k["attacker_sid"]
+            if aid:
+                by_attacker.setdefault(aid, []).append(k)
+        for aid, kills in by_attacker.items():
+            if not _perfect_fire_kills(kills, fires_by_player):
+                continue
+            ticks = sorted(k["tick"] for k in kills)
+            end_tick = ticks[-1] + _POST_KILL_TICK_MARGIN
+            start_tick = min(
+                end_tick - _SHORT_TICK_DURATION,
+                ticks[0] - _PRE_KILL_TICK_MARGIN,
+            )
+            shorts.append({
+                "short_type": "perfect_shots",
+                "pov_steam_id": aid,
+                "pov_nick": nickname_by_sid.get(aid, "Unknown"),
+                "start_tick": start_tick,
+                "end_tick": end_tick,
+                "kill_ticks": ticks,
+                "punch_up_tags": _punch_up_tags(kills),
+            })
+
+    # ================================================================
+    # FLICK (gun kill, fast yaw snap — not quickscope)
+    # ================================================================
+    _flick = flick_kills or set()
+    for _rn, rkills in sorted(kills_by_round.items()):
+        if _rn <= 0:
+            continue
+        for k in rkills:
+            aid = k["attacker_sid"]
+            tick = int(k["tick"])
+            if not aid or (aid, tick) not in _flick:
+                continue
+            if not _is_gun_kill(k):
+                continue
+            start_tick, end_tick = _one_kill_window(tick)
+            shorts.append({
+                "short_type": "flick",
+                "pov_steam_id": aid,
+                "pov_nick": nickname_by_sid.get(aid, "Unknown"),
+                "start_tick": start_tick,
+                "end_tick": end_tick,
+                "kill_ticks": [tick],
+                "punch_up_tags": _punch_up_tags([k]),
+                "flick": True,
             })
 
     # ================================================================
@@ -927,6 +1497,41 @@ def detect_shorts(
                 for c in clutches
             )
         ]
+
+    if _flick:
+        for s in shorts:
+            sid = str(s.get("pov_steam_id") or "")
+            if any((sid, int(t)) in _flick for t in (s.get("kill_ticks") or [])):
+                s["flick"] = True
+        covered = {
+            (str(s.get("pov_steam_id") or ""), int(t))
+            for s in shorts
+            if s["short_type"] != "flick"
+            for t in (s.get("kill_ticks") or [])
+        }
+        shorts = [
+            s for s in shorts
+            if s["short_type"] != "flick"
+            or not any(
+                (str(s.get("pov_steam_id") or ""), int(t)) in covered
+                for t in (s.get("kill_ticks") or [])
+            )
+        ]
+
+    tick_to_round: dict[int, int] = {}
+    for rn, rkills in kills_by_round.items():
+        for k in rkills:
+            tick_to_round[int(k["tick"])] = int(k["round"])
+    for s in shorts:
+        rn = None
+        for t in s.get("kill_ticks") or []:
+            rn = tick_to_round.get(int(t))
+            if rn is not None:
+                break
+        if rn is None:
+            tick = int(s.get("end_tick") or s.get("start_tick") or 0)
+            rn = _round_for_tick(tick, round_starts, first_freeze)
+        s["round"] = int(rn or 0)
 
     kills: list[dict] = []
     for rn in sorted(kills_by_round):

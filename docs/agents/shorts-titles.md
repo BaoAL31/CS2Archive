@@ -8,8 +8,11 @@ instead of re-deriving the convention.
 
 1. **Must contain** the PLAYER name, the clip KIND, and the OPPONENT.
 2. **Kinds:** clutch (e.g. "1v4 Clutch", "2v5 Clutch", "ACE") or multikill
-   ("4K", "5K"). Add the weapon/gun for flavour when it's distinctive (e.g.
-   "AK 4K", "M4 + AK 4K").
+   ("4K", "5K"), plus **wallbang**, **knife** (incl. Zeus — punch-up, round-winning
+   last kill, or last-alive Zeus only), **defuse** (1v1 kit, or Ts outnumber CTs),
+   **perfect shots** (2–4 taps, fire count ≈ kills), and **flick** (fast yaw snap
+   onto the target; not a quickscope). Add the weapon/gun for flavour when it's
+   distinctive (e.g. "AK 4K", "M4 + AK 4K").
 3. **Opponent label**
    - HLTV/tournament: name the opposing **org**. If that org is HLTV **top 10**,
      the name is required in the title (never map-only).

@@ -15,7 +15,6 @@ _CLUTCH = (
 _MULTIKILL = (
     (re.compile(r"\bace\b|\b5\s*k\b", re.I), "ace"),
     (re.compile(r"\b4\s*k\b|\bquad(?:ro)?\b", re.I), "4k"),
-    (re.compile(r"\bnearly\b|\balmost\b", re.I), "nearly"),
     (re.compile(r"\b3\s*k\b|\btriple\b", re.I), "3k"),
 )
 _STACK = (
@@ -111,25 +110,60 @@ def opponent_of_cut(short: dict, orgs: list[str] | None = None) -> str | None:
     return None
 
 
-def opponent_from_fixture(hint: str | None, match: dict | None) -> str | None:
+def opponent_from_fixture(
+    hint: str | None,
+    match: dict | None,
+    pov_team: str | None = None,
+) -> str | None:
     teams = fixture_teams(match)
     if not teams:
         return None
     hint_canon = canonical_ranking_name(hint)
     if hint_canon in teams:
         return hint_canon
+    if hint and str(hint).strip():
+        return None
+    pov = canonical_ranking_name(pov_team)
+    if pov in teams:
+        return teams[0] if pov == teams[1] else teams[1]
     return None
 
 
+_VETO_ITEM = re.compile(r"\s+\d+\.\s")
+
+
+def clean_hltv_stage(text: str | None) -> str:
+    """Keep the stage label; drop veto lists, TBA placeholders, leftover markup."""
+    raw = re.sub(r"<[^>]+", " ", text or "")
+    raw = re.sub(r"&[a-zA-Z0-9#]+;", " ", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    raw = _VETO_ITEM.split(raw, maxsplit=1)[0].strip()
+    if " TBA" in raw:
+        raw = raw.split(" TBA", 1)[0].strip()
+    if ". " in raw:
+        raw = raw.split(". ", 1)[0].strip()
+    while raw.endswith(" 1") and not raw.lower().endswith("round of 16"):
+        raw = raw[:-2].strip()
+    return raw
+
+
 def parse_stage(text: str | None) -> str | None:
-    raw = (text or "").strip().lower()
+    raw = clean_hltv_stage(text).lower()
     if not raw:
         return None
     if "grand final" in raw:
         return "grand_final"
-    if any(token in raw for token in ("quarter", "semi", "playoff", "final")):
+    if "group" in raw:
+        return "group"
+    if any(
+        token in raw
+        for token in (
+            "quarter", "semi", "playoff", "final",
+            "round of", "3rd place", "decider",
+        )
+    ):
         return "playoff"
-    if any(token in raw for token in ("swiss", "opening", "group")):
+    if any(token in raw for token in ("swiss", "opening", "stage 1", "stage 2")):
         return "group"
     return None
 
@@ -162,7 +196,57 @@ def kinds_from_cut(short: dict) -> tuple[str, ...]:
             kinds.append(stack)
     if short.get("perfect_shots") and "perfect_shots" not in kinds:
         kinds.append("perfect_shots")
+    if short.get("flick") and "flick" not in kinds:
+        kinds.append("flick")
     return tuple(kinds)
+
+
+_CLUTCH_KINDS = ("1v5_won", "1v4_won", "1v3_won", "2vx_won")
+_MULTI_KINDS = ("ace", "4k", "3k")
+_STACK_KINDS = ("flick", "perfect_shots", "wallbang", "knife", "defuse")
+
+
+def merge_label_and_demo_kinds(
+    label_kinds: tuple[str, ...] | list[str] | None,
+    demo_kinds: tuple[str, ...] | list[str] | None,
+) -> tuple[str, ...]:
+    """Factory label wins clutch/multikill mutex; demo fills empty categories."""
+    out: list[str] = []
+    have_clutch = False
+    have_multi = False
+    for kind in label_kinds or ():
+        if kind in _CLUTCH_KINDS:
+            if have_clutch:
+                continue
+            have_clutch = True
+        elif kind in _MULTI_KINDS:
+            if have_multi:
+                continue
+            have_multi = True
+        if kind not in out:
+            out.append(kind)
+    for kind in demo_kinds or ():
+        if kind in out:
+            continue
+        if kind in _CLUTCH_KINDS:
+            if have_clutch:
+                continue
+            have_clutch = True
+            out.append(kind)
+        elif kind in _MULTI_KINDS:
+            if have_multi:
+                continue
+            have_multi = True
+            out.append(kind)
+        elif kind in _STACK_KINDS:
+            out.append(kind)
+    have = set(out)
+    label_order = [k for k in (label_kinds or ()) if k in have]
+    rest = [
+        k for k in (*_CLUTCH_KINDS, *_MULTI_KINDS, *_STACK_KINDS)
+        if k in have and k not in label_order
+    ]
+    return tuple(label_order + rest)
 
 
 def parse_kinds(label: str) -> tuple[str, ...]:
@@ -197,6 +281,18 @@ def observation_from_allstar(clip: dict, match: dict | None = None) -> dict | No
     if match and not match_id:
         match_id = str(match.get("match_id") or "") or None
     hint = clip.get("opponent_team")
+    pov_team = None
+    if not (isinstance(hint, str) and hint.strip()) and player:
+        try:
+            from hltv_ranking import PRO_TEAM_OVERRIDE, _load_roster
+            raw = (
+                PRO_TEAM_OVERRIDE.get(player)
+                or PRO_TEAM_OVERRIDE.get(player.lower())
+                or _load_roster().get(player.lower())
+            )
+            pov_team = canonical_ranking_name(raw)
+        except Exception:
+            pov_team = None
     return {
         "source": "allstar",
         "clip_id": str(clip.get("clip_id") or ""),
@@ -204,7 +300,9 @@ def observation_from_allstar(clip: dict, match: dict | None = None) -> dict | No
         "player": player,
         "match_id": match_id,
         "kinds": parse_kinds(label),
-        "opponent": opponent_from_fixture(hint if isinstance(hint, str) else None, match),
+        "opponent": opponent_from_fixture(
+            hint if isinstance(hint, str) else None, match, pov_team=pov_team,
+        ),
         "stage": parse_stage(match.get("stage") if match else None),
         "label": label,
         "views": clip.get("views"),

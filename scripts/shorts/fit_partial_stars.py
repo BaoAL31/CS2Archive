@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 STARS_PATH = ROOT / ".data" / "partial_stars.json"
 ALLSTAR_JSONL = ROOT / ".data" / "allstar_hltv_probe.jsonl"
 TO_JSONL = ROOT / ".data" / "to_shorts_observations.jsonl"
+DEMO_KIND_STAMPS = ROOT / ".data" / "demo_kind_stamps.json"
 LISTENER_LOCK = ROOT / ".listener" / "hltv.json.lock"
 YOUTUBE_VIDEO_URL = "https://www.googleapis.com/youtube/v3/videos"
 _YT_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -19,7 +20,7 @@ WINDOW_DAYS = 180
 DAILY_NEW_MATCHES = 15
 KIND_LEVELS = (
     "1v5_won", "1v4_won", "1v3_won", "2vx_won",
-    "ace", "4k", "nearly", "3k",
+    "ace", "4k", "3k",
     "flick", "perfect_shots", "wallbang", "knife", "defuse",
 )
 STAGE_LEVELS = ("group", "playoff", "grand_final")
@@ -251,6 +252,43 @@ def fetch_youtube_view_counts(
     return out
 
 
+def load_demo_kind_stamps(path: Path | None = None) -> dict[str, list[str]]:
+    dest = path or DEMO_KIND_STAMPS
+    if not dest.is_file():
+        return {}
+    try:
+        data = json.loads(dest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+    stamps = data.get("stamps") if isinstance(data, dict) else None
+    if not isinstance(stamps, dict):
+        return {}
+    return {
+        str(key): [str(k) for k in val]
+        for key, val in stamps.items()
+        if isinstance(val, list)
+    }
+
+
+def apply_demo_kind_stamps(
+    rows: list[dict],
+    stamps: dict[str, list[str]] | None,
+) -> list[dict]:
+    if not stamps:
+        return rows
+    from shorts.clip_observation import merge_label_and_demo_kinds
+
+    out: list[dict] = []
+    for row in rows:
+        extra = stamps.get(str(row.get("clip_id") or ""))
+        if extra:
+            merged = merge_label_and_demo_kinds(row.get("kinds") or (), extra)
+            out.append({**row, "kinds": merged})
+        else:
+            out.append(row)
+    return out
+
+
 def observations_from_to_jsonl(path: Path | None = None) -> list[dict]:
     dest = path or TO_JSONL
     if not dest.is_file():
@@ -277,7 +315,7 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
 
 
 def observations_from_allstar_jsonl(path: Path | None = None) -> list[dict]:
-    from shorts.clip_observation import observations_from_match_row
+    from shorts.clip_observation import observations_from_match_row, parse_stage
 
     dest = path or ALLSTAR_JSONL
     if not dest.is_file():
@@ -294,9 +332,15 @@ def observations_from_allstar_jsonl(path: Path | None = None) -> list[dict]:
             continue
         clips = row.get("clips") or []
         if clips and isinstance(clips[0], dict) and "kinds" in clips[0] and "source" in clips[0]:
-            out.extend(c for c in clips if isinstance(c, dict))
+            stage = parse_stage(row.get("match_stage") or row.get("stage"))
+            for c in clips:
+                if not isinstance(c, dict):
+                    continue
+                out.append({**c, "stage": stage} if stage else c)
             continue
         out.extend(observations_from_match_row(row))
+    if dest.resolve() == ALLSTAR_JSONL.resolve():
+        out = apply_demo_kind_stamps(out, load_demo_kind_stamps())
     return out
 
 

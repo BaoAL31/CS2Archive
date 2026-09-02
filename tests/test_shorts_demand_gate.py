@@ -142,6 +142,16 @@ def test_hltv_source_and_clip_age_are_not_in_candidate_score():
     }
     assert candidate_score(cut, polluted) == candidate_score(cut, STARS)
 
+
+def test_hltv_stage_is_not_in_candidate_score():
+    from shorts.demand_gate import candidate_score
+
+    plain = _cut(kill_ticks=[1, 2, 3, 4, 5])
+    playoff = _cut(kill_ticks=[1, 2, 3, 4, 5], stage="playoff")
+    gf = _cut(kill_ticks=[1, 2, 3, 4, 5], stage="grand_final")
+    assert candidate_score(playoff, STARS) == candidate_score(plain, STARS)
+    assert candidate_score(gf, STARS) == candidate_score(plain, STARS)
+
 PAYLOAD = {
     "index": {"donk": 1.53, "m0nesy": 1.28, "tn1r": 1.19},
     "players": {

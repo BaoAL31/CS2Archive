@@ -14,6 +14,8 @@ from shorts.clip_observation import (
     observation_from_to,
     observations_from_match_row,
     opponent_of_cut,
+    parse_kinds,
+    parse_stage,
 )
 
 
@@ -55,6 +57,28 @@ def test_five_kills_is_ace_not_also_4k():
     obs = observation_from_allstar(clip)
     assert obs["kinds"] == ("1v3_won", "ace")
     assert "4k" not in obs["kinds"]
+
+
+def test_almost_and_nearly_are_not_kinds():
+    obs = observation_from_allstar({**LATTO_CLIP, "label": "latto Dust 2 almost ACE"})
+    assert obs["kinds"] == ("ace",)
+    assert "nearly" not in obs["kinds"]
+    assert "nearly" not in parse_kinds("nearly 4K")
+
+
+def test_demo_kinds_fill_empty_categories_without_replacing_label_clutch():
+    from shorts.clip_observation import merge_label_and_demo_kinds
+
+    assert merge_label_and_demo_kinds(
+        ("1v3_won", "ace"),
+        ("1v5_won", "flick", "perfect_shots", "defuse"),
+    ) == ("1v3_won", "ace", "flick", "perfect_shots", "defuse")
+    assert merge_label_and_demo_kinds(("4k",), ("1v5_won", "4k", "flick")) == (
+        "4k", "1v5_won", "flick",
+    )
+    assert merge_label_and_demo_kinds((), ("2vx_won", "defuse")) == (
+        "2vx_won", "defuse",
+    )
 
 
 def test_flick_perfect_shots_wallbang_knife_defuse_stack_with_clutch_and_multikill():
@@ -118,6 +142,12 @@ def test_stage_from_joined_match_not_round_number():
     assert unset["stage"] is None
     no_match = observation_from_allstar(clip)
     assert no_match["stage"] is None
+    assert parse_stage("Group B lower bracket final") == "group"
+    assert parse_stage("Round of 16") == "playoff"
+    assert parse_stage("Stage 1 round") == "group"
+    assert parse_stage("3rd place decider") == "playoff"
+    assert parse_stage("Grand final 1") == "grand_final"
+    assert parse_stage("Quarter-final TBA TBA Watch") == "playoff"
 
 
 def test_hltv_highlight_boxes_are_not_clip_observations():
@@ -269,6 +299,26 @@ def test_kinds_from_cut_five_clean_taps_are_ace_and_perfect_shots():
         "perfect_shots": True,
     })
     assert clutch == ("1v3_won", "ace", "perfect_shots")
+
+
+def test_kinds_from_cut_stacks_flick():
+    assert kinds_from_cut({
+        "short_type": "flick",
+        "kill_ticks": [1],
+        "flick": True,
+    }) == ("flick",)
+    stacked = kinds_from_cut({
+        "short_type": "clutch",
+        "clutch_initial_count": "1v3",
+        "kill_ticks": [1, 2, 3],
+        "flick": True,
+    })
+    assert stacked == ("1v3_won", "flick")
+
+
+def test_quickscope_label_is_not_flick():
+    assert "flick" not in parse_kinds("m0NESY Mirage Quickscope")
+    assert parse_kinds("insane flick") == ("flick",)
 
 
 def test_talk_and_ewc_without_cs2_are_not_observations():

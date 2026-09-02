@@ -7,6 +7,7 @@ clips (steamid, HLTV nick, match id, views). Writes JSONL as it goes.
     python scripts/shorts/scrape_allstar_hltv.py
     python scripts/shorts/scrape_allstar_hltv.py --max-matches 10
     python scripts/shorts/scrape_allstar_hltv.py --enrich
+    python scripts/shorts/scrape_allstar_hltv.py --fill-stage
 """
 
 from __future__ import annotations
@@ -33,7 +34,8 @@ ensure()
 
 from config import settings  # noqa: E402
 from shorts.popular_events import is_popular_event  # noqa: E402
-from shorts.clip_observation import observations_from_match_row  # noqa: E402
+from shorts.clip_observation import observations_from_match_row, parse_stage  # noqa: E402
+from scrapers.ratings import extract_match_stage  # noqa: E402
 
 PROFILE_DIR = ROOT / ".sessions" / "hltv-cloak"
 OUT_DEFAULT = ROOT / ".data" / "allstar_hltv_probe.jsonl"
@@ -140,15 +142,7 @@ def _playlist_id(html: str) -> str | None:
 
 def match_stage_from_html(html: str) -> str | None:
     """Event stage from the joined HLTV match page (not map/round)."""
-    if not html:
-        return None
-    soup = BeautifulSoup(html, "lxml")
-    el = soup.select_one("div.match-info-box div.text") or soup.select_one(
-        "div.map-info-wrap ul li"
-    )
-    if not el:
-        return None
-    text = el.get_text(strip=True)
+    text = extract_match_stage(html)
     return text or None
 
 
@@ -402,6 +396,152 @@ def _append(path: Path, row: dict) -> None:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def load_ratings_stages(analysis_dir: Path | None = None) -> dict[str, str]:
+    """match_stage from backlog ratings JSON, keyed by slug and match id."""
+    from shorts.clip_observation import clean_hltv_stage
+
+    dest = analysis_dir or (ROOT / "demos" / "analysis")
+    known: dict[str, str] = {}
+    if not dest.is_dir():
+        return known
+    for path in dest.glob("*_ratings.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        stage = clean_hltv_stage(data.get("match_stage"))
+        if not parse_stage(stage):
+            continue
+        known[path.name[: -len("_ratings.json")]] = stage
+        m = MATCH_HREF.search(str(data.get("url") or ""))
+        if m:
+            known[m.group(1)] = stage
+    return known
+
+
+def apply_known_stages(rows: list[dict], known: dict[str, str]) -> int:
+    filled = 0
+    for row in rows:
+        if parse_stage(row.get("match_stage") or row.get("stage")):
+            continue
+        slug = str(row.get("slug") or "")
+        mid = str(row.get("match_id") or "")
+        stage = known.get(slug) or known.get(mid)
+        if not parse_stage(stage):
+            continue
+        row["match_stage"] = stage
+        filled += 1
+    return filled
+
+
+def _rewrite_jsonl(path: Path, rows: list[dict]) -> None:
+    tmp = path.with_suffix(".jsonl.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    tmp.replace(path)
+
+
+def _fetch_missing_stages(
+    pending: list[dict], *, sleep: float, abort_after_cf: int,
+    on_progress=None,
+) -> dict:
+    from cloakbrowser import launch_persistent_context
+
+    stats = {"fetched": 0, "cloudflare": 0}
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    ctx = launch_persistent_context(
+        str(PROFILE_DIR.resolve()),
+        headless=True,
+        viewport={"width": 1920, "height": 1080},
+        humanize=True,
+        channel="chrome",
+    )
+    cf_streak = 0
+    try:
+        page = ctx.new_page()
+        for i, row in enumerate(pending, 1):
+            if parse_stage(row.get("match_stage")):
+                continue
+            url = row.get("url")
+            if not url:
+                continue
+            time.sleep(sleep + random.random())
+            html, cf = _goto(page, url)
+            if cf:
+                stats["cloudflare"] += 1
+                cf_streak += 1
+                print(f"[CF] {row.get('match_id')} {cf}  ({i}/{len(pending)})")
+                if cf_streak >= abort_after_cf:
+                    print("[fill-stage] abort: consecutive Cloudflare")
+                    break
+                continue
+            cf_streak = 0
+            stage = match_stage_from_html(html)
+            if parse_stage(stage):
+                row["match_stage"] = stage
+                stats["fetched"] += 1
+                print(f"[ok] {row.get('match_id')} {stage}  ({i}/{len(pending)})")
+                if on_progress and stats["fetched"] % 20 == 0:
+                    on_progress()
+            else:
+                print(f"[--] {row.get('match_id')} no stage  ({i}/{len(pending)})")
+    finally:
+        try:
+            ctx.close()
+        except Exception:
+            pass
+    return stats
+
+
+def fill_jsonl_stages(
+    path: Path,
+    *,
+    fetch: bool = True,
+    sleep: float = 2.0,
+    abort_after_cf: int = 5,
+) -> dict:
+    """Write match_stage onto an existing Allstar JSONL. Does not wipe clips."""
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        rows.append(json.loads(line))
+    stats = {
+        "rows": len(rows),
+        "from_ratings": 0,
+        "fetched": 0,
+        "cloudflare": 0,
+        "still_empty": 0,
+    }
+    stats["from_ratings"] = apply_known_stages(rows, load_ratings_stages())
+    _rewrite_jsonl(path, rows)
+    pending = [
+        r for r in rows if not parse_stage(r.get("match_stage") or r.get("stage"))
+    ]
+    if fetch and pending:
+        from shorts.fit_partial_stars import listener_holds_cloak
+
+        if listener_holds_cloak():
+            print("[fill-stage] skip fetch: listener holds Cloak")
+        else:
+            fetched = _fetch_missing_stages(
+                pending, sleep=sleep, abort_after_cf=abort_after_cf,
+                on_progress=lambda: _rewrite_jsonl(path, rows),
+            )
+            stats["fetched"] = fetched.get("fetched", 0)
+            stats["cloudflare"] = fetched.get("cloudflare", 0)
+    stats["still_empty"] = sum(
+        1 for r in rows if not parse_stage(r.get("match_stage") or r.get("stage"))
+    )
+    _rewrite_jsonl(path, rows)
+    return stats
+
+
 def enrich_jsonl(path: Path, sleep: float) -> dict:
     """Re-fetch playlists for rows that already have playlist_id. No HLTV."""
     if not path.is_file():
@@ -455,7 +595,35 @@ def main() -> int:
         action="store_true",
         help="Re-fetch Allstar playlists into an existing JSONL (no HLTV)",
     )
+    ap.add_argument(
+        "--fill-stage",
+        action="store_true",
+        help="Fill match_stage on an existing JSONL from ratings + HLTV match pages",
+    )
+    ap.add_argument(
+        "--no-fetch",
+        action="store_true",
+        help="With --fill-stage, only use local ratings JSON (no Cloak)",
+    )
     args = ap.parse_args()
+
+    if args.fill_stage:
+        stats = fill_jsonl_stages(
+            args.out,
+            fetch=not args.no_fetch,
+            sleep=args.sleep,
+            abort_after_cf=args.abort_after_cf,
+        )
+        print(json.dumps(stats))
+        print(f"[fill-stage] wrote {args.out}")
+        from shorts.fit_partial_stars import refresh_partial_stars
+
+        stars = refresh_partial_stars()
+        print(json.dumps({
+            "stage": stars.get("stage"),
+            "rows": stars.get("_rows"),
+        }))
+        return 0 if stats["cloudflare"] == 0 or stats["fetched"] or stats["from_ratings"] else 2
 
     if args.enrich:
         stats = enrich_jsonl(args.out, sleep=max(args.sleep, 0.2))

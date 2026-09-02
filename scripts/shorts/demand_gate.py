@@ -55,7 +55,11 @@ def load_partial_stars(path: Path | None = None) -> dict:
 
 
 def candidate_score(short: dict, stars: dict, *, orgs: list[str] | None = None) -> float:
-    """Intercept + player + opponent + stage + every active kind. Missing add 0."""
+    """Intercept + player + opponent + every active kind. Missing add 0.
+
+    Stage stays in the fit (so it does not leak into player/opponent/kind) but
+    is not in this score — same as source and Clip age.
+    """
     from shorts.clip_observation import kinds_from_cut, opponent_of_cut
 
     intercept = float(stars.get("intercept") or 0)
@@ -63,14 +67,12 @@ def candidate_score(short: dict, stars: dict, *, orgs: list[str] | None = None) 
     player = float((stars.get("player") or {}).get(sid) or 0) if sid else 0.0
     opp_canon = opponent_of_cut(short, orgs)
     opponent = float((stars.get("opponent") or {}).get(opp_canon) or 0) if opp_canon else 0.0
-    stage = short.get("stage")
-    stage_star = float((stars.get("stage") or {}).get(stage) or 0) if stage else 0.0
     kinds = short.get("kinds")
     if not isinstance(kinds, (list, tuple)):
         kinds = kinds_from_cut(short)
     kind_table = stars.get("kind") or {}
     kind_sum = sum(float(kind_table.get(k) or 0) for k in kinds)
-    return intercept + player + opponent + stage_star + kind_sum
+    return intercept + player + opponent + kind_sum
 
 
 def _player_qualifies(nick: str, payload: dict) -> bool:

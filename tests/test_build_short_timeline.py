@@ -58,8 +58,8 @@ def test_4k_detected():
     assert timeline["kills"][0]["attacker_steam_id"] == "A"
 
 
-def test_4k_dynamic_prekill_caps_at_30s():
-    """Tight multikill: pre-kill stretches to make the short exactly 30s (1920 ticks)."""
+def test_4k_dynamic_prekill_caps_at_20s():
+    """Tight multikill: pre-kill stretches to the 20s target (1280 ticks)."""
     kill_events = [
         {"tick": 1000, "round": 1, "attacker_sid": "A", "victim_sid": "B", "weapon": "ak47", "victim_weapon": "ak47"},
         {"tick": 1100, "round": 1, "attacker_sid": "A", "victim_sid": "C", "weapon": "ak47", "victim_weapon": "ak47"},
@@ -73,7 +73,7 @@ def test_4k_dynamic_prekill_caps_at_30s():
     )
     s = result["shorts"][0]
     assert s["end_tick"] == 1300 + 128 == 1428
-    assert s["start_tick"] == s["end_tick"] - 1920 == -492
+    assert s["start_tick"] == s["end_tick"] - 1280 == 148
     assert s["start_tick"] < 1000  # pre-kill is dynamic, much longer than 5s floor
 
 
@@ -529,7 +529,7 @@ def test_4k_with_two_high_tier_victims_detected():
 
 def test_build_from_action_timeline_detects_4k(tmp_path):
     """build_short_timeline_from_action converts an action_timeline.json and detects a 4K."""
-    from scripts.shorts.build_short_timeline import build_short_timeline_from_action
+    from shorts.build_short_timeline import build_short_timeline_from_action
 
     at = {
         "demo_path": "demos/faceit/test.dem",
@@ -586,7 +586,7 @@ def test_build_from_action_timeline_detects_4k(tmp_path):
 
 def test_build_from_action_preserves_demo_path(tmp_path):
     """Action timeline conversion preserves the demo_path in the output."""
-    from scripts.shorts.build_short_timeline import build_short_timeline_from_action
+    from shorts.build_short_timeline import build_short_timeline_from_action
 
     at = {
         "demo_path": "demos/faceit/my-match.dem",
@@ -745,3 +745,489 @@ def test_winner_by_round_respects_halftime_side_swap():
     result = _winner_by_round_from_demo(parser, info, round_start, round_end_winner)
 
     assert result[0] == {1: 2, 2: 3}
+
+
+# ------------------------------ WALLBANG TESTS ------------------------------
+
+def test_wallbang_awp_detected():
+    kill_events = [
+        {
+            "tick": 2000, "round": 1, "attacker_sid": "A", "victim_sid": "B",
+            "weapon": "awp", "victim_weapon": "ak47", "penetrated": 1,
+        },
+    ]
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=kill_events,
+        round_starts=[(500, 1)],
+    )
+    bangs = [s for s in result["shorts"] if s["short_type"] == "wallbang"]
+    assert len(bangs) == 1
+    s = bangs[0]
+    assert s["pov_steam_id"] == "A"
+    assert s["kill_ticks"] == [2000]
+    assert s["end_tick"] == 2000 + 128
+    assert s["start_tick"] == s["end_tick"] - 1280
+
+
+def test_wallbang_requires_penetration():
+    kill_events = [
+        {
+            "tick": 2000, "round": 1, "attacker_sid": "A", "victim_sid": "B",
+            "weapon": "awp", "victim_weapon": "ak47", "penetrated": 0,
+        },
+    ]
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=kill_events,
+        round_starts=[(500, 1)],
+    )
+    assert [s["short_type"] for s in result["shorts"]] == []
+
+
+def test_wallbang_pistol_rejected():
+    """USP through a box is not a wallbang Short."""
+    kill_events = [
+        {
+            "tick": 2000, "round": 1, "attacker_sid": "A", "victim_sid": "B",
+            "weapon": "usp_silencer", "victim_weapon": "ak47", "penetrated": 2,
+        },
+    ]
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=kill_events,
+        round_starts=[(500, 1)],
+    )
+    assert [s["short_type"] for s in result["shorts"]] == []
+
+
+def test_wallbang_round_0_rejected():
+    kill_events = [
+        {
+            "tick": 2000, "round": 0, "attacker_sid": "A", "victim_sid": "B",
+            "weapon": "awp", "victim_weapon": "ak47", "penetrated": 1,
+        },
+    ]
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=kill_events,
+        round_starts=[(500, 0)],
+    )
+    assert result["short_count"] == 0
+
+
+def test_knife_punch_up_detected():
+    kill_events = [
+        {
+            "tick": 2000, "round": 1, "attacker_sid": "A", "victim_sid": "B",
+            "weapon": "knife", "victim_weapon": "ak47",
+        },
+    ]
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=kill_events,
+        round_starts=[(500, 1)],
+    )
+    knives = [s for s in result["shorts"] if s["short_type"] == "knife"]
+    assert len(knives) == 1
+    assert knives[0]["pov_steam_id"] == "A"
+    assert knives[0]["kill_ticks"] == [2000]
+
+
+def test_knife_eco_tase_rejected():
+    """Knife/Zeus on a pistol without punch-up, win, or last-alive is not a Short."""
+    kill_events = [
+        {
+            "tick": 2000, "round": 1, "attacker_sid": "A", "victim_sid": "B",
+            "weapon": "zeus", "victim_weapon": "glock",
+        },
+        {
+            "tick": 2500, "round": 1, "attacker_sid": "C", "victim_sid": "D",
+            "weapon": "ak47", "victim_weapon": "ak47",
+        },
+    ]
+    team_by_sid = {"A": 2, "B": 3, "C": 2, "D": 3}
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=kill_events,
+        team_by_sid=team_by_sid,
+        round_starts=[(500, 1)],
+        round_win_events={1: [{"tick": 3000, "event": "explode", "player_sid": "C"}]},
+    )
+    assert [s["short_type"] for s in result["shorts"] if s["short_type"] == "knife"] == []
+
+
+def test_knife_round_winning_last_kill():
+    kill_events = [
+        {
+            "tick": 2000, "round": 1, "attacker_sid": "A", "victim_sid": "B",
+            "weapon": "knife", "victim_weapon": "glock",
+        },
+    ]
+    team_by_sid = {"A": 2, "B": 3}
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=kill_events,
+        team_by_sid=team_by_sid,
+        round_starts=[(500, 1)],
+        round_win_events={1: [{"tick": 3000, "event": "explode", "player_sid": "A"}]},
+    )
+    knives = [s for s in result["shorts"] if s["short_type"] == "knife"]
+    assert len(knives) == 1
+
+
+def test_zeus_last_alive_detected():
+    kill_events = [
+        {
+            "tick": 1500, "round": 1, "attacker_sid": "E", "victim_sid": "Mate",
+            "weapon": "ak47", "victim_weapon": "ak47",
+        },
+        {
+            "tick": 2000, "round": 1, "attacker_sid": "A", "victim_sid": "B",
+            "weapon": "zeus", "victim_weapon": "glock",
+        },
+    ]
+    team_by_sid = {"A": 2, "Mate": 2, "B": 3, "E": 3}
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=kill_events,
+        team_by_sid=team_by_sid,
+        round_starts=[(500, 1)],
+        round_win_events={1: [{"tick": 3000, "event": "explode", "player_sid": "E"}]},
+    )
+    knives = [s for s in result["shorts"] if s["short_type"] == "knife"]
+    assert len(knives) == 1
+    assert knives[0]["pov_steam_id"] == "A"
+
+
+def test_ninja_defuse_detected():
+    """1v3 kit: Ts outnumber CTs, someone on T is still alive."""
+    team_by_sid = {"CT1": 3, "T1": 2, "T2": 2, "T3": 2}
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=[],
+        team_by_sid=team_by_sid,
+        round_starts=[(500, 1)],
+        defuse_events=[{
+            "tick": 4000, "round": 1, "player_sid": "CT1",
+            "begin_tick": 3600, "aborted": False,
+            "health": 100, "spotted": False, "in_smoke": False,
+        }],
+    )
+    defs = [s for s in result["shorts"] if s["short_type"] == "defuse"]
+    assert len(defs) == 1
+    assert defs[0]["pov_steam_id"] == "CT1"
+    assert defs[0]["round"] == 1
+    assert defs[0]["end_tick"] == 4000 + 128
+    assert defs[0]["start_tick"] == 3600 - 320
+
+
+def test_spotted_clutch_defuse_detected():
+    """1v2 kit: T numbers advantage is enough — spotted / 1 HP does not matter."""
+    team_by_sid = {"CT1": 3, "T1": 2, "T2": 2}
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=[],
+        team_by_sid=team_by_sid,
+        round_starts=[(500, 1)],
+        defuse_events=[{
+            "tick": 4000, "round": 1, "player_sid": "CT1",
+            "begin_tick": 3600, "aborted": False,
+            "health": 1, "spotted": True, "in_smoke": False,
+        }],
+    )
+    defs = [s for s in result["shorts"] if s["short_type"] == "defuse"]
+    assert len(defs) == 1
+    assert defs[0]["pov_steam_id"] == "CT1"
+
+
+def test_even_1v1_defuse_detected():
+    """1v1 kit is a clutch defuse."""
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=[],
+        team_by_sid={"CT1": 3, "T1": 2},
+        round_starts=[(500, 1)],
+        defuse_events=[{
+            "tick": 4000, "round": 1, "player_sid": "CT1",
+            "begin_tick": 3600, "aborted": False,
+            "health": 1, "spotted": False, "in_smoke": True,
+        }],
+    )
+    defs = [s for s in result["shorts"] if s["short_type"] == "defuse"]
+    assert len(defs) == 1
+    assert defs[0]["pov_steam_id"] == "CT1"
+
+
+def test_ct_numbers_advantage_defuse_rejected():
+    """T still alive but CTs are ahead on numbers — not a clutch defuse."""
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=[
+            {"tick": 1000, "round": 1, "attacker_sid": "CT1", "victim_sid": "T2",
+             "weapon": "ak47", "victim_weapon": "ak47"},
+        ],
+        team_by_sid={"CT1": 3, "CT2": 3, "T1": 2, "T2": 2},
+        round_starts=[(500, 1)],
+        defuse_events=[{
+            "tick": 4000, "round": 1, "player_sid": "CT1",
+            "begin_tick": 3600, "aborted": False,
+            "health": 100, "spotted": False, "in_smoke": False,
+        }],
+    )
+    assert [s["short_type"] for s in result["shorts"] if s["short_type"] == "defuse"] == []
+
+
+def test_smoke_defuse_all_dead_rejected():
+    """Smoke or 1 HP is not a Short once every enemy is dead."""
+    team_by_sid = {"CT1": 3, "T1": 2}
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=[
+            {"tick": 1000, "round": 1, "attacker_sid": "CT1", "victim_sid": "T1",
+             "weapon": "ak47", "victim_weapon": "ak47"},
+        ],
+        team_by_sid=team_by_sid,
+        round_starts=[(500, 1)],
+        defuse_events=[{
+            "tick": 4000, "round": 1, "player_sid": "CT1",
+            "begin_tick": 3600, "aborted": False,
+            "health": 1, "spotted": True, "in_smoke": True,
+        }],
+    )
+    assert [s["short_type"] for s in result["shorts"] if s["short_type"] == "defuse"] == []
+
+
+def test_comfortable_defuse_rejected():
+    """Full HP, spotted, no smoke, no enemies alive — not a Short."""
+    team_by_sid = {"CT1": 3, "T1": 2}
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=[
+            {"tick": 1000, "round": 1, "attacker_sid": "CT1", "victim_sid": "T1",
+             "weapon": "ak47", "victim_weapon": "ak47"},
+        ],
+        team_by_sid=team_by_sid,
+        round_starts=[(500, 1)],
+        defuse_events=[{
+            "tick": 4000, "round": 1, "player_sid": "CT1",
+            "begin_tick": 3600, "aborted": False,
+            "health": 100, "spotted": True, "in_smoke": False,
+        }],
+    )
+    assert [s["short_type"] for s in result["shorts"] if s["short_type"] == "defuse"] == []
+
+
+def test_defuse_round_0_rejected():
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=[],
+        team_by_sid={"CT1": 3, "T1": 2},
+        round_starts=[(500, 0)],
+        defuse_events=[{
+            "tick": 4000, "round": 0, "player_sid": "CT1",
+            "begin_tick": 3600, "aborted": False,
+            "health": 1, "spotted": False, "in_smoke": True,
+        }],
+    )
+    assert result["short_count"] == 0
+
+
+def test_perfect_shots_two_taps_detected():
+    kill_events = [
+        {"tick": 2000, "round": 1, "attacker_sid": "A", "victim_sid": "B",
+         "weapon": "awp", "victim_weapon": "ak47"},
+        {"tick": 2200, "round": 1, "attacker_sid": "A", "victim_sid": "C",
+         "weapon": "awp", "victim_weapon": "ak47"},
+    ]
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=kill_events,
+        round_starts=[(500, 1)],
+        weapon_fires=[
+            {"tick": 1990, "player_sid": "A", "weapon": "awp"},
+            {"tick": 2190, "player_sid": "A", "weapon": "awp"},
+        ],
+    )
+    shots = [s for s in result["shorts"] if s["short_type"] == "perfect_shots"]
+    assert len(shots) == 1
+    assert shots[0]["pov_steam_id"] == "A"
+    assert shots[0]["kill_ticks"] == [2000, 2200]
+
+
+def test_perfect_shots_replaces_sprayless_4k():
+    """Four clean taps is perfect_shots, not a 4K."""
+    kill_events = [
+        {"tick": 1000, "round": 1, "attacker_sid": "A", "victim_sid": "B",
+         "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 1100, "round": 1, "attacker_sid": "A", "victim_sid": "C",
+         "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 1200, "round": 1, "attacker_sid": "A", "victim_sid": "D",
+         "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 1300, "round": 1, "attacker_sid": "A", "victim_sid": "E",
+         "weapon": "ak47", "victim_weapon": "ak47"},
+    ]
+    fires = [{"tick": t - 10, "player_sid": "A", "weapon": "ak47"} for t in (1000, 1100, 1200, 1300)]
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=kill_events,
+        round_starts=[(500, 1)],
+        weapon_fires=fires,
+    )
+    types = [s["short_type"] for s in result["shorts"]]
+    assert "perfect_shots" in types
+    assert "4k" not in types
+
+
+def test_spray_4k_stays_4k():
+    kill_events = [
+        {"tick": 1000, "round": 1, "attacker_sid": "A", "victim_sid": "B",
+         "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 1100, "round": 1, "attacker_sid": "A", "victim_sid": "C",
+         "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 1200, "round": 1, "attacker_sid": "A", "victim_sid": "D",
+         "weapon": "ak47", "victim_weapon": "glock"},
+        {"tick": 1300, "round": 1, "attacker_sid": "A", "victim_sid": "E",
+         "weapon": "ak47", "victim_weapon": "glock"},
+    ]
+    fires = [{"tick": 900 + i * 8, "player_sid": "A", "weapon": "ak47"} for i in range(20)]
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=kill_events,
+        round_starts=[(500, 1)],
+        weapon_fires=fires,
+    )
+    types = [s["short_type"] for s in result["shorts"]]
+    assert "4k" in types
+    assert "perfect_shots" not in types
+
+
+def test_five_perfect_shots_stay_ace():
+    """Five kills is still a 4K/ACE even when every shot connected."""
+    kill_events = [
+        {"tick": 100 + i * 80, "round": 1, "attacker_sid": "X", "victim_sid": f"v{i}",
+         "weapon": "ak47", "victim_weapon": "ak47"}
+        for i in range(5)
+    ]
+    fires = [{"tick": 90 + i * 80, "player_sid": "X", "weapon": "ak47"} for i in range(5)]
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=kill_events,
+        round_starts=[(50, 1)],
+        weapon_fires=fires,
+    )
+    types = [s["short_type"] for s in result["shorts"]]
+    assert "4k" in types
+    assert "perfect_shots" not in types
+    assert len(result["shorts"][0]["kill_ticks"]) == 5
+
+
+def test_knife_round_0_rejected():
+    kill_events = [
+        {
+            "tick": 2000, "round": 0, "attacker_sid": "A", "victim_sid": "B",
+            "weapon": "knife", "victim_weapon": "ak47",
+        },
+    ]
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=kill_events,
+        round_starts=[(500, 0)],
+    )
+    assert result["short_count"] == 0
+
+
+def test_flick_gun_kill_detected():
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=[{
+            "tick": 2000, "round": 1, "attacker_sid": "A", "victim_sid": "B",
+            "weapon": "awp", "victim_weapon": "ak47",
+        }],
+        round_starts=[(500, 1)],
+        flick_kills={("A", 2000)},
+    )
+    flicks = [s for s in result["shorts"] if s["short_type"] == "flick"]
+    assert len(flicks) == 1
+    assert flicks[0]["kill_ticks"] == [2000]
+    assert flicks[0]["flick"] is True
+
+
+def test_flick_stacks_on_ace_cut():
+    from shorts.clip_observation import kinds_from_cut
+
+    kill_events = [
+        {"tick": 1000 + i * 50, "round": 1, "attacker_sid": "A",
+         "victim_sid": f"V{i}", "weapon": "awp", "victim_weapon": "ak47"}
+        for i in range(5)
+    ]
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=kill_events,
+        round_starts=[(500, 1)],
+        flick_kills={("A", 1000)},
+        winner_by_round={1: 2},
+        team_by_sid={"A": 2, "V0": 3, "V1": 3, "V2": 3, "V3": 3, "V4": 3},
+    )
+    ace = [s for s in result["shorts"] if len(s.get("kill_ticks") or []) >= 5]
+    assert ace
+    assert ace[0]["flick"] is True
+    kinds = kinds_from_cut(ace[0])
+    assert "ace" in kinds
+    assert "flick" in kinds
+    assert not any(s["short_type"] == "flick" for s in result["shorts"])
+
+
+def test_flick_stacks_on_clutch_and_drops_duplicate_short():
+    kill_events = [
+        {"tick": 1000, "round": 1, "attacker_sid": "A1", "victim_sid": "B5", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 2000, "round": 1, "attacker_sid": "A2", "victim_sid": "B4", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 3000, "round": 1, "attacker_sid": "A3", "victim_sid": "B3", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 3500, "round": 1, "attacker_sid": "B2", "victim_sid": "A4", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 4000, "round": 1, "attacker_sid": "B2", "victim_sid": "A5", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 4500, "round": 1, "attacker_sid": "B2", "victim_sid": "A1", "weapon": "ak47", "victim_weapon": "glock"},
+        {"tick": 5000, "round": 1, "attacker_sid": "B2", "victim_sid": "A2", "weapon": "ak47", "victim_weapon": "glock"},
+    ]
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=kill_events,
+        team_by_sid={
+            "A1": 2, "A2": 2, "A3": 2, "A4": 2, "A5": 2,
+            "B1": 3, "B2": 3, "B3": 3, "B4": 3, "B5": 3,
+        },
+        round_win_events={1: [{"tick": 6000, "event": "defuse", "player_sid": "B2"}]},
+        round_starts=[(500, 1)],
+        round_ends={1: 6000},
+        flick_kills={("B2", 3500)},
+    )
+    clutches = [s for s in result["shorts"] if s["short_type"] == "clutch"]
+    assert len(clutches) == 1
+    assert clutches[0]["flick"] is True
+    assert not any(s["short_type"] == "flick" for s in result["shorts"])
+
+
+def test_flick_knife_kill_not_emitted():
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=[{
+            "tick": 2000, "round": 1, "attacker_sid": "A", "victim_sid": "B",
+            "weapon": "knife", "victim_weapon": "ak47",
+        }],
+        round_starts=[(500, 1)],
+        flick_kills={("A", 2000)},
+    )
+    assert [s["short_type"] for s in result["shorts"] if s["short_type"] == "flick"] == []
+
+
+def test_flick_round_0_rejected():
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=[{
+            "tick": 2000, "round": 0, "attacker_sid": "A", "victim_sid": "B",
+            "weapon": "awp", "victim_weapon": "ak47",
+        }],
+        round_starts=[(500, 0)],
+        flick_kills={("A", 2000)},
+    )
+    assert [s["short_type"] for s in result["shorts"] if s["short_type"] == "flick"] == []
+
