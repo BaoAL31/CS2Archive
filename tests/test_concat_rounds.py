@@ -1,4 +1,4 @@
-"""Tests for scripts/pov/concat_rounds.py — batch-based incremental concat."""
+"""Tests for scripts/pov/concat_rounds.py — single-pass concat-demuxer."""
 
 from __future__ import annotations
 

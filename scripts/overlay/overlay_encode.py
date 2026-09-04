@@ -55,6 +55,7 @@ def _ffmpeg_encode(
     segment: tuple[float, float] | None = None,
     loop_inputs: set[str] | None = None,
     raw_inputs: list[tuple[Path, list[str]]] | None = None,
+    include_audio: bool = True,
 ) -> None:
     """Run ffmpeg with h264_nvenc. No CPU fallback (libx forbidden by user).
 
@@ -72,6 +73,14 @@ def _ffmpeg_encode(
     (e.g. 1x1 RGBA alpha controls) that need explicit demuxer flags before
     ``-i`` (``-f rawvideo -pix_fmt rgba -s 1x1 -r <fps>``). They are appended
     AFTER ``extra_inputs`` in input order.
+
+    ``include_audio=False`` encodes video-only (``-an``). The batched overlay
+    path uses this: per-batch audio re-encodes drift a few ms per batch
+    (video is frame-quantized, audio sample-precise), so batches carry no
+    audio at all and the source audio is muxed back exactly once at the end
+    by ``_remux_source_audio`` (``-c:a copy``, no re-encode). With no batch
+    audio there is no drift to fix — the source track is sample-locked to
+    the video timeline.
 
     Atomic write: ffmpeg renders to ``{output}.part`` and the file is
     renamed onto ``output_path`` only after a successful exit. A cancelled /
@@ -120,8 +129,16 @@ def _ffmpeg_encode(
     for raw_path, raw_opts in (raw_inputs or []):
         cmd.extend(raw_opts)
         cmd.extend(["-i", str(raw_path)])
+    if include_audio:
+        audio_map_args = ["-map", "0:a?"]
+        audio_codec_args = ["-c:a", "aac", "-b:a", "256k",
+                            "-af", "asetpts=PTS-STARTPTS"]
+    else:
+        audio_map_args = ["-an"]
+        audio_codec_args: list[str] = []
     cmd.extend([
-        *fc_out, "-map", map_label, "-map", "0:a?", "-shortest",
+        *fc_out, "-map", map_label,
+        *audio_map_args, "-shortest",
         # FINAL EXPORT — uploaded verbatim (YouTube copy + outro append are both
         # -c copy, so this bitstream is exactly what goes up). Max practical
         # 1440p quality for overlay content (text/UI/keyboard-cam edges are the
@@ -136,8 +153,7 @@ def _ffmpeg_encode(
         "-maxrate", "60M", "-bufsize", "120M",
         "-profile:v", "high", "-pix_fmt", "yuv420p",
         "-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
-        "-c:a", "aac", "-b:a", "256k",
-        "-af", "asetpts=PTS-STARTPTS",
+        *audio_codec_args,
         "-movflags", "+faststart",
         "-g", "60", "-keyint_min", "60",
         "-f", "mp4", str(tmp_path),
@@ -187,11 +203,11 @@ def _ffmpeg_segment_copy(
 def _remux_source_audio(overlay_path: Path, source_path: Path) -> None:
     """Replace the overlay video's audio with the original source audio.
 
-    The overlay re-encodes audio per batch and stream-copies the batches
-    together, which lets audio drift a few ms per batch (video is frame
-    quantized, audio is sample-precise) — cumulative A/V desync. The overlay
-    adds no audio, so the source's audio is the correct sync reference. Mux it
-    back, trimmed to the overlay video's duration, stream-copying the video.
+    Batch encodes run video-only (``-an``), so the concatenated overlay has
+    no audio track at all — there is no per-batch drift to fix. The overlay
+    adds no audio, so the source's audio is the correct sync reference. Mux
+    it back, trimmed to the overlay video's duration, stream-copying both
+    video and audio (no re-encode of either).
     """
     from overlay._common import _log
     tmp = overlay_path.with_name(overlay_path.name + ".resync.mp4")
@@ -202,7 +218,7 @@ def _remux_source_audio(overlay_path: Path, source_path: Path) -> None:
         "-i", str(source_path),
         "-map", "0:v", "-map", "1:a?",
         "-c:v", "copy",
-        "-c:a", "aac", "-b:a", "256k",
+        "-c:a", "copy",
         "-movflags", "+faststart",
         "-shortest",
         str(tmp),
@@ -220,7 +236,10 @@ def _concat_overlay_batches(batch_files: list[Path], output_path: Path) -> None:
 
     Validates the merged file is non-empty. Raises ``SystemExit`` on ffmpeg
     failure. Stream copy requires all inputs to share codec params (same
-    _ffmpeg_encode call produces all batches, so this holds).
+    _ffmpeg_encode call produces all batches, so this holds). Batches are
+    video-only (``-an`` at encode); ``-an`` here too so a stale pre-change
+    batch with an audio track can never sneak audio into the concat — the
+    source audio is muxed back exactly once by ``_remux_source_audio``.
     """
     if not batch_files:
         _log("[ERROR] no batch files to concat")
@@ -234,7 +253,7 @@ def _concat_overlay_batches(batch_files: list[Path], output_path: Path) -> None:
         tmp_path.unlink(missing_ok=True)
         cmd = [
             "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
-            "-c", "copy", "-movflags", "+faststart", "-f", "mp4", str(tmp_path),
+            "-c", "copy", "-an", "-movflags", "+faststart", "-f", "mp4", str(tmp_path),
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
         if result.returncode != 0 or not tmp_path.is_file():

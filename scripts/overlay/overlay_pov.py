@@ -1075,6 +1075,7 @@ def run_overlay(
                             ["-filter_complex", "[0:v]null[outv]"],
                             "[outv]", str(batch_path),
                             segment=(batch_start_sec, batch_end_sec),
+                            include_audio=False,
                         )
                         continue
 
@@ -1092,6 +1093,7 @@ def run_overlay(
                         out_label, str(batch_path),
                         segment=(batch_start_sec, batch_end_sec),
                         loop_inputs=loops,
+                        include_audio=False,
                     )
 
                 _log(f"  [batch] All batches encoded in {time.time()-t5:.1f}s")
@@ -1108,13 +1110,11 @@ def run_overlay(
                 _log(f"  [concat] OK in {time.time()-t6:.1f}s")
                 for bf in batch_files:
                     bf.unlink(missing_ok=True)
-                # Re-sync audio: the per-batch re-encode + stream-copy concat lets
-                # audio drift a few ms per batch (measured ~44ms after batch 1,
-                # ~33ms more per subsequent batch) because video is frame-quantized
-                # while audio is sample-precise. Replace the concatenated audio
-                # with the ORIGINAL source audio (sample-locked to the video),
-                # stream-copied from video_path. The overlay adds no audio, so the
-                # source audio is the correct sync reference.
+                # Re-attach source audio: batch encodes are video-only (`-an`),
+                # so the concat has no audio track. Mux the ORIGINAL source
+                # audio back (sample-locked to the video timeline) with a
+                # stream copy — no re-encode. The overlay adds no audio, so
+                # the source audio is the correct sync reference.
                 _remux_source_audio(output_path, video_path)
                 mb = output_path.stat().st_size / 1024 / 1024
                 _log(f"Overlay: {output_path.name} ({mb:.0f} MB) in {time.time()-t4:.1f}s")

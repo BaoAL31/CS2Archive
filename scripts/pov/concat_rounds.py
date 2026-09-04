@@ -38,15 +38,22 @@ def _batch_range(f: Path) -> tuple[int, int]:
     return (int(m.group(1)), int(m.group(2)))
 
 
-def _concat_two(a: Path, b: Path, out: Path) -> None:
-    a_mb = a.stat().st_size / 1024 / 1024
-    b_mb = b.stat().st_size / 1024 / 1024
-    print(f"\n  [Concat] {a_mb:.0f} MB + {b_mb:.0f} MB (disk I/O, no re-encode)...", end=" ", flush=True)
+def _concat_many(parts: list[Path], out: Path) -> None:
+    """Concat N files in ONE ffmpeg demuxer pass (stream copy, no re-encode).
+
+    The old pairwise loop rewrote the growing combined.mp4 once per batch
+    (quadratic disk I/O — hundreds of GB rewritten on a full map). One
+    pass reads + writes the total bytes exactly once. Resume-safe: callers
+    pass [existing combined.mp4, *leftover batch files].
+    """
+    total_mb = sum(p.stat().st_size for p in parts) / 1024 / 1024
+    print(f"\n  [Concat] {len(parts)} file(s), {total_mb:.0f} MB total "
+          f"(single pass, no re-encode)...", end=" ", flush=True)
     with tempfile.TemporaryDirectory() as tmp:
         lst = Path(tmp) / "files.txt"
         with open(lst, "w") as f:
-            f.write(f"file '{a.resolve().as_posix()}'\n")
-            f.write(f"file '{b.resolve().as_posix()}'\n")
+            for p in parts:
+                f.write(f"file '{p.resolve().as_posix()}'\n")
         r = subprocess.run(
             [FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
              "-c", "copy", str(out)],
@@ -358,30 +365,20 @@ def concat_rounds(folder: Path, allow_gaps: bool = False) -> Path:
                 "for rounds already inside combined.mp4"
             )
 
+    # Probe EVERY batch before consuming any file. After rename/unlink,
+    # probing `combined` would return the cumulative duration so far — which
+    # for batch N>1 double-counts earlier batches into total_duration_seconds
+    # and pushes later round_offsets past the end of the video
+    # (e.g. round 22 at 3093s in a 2202s POV).
+    durations: list[float] = []
     for f in files:
-        s, e = _batch_range(f)
-
-        # Probe THIS batch before consuming it. After rename/unlink, probing
-        # `combined` would return the cumulative duration so far — which for
-        # batch N>1 double-counts earlier batches into total_duration_seconds
-        # and pushes later round_offsets past the end of the video
-        # (e.g. round 22 at 3093s in a 2202s POV).
         dur = _probe_duration(f)
         if dur <= 0:
             print(f"  [warn] ffprobe returned 0 duration for {f.name}")
+        durations.append(dur)
 
-        if not combined.exists():
-            f.rename(combined)
-            mb = combined.stat().st_size / 1024 / 1024
-            print(f"  {f.name} -> {combined.name} ({mb:.0f} MB)")
-        else:
-            tmp = folder / "_tmp.mp4"
-            _concat_two(combined, f, tmp)
-            tmp.replace(combined)
-            f.unlink()  # consumed into combined; remaining batch-*.mp4 = not-yet-concatted (resume signal)
-            mb = combined.stat().st_size / 1024 / 1024
-            print(f"  {f.name} appended ({mb:.0f} MB)")
-
+    for f, dur in zip(files, durations):
+        s, e = _batch_range(f)
         # Distribute this batch's duration evenly across its rounds
         per_round = dur / (e - s + 1)
         for r in range(s, e + 1):
@@ -394,6 +391,29 @@ def concat_rounds(folder: Path, allow_gaps: bool = False) -> Path:
             "round_end": e,
             "duration_seconds": dur,
         })
+
+    # Single concat-demuxer pass (stream copy). First file renames into
+    # place (zero-copy); everything else appends in one ffmpeg invocation.
+    # On resume combined.mp4 already holds the consumed batches (deleted
+    # from disk), so only the leftover files are appended.
+    if combined.exists():
+        parts = [combined, *files]
+        consumed = list(files)
+    else:
+        first, rest = files[0], files[1:]
+        first.rename(combined)
+        mb = combined.stat().st_size / 1024 / 1024
+        print(f"  {first.name} -> {combined.name} ({mb:.0f} MB)")
+        parts = [combined, *rest]
+        consumed = list(rest)
+    if len(parts) > 1:
+        tmp = folder / "_tmp.mp4"
+        _concat_many(parts, tmp)
+        tmp.replace(combined)
+        for f in consumed:
+            f.unlink()  # consumed into combined; remaining batch-*.mp4 = not-yet-concatted (resume signal)
+        mb = combined.stat().st_size / 1024 / 1024
+        print(f"  {len(consumed)} file(s) appended ({mb:.0f} MB)")
 
     # Write round offset sidecar. When CSDM sequence files are present, parse
     # the actual per-round tick ranges and probed video durations from them —
