@@ -27,7 +27,7 @@ short is detected: `renders/shorts/shorts-<demo-stem>/shorts-<slug>/`.
 
 The listener also reads upcoming / live matches from the event page (and the
 event matches tab when the overview has no timestamps). If nothing is live
-and nothing starts in the next 24 hours, it **keeps polling FACEIT** (same
+and nothing starts in the next 12 hours, it **keeps polling FACEIT** (same
 loop as HLTV, 15-minute scrape cooldown) for watchable Recognised-Pro POVs
 from the last 24 hours. A POV qualifies only if it is a **plus-K/D win**
 from a player on the YouTube **demand index** (>= 1.0). Org rank is not

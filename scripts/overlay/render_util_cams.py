@@ -548,7 +548,7 @@ def _render_util_cams(
         # Pip overlay only needs flight/detonate — victims are showcase-only and
         # cause 1-tick zero-length batches (e.g. 192833) that kill the 40-spot batch.
         # Disable victims for pip to allow partial finalize (56/56 flights succeed).
-        camera_types=("throw", "flight", "orbit"),
+        camera_types=("flight", "orbit"),
         max_victim_povs=0,
         width=rw,
         height=rh,

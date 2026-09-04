@@ -48,7 +48,7 @@ def _concat_two(a: Path, b: Path, out: Path) -> None:
             f.write(f"file '{a.resolve().as_posix()}'\n")
             f.write(f"file '{b.resolve().as_posix()}'\n")
         r = subprocess.run(
-            [FFMPEG, "-f", "concat", "-safe", "0", "-i", str(lst),
+            [FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
              "-c", "copy", str(out)],
             capture_output=True, text=True, timeout=36000,
         )
@@ -312,6 +312,26 @@ def concat_rounds(folder: Path, allow_gaps: bool = False) -> Path:
     seq_fields = _parse_sequence_files(folder, files)
     if seq_fields:
         print(f"  [seq] per-round tick spans available ({len(seq_fields['per_round_ticks'])} rounds)")
+        # Persist HLAE filename ticks before concat deletes round-*.mp4. Overlay
+        # mapping must use these play windows, not analysis freeze-inclusive
+        # startTick/endTick (that shift keyboard + PiPs by ~20s).
+        tick_cache = folder / "combined.sequence_ticks.json"
+        tick_cache.write_text(
+            json.dumps(
+                {
+                    "per_round_ticks": {
+                        str(k): list(v)
+                        for k, v in seq_fields["per_round_ticks"].items()
+                    },
+                    "per_round_durations": {
+                        str(k): round(v, 3)
+                        for k, v in seq_fields["per_round_durations"].items()
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
     round_offsets: dict[int, float] = {}
     batch_offsets: list[dict] = []
@@ -494,7 +514,7 @@ def _scale_vf(w: int, h: int, scaling_mode: str = "") -> tuple[str, str]:
     pillarboxed/unsquished instead of anamorphically stretched to 16:9.
     """
     _ = scaling_mode
-    return f"scale={w}:{h}:flags=spline,setsar=1,format=nv12", "stretch"
+    return f"scale={w}:{h}:flags=spline,setsar=1,format=nv12,fps=60", "stretch"
 
 
 def _scale_vf_gpu(w: int, h: int) -> str:
@@ -509,7 +529,7 @@ def _scale_vf_gpu(w: int, h: int) -> str:
     libx264, pegging the CPU. Scaling to an exact WxH already yields SAR 1:1, so
     no ``setsar`` filter.
     """
-    return f"scale_cuda={w}:{h}:interp_algo=lanczos:format=nv12,hwdownload,format=nv12"
+    return f"scale_cuda={w}:{h}:interp_algo=lanczos:format=nv12,hwdownload,format=nv12,fps=60"
 
 
 
@@ -538,7 +558,10 @@ def _build_shade_filter(
     whole reason the shade lives in the scale step, not the overlay step.
     """
     vf, _ = _scale_vf(w, h, scaling_mode)
-    parts = ["[0:v]null[v0]"]
+    # fps=60 first: HLAE can write a 60 tbr file whose real average is ~58fps
+    # (same frame count, longer timestamps). Shade timelines are duration*60;
+    # without this, -shortest truncates the 1440p encode to frame_count/60.
+    parts = ["[0:v]fps=60[v0]"]
     cur = "v0"
     idx = 1
     for ctrl, rect in zip(shade_ctrls, box_rects):

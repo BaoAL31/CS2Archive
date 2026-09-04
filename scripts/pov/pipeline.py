@@ -439,7 +439,8 @@ class Pipeline:
             # skip the scale and ship an unscaled (e.g. 1280x960) video.
             from concat_rounds import _get_resolution
 
-            FINAL_W, FINAL_H = 2560, 1440
+            FINAL_W = int(getattr(self.args, "width", None) or 2560)
+            FINAL_H = int(getattr(self.args, "height", None) or 1440)
             w, h = _get_resolution(combined)
             if (w, h) == (FINAL_W, FINAL_H):
                 print(f"  [skip] render + scale complete: {combined.name} "
@@ -635,6 +636,8 @@ class Pipeline:
             fail(2, "RENDER_STEAM_NOT_RUNNING", "Steam must be running before rendering")
 
         skip_failed = getattr(self.args, "skip_failed_rounds", False)
+        export_w = int(getattr(self.args, "width", None) or 0)
+        export_h = int(getattr(self.args, "height", None) or 0)
         render_args = [
             "scripts/pov/render_pov.py", str(self.demo_path), self.steam_id,
             "--output", str(self.render_dir),
@@ -646,7 +649,10 @@ class Pipeline:
             render_args += ["--skip-failed-rounds"]
         cap_w = int(self.meta.get("capture_width") or 0)
         cap_h = int(self.meta.get("capture_height") or 0)
-        if cap_w >= 800 and cap_h >= 600:
+        if export_w >= 800 and export_h >= 600:
+            render_args += ["--width", str(export_w), "--height", str(export_h)]
+            print(f"  [capture] {export_w}x{export_h} (CLI --width/--height)")
+        elif cap_w >= 800 and cap_h >= 600:
             render_args += ["--width", str(cap_w), "--height", str(cap_h)]
             print(f"  [capture] {cap_w}x{cap_h} "
                   f"({self.meta.get('aspect_ratio', '?')} "
@@ -1051,6 +1057,10 @@ class Pipeline:
         skip_failed = getattr(self.args, "skip_failed_rounds", False)
 
         concat_args = ["scripts/pov/concat_rounds.py", str(self.render_dir)]
+        export_w = int(getattr(self.args, "width", None) or 0)
+        export_h = int(getattr(self.args, "height", None) or 0)
+        if export_w >= 800 and export_h >= 600:
+            concat_args += ["--width", str(export_w), "--height", str(export_h)]
         scaling = (self.meta.get("scaling_mode") or "").strip()
         if scaling:
             concat_args += ["--scaling-mode", scaling]
@@ -1710,6 +1720,18 @@ def main() -> None:
         "--overlay-only",
         action="store_true",
         help="Deprecated no-op: overlay-only is the default.",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=None,
+        help="HLAE + concat export width (default: player capture width, concat 2560).",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=None,
+        help="HLAE + concat export height (default: player capture height, concat 1440).",
     )
     parser.add_argument(
         "--batches",

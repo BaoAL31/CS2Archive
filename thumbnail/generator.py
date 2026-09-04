@@ -40,11 +40,32 @@ def cutout_player(avatar_path: Path) -> Image.Image:
     return Image.open(avatar_path).convert("RGBA")
 
 
+def _trim_transparent(player: Image.Image, alpha_min: int = 8) -> Image.Image:
+    """Crop to the opaque subject so scale/paste ignore empty canvas padding.
+
+    HLTV bodyshots keep a 400x417 canvas after rembg. Players framed smaller
+    in that box (more left/side padding) otherwise look shrunk and shifted
+    right, because scale uses the full canvas height and paste anchors at x=0.
+    """
+    if player.mode != "RGBA":
+        player = player.convert("RGBA")
+    alpha = player.getchannel("A")
+    if alpha_min > 0:
+        alpha = alpha.point(lambda p, t=alpha_min: 255 if p >= t else 0)
+    bbox = alpha.getbbox()
+    if not bbox:
+        return player
+    return player.crop(bbox)
+
+
 def scale_player(player: Image.Image, target_height: int) -> Image.Image:
+    player = _trim_transparent(player)
     w, h = player.size
+    if h <= 0:
+        return player
     ratio = target_height / h
-    new_w = int(w * ratio)
-    new_h = int(h * ratio)
+    new_w = max(1, int(w * ratio))
+    new_h = max(1, int(h * ratio))
     return player.resize((new_w, new_h), Image.LANCZOS)
 
 

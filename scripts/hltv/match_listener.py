@@ -6,7 +6,7 @@ demand, org rank, and HLTV rating. One card per match is queued from
 
 Cap is 3 uploads per local calendar day (the YouTube long-form slots).
 When the configured event has nothing live and nothing starting in the
-next 24 hours, the listener keeps polling FACEIT for watchable POVs
+next 12 hours, the listener keeps polling FACEIT for watchable POVs
 (plus-K/D win from a player on the YouTube demand index). It queues those
 as they appear, up
 to the remaining daily slots, and does not pad with weak games.
@@ -73,7 +73,7 @@ DEFAULT_STATE = ROOT / ".listener" / "hltv.json"
 DEFAULT_RANKINGS_URL = "https://www.hltv.org/ranking/teams"
 MIN_RATING = 1.5
 DAILY_UPLOAD_LIMIT = 3
-FACEIT_HORIZON = timedelta(hours=24)
+FACEIT_HORIZON = timedelta(hours=12)
 FACEIT_SCRAPE_INTERVAL = timedelta(minutes=15)
 
 
@@ -349,7 +349,7 @@ def event_busy(
     scheduled: list[ScheduledMatch],
     now: datetime | None = None,
 ) -> bool:
-    """True when the event is live or a match starts within 24h."""
+    """True when the event is live or a match starts within 12h."""
     return bool(upcoming_within(scheduled, now=now))
 
 
@@ -665,7 +665,7 @@ async def _maybe_queue_faceit(args, state: State, indexes: dict | None) -> None:
         state.save()
         return
     print(
-        f"[faceit-notable] no HLTV match in the next 24h; "
+        f"[faceit-notable] no HLTV match in the next 12h; "
         f"scraping last {DEFAULT_HOURS}h for watchable POVs "
         f"({room} slot(s))",
         flush=True,
@@ -957,7 +957,7 @@ async def poll_once(args, state: State) -> None:
     hltv_busy = event_busy(scheduled, now)
     print(
         f"[poll] {len(matches)} notable completed event match(es); "
-        f"hltv_next_24h={'yes' if hltv_busy else 'no'}; "
+        f"hltv_next_12h={'yes' if hltv_busy else 'no'}; "
         f"{_slots_left(state)}/{DAILY_UPLOAD_LIMIT} upload slot(s) left",
         flush=True,
     )

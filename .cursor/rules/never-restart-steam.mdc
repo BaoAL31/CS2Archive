@@ -1,0 +1,14 @@
+---
+description: Never shutdown, restart, or offline-toggle Steam. Agent process lists are a false negative.
+alwaysApply: true
+---
+
+# Never restart Steam
+
+`Get-Process steam`, `tasklist`, and `steam_mode.py --status` in the agent shell often report Steam as not running **while it is running**. That false negative has caused agents to kill a live Steam session three times.
+
+**Do not** run `scripts/misc/steam_mode.py` (`--offline` / `--online`). Both paths call `steam.exe -shutdown` first.
+
+**Do not** start, stop, or restart `steam.exe` because a process listing was empty.
+
+Trust that Steam is already up unless the user says it is down. The pipeline's own `RENDER_STEAM_NOT_RUNNING` check (from a real render process) is the authority — not the agent shell.

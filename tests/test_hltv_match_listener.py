@@ -389,16 +389,16 @@ def test_parse_scheduled_matches_reads_live_attribute():
     assert parsed[0].live is True
 
 
-def test_event_busy_when_match_starts_within_24h():
+def test_event_busy_when_match_starts_within_12h():
     now = datetime(2026, 9, 1, 20, 39)
-    soon = now + timedelta(hours=18)
+    soon = now + timedelta(hours=8)
     scheduled = [ScheduledMatch("200", unix_ms=int(soon.timestamp() * 1000))]
     assert event_busy(scheduled, now) is True
 
 
-def test_event_idle_when_next_match_is_beyond_24h():
+def test_event_idle_when_next_match_is_beyond_12h():
     now = datetime(2026, 9, 1, 20, 39)
-    later = now + timedelta(hours=25)
+    later = now + timedelta(hours=13)
     scheduled = [ScheduledMatch("200", unix_ms=int(later.timestamp() * 1000))]
     assert event_busy(scheduled, now) is False
 

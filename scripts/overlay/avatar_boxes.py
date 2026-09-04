@@ -14,6 +14,7 @@ Verified against renders:
   - 1280x960  (4:3):         donk "team_donk666 vs team_KiMaRR - Mirage"          (recorded from prior
                              scoreboard-render analysis; the source frame was since deleted, so these values
                              should be re-confirmed against a fresh donk frame before relying on them)
+  - 1024x768  (4:3):         TeSeS "team_CEMEN_BAKIN vs team_Maarkoos - mirage" (0.8× 1280x960, HUD-strip check)
 """
 AVATAR_BOXES = {
     "1920x1080": {
@@ -36,6 +37,19 @@ AVATAR_BOXES = {
         ],
         "RIGHT": [
             (674, 717), (720, 763), (766, 809), (812, 855), (858, 901),
+        ],
+    },
+    # 1024x768 (4:3 Black Bars — TeSeS). 0.8× the 1280x960 layout; checked
+    # against a native HUD strip from team_CEMEN_BAKIN vs team_Maarkoos.
+    "1024x768": {
+        "aspect": "4:3",
+        "y0": 11,
+        "y1": 46,
+        "LEFT": [
+            (302, 337), (339, 374), (376, 410), (413, 447), (450, 484),
+        ],
+        "RIGHT": [
+            (539, 574), (576, 610), (613, 647), (650, 684), (686, 721),
         ],
     },
     # 1680x1050 (16:10 Black Bars — Jimpphat). Measured from a native

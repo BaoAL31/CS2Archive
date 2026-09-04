@@ -6,7 +6,7 @@ Picks the top N (=3) Recognised-Pro POVs for a calendar day from
 to performances left in the persistent pool from previous days.
 
 The HLTV match listener polls this on off days (no tournament match live
-or starting within 24 hours) and queues only watchable POVs — it does not
+or starting within 12 hours) and queues only watchable POVs — it does not
 pad the day to 3. Manual CLI still works.
 
 ``pick_for_day`` is idempotent per calendar day. The listener uses
