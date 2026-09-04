@@ -457,6 +457,10 @@ def _poll_and_inject(
 
 def _run_csdm_batch(config_path: Path, demo_path: str, segments: list[dict]) -> int:
     """Run CSDM with config file, injecting camera commands in background."""
+    from hook_aware import kill_stale_processes, prepare_steam_hlae
+
+    kill_stale_processes()
+    prepare_steam_hlae()
     cmd = [CSDM, "video", "--config-file", str(config_path.resolve())]
     _dbg("csdm", f"command: {' '.join(cmd)}")
 

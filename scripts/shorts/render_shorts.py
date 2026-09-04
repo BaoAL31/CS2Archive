@@ -392,6 +392,8 @@ def _build_csdm_config(
 
 
 def _run_csdm(config_path: Path) -> int:
+    from hook_aware import prepare_steam_hlae
+    prepare_steam_hlae()
     cmd = [CSDM, "video", "--config-file", str(config_path.resolve())]
     _dbg("csdm", f"command: {' '.join(cmd)}")
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=14400)
@@ -412,8 +414,9 @@ def _run_csdm_hook_aware(config_path: Path, segments_dir: Path, label: str,
     the CS2/HLAE tree and retry, up to ``hook_retries`` times. Exits if the
     hook never engages.
     """
-    from hook_aware import kill_stale_processes
+    from hook_aware import kill_stale_processes, prepare_steam_hlae
 
+    prepare_steam_hlae()
     cmd = [CSDM, "video", "--config-file", str(config_path.resolve())]
     for attempt in range(1, hook_retries + 1):
         suffix = f" (attempt {attempt}/{hook_retries})" if hook_retries > 1 else ""

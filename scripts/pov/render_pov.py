@@ -18,7 +18,10 @@ ensure()
 
 from cs2_minimizer import CS2Park
 from config import settings, apply_runtime_env
-from hook_aware import kill_stale_processes as _kill_stale_processes
+from hook_aware import (
+    kill_stale_processes as _kill_stale_processes,
+    prepare_steam_hlae as _prepare_steam_hlae,
+)
 
 apply_runtime_env()
 
@@ -309,6 +312,7 @@ def run_csdm(cmd: list[str], label: str, expected: Path | None = None,
         return _run_csdm_hook_aware(cmd, label, expected,
                                     output_dir, hook_timeout, hook_retries)
 
+    _prepare_steam_hlae()
     print(f"  [{label}]...", end=" ", flush=True)
     t0 = time.time()
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=14400)

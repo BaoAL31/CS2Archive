@@ -13,6 +13,7 @@ generator, and the util-cam flight renderer.
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
@@ -35,6 +36,14 @@ _FATAL_MARKERS = (
 # Min size for a real encoded sequence/clip. A partially-written file under this
 # threshold is treated as not-yet-engaged.
 _MIN_VIDEO_BYTES = 1_048_576  # 1 MB
+
+# Steam-online HLAE latch: overlay inject / steam://run relaunch drops AfxHookSource2.
+CS2_APP_ID = "730"
+STEAM_DIR = Path(r"D:\Steam")
+CS2_GAME_DIR = STEAM_DIR / "steamapps" / "common" / "Counter-Strike Global Offensive"
+CSDM_SETTINGS = Path.home() / ".csdm" / "settings.json"
+_OVERLAY_DLLS = ("GameOverlayRenderer64.dll", "GameOverlayRenderer.dll")
+_STEAM_LAUNCH_FLAGS = ("-steam", "-insecure")
 
 
 def _taskkill_tree(image_name: str) -> bool:
@@ -60,6 +69,105 @@ def _process_running(image_name: str) -> bool:
         return image_name.lower() in out.lower() and "no tasks" not in out.lower()
     except Exception:
         return True  # assume alive on failure so we retry the kill
+
+
+def _steam_appid_dirs(game_dir: Path) -> list[Path]:
+    return [
+        game_dir / "game" / "bin" / "win64",
+        game_dir / "game" / "csgo",
+        game_dir / "game",
+    ]
+
+
+def ensure_steam_appid(game_dir: Path = CS2_GAME_DIR) -> list[Path]:
+    """Write steam_appid.txt (730) next to cs2.exe so SteamAPI will not relaunch."""
+    written: list[Path] = []
+    for folder in _steam_appid_dirs(game_dir):
+        if not folder.is_dir():
+            continue
+        path = folder / "steam_appid.txt"
+        try:
+            current = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+        except OSError:
+            current = ""
+        if current.strip().split()[0:1] == [CS2_APP_ID]:
+            continue
+        try:
+            path.write_text(CS2_APP_ID + "\n", encoding="ascii")
+        except OSError as e:
+            print(f"  [WARN] steam_appid.txt {path}: {e}", flush=True)
+            continue
+        written.append(path)
+    return written
+
+
+def block_steam_overlay(steam_dir: Path = STEAM_DIR) -> list[Path]:
+    """Rename Steam overlay DLLs so they cannot inject into cs2.exe."""
+    blocked: list[Path] = []
+    if sys.platform != "win32" or not steam_dir.is_dir():
+        return blocked
+    for name in _OVERLAY_DLLS:
+        src = steam_dir / name
+        dst = steam_dir / (name + ".blocked")
+        if not src.is_file():
+            continue
+        try:
+            if dst.is_file():
+                dst.unlink()
+            src.replace(dst)
+        except OSError as e:
+            print(f"  [WARN] could not block {src.name}: {e}", flush=True)
+            continue
+        blocked.append(dst)
+    return blocked
+
+
+def ensure_csdm_steam_launch(settings_path: Path = CSDM_SETTINGS) -> bool:
+    """Append -steam -insecure to CSDM playback.launchParameters (HLAE cmdLine)."""
+    if not settings_path.is_file():
+        return False
+    try:
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+    playback = data.setdefault("playback", {})
+    existing = str(playback.get("launchParameters") or "")
+    tokens = existing.split()
+    changed = False
+    for flag in _STEAM_LAUNCH_FLAGS:
+        if flag not in tokens:
+            tokens.append(flag)
+            changed = True
+    if not changed:
+        return False
+    playback["launchParameters"] = " ".join(tokens)
+    try:
+        settings_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    except OSError as e:
+        print(f"  [WARN] CSDM settings.json: {e}", flush=True)
+        return False
+    return True
+
+
+def prepare_steam_hlae(
+    *,
+    game_dir: Path = CS2_GAME_DIR,
+    steam_dir: Path = STEAM_DIR,
+    settings_path: Path = CSDM_SETTINGS,
+) -> None:
+    """Stop Steam-online overlay/relaunch from dropping the HLAE hook."""
+    appids = ensure_steam_appid(game_dir)
+    overlay = block_steam_overlay(steam_dir)
+    launch = ensure_csdm_steam_launch(settings_path)
+    if appids or overlay or launch:
+        bits = []
+        if appids:
+            bits.append(f"steam_appid.txt x{len(appids)}")
+        if overlay:
+            bits.append("overlay DLLs blocked")
+        if launch:
+            bits.append("CSDM -steam -insecure")
+        print(f"  [HLAE] Steam preflight: {', '.join(bits)}", flush=True)
 
 
 def kill_stale_processes() -> None:
@@ -164,6 +272,9 @@ def run_csdm_hook_aware(
     intermediate flight clips. When omitted, the newest >= 1 MB .mp4 wins.
     """
     last_err = ""
+    print(f"  [{label}] pre-launch cleanup of stale render processes...", flush=True)
+    kill_stale_processes()
+    prepare_steam_hlae()
     for attempt in range(1, hook_retries + 2):
         suffix = f" (attempt {attempt}/{hook_retries + 1})" if hook_retries else ""
         print(f"  [{label}]{suffix}...", end=" ", flush=True)
