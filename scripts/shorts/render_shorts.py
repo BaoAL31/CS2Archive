@@ -768,7 +768,7 @@ def _short_output_path(out_dir: Path, short: dict, name: str | None = None) -> P
         st = short["short_type"]
         nick = short.get("pov_nick", "unknown")
         tick = short.get("start_tick", 0)
-        if st == "4k":
+        if st in ("4k", "punch_up"):
             kills = len(short.get("kill_ticks", []))
             base = f"{kills}k_multikill-{nick}-t{tick}"
         elif st == "clutch":

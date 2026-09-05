@@ -177,6 +177,15 @@ def _make_title(nick: str, short_type: str, opp: str | None, mname: str, tournam
             ("kind-lead", f"{nick} flick {vs}"),
             ("possessive", f"{nick}'s flick {vs}"),
         )
+    elif short_type == "punch_up":
+        kind = f"{gun_sp}PUNCH-UP {nk}".strip() or "PUNCH-UP"
+        going, looking, kadj = _adj(key, "going"), _adj(key, "looking"), _adj(key, "kind")
+        formats = (
+            ("possessive", f"{nick}'s {kind} {vs}"),
+            ("gerund", f"{nick} dropping a {kind} {vs}"),
+            ("kind-lead", f"{kadj} {kind} from {nick} {vs}"),
+            ("casual-drop", f"{nick} casually drops a {kind} {vs}"),
+        )
     elif kills >= 5:
         ace = f"{gun} ACE" if gun else "ACE"
         going, looking, kadj = _adj(key, "going"), _adj(key, "looking"), _adj(key, "kind")

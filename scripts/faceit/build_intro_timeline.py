@@ -109,7 +109,7 @@ def build_intro_timeline(
             and s.get("clutch_initial_count") in VALID_CLUTCH_COUNTS
         )
         or (
-            s.get("short_type") == "4k"
+            s.get("short_type") in ("4k", "punch_up")
             and len(s.get("kill_ticks", [])) >= 5
         )
     ]

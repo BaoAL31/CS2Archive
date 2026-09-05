@@ -80,13 +80,14 @@ def costar_bonus(pros: list[str]) -> int:
 
 
 def star_bonus(raw_star: int, won: bool = False, kd: float = 1.0) -> int:
-    """Org rank is who the POV is, not whether the map was won.
+    """Org rank is who the POV is, not how one map went.
 
-    Minus-KD IGLs still get 0 star. ``won`` is accepted for call-site
-    compatibility and is not used (the 80k win chip lives in perf_bonus).
+    No K/D gate: a minus map does not erase the badge (YEKINDAR Cache
+    17-22 still carries FURIA #3). ``won``/``kd`` accepted for call-site
+    compatibility and not used.
     """
-    del won
-    if raw_star <= 0 or kd < 1.0:
+    del won, kd
+    if raw_star <= 0:
         return 0
     return raw_star // 2
 

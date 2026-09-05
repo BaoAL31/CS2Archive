@@ -1072,15 +1072,22 @@ def detect_shorts(
                 end_tick - _SHORT_TICK_DURATION,
                 ticks[0] - _PRE_KILL_TICK_MARGIN,
             )
+            punch_tags = _punch_up_tags(kills)
             shorts.append({
-                "short_type": "4k",
+                # Punch-up is its own type: ≥2 kills on lower-tier guns
+                # vs rifle+ victims. Plain 4Ks stay "4k".
+                "short_type": "punch_up" if punch_tags else "4k",
                 "pov_steam_id": aid,
                 "pov_nick": nickname_by_sid.get(aid, "Unknown"),
                 "start_tick": start_tick,
                 "end_tick": end_tick,
                 "kill_ticks": ticks,
-                "punch_up_tags": _punch_up_tags(kills),
+                "punch_up_tags": punch_tags,
             })
+
+    # NOTE: "punch_up" shorts overlap clutches exactly like "4k" does —
+    # the clutch-priority filter below treats every non-clutch short the
+    # same, so no special-casing needed there.
 
     # ================================================================
     # WALLBANG DETECTION (rifle/AWP through at least one object)
@@ -1544,6 +1551,8 @@ def detect_shorts(
                 "attacker_steam_id": aid,
                 "victim_steam_id": vid,
                 "weapon": k.get("weapon", ""),
+                "victim_weapon": k.get("victim_weapon", ""),
+                "penetrated": k.get("penetrated", 0),
                 "attacker": nickname_by_sid.get(aid, ""),
                 "victim": nickname_by_sid.get(vid, ""),
             })
@@ -1728,7 +1737,7 @@ def _build_short_slug(short: dict) -> str:
     tick = short.get("start_tick", 0)
     tags = short.get("punch_up_tags") or []
     suffix = ("_" + "_".join(tags)) if tags else ""
-    if st == "4k":
+    if st in ("4k", "punch_up"):
         kills = len(short.get("kill_ticks", []))
         return f"{kills}k_multikill-{safe}-t{tick}{suffix}"
     elif st == "clutch":

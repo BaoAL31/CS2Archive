@@ -1231,3 +1231,37 @@ def test_flick_round_0_rejected():
     )
     assert [s["short_type"] for s in result["shorts"] if s["short_type"] == "flick"] == []
 
+
+
+def test_punch_up_is_own_type_not_4k():
+    kill_events = [
+        {"tick": 1000, "round": 1, "attacker_sid": "A1", "victim_sid": "B5", "weapon": "usp_silencer", "victim_weapon": "ak47"},
+        {"tick": 2000, "round": 1, "attacker_sid": "A1", "victim_sid": "B4", "weapon": "usp_silencer", "victim_weapon": "ak47"},
+        {"tick": 3000, "round": 1, "attacker_sid": "A1", "victim_sid": "B3", "weapon": "usp_silencer", "victim_weapon": "ak47"},
+        {"tick": 4000, "round": 1, "attacker_sid": "A1", "victim_sid": "B2", "weapon": "usp_silencer", "victim_weapon": "ak47"},
+    ]
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=kill_events,
+        round_starts=[(500, 1)],
+    )
+    types = [s["short_type"] for s in result["shorts"]]
+    assert "punch_up" in types
+    assert "4k" not in types
+
+
+def test_even_fight_4k_stays_4k():
+    kill_events = [
+        {"tick": 1000, "round": 1, "attacker_sid": "A1", "victim_sid": "B5", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 2000, "round": 1, "attacker_sid": "A1", "victim_sid": "B4", "weapon": "ak47", "victim_weapon": "m4a1"},
+        {"tick": 3000, "round": 1, "attacker_sid": "A1", "victim_sid": "B3", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 4000, "round": 1, "attacker_sid": "A1", "victim_sid": "B2", "weapon": "ak47", "victim_weapon": "awp"},
+    ]
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=kill_events,
+        round_starts=[(500, 1)],
+    )
+    types = [s["short_type"] for s in result["shorts"]]
+    assert "4k" in types
+    assert "punch_up" not in types

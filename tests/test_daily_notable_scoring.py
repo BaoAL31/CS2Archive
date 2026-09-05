@@ -90,11 +90,12 @@ def test_performance_win_is_the_watchable_gate():
     assert sn._perf_bonus(5.0, 200, 60, True) == 255_000
 
 
-def test_star_bonus_pays_on_plus_kd_even_if_they_lost():
+def test_star_bonus_pays_on_org_alone_regardless_of_kd():
     assert sn.star_bonus(400_000, True) == 200_000
     assert sn.star_bonus(400_000, False, kd=1.5) == 200_000
-    assert sn.star_bonus(400_000, True, kd=0.77) == 0
+    assert sn.star_bonus(400_000, True, kd=0.77) == 200_000
     assert sn.star_bonus(250_000, True, kd=1.13) == 125_000
+    assert sn.star_bonus(0, True, kd=2.0) == 0
 
 
 def test_candidate_weight_keeps_explainable_components(monkeypatch):

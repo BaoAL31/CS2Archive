@@ -195,14 +195,14 @@ def test_star_player_medium_beats_unknown_high():
     assert donk["weight"] > nobody["weight"]
 
 
-def test_minus_kd_drops_org_star():
+def test_minus_kd_keeps_org_star():
     scored = score_card(
         {"player": "karrigan", "team": "Falcons", "rating": 1.6, "kd": "10-13"},
         ranking={"Falcons": 2},
         player_demand={},
         team_demand={},
     )
-    assert scored["star_bonus"] == 0
+    assert scored["star_bonus"] == 200_000
     assert scored["rating_bonus"] == 48_000
 
 
