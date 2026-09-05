@@ -36,7 +36,9 @@ from hltv.update_team_demand import (  # noqa: E402
 from hltv_ranking import pro_team_rank, rank_bonus  # noqa: E402
 from scoring import demand_points, load_player_demand_index, star_bonus  # noqa: E402
 
-SCORE_VERSION = 1
+SCORE_VERSION = 2
+CLIP_WEIGHTS_PATH = ROOT / ".data" / "clip_kind_weights.json"
+SHORTS_ROOT = ROOT / "renders" / "shorts"
 HIGHLIGHT_VIEW_FLOOR = 1_000
 HIGHLIGHT_LOOKBACK_DAYS = 7
 PLAYER_DEMAND_STALE_DAYS = 7
@@ -60,6 +62,16 @@ def parse_kd_ratio(kd) -> float:
         return float(text)
     except ValueError:
         return 0.0
+
+
+def load_kind_premiums(path: Path | None = None) -> dict[str, float]:
+    """Fitted log10-view premiums per clip kind (see fit_clip_weights)."""
+    try:
+        payload = json.loads((path or CLIP_WEIGHTS_PATH).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return {}
+    weights = payload.get("weights") or {}
+    return dict(weights.get("kind") or {})
 
 
 def rating_bonus(rating: float) -> int:
@@ -157,6 +169,95 @@ def player_demand_index(
     return max(pov, highlight, 1.0)
 
 
+def _extractor_kind(short: dict) -> str:
+    """Map extractor short_type to a fitted kind label."""
+    st = str(short.get("short_type") or "").lower()
+    kills = len(short.get("kill_ticks") or [])
+    if st == "clutch":
+        raw = str(short.get("clutch_initial_count") or "").replace(" ", "")
+        if raw.startswith("1v5"):
+            return "1v5_won"
+        if raw.startswith("1v4"):
+            return "1v4_won"
+        return "1v3_won"
+    if st == "1v3":
+        return "1v3_won"
+    if st in ("4k", "punch_up"):
+        return "ace" if kills >= 5 else "4k"
+    if st in ("knife", "wallbang", "perfect_shots", "flick", "defuse"):
+        return st
+    return "other"
+
+
+def _index_demo_kinds(demo_stems: set[str]) -> dict[tuple[str, str], tuple[str, float]]:
+    """(demo_stem, nick) -> (best kind, premium) from extracted shorts."""
+    premiums = load_kind_premiums()
+    out: dict[tuple[str, str], tuple[str, float]] = {}
+    for stem in demo_stems:
+        folder = SHORTS_ROOT / f"shorts-{stem}"
+        if not folder.is_dir():
+            continue
+        kinds: dict[str, tuple[str, float]] = {}
+
+        def _offer(nick: str, kind: str) -> None:
+            premium = float(premiums.get(kind, 0.0))
+            if nick and (nick not in kinds or premium > kinds[nick][1]):
+                kinds[nick] = (kind, premium)
+
+        for path in folder.glob("*/short_timeline.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            shorts = payload.get("shorts") if isinstance(payload, dict) else None
+            if not shorts:
+                continue
+            for short in shorts:
+                if not isinstance(short, dict) or "short_type" not in short:
+                    continue
+                nick = str(short.get("pov_nick") or "").strip().lower()
+                if not nick:
+                    continue
+                _offer(nick, _extractor_kind(short))
+        # Unfiltered multikills (e.g. eco 4Ks the extractor drops) still
+        # count: action_timeline.json carries the raw kill table.
+        action = folder / "action_timeline.json"
+        try:
+            kills = (json.loads(action.read_text(encoding="utf-8"))
+                     .get("kills") or [])
+        except (OSError, json.JSONDecodeError, AttributeError):
+            kills = []
+        by_round: dict[tuple, list] = {}
+        for kill in kills:
+            if not isinstance(kill, dict):
+                continue
+            aid = str(kill.get("attacker_steam_id") or "")
+            if not aid:
+                continue
+            by_round.setdefault((kill.get("round"), aid), []).append(kill)
+        for (_, _), ks in by_round.items():
+            if len(ks) < 4:
+                continue
+            nick = str(ks[0].get("attacker") or "").strip().lower()
+            _offer(nick, "ace" if len(ks) >= 5 else "4k")
+        for nick, tagged in kinds.items():
+            key = (stem, nick)
+            if key not in out or tagged[1] > out[key][1]:
+                out[key] = tagged
+    return out
+
+
+def _clip_kind_premium(meta: dict, premiums: dict | None,
+                       demo_kinds: dict | None) -> tuple[str, float]:
+    """Best fitted kind premium for this card's demo moments."""
+    premiums = premiums if premiums is not None else load_kind_premiums()
+    if not premiums or not demo_kinds:
+        return "none", 0.0
+    stem = Path(str(meta.get("demo_path") or "")).stem
+    nick = str(meta.get("player") or "").strip().lower()
+    return demo_kinds.get((stem, nick), ("none", 0.0))
+
+
 def score_card(
     meta: dict,
     *,
@@ -166,6 +267,8 @@ def score_card(
     highlight_players: dict[str, float] | None = None,
     fixtures: list[dict] | None = None,
     fixture_teams: tuple[str, str] | None = None,
+    kind_premiums: dict | None = None,
+    demo_kinds: dict | None = None,
     now: datetime | None = None,
 ) -> dict:
     """Return explainable chips + weight for one backlog card."""
@@ -208,6 +311,8 @@ def score_card(
     )
     rating_pts = rating_bonus(rating)
     weight = star + demand + match_team + highlight + rating_pts
+    kind, premium = _clip_kind_premium(meta, kind_premiums, demo_kinds)
+    star_score = round(math.log10(max(weight, 1)) + premium, 3)
     return {
         "score_version": SCORE_VERSION,
         "raw_star_bonus": raw_star,
@@ -219,6 +324,9 @@ def score_card(
         "demand_index": demand_index,
         "kd_ratio": round(kd, 2),
         "weight": weight,
+        "clip_kind": kind,
+        "kind_premium": premium,
+        "star_score": star_score,
     }
 
 
@@ -255,6 +363,10 @@ def attach_scores(
     fixture_teams: tuple[str, str] | None = None,
 ) -> list[tuple[str, dict]]:
     indexes = indexes or load_indexes()
+    premiums = load_kind_premiums()
+    stems = {Path(str(m.get("demo_path") or "")).stem
+             for _, m in cards if m.get("demo_path")}
+    demo_kinds = _index_demo_kinds(stems)
     out: list[tuple[str, dict]] = []
     for path, meta in cards:
         scored = {
@@ -267,6 +379,8 @@ def attach_scores(
                 highlight_players=indexes.get("highlight_players"),
                 fixtures=indexes.get("fixtures"),
                 fixture_teams=fixture_teams,
+                kind_premiums=premiums,
+                demo_kinds=demo_kinds,
             ),
         }
         out.append((path, scored))
@@ -303,7 +417,8 @@ def format_score(meta: dict) -> str:
     return (
         f"star={meta.get('star_bonus', 0)} demand={meta.get('market_demand_bonus', 0)} "
         f"teams={meta.get('match_team_bonus', 0)} rating={meta.get('rating_bonus', 0)} "
-        f"highlight={meta.get('match_highlight_bonus', 0)} total={meta.get('weight', 0)}"
+        f"highlight={meta.get('match_highlight_bonus', 0)} total={meta.get('weight', 0)} "
+        f"kind={meta.get('clip_kind', 'none')} score={meta.get('star_score', 0)}"
     )
 
 
@@ -334,7 +449,7 @@ def main() -> int:
     if not folder.is_absolute():
         folder = ROOT / folder
     cards = attach_scores(_iter_backlog_cards(folder))
-    cards.sort(key=lambda item: (-item[1].get("weight", 0), item[0]))
+    cards.sort(key=lambda item: (-item[1].get("star_score", item[1].get("weight", 0)), item[0]))
     print(f"{len(cards)} card(s) in {folder}")
     for path, meta in cards:
         print(

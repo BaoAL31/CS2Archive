@@ -170,7 +170,14 @@ def parse_match_links(
                 continue
             if node.name != "div" or "result-con" not in classes:
                 continue
-            if on_dates is not None and headline_date not in on_dates:
+            # Featured results (and any block with no parseable date) are the
+            # live dump's latest completed matches. Only dated headlines
+            # outside on_dates are skipped.
+            if (
+                on_dates is not None
+                and headline_date is not None
+                and headline_date not in on_dates
+            ):
                 continue
             match = _match_from_result_con(node, base_url)
             if match is None or match.match_id in seen:
@@ -495,16 +502,16 @@ def _candidate_cards(match: Match, indexes: dict | None = None) -> list[str]:
 
 
 def _card_rank(meta: dict) -> tuple[float, float]:
-    """Higher weight, then higher rating."""
+    """Higher star_score (log card + fitted kind lift), then rating."""
     try:
-        weight = float(meta.get("weight") or 0)
+        score = float(meta.get("star_score", meta.get("weight") or 0))
     except (TypeError, ValueError):
-        weight = 0.0
+        score = 0.0
     try:
         rating = float(meta.get("rating") or 0)
     except (TypeError, ValueError):
         rating = 0.0
-    return (weight, rating)
+    return (score, rating)
 
 
 def select_best_card(

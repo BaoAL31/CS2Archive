@@ -232,3 +232,44 @@ def test_queue_sorts_by_weight_then_rating():
         "backlog/high-rating.json",
         "backlog/mid.json",
     ]
+
+
+def test_star_score_adds_kind_premium_in_log_space():
+    from hltv.score_cards import _clip_kind_premium
+    meta = {"player": "YEKINDAR", "map": "Cache",
+            "demo_path": "demos/hltv/m/cache.dem"}
+    premiums = {"4k": 1.707}
+    demo_kinds = {("cache", "yekindar"): ("4k", 1.707)}
+    kind, premium = _clip_kind_premium(meta, premiums, demo_kinds)
+    assert (kind, premium) == ("4k", 1.707)
+    scored = score_card(
+        {**meta, "team": "FURIA", "rating": 0.82, "kd": "17-22"},
+        ranking={"FURIA": 3},
+        kind_premiums=premiums, demo_kinds=demo_kinds,
+    )
+    assert scored["clip_kind"] == "4k"
+    assert scored["star_score"] == round(math.log10(scored["weight"]) + 1.707, 3)
+
+
+def test_star_score_falls_back_without_premiums_or_kinds(tmp_path):
+    from hltv.score_cards import load_kind_premiums
+    assert load_kind_premiums(tmp_path / "missing.json") == {}
+    scored = score_card(
+        {"player": "x", "team": "FURIA", "rating": 1.2, "kd": "20-10",
+         "demo_path": "demos/hltv/m/cache.dem"},
+        ranking={"FURIA": 3},
+        kind_premiums={}, demo_kinds={},
+    )
+    assert scored["clip_kind"] == "none"
+    assert scored["kind_premium"] == 0.0
+    assert scored["star_score"] == round(math.log10(scored["weight"]), 3)
+
+
+def test_extractor_kind_mapping():
+    from hltv.score_cards import _extractor_kind
+    assert _extractor_kind({"short_type": "punch_up", "kill_ticks": [1, 2, 3, 4]}) == "4k"
+    assert _extractor_kind({"short_type": "4k", "kill_ticks": [1] * 5}) == "ace"
+    assert _extractor_kind({"short_type": "clutch", "clutch_initial_count": "1v4",
+                            "kill_ticks": [1, 2]}) == "1v4_won"
+    assert _extractor_kind({"short_type": "clutch", "kill_ticks": [1]}) == "1v3_won"
+    assert _extractor_kind({"short_type": "wallbang", "kill_ticks": [1]}) == "wallbang"
