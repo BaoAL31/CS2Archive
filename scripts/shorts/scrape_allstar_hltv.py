@@ -441,7 +441,18 @@ def _rewrite_jsonl(path: Path, rows: list[dict]) -> None:
     with tmp.open("w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    tmp.replace(path)
+    try:
+        tmp.replace(path)
+    except PermissionError:
+        # Windows: another process (listener) holds the target open without
+        # share-delete; fall back to an in-place rewrite (same bytes).
+        with path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
 
 
 def _fetch_missing_stages(
@@ -579,6 +590,96 @@ def enrich_jsonl(path: Path, sleep: float) -> dict:
     return stats
 
 
+def _probe_slug(path: Path, mid: str) -> str | None:
+    if not path.exists():
+        return None
+    with path.open(encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if str(row.get("match_id")) == str(mid):
+                return str(row.get("slug") or "") or None
+    return None
+
+
+def upsert_row(path: Path, row: dict) -> None:
+    """Replace the row for this match_id, or append if new."""
+    rows: list[dict] = []
+    if path.exists():
+        with path.open(encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if str(parsed.get("match_id")) != str(row.get("match_id")):
+                    rows.append(parsed)
+    rows.append(row)
+    _rewrite_jsonl(path, rows)
+
+
+def scrape_one_match(page, match_ref: str, base: str,
+                     *, out: Path, skip_iframe: bool = False) -> dict:
+    """Scrape a single HLTV match page by id or URL; upsert probe row."""
+    ref = (match_ref or "").strip()
+    hit = MATCH_HREF.search(ref if ref.startswith("http") else f"/matches/{ref}/x")
+    if not hit:
+        raise SystemExit(f"[match] can't parse match id from {match_ref!r}")
+    mid, slug = hit.group(1), hit.group(2)
+    if slug == "x":
+        # Bare /matches/<id> serves a thin shell without embeds — resolve
+        # the slug from the existing probe row.
+        slug = _probe_slug(out, mid) or "x"
+        if slug == "x":
+            raise SystemExit(
+                f"[match] unknown slug for {mid}; pass the full HLTV URL")
+    url = f"{base}/matches/{mid}/{slug}"
+    html, cf = _goto(page, url)
+    html, cf = _goto(page, url)
+    if not cf:
+        # Allstar iframes are loading="lazy" — scroll so they enter the DOM.
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(2500)
+            html = page.content()
+        except Exception:
+            pass
+    row = {
+        "match_id": mid,
+        "slug": slug if slug != "x" else "",
+        "url": url,
+        "ok": False,
+        "cloudflare": cf,
+        "playlist_id": None,
+        "clips": [],
+        "iframe_error": None,
+        "iframe_sample": "",
+        "scraped_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if cf:
+        upsert_row(out, row)
+        return row
+    row["match_stage"] = match_stage_from_html(html)
+    pid = _playlist_id(html)
+    row["playlist_id"] = pid
+    if pid and not skip_iframe:
+        clips, icf = fetch_playlist_clips(pid)
+        clips = _stamp_match(clips, mid)
+        row["iframe_error"] = icf
+        row["clips"] = _store_clips(row, clips)
+    row["ok"] = True
+    upsert_row(out, row)
+    own = sum(1 for c in row["clips"] if str(c.get("match_id")) == mid)
+    print(f"[match] {mid} playlist={pid} clips={len(row['clips'])} own={own}")
+    top = sorted(row["clips"], key=lambda c: -(c.get("views") or 0))[:5]
+    for c in top:
+        print(f"   {c.get('views', 0):>8}  {c.get('player', '?'):12s} "
+              f"R{c.get('round', '?')}  {c.get('label') or c.get('title')}")
+    return row
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Allstar/HLTV Cloudflare probe (Popular events)")
     ap.add_argument("--days", type=int, default=180)
@@ -586,6 +687,10 @@ def main() -> int:
     ap.add_argument("--sleep", type=float, default=2.0)
     ap.add_argument("--abort-after-cf", type=int, default=5)
     ap.add_argument("--headed", action="store_true")
+    ap.add_argument(
+        "--match", default="",
+        help="Single HLTV match id or URL (skips events sweep, upserts row)",
+    )
     ap.add_argument("--skip-iframe", action="store_true", help="HLTV pages only; skip playlist fetch")
     ap.add_argument("--out", type=Path, default=OUT_DEFAULT)
     ap.add_argument("--events-out", type=Path, default=EVENTS_DEFAULT)
@@ -652,6 +757,16 @@ def main() -> int:
         channel="chrome",
     )
     page = ctx.new_page()
+    if args.match:
+        try:
+            row = scrape_one_match(page, args.match, base, out=args.out,
+                                     skip_iframe=args.skip_iframe)
+        finally:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+        return 0 if row.get("ok") else 2
     stats = {
         "events_seen": 0,
         "events_popular": 0,

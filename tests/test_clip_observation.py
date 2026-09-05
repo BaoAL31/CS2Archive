@@ -340,3 +340,22 @@ def test_talk_and_ewc_without_cs2_are_not_observations():
         "views": 10,
         "channel": "EWC Extra",
     }) is not None
+
+
+def test_probe_slug_and_upsert_roundtrip(tmp_path):
+    import json
+    from shorts.scrape_allstar_hltv import _probe_slug, upsert_row
+    path = tmp_path / "probe.jsonl"
+    assert _probe_slug(path, "2396947") is None
+    upsert_row(path, {"match_id": "2396947", "slug": "s1", "clips": []})
+    assert _probe_slug(path, "2396947") == "s1"
+    upsert_row(path, {"match_id": "2396947", "slug": "s2", "clips": [{"a": 1}]})
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1 and rows[0]["slug"] == "s2"
+
+
+def test_playlist_id_parsing():
+    from shorts.scrape_allstar_hltv import _playlist_id
+    html = '<iframe src="https://allstar.gg/iframe?playlist=6a9c957875f9014d58a945c1&x=1">'
+    assert _playlist_id(html) == "6a9c957875f9014d58a945c1"
+    assert _playlist_id("<html>no embeds here</html>") is None
