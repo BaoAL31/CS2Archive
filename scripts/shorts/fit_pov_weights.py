@@ -57,6 +57,7 @@ def _derby_bucket(views) -> str:
 
 def features_from_row(row: dict) -> dict:
     return {
+        "_channel": str(row.get("channel") or ""),
         "player": str(row.get("player") or ""),
         "org": str(row.get("org") or "") or None,
         "map": str(row.get("map") or "unknown"),
@@ -170,7 +171,7 @@ GRID = {
     "tier": [0.0, 0.005],
     "weekday": [0.0],
     "bias": [0.01],
-    "channel": [0.0],
+    "channel": [0.0, 0.05],
 }
 EPOCHS = [6]
 
@@ -205,14 +206,14 @@ REF_ALPHAS = {"player": 0.005, "org": 0.005, "map": 0.0,
               "opp_tier": 0.005, "rating": 0.0, "kd": 0.0,
               "decider": 0.0, "won": 0.0, "ot": 0.0, "derby": 0.0,
               "stage": 0.0, "tier": 0.005, "weekday": 0.0,
-              "bias": 0.01, "channel": 0.0, "l2": 0.0}
+              "bias": 0.01, "channel": 0.05, "l2": 0.0}
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dataset", type=Path, default=DATASET)
     ap.add_argument("--lr-scales", type=float, nargs="+",
-                    default=[0.25, 0.5, 1.0, 2.0, 4.0])
+                    default=[0.1, 0.25, 0.5, 1.0, 2.0])
     ap.add_argument("--max-epochs", type=int, default=40)
     ap.add_argument("--patience", type=int, default=5)
     ap.add_argument("--out", type=Path, default=OUT_DEFAULT)
@@ -282,6 +283,12 @@ def main() -> int:
         mse, weights = _run(f"add-{group}", trial)
         if mse < best[0]:
             best = (mse, trial, weights, f"add-{group}")
+    for ch_alpha in (0.02, 0.05, 0.1):
+        trial = dict(best[1])
+        trial["channel"] = ch_alpha
+        mse, weights = _run(f"add-channel-{ch_alpha}", trial)
+        if mse < best[0]:
+            best = (mse, trial, weights, f"add-channel-{ch_alpha}")
 
     mse, alphas, weights, tag = best
     score = evaluate(val, weights)

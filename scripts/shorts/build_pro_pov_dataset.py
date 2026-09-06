@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -21,22 +22,38 @@ from _pathsetup import ensure  # noqa: E402
 ensure()
 
 from shorts.fit_clip_weights import load_roster_orgs  # noqa: E402
-from shorts.fit_pov_weights import recognised_aliases  # noqa: E402
+from shorts.pro_context import recognised_aliases  # noqa: E402
 from shorts.pro_context import (derby_heat, event_tier, index_ratings,
                                 kd_bucket, load_match_scores, lookup_rating,
                                 normalize_stage, parse_kd_ratio,
                                 parse_pro_title, rating_bucket,
                                 series_context)
 
-CHANNEL = "LIM-CS POV | Pro Tournaments"
+CHANNELS = (
+    "LIM-CS POV | Pro Tournaments",
+    "CAL CS POV",
+    "CS2 POV DEMOS",
+    "EDCS - POV",
+    "LIM-CS POV",
+)
+# Own channel excluded from training: tiny base, promo-driven views
+# (val MSE 1.2 vs 0.2-0.4 elsewhere). Revisit at 10x subs.
+_FACEIT_RES = re.compile(r"\bfaceit\b|\belo\b|soloq", re.I)
 HISTORY = ROOT / "exports" / "pov_market" / "video_history.csv"
 OUT = ROOT / ".data" / "pro_pov_dataset.jsonl"
 RANKING_PATH = ROOT / ".data" / "hltv_team_ranking.json"
 
 
-def build() -> list[dict]:
-    aliases = recognised_aliases()
+def is_pro_style(title: str, channel: str) -> bool:
+    if channel == "LIM-CS POV | Pro Tournaments":
+        return True
+    text = title or ""
+    return bool(re.search(r"\bvs\b", text, re.I)) and not _FACEIT_RES.search(text)
+
+
+def build() -> tuple[list[dict], dict]:
     orgs = load_roster_orgs()
+    aliases = recognised_aliases(orgs)
     try:
         ranking = (json.loads(RANKING_PATH.read_text(encoding="utf-8"))
                    .get("teams") or {})
@@ -53,7 +70,11 @@ def build() -> list[dict]:
     skipped = {"no_player": 0, "no_views": 0}
     with HISTORY.open(encoding="utf-8-sig", newline="") as fh:
         for source in csv.DictReader(fh):
-            if str(source.get("channel") or "") != CHANNEL:
+            if str(source.get("channel") or "") not in CHANNELS:
+                continue
+            if not is_pro_style(str(source.get("title") or ""),
+                                 str(source.get("channel") or "")):
+                skipped["not_pro"] = skipped.get("not_pro", 0) + 1
                 continue
             try:
                 views = int(float(source.get("views") or 0))
@@ -77,9 +98,16 @@ def build() -> list[dict]:
             opp = ""
             if team1 and team2:
                 opp = team2 if team1.lower() == mine else team1
+            elif team2:
+                opp = team2
             stats, file_stage, entry = lookup_rating(ratings, team1, team2,
                                                       game_map, player)
             rating = stats.get("rating") or None
+            rating_source = "hltv" if rating else ""
+            if rating is None and isinstance(parsed.get("title_rating"),
+                                             float):
+                rating = parsed["title_rating"]
+                rating_source = "title"
             kd = stats.get("kd")
             if kd is None and isinstance(parsed.get("title_kd"), float):
                 kd = parsed["title_kd"]
@@ -95,6 +123,7 @@ def build() -> list[dict]:
                         "top30" if rank else "unranked")
             rows.append({
                 "video_id": source.get("video_id"),
+                "channel": source.get("channel"),
                 "published_at": source.get("published_at"),
                 "publish_weekday": source.get("publish_weekday"),
                 "publish_hour_utc": source.get("publish_hour_utc"),
@@ -107,6 +136,7 @@ def build() -> list[dict]:
                 "opp": opp or "unknown",
                 "opp_tier": opp_tier,
                 "rating": rating,
+                "rating_source": rating_source,
                 "rating_bucket": rating_bucket(rating),
                 "kd": kd,
                 "kd_bucket": kd_bucket(kd),

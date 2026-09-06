@@ -19,7 +19,7 @@ from _pathsetup import ensure  # noqa: E402
 
 ensure()
 
-from hltv.update_team_demand import extract_fixture_teams, team_lookup  # noqa: E402
+from hltv.update_team_demand import (canonical_team, extract_fixture_teams, team_lookup)
 
 _LOOKUP = team_lookup()
 
@@ -32,6 +32,9 @@ _STAGE_RES = [
     ("playoffs", re.compile(r"\bplayoffs?\b", re.I)),
 ]
 _KD_RE = re.compile(r"\((\d+)\s*[-–]\s*(\d+)\)")
+_RATING_RE = re.compile(r"rating\s*[:\-]?\s*(\d+\.\d+)", re.I)
+_SINGLE_VS_RE = re.compile(
+    r"\bvs\.?\s+([A-Z][A-Za-z0-9 .\-']{1,28}?)(?:\s*[\(|\|#!]|\s*$)", re.I)
 _KD_SPLIT = re.compile(r"^\s*(\d+)\s*[-–/]\s*(\d+)\s*$")
 _MAP_RES = (
     ("dust2", re.compile(r"\bdust\s*2\b", re.I)),
@@ -53,6 +56,19 @@ def parse_pro_title(title: str) -> dict:
     """Teams, event text, stage bucket, title K-D, map from a pro POV title."""
     text = title or ""
     fixture = extract_fixture_teams(text, _LOOKUP)
+    title_rating = None
+    hit = _RATING_RE.search(text)
+    if hit:
+        try:
+            title_rating = float(hit.group(1))
+        except ValueError:
+            title_rating = None
+    if not fixture:
+        single = _SINGLE_VS_RE.search(text)
+        if single:
+            opp = canonical_team(single.group(1).strip(), _LOOKUP)
+            if opp:
+                fixture = ("", opp)
     stage = "other"
     for name, rx in _STAGE_RES:
         if rx.search(text):
@@ -60,6 +76,8 @@ def parse_pro_title(title: str) -> dict:
             break
     kd = None
     match = _KD_RE.search(text)
+    if not match:
+        match = re.search(r"\b(\d{1,2})\s*[-–]\s*(\d{1,2})\s*(?:POV|\|)", text)
     if match:
         kills, deaths = int(match.group(1)), int(match.group(2))
         kd = kills / deaths if deaths else float(kills)
@@ -70,8 +88,8 @@ def parse_pro_title(title: str) -> dict:
             break
     return {"team1": fixture[0] if fixture else "",
             "team2": fixture[1] if fixture else "",
-            "stage": stage, "title_kd": kd, "map": game_map,
-            "text": text}
+            "stage": stage, "title_kd": kd, "title_rating": title_rating,
+            "map": game_map, "text": text}
 
 
 def event_tier(*texts: str) -> str:
@@ -81,6 +99,25 @@ def event_tier(*texts: str) -> str:
     if any(token in blob for token in _S_TIER):
         return "s-tier"
     return "regular"
+
+
+def recognised_aliases(roster: dict[str, str] | None = None) -> dict[str, str]:
+    """Lowercase label -> canonical nick (drops smoke/molotov guide rows)."""
+    aliases: dict[str, str] = {"dev1ce": "device", "device": "device"}
+    try:
+        from player_accounts import list_accounts
+        for account in list_accounts():
+            nick = (account.nickname or "").strip()
+            if nick:
+                aliases[nick.casefold()] = nick
+            faceit = (account.faceit_nickname or "").strip()
+            if faceit:
+                aliases[faceit.casefold()] = nick
+    except Exception:
+        pass
+    for nick in (roster or {}):
+        aliases.setdefault(nick, nick)
+    return aliases
 
 
 def _norm(name: str) -> str:
