@@ -296,8 +296,8 @@ def generate(
     player_img = scale_player(player_img, target_h)
 
     pw, ph = player_img.size
-    px = 24
-    py = HEIGHT - ph
+    px = 48
+    py = HEIGHT - ph + 40  # clear the overlay pills (hair was under badge)
     bg.paste(player_img, (px, py), player_img)
 
     _draw_text_scrim(bg)
@@ -307,7 +307,7 @@ def generate(
     text_y_center = HEIGHT // 2
 
     kd_fill = (239, 195, 79)       # gold — hero K-D
-    GOLD = 128
+    GOLD = FONT_SIZES["player"]  # same box as name -> even gaps above/below KD
 
     match_line = match_detail.strip()
     if map_name:
@@ -363,8 +363,8 @@ def generate_faceit(
             target_h = int(HEIGHT * AVATAR_HEIGHT_RATIO)
             player_img = scale_player(player_img, target_h)
             pw, ph = player_img.size
-            px = 24
-            py = HEIGHT - ph
+            px = 48
+            py = HEIGHT - ph + 40  # clear the overlay pills (hair was under badge)
             bg.paste(player_img, (px, py), player_img)
         except Exception as e:
             print(f"  [WARN] faceit avatar composite failed: {e}")
