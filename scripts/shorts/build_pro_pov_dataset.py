@@ -22,9 +22,11 @@ ensure()
 
 from shorts.fit_clip_weights import load_roster_orgs  # noqa: E402
 from shorts.fit_pov_weights import recognised_aliases  # noqa: E402
-from shorts.pro_context import (event_tier, index_ratings, lookup_rating,
-                                normalize_stage, parse_pro_title,
-                                rating_bucket)
+from shorts.pro_context import (derby_heat, event_tier, index_ratings,
+                                kd_bucket, load_match_scores, lookup_rating,
+                                normalize_stage, parse_kd_ratio,
+                                parse_pro_title, rating_bucket,
+                                series_context)
 
 CHANNEL = "LIM-CS POV | Pro Tournaments"
 HISTORY = ROOT / "exports" / "pov_market" / "video_history.csv"
@@ -41,6 +43,12 @@ def build() -> list[dict]:
     except (OSError, json.JSONDecodeError, AttributeError):
         ranking = {}
     ratings = index_ratings()
+    scores = load_match_scores()
+    try:
+        from hltv.update_team_demand import load_team_demand
+        fixtures = load_team_demand().get("fixtures") or []
+    except Exception:
+        fixtures = []
     rows: list[dict] = []
     skipped = {"no_player": 0, "no_views": 0}
     with HISTORY.open(encoding="utf-8-sig", newline="") as fh:
@@ -69,11 +77,17 @@ def build() -> list[dict]:
             opp = ""
             if team1 and team2:
                 opp = team2 if team1.lower() == mine else team1
-            rating, file_stage = lookup_rating(ratings, team1, team2,
-                                               game_map, player)
+            stats, file_stage, entry = lookup_rating(ratings, team1, team2,
+                                                      game_map, player)
+            rating = stats.get("rating") or None
+            kd = stats.get("kd")
+            if kd is None and isinstance(parsed.get("title_kd"), float):
+                kd = parsed["title_kd"]
             stage = parsed["stage"]
             if stage == "other" and file_stage:
                 stage = normalize_stage(file_stage)
+            series = series_context(entry, scores, org)
+            heat = derby_heat(team1, team2, fixtures)
             rank = ranking.get(opp or "", 0) or 0
             opp_tier = ("top5" if rank and rank <= 5 else
                         "top10" if rank and rank <= 10 else
@@ -82,6 +96,9 @@ def build() -> list[dict]:
             rows.append({
                 "video_id": source.get("video_id"),
                 "published_at": source.get("published_at"),
+                "publish_weekday": source.get("publish_weekday"),
+                "publish_hour_utc": source.get("publish_hour_utc"),
+                "age_days": source.get("age_days"),
                 "target_views": views,
                 "target_vpd": round(vpd, 2),
                 "player": player,
@@ -91,6 +108,12 @@ def build() -> list[dict]:
                 "opp_tier": opp_tier,
                 "rating": rating,
                 "rating_bucket": rating_bucket(rating),
+                "kd": kd,
+                "kd_bucket": kd_bucket(kd),
+                "decider": series["decider"],
+                "won": series["won"],
+                "ot": series["ot"],
+                "derby_views": heat,
                 "stage": stage,
                 "tier": event_tier(str(source.get("title") or "")),
                 "title": source.get("title"),

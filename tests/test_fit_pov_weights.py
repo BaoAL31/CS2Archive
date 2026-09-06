@@ -1,62 +1,52 @@
-"""Seams for the POV weight fitter (LIM pro channel)."""
+"""Seams for the dataset-backed POV fitter (LIM pro channel)."""
 from __future__ import annotations
 
 from shorts.fit_clip_weights import spearman
-from shorts.fit_pov_weights import features_from_pov, predict_log_vpd, sgd_epoch
+from shorts.fit_pov_weights import (
+    features_from_row,
+    new_weights,
+    predict_log_views,
+    sgd_epoch,
+)
 
 
-def _row(player="frozen", title="frozen POV with Keystrokes (15-7) FaZe vs PARIVISION (mirage) PGL Cluj-Napoca 2026",
-         channel="LIM-CS POV | Pro Tournaments", vpd=1000.0,
-         published_at="2026-06-01T00:00:00+00:00"):
-    return {"primary_player": player, "title": title, "channel": channel,
-            "views_per_day": str(vpd), "map": "mirage",
-            "published_at": published_at, "views": "10000"}
+def _row(**over):
+    base = {"video_id": "x", "published_at": "2026-06-01T00:00:00+00:00",
+            "target_views": 10000, "target_vpd": 1000.0,
+            "player": "frozen", "org": "FaZe", "map": "mirage",
+            "opp": "PARIVISION", "opp_tier": "top20",
+            "rating": 1.2, "rating_bucket": "1.2+",
+            "kd": 1.5, "kd_bucket": "1.5+",
+            "decider": "no", "won": "yes", "ot": "no",
+            "derby_views": 5000, "stage": "other", "tier": "regular",
+            "publish_weekday": "Monday"}
+    base.update(over)
+    return base
 
 
-def test_features_pro_context():
-    feats = features_from_pov(_row(), org_of=lambda p: "FaZe")
+def test_features_from_row():
+    feats = features_from_row(_row())
     assert feats["player"] == "frozen"
-    assert feats["org"] == "FaZe"
-    assert feats["map"] == "mirage"
-    assert feats["opp"] == "PARIVISION"
-    assert feats["stage"] == "other"
-    assert feats["tier"] == "regular"
+    assert feats["opp_tier"] == "top20"
+    assert feats["rating"] == "1.2+"
+    assert feats["kd"] == "1.5+"
+    assert feats["derby"] == "cold"
+    assert feats["weekday"] == "Monday"
 
 
-def test_features_stage_and_major():
-    feats = features_from_pov(_row(
-        title="donk (25-11) Spirit vs FaZe (Dust2) IEM Cologne Major 2026 Grand Final"),
-        org_of=lambda p: "Spirit")
-    assert feats["stage"] == "final"
-    assert feats["tier"] == "major"
-    assert feats["opp"] == "FaZe"
-
-
-def test_predict_sums_all_groups():
-    weights = {"bias": 2.0, "player": {"frozen": 0.5}, "org": {},
-               "map": {}, "opp": {}, "opp_tier": {}, "rating": {},
-               "stage": {}, "tier": {}}
-    feats = features_from_pov(_row())
-    feats["_channel"] = "LIM-CS POV | Pro Tournaments"
-    assert predict_log_vpd(feats, weights,
-                           channel_bias={"LIM-CS POV | Pro Tournaments": 1.0},
-                           org_of=lambda p: None) == 3.5
-
-
-def test_sgd_epoch_alpha_zero_freezes_group():
-    from shorts.fit_pov_weights import new_weights
+def test_predict_sums_groups():
     weights = new_weights()
-    bias: dict = {}
-    letters = "abcdefghijklmnopqrstuvwxyz"
-    alphas = {"player": 0.0, "org": 0.0, "map": 0.1, "opp": 0.0,
-              "opp_tier": 0.0, "rating": 0.0, "stage": 0.0, "tier": 0.0,
-              "bias": 0.0, "channel": 0.0}
-    assert all(weights[g] == {} for g in
-               ("player", "org", "map", "opp", "opp_tier", "rating",
-                "stage", "tier"))
-    _ = letters
-    sgd_epoch([_row(vpd=100000.0)], weights, bias,
-              alphas=alphas, org_of=lambda p: None)
+    weights["bias"] = 2.0
+    weights["player"]["frozen"] = 0.5
+    assert predict_log_views(features_from_row(_row()), weights) == 2.5
+
+
+def test_sgd_epoch_learns_and_zero_alpha_freezes():
+    from shorts.fit_pov_weights import GROUPS
+    weights = new_weights()
+    alphas = {group: 0.0 for group in GROUPS}
+    alphas.update({"map": 0.1, "bias": 0.0, "channel": 0.0})
+    sgd_epoch([_row(target_views=100000)], weights, {}, alphas=alphas)
     assert weights["player"] == {}
     assert weights["map"]["mirage"] > 0
 
