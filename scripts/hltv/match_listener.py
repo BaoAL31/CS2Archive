@@ -501,17 +501,21 @@ def _candidate_cards(match: Match, indexes: dict | None = None) -> list[str]:
     return [path for path, _ in selected]
 
 
-def _card_rank(meta: dict) -> tuple[float, float]:
-    """Higher star_score (log card + fitted kind lift), then rating."""
+def _card_rank(meta: dict) -> tuple[float, float, float]:
+    """Model predicted views, then algo weight, then rating."""
     try:
-        score = float(meta.get("star_score", meta.get("weight") or 0))
+        model = float(meta.get("model_log_views") or 0)
     except (TypeError, ValueError):
-        score = 0.0
+        model = 0.0
+    try:
+        weight = float(meta.get("weight") or 0)
+    except (TypeError, ValueError):
+        weight = 0.0
     try:
         rating = float(meta.get("rating") or 0)
     except (TypeError, ValueError):
         rating = 0.0
-    return (score, rating)
+    return (model, weight, rating)
 
 
 def select_best_card(
@@ -557,11 +561,11 @@ def _prune_queue(cards: list[str], indexes: dict | None = None) -> list[str]:
 
 
 def sort_card_records(cards: list[tuple[str, dict]]) -> list[str]:
-    """Order queued cards by weight, then rating, then path."""
+    """Order queued cards by model, then weight, then rating, then path."""
     def key(record: tuple[str, dict]) -> tuple:
         path, meta = record
-        weight, rating = _card_rank(meta)
-        return (-weight, -rating, path)
+        model, weight, rating = _card_rank(meta)
+        return (-model, -weight, -rating, path)
 
     return [path for path, _ in sorted(cards, key=key)]
 

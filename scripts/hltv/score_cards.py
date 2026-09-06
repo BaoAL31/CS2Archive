@@ -39,6 +39,50 @@ from scoring import demand_points, load_player_demand_index, star_bonus  # noqa:
 SCORE_VERSION = 2
 CLIP_WEIGHTS_PATH = ROOT / ".data" / "clip_kind_weights.json"
 SHORTS_ROOT = ROOT / "renders" / "shorts"
+MODEL_WEIGHTS_PATH = ROOT / ".data" / "pov_kind_weights.json"
+_MODEL_CACHE: dict | None = None
+
+
+def load_model_weights(path: Path | None = None) -> dict:
+    """Fitted POV-view weights (12/20 top-20 model). Cached."""
+    global _MODEL_CACHE
+    if path is None and _MODEL_CACHE is not None:
+        return _MODEL_CACHE
+    try:
+        payload = json.loads((path or MODEL_WEIGHTS_PATH).read_text(
+            encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return {}
+    weights = payload.get("weights") or {}
+    if path is None:
+        _MODEL_CACHE = weights
+    return weights
+
+
+def predict_model_log_views(meta: dict, team: str, opponent: str,
+                            weights: dict | None,
+                            ranking: dict | None) -> float:
+    """LIM-pro model prediction for this card (bias + fitted groups)."""
+    from shorts.pro_context import event_tier
+    weights = weights if weights is not None else load_model_weights()
+    if not weights:
+        return 0.0
+    player = str(meta.get("player") or "").strip().lower()
+    org = str(team or "").strip()
+    opp = str(opponent or "").strip()
+    ranking = ranking or {}
+    rank = ranking.get(opp, 0) or 0
+    opp_tier = ("top5" if rank and rank <= 5 else
+                "top10" if rank and rank <= 10 else
+                "top20" if rank and rank <= 20 else
+                "top30" if rank else "unranked")
+    tier = event_tier(str(meta.get("tournament") or ""))
+    total = float(weights.get("bias", 0.0))
+    total += weights.get("player", {}).get(player, 0.0)
+    total += weights.get("org", {}).get(org, 0.0)
+    total += weights.get("opp_tier", {}).get(opp_tier, 0.0)
+    total += weights.get("tier", {}).get(tier, 0.0)
+    return round(total, 3)
 HIGHLIGHT_VIEW_FLOOR = 1_000
 HIGHLIGHT_LOOKBACK_DAYS = 7
 PLAYER_DEMAND_STALE_DAYS = 7
@@ -313,6 +357,7 @@ def score_card(
     weight = star + demand + match_team + highlight + rating_pts
     kind, premium = _clip_kind_premium(meta, kind_premiums, demo_kinds)
     star_score = round(math.log10(max(weight, 1)) + premium, 3)
+    model_views = predict_model_log_views(meta, team, opponent, None, ranking)
     return {
         "score_version": SCORE_VERSION,
         "raw_star_bonus": raw_star,
@@ -327,6 +372,7 @@ def score_card(
         "clip_kind": kind,
         "kind_premium": premium,
         "star_score": star_score,
+        "model_log_views": model_views,
     }
 
 
