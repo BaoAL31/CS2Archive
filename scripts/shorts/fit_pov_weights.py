@@ -35,8 +35,9 @@ from shorts.fit_clip_weights import load_roster_orgs, spearman  # noqa: E402
 HISTORY = ROOT / "exports" / "pov_market" / "video_history.csv"
 OUT_DEFAULT = ROOT / ".data" / "pov_kind_weights.json"
 OWN_CHANNEL = "CS2 Archive"
-LIM_CHANNEL = "LIM-CS POV"
+LIM_CHANNEL = "LIM-CS POV | Pro Tournaments"
 TRAIN_FRAC = 0.8
+RANKING_PATH = ROOT / ".data" / "hltv_team_ranking.json"
 
 
 def _parse_stamp(value: str | None) -> datetime | None:
@@ -65,28 +66,88 @@ def _elo_bucket(raw: str | float | None) -> str:
     return "sub3k"
 
 
+def _load_opp_rank() -> dict[str, int]:
+    try:
+        return (json.loads(RANKING_PATH.read_text(encoding="utf-8"))
+                .get("teams") or {})
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return {}
+
+
+_OPP_RANK = _load_opp_rank()
+_RATINGS_INDEX: list | None = None
+
+
+def _ratings_index() -> list:
+    global _RATINGS_INDEX
+    if _RATINGS_INDEX is None:
+        from shorts.pro_context import index_ratings
+        _RATINGS_INDEX = index_ratings()
+    return _RATINGS_INDEX
+
+
+def _opp_tier(team: str) -> str:
+    rank = _OPP_RANK.get(team or "")
+    if not rank:
+        return "unranked"
+    if rank <= 5:
+        return "top5"
+    if rank <= 10:
+        return "top10"
+    if rank <= 20:
+        return "top20"
+    return "top30"
+
+
 def features_from_pov(row: dict, *, org_of=None) -> dict:
+    from shorts.pro_context import (event_tier, lookup_rating,
+                                    normalize_stage, parse_pro_title,
+                                    rating_bucket)
     player = str(row.get("primary_player") or "").strip().lower()
     org = (org_of(player) if org_of else None) or None
+    parsed = parse_pro_title(str(row.get("title") or ""))
+    game_map = parsed["map"] or str(row.get("map") or "").strip().lower()
+    team1, team2 = parsed["team1"], parsed["team2"]
+    mine = (org or "").lower()
+    opp = ""
+    if team1 and team2:
+        if team1.lower() == mine:
+            opp = team2
+        elif team2.lower() == mine:
+            opp = team1
+        else:
+            opp = team2
+    rating, file_stage = lookup_rating(_ratings_index(), team1, team2,
+                                       game_map, player)
+    stage = parsed["stage"]
+    if stage == "other" and file_stage:
+        stage = normalize_stage(file_stage)
     return {"player": player,
             "org": org,
-            "map": str(row.get("map") or "").strip().lower() or "unknown",
-            "elo": _elo_bucket(row.get("elo"))}
+            "map": game_map or "unknown",
+            "opp": opp or "unknown",
+            "opp_tier": _opp_tier(opp),
+            "rating": rating_bucket(rating),
+            "stage": stage,
+            "tier": event_tier(str(row.get("title") or ""))}
 
 
 def new_weights() -> dict:
-    return {"bias": 0.0, "player": {}, "org": {}, "map": {}, "elo": {}}
+    return {"bias": 0.0, "player": {}, "org": {}, "map": {},
+            "opp": {}, "opp_tier": {}, "rating": {}, "stage": {},
+            "tier": {}}
 
 
 def predict_log_vpd(feats: dict, weights: dict, *,
                     channel_bias: dict, org_of=None) -> float:
     del org_of
-    return (weights["bias"]
-            + channel_bias.get(feats.get("_channel", ""), 0.0)
-            + weights["player"].get(feats["player"], 0.0)
-            + (weights["org"].get(feats["org"], 0.0) if feats.get("org") else 0.0)
-            + weights["map"].get(feats["map"], 0.0)
-            + weights["elo"].get(feats["elo"], 0.0))
+    total = weights["bias"] + channel_bias.get(feats.get("_channel", ""), 0.0)
+    for group in ("player", "org", "map", "opp", "opp_tier",
+                  "rating", "stage", "tier"):
+        key = feats.get(group)
+        if key:
+            total += weights[group].get(key, 0.0)
+    return total
 
 
 def sgd_epoch(rows, weights: dict, channel_bias: dict,
@@ -110,15 +171,16 @@ def sgd_epoch(rows, weights: dict, channel_bias: dict,
         if feats["player"] and alphas["player"]:
             d = weights["player"]
             d[feats["player"]] = d.get(feats["player"], 0.0) + alphas["player"] * err
-        if feats.get("org") and alphas["org"]:
-            d = weights["org"]
-            d[feats["org"]] = d.get(feats["org"], 0.0) + alphas["org"] * err
-        if alphas["map"]:
-            d = weights["map"]
-            d[feats["map"]] = d.get(feats["map"], 0.0) + alphas["map"] * err
-        if feats["elo"] != "none" and alphas["elo"]:
-            d = weights["elo"]
-            d[feats["elo"]] = d.get(feats["elo"], 0.0) + alphas["elo"] * err
+        for group, alpha in (("org", alphas["org"]), ("map", alphas["map"]),
+                             ("opp", alphas["opp"]),
+                             ("opp_tier", alphas["opp_tier"]),
+                             ("rating", alphas["rating"]),
+                             ("stage", alphas["stage"]),
+                             ("tier", alphas["tier"])):
+            key = feats.get(group)
+            if key and alpha:
+                d = weights[group]
+                d[key] = d.get(key, 0.0) + alpha * err
 
 
 def recognised_aliases() -> dict[str, str]:
@@ -214,7 +276,11 @@ GRID = {
     "player": [0.0, 0.005],
     "org": [0.0, 0.005],
     "map": [0.0, 0.01],
-    "elo": [0.0, 0.005],
+    "opp": [0.0],
+    "opp_tier": [0.0, 0.005],
+    "rating": [0.0, 0.01],
+    "stage": [0.0, 0.005],
+    "tier": [0.0, 0.005],
     "bias": [0.01],
     "channel": [0.0],
 }
@@ -239,9 +305,9 @@ def main() -> int:
           flush=True)
 
     best = None
-    keys = ["player", "org", "map", "elo"]
+    keys = ["player", "org", "map", "opp_tier", "rating", "stage", "tier"]
     for combo in itertools.product(*(GRID[k] for k in keys)):
-        alphas = {**{k: v for k, v in zip(keys, combo)},
+        alphas = {**{k: v for k, v in zip(keys, combo)}, "opp": 0.0,
                   "bias": GRID["bias"][0], "channel": GRID["channel"][0]}
         for epochs in EPOCHS:
             weights = new_weights()
@@ -251,7 +317,8 @@ def main() -> int:
                           alphas=alphas, org_of=org_of)
             score = evaluate(val, weights, org_of=org_of)
             tag = (f"player={alphas['player']} org={alphas['org']} "
-                   f"map={alphas['map']} elo={alphas['elo']} ep={epochs}")
+                   f"map={alphas['map']} rating={alphas['rating']} "
+                   f"stage={alphas['stage']} tier={alphas['tier']} ep={epochs}")
             print(f"  {tag} -> mse={score['mse']:.3f} (~{score['rmse_x']:.1f}x) "
                   f"mae={score['mae']:.3f}", flush=True)
             if best is None or score["mse"] < best[0]:
@@ -261,12 +328,14 @@ def main() -> int:
     payload = {"alphas": alphas, "epochs": epochs, "val": score,
                "weights": weights,
                "method": "log10(views/day) = channel_bias + bias + player "
-                         "+ org + map + elo; per-video SGD"}
+                         "+ org + map + opp_tier + rating + stage + tier; "
+                         "per-video SGD; LIM pro channel only"}
     args.out.write_text(json.dumps(payload, indent=1), encoding="utf-8")
     print(f"BEST alphas={alphas} ep={epochs} "
           f"mse={score['mse']:.3f} (~{score['rmse_x']:.1f}x) "
           f"mae={score['mae']:.3f}", flush=True)
-    for group in ("org", "map", "elo", "player"):
+    for group in ("org", "map", "opp_tier", "rating", "stage", "tier",
+                  "player"):
         items = sorted(weights[group].items(), key=lambda kv: -kv[1])[:8]
         if items:
             print(f"top {group}:", flush=True)
