@@ -35,6 +35,7 @@ from shorts.fit_clip_weights import load_roster_orgs, spearman  # noqa: E402
 HISTORY = ROOT / "exports" / "pov_market" / "video_history.csv"
 OUT_DEFAULT = ROOT / ".data" / "pov_kind_weights.json"
 OWN_CHANNEL = "CS2 Archive"
+LIM_CHANNEL = "LIM-CS POV"
 TRAIN_FRAC = 0.8
 
 
@@ -144,6 +145,8 @@ def load_rows(min_vpd: float = 0.0) -> list[dict]:
     rows: list[dict] = []
     with HISTORY.open(encoding="utf-8-sig", newline="") as fh:
         for row in csv.DictReader(fh):
+            if str(row.get("channel") or "") != LIM_CHANNEL:
+                continue
             try:
                 vpd = float(row.get("views_per_day") or 0)
             except (TypeError, ValueError):
@@ -213,7 +216,7 @@ GRID = {
     "map": [0.0, 0.01],
     "elo": [0.0, 0.005],
     "bias": [0.01],
-    "channel": [0.05],
+    "channel": [0.0],
 }
 EPOCHS = [6]
 
