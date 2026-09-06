@@ -307,9 +307,7 @@ def generate(
     text_y_center = HEIGHT // 2
 
     kd_fill = (239, 195, 79)       # gold — hero K-D
-    rating_fill = (92, 214, 128)   # HLTV-ish green
     GOLD = 128
-    RATING = 62
 
     match_line = match_detail.strip()
     if map_name:
@@ -318,7 +316,6 @@ def generate(
     lines = [
         (player_name, FONT_SIZES["player"], TEXT_COLOR, 0),
         (kd, GOLD, kd_fill, 0),
-        (str(rating), RATING, rating_fill, 0),
         (match_line, FONT_SIZES["tiny"], TEXT_COLOR, 0),
     ]
     if tournament_logo is not None:
