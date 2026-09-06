@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 FONT_PATH = Path(__file__).parent.parent / "assets" / "fonts" / "Montserrat-Bold.ttf"
 
@@ -32,7 +32,6 @@ def _load_font(size: int) -> ImageFont.FreeTypeFont:
 def load_background(bg_path: Path) -> Image.Image:
     img = Image.open(bg_path).convert("RGB")
     img = img.resize((WIDTH, HEIGHT), Image.LANCZOS)
-    img = img.filter(ImageFilter.GaussianBlur(radius=6))
     return img
 
 

@@ -296,7 +296,7 @@ def generate(
     player_img = scale_player(player_img, target_h)
 
     pw, ph = player_img.size
-    px = 0
+    px = 24
     py = HEIGHT - ph
     bg.paste(player_img, (px, py), player_img)
 
@@ -366,7 +366,7 @@ def generate_faceit(
             target_h = int(HEIGHT * AVATAR_HEIGHT_RATIO)
             player_img = scale_player(player_img, target_h)
             pw, ph = player_img.size
-            px = 0
+            px = 24
             py = HEIGHT - ph
             bg.paste(player_img, (px, py), player_img)
         except Exception as e:
