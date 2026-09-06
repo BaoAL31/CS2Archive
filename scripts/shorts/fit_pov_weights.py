@@ -105,6 +105,7 @@ def predict_log_vpd(feats: dict, weights: dict, *,
 
 def sgd_epoch(rows, weights: dict, channel_bias: dict,
               *, alphas: dict, org_of=None) -> None:
+    l2 = alphas.get("l2", 0.0)
     for row in rows:
         views = row.get("target_views") or 0
         if views <= 0:
@@ -124,7 +125,8 @@ def sgd_epoch(rows, weights: dict, channel_bias: dict,
             key = feats.get(group)
             if key and alpha:
                 d = weights[group]
-                d[key] = d.get(key, 0.0) + alpha * err
+                grad = alpha * err - alpha * l2 * d.get(key, 0.0)
+                d[key] = d.get(key, 0.0) + grad
 
 
 def load_dataset(path: Path | None = None) -> list[dict]:
@@ -173,9 +175,46 @@ GRID = {
 EPOCHS = [6]
 
 
+def train_run(train, val, alphas: dict, max_epochs: int = 40,
+              patience: int = 5) -> tuple[dict, list, int, float]:
+    """SGD with early stopping on val MSE. Returns (weights, history,
+    best_epoch, best_mse). History holds per-epoch train/val MSE."""
+    import copy
+    weights = new_weights()
+    history: list[dict] = []
+    best: tuple[float, dict, int] | None = None
+    stale = 0
+    for epoch in range(1, max_epochs + 1):
+        sgd_epoch(train, weights, {}, alphas=alphas)
+        train_mse = evaluate(train, weights)["mse"]
+        val_mse = evaluate(val, weights)["mse"]
+        history.append({"epoch": epoch, "train_mse": train_mse,
+                        "val_mse": val_mse})
+        if best is None or val_mse < best[0] - 1e-6:
+            best = (val_mse, copy.deepcopy(weights), epoch)
+            stale = 0
+        else:
+            stale += 1
+        if stale >= patience:
+            break
+    assert best is not None
+    return best[1], history, best[2], best[0]
+
+
+REF_ALPHAS = {"player": 0.005, "org": 0.005, "map": 0.0,
+              "opp_tier": 0.005, "rating": 0.0, "kd": 0.0,
+              "decider": 0.0, "won": 0.0, "ot": 0.0, "derby": 0.0,
+              "stage": 0.0, "tier": 0.005, "weekday": 0.0,
+              "bias": 0.01, "channel": 0.0, "l2": 0.0}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dataset", type=Path, default=DATASET)
+    ap.add_argument("--lr-scales", type=float, nargs="+",
+                    default=[0.25, 0.5, 1.0, 2.0, 4.0])
+    ap.add_argument("--max-epochs", type=int, default=40)
+    ap.add_argument("--patience", type=int, default=5)
     ap.add_argument("--out", type=Path, default=OUT_DEFAULT)
     args = ap.parse_args()
 
@@ -185,48 +224,70 @@ def main() -> int:
     train, val = rows[:cut], rows[cut:]
     print(f"rows={len(rows)} train={len(train)} val={len(val)}", flush=True)
 
+    from shorts.ml_common import append_run_log
+    run_log = ROOT / ".data" / "fit_pov_runs.jsonl"
+
     base = evaluate(val, new_weights())
     print(f"baseline(zero): mse={base['mse']:.3f} (~{base['rmse_x']:.1f}x) "
           f"mae={base['mae']:.3f}", flush=True)
 
-    keys = [group for group in GROUPS if len(GRID[group]) > 1]
-    # Stage 1: single-group screen — keep groups that beat zero alone.
-    screened = []
-    for group in keys:
-        alphas = {other: 0.0 for other in GROUPS}
-        alphas[group] = GRID[group][1]
-        alphas.update({"bias": GRID["bias"][0],
-                       "channel": GRID["channel"][0]})
-        weights = new_weights()
-        for _ in range(EPOCHS[0]):
-            sgd_epoch(train, weights, {}, alphas=alphas)
-        score = evaluate(val, weights)
-        print(f"  [screen] {group} -> mse={score['mse']:.3f} "
-              f"(zero={base['mse']:.3f})", flush=True)
-        if score["mse"] < base["mse"]:
-            screened.append(group)
-    print(f"  screened groups: {screened}", flush=True)
-    keys = screened
-    best = None
-    for combo in itertools.product(*(GRID[k] for k in keys)):
-        alphas = {group: 0.0 for group in GROUPS}
-        alphas.update({k: v for k, v in zip(keys, combo)})
-        alphas.update({"bias": GRID["bias"][0],
-                       "channel": GRID["channel"][0]})
-        for epochs in EPOCHS:
-            weights = new_weights()
-            for _ in range(epochs):
-                sgd_epoch(train, weights, {}, alphas=alphas)
-            score = evaluate(val, weights)
-            tag = " ".join(f"{k}={alphas[k]}" for k in keys)
-            print(f"  {tag} -> mse={score['mse']:.3f} "
-                  f"(~{score['rmse_x']:.1f}x) mae={score['mae']:.3f} "
-                  f"spear={score['spearman']:.3f}", flush=True)
-            if best is None or score["mse"] < best[0]:
-                best = (score["mse"], alphas, epochs, weights, score)
+    from shorts.ml_common import append_run_log
+    run_log = ROOT / ".data" / "fit_pov_runs.jsonl"
 
-    _, alphas, epochs, weights, score = best
-    payload = {"alphas": alphas, "epochs": epochs, "val": score,
+    # Phase 1: LR sweep (scale reference alphas) with early stopping.
+    lr_results = []
+    for scale in args.lr_scales:
+        alphas = {k: (v * scale if k not in ("bias", "channel", "l2")
+                       else v) for k, v in REF_ALPHAS.items()}
+        weights, history, epoch, mse = train_run(
+            train, val, alphas, max_epochs=args.max_epochs,
+            patience=args.patience)
+        append_run_log(run_log, {"model": "pov", "phase": "lr",
+                                 "scale": scale, "epoch": epoch,
+                                 "mse": mse, "history": history})
+        lr_results.append((mse, scale, epoch, weights, history))
+        print(f"  [lr] scale={scale:<5} stopped={epoch:<3} mse={mse:.4f}",
+              flush=True)
+    lr_results.sort(key=lambda t: t[0])
+    _, best_scale, best_epoch, _, _ = lr_results[0]
+    print(f"  best lr scale={best_scale} epoch={best_epoch}", flush=True)
+
+    ref = {k: (v * best_scale if k not in ("bias", "channel", "l2")
+               else v) for k, v in REF_ALPHAS.items()}
+
+    # Phase 2: ablations — drop each active group, add each inactive one.
+    def _run(tag: str, alphas: dict) -> tuple[float, dict]:
+        weights, _, epoch, mse = train_run(
+            train, val, alphas, max_epochs=args.max_epochs,
+            patience=args.patience)
+        append_run_log(run_log, {"model": "pov", "phase": "ablate",
+                                 "tag": tag, "epoch": epoch, "mse": mse})
+        print(f"  [ablate] {tag:24s} stopped={epoch:<3} mse={mse:.4f}",
+              flush=True)
+        return mse, weights
+
+    full_mse, full_w = _run("full", dict(ref))
+    best = (full_mse, dict(ref), full_w, "full")
+    active = [g for g in GROUPS if ref.get(g, 0.0) > 0]
+    for group in active:
+        trial = dict(ref)
+        trial[group] = 0.0
+        mse, weights = _run(f"drop-{group}", trial)
+        if mse < best[0]:
+            best = (mse, trial, weights, f"drop-{group}")
+    inactive = [g for g in GROUPS if ref.get(g, 0.0) == 0.0]
+    for group in inactive:
+        trial = dict(ref)
+        trial[group] = 0.005 * best_scale
+        mse, weights = _run(f"add-{group}", trial)
+        if mse < best[0]:
+            best = (mse, trial, weights, f"add-{group}")
+
+    mse, alphas, weights, tag = best
+    score = evaluate(val, weights)
+    epochs = None
+
+    payload = {"alphas": alphas, "ablation": tag, "val": score,
                "weights": weights,
                "method": "log10(views) = bias + 13 feature groups; "
                          "per-video SGD; LIM pro dataset"}
