@@ -29,13 +29,9 @@ from shorts.pro_context import (derby_heat, event_tier, index_ratings,
                                 parse_pro_title, rating_bucket,
                                 series_context)
 
-CHANNELS = (
-    "LIM-CS POV | Pro Tournaments",
-    "CAL CS POV",
-    "CS2 POV DEMOS",
-    "EDCS - POV",
-    "LIM-CS POV",
-)
+# LIM pro only: multi-channel (CAL/EDCS/own) lost on both val loss
+# (0.237 vs 0.119) and top-20 overlap (7 vs 12). Revisit at 3x rows.
+CHANNELS = ("LIM-CS POV | Pro Tournaments",)
 # Own channel excluded from training: tiny base, promo-driven views
 # (val MSE 1.2 vs 0.2-0.4 elsewhere). Revisit at 10x subs.
 _FACEIT_RES = re.compile(r"\bfaceit\b|\belo\b|soloq", re.I)
