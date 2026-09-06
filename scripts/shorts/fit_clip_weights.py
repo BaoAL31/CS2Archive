@@ -195,8 +195,9 @@ def load_matches(min_clips: int = MIN_CLIPS) -> list[tuple[str, list[dict]]]:
 
 
 def evaluate(matches, weights: dict, *, org_of) -> dict:
-    """Mean per-match Spearman + pairwise accuracy (bias-free: rank only)."""
+    """Val loss: MSE/MAE on log10 views (bias-free: rank only)."""
     spes, pair_hit, pair_tot = [], 0, 0
+    se_sum, ae_sum, n = 0.0, 0.0, 0
     for mid, clips in matches:
         preds, actual = [], []
         for clip in clips:
@@ -206,6 +207,9 @@ def evaluate(matches, weights: dict, *, org_of) -> dict:
             preds.append(predict_log_views(features_from_clip(clip),
                                            weights, org_of=org_of))
             actual.append(math.log10(views))
+            se_sum += (preds[-1] - actual[-1]) ** 2
+            ae_sum += abs(preds[-1] - actual[-1])
+            n += 1
         if len(preds) < 3:
             continue
         spes.append(spearman(preds, actual))
@@ -216,7 +220,11 @@ def evaluate(matches, weights: dict, *, org_of) -> dict:
                 pair_tot += 1
                 if (preds[i] > preds[j]) == (actual[i] > actual[j]):
                     pair_hit += 1
+    mse = se_sum / n if n else float("inf")
     return {"matches": len(spes),
+            "mse": mse,
+            "rmse_x": 10 ** math.sqrt(mse) if n else float("inf"),
+            "mae": ae_sum / n if n else float("inf"),
             "mean_spearman": sum(spes) / len(spes) if spes else 0.0,
             "pairwise_acc": pair_hit / pair_tot if pair_tot else 0.0}
 
@@ -246,8 +254,8 @@ def main() -> int:
     org_of = lambda p: orgs.get((p or "").lower())
 
     base = evaluate(val, new_weights(), org_of=org_of)
-    print(f"baseline(zero): spearman={base['mean_spearman']:.3f} "
-          f"pairwise={base['pairwise_acc']:.3f}", flush=True)
+    print(f"baseline(zero): mse={base['mse']:.3f} (~{base['rmse_x']:.1f}x) "
+          f"mae={base['mae']:.3f}", flush=True)
 
     best = None
     keys = ["kind", "player", "org", "weapon"]
@@ -263,10 +271,10 @@ def main() -> int:
             score = evaluate(val, weights, org_of=org_of)
             tag = (f"kind={alphas['kind']} player={alphas['player']} "
                    f"org={alphas['org']} weapon={alphas['weapon']} ep={epochs}")
-            print(f"  {tag} -> spearman={score['mean_spearman']:.3f} "
-                  f"pairwise={score['pairwise_acc']:.3f}", flush=True)
-            if best is None or score["mean_spearman"] > best[0]:
-                best = (score["mean_spearman"], alphas, epochs, weights, score)
+            print(f"  {tag} -> mse={score['mse']:.3f} (~{score['rmse_x']:.1f}x) "
+                  f"mae={score['mae']:.3f}", flush=True)
+            if best is None or score["mse"] < best[0]:
+                best = (score["mse"], alphas, epochs, weights, score)
 
     _, alphas, epochs, weights, score = best
     payload = {"alphas": alphas, "epochs": epochs, "val": score,
@@ -275,8 +283,8 @@ def main() -> int:
                          "+ org + weapon + wallbang; per-match SGD"}
     args.out.write_text(json.dumps(payload, indent=1), encoding="utf-8")
     print(f"BEST alphas={alphas} ep={epochs} "
-          f"spearman={score['mean_spearman']:.3f} "
-          f"pairwise={score['pairwise_acc']:.3f}", flush=True)
+          f"mse={score['mse']:.3f} (~{score['rmse_x']:.1f}x) "
+          f"mae={score['mae']:.3f}", flush=True)
     print("kind premiums (log10 pts):", flush=True)
     for kind, val_ in sorted(weights["kind"].items(), key=lambda kv: -kv[1]):
         print(f"  {kind:14s} {val_:+.3f}  (~{10 ** val_:.2f}x views)", flush=True)
