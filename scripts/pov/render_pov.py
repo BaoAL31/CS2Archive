@@ -18,9 +18,15 @@ ensure()
 
 from cs2_minimizer import CS2Park
 from config import settings, apply_runtime_env
+from csdm_segments import sequence, tick_range_config
 from hook_aware import (
     kill_stale_processes as _kill_stale_processes,
     prepare_steam_hlae as _prepare_steam_hlae,
+)
+from round_windows import (
+    load_voided_rounds,
+    plan_round_windows,
+    write_voided_rounds,
 )
 
 apply_runtime_env()
@@ -110,7 +116,7 @@ BASE_FLAGS = [
     "--ffmpeg-executable-path", FFMPEG_PATH,
     "--ffmpeg-video-codec", "h264_nvenc",
     "--ffmpeg-crf", "10",
-    "--ffmpeg-output-parameters=-cq 10 -preset p7 -maxrate 200M -bufsize 400M -profile:v high -pix_fmt yuv420p -level 5.1",
+    "--ffmpeg-output-parameters=-cq 10 -preset p5 -maxrate 200M -bufsize 400M -profile:v high -pix_fmt yuv420p -level 5.1",
     "--recording-system", "HLAE",
     "--close-game-after-recording",
 ]
@@ -148,7 +154,71 @@ def _copy_and_verify(src: Path, dst: Path) -> bool:
     return True
 
 
-def _rename_sequence_files(output_dir: Path, global_rounds: list[int]) -> set[int]:
+def _seq_num(p: Path) -> int:
+    """Numeric sequence index for a CSDM old-format sequence file.
+
+    NEVER sort these lexicographically: 'sequence-10-...' < 'sequence-2-...'.
+    Lexicographic fallback pairing silently mislabels rounds 2-9 with
+    rounds 10+ content after any crash-resume (seen 2026-09-07, m3 ancient).
+    """
+    m = _SEQ_RENDER_RE.match(p.name)
+    return int(m.group(1)) if m else 10 ** 9
+
+
+def _spans_overlap(a0: int, a1: int, b0: int, b1: int) -> int:
+    """Length of tick overlap between spans [a0, a1] and [b0, b1]."""
+    try:
+        return max(0, min(int(a1), int(b1)) - max(int(a0), int(b0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def rendered_rounds(output_dir: Path) -> set[int]:
+    """Round numbers with a usable (>=1 MB) round-*.mp4 clip.
+
+    Undersized files (crashed encodes) and non-matching names are ignored
+    so resume re-renders them instead of treating them as done.
+    """
+    done: set[int] = set()
+    for p in output_dir.glob("round-*-tick-*-to-*.mp4"):
+        m = _ROUND_RENDER_RE.match(p.name)
+        if not m:
+            continue
+        try:
+            if p.stat().st_size >= 1_048_576:
+                done.add(int(m.group(1)))
+        except OSError:
+            continue
+    return done
+
+
+def _clear_stale_sequences(output_dir: Path) -> int:
+    """Delete crash-debris sequence outputs before a (re-)render.
+
+    Successful outputs are renamed to round-*.mp4 immediately after each
+    batch, so anything still named sequence-*/sequence-*.mp4 is debris from
+    a dead attempt. Left in place it collides with the next run's positional
+    mapping (seq_num -> global_rounds[seq_num-1]) and can silently mislabel
+    rounds. Returns the number of entries removed.
+    """
+    removed = 0
+    for p in sorted(output_dir.glob("*-sequence")):
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+            removed += 1
+    for p in sorted(output_dir.glob("sequence-*-tick-*-to-*.mp4")):
+        try:
+            p.unlink()
+            removed += 1
+        except OSError:
+            pass
+    if removed:
+        print(f"  [resume] cleared {removed} stale sequence output(s)")
+    return removed
+
+
+def _rename_sequence_files(output_dir: Path, global_rounds: list[int],
+                           tick_overrides: dict[int, tuple[int, int]] | None = None) -> set[int]:
     """Rename per-round CSDM outputs to round-{global:03d}-tick-{A}-to-{B}.mp4.
 
     Handles two CSDM output formats:
@@ -174,6 +244,8 @@ def _rename_sequence_files(output_dir: Path, global_rounds: list[int]) -> set[in
                     tick_map[rn] = (r.get("startTick", 0), r.get("endTick", 0))
         except Exception:
             pass
+    if tick_overrides:
+        tick_map.update(tick_overrides)
 
     # --- Old format: sequence-{i}-tick-{A}-to-{B}.mp4 ---
     seqs = sorted(
@@ -190,29 +262,61 @@ def _rename_sequence_files(output_dir: Path, global_rounds: list[int]) -> set[in
                     salvaged.add(gr)
             return salvaged
 
-        # Partial match: fewer seq files than rounds. Map by tick start.
-        tick_start_to_rn: dict[int, int] = {a: rn for rn, (a, _b) in tick_map.items()}
-        for seq in seqs:
+        # Partial match: fewer seq files than rounds. Map by tick overlap
+        # against analysis spans. Exact-start match alone is too brittle:
+        # CSDM native windows start at freeze-128, not analysis startTick,
+        # so a total miss used to fall through to lexicographic pairing
+        # ('sequence-10' < 'sequence-2') and silently scramble rounds.
+        span_by_rn: dict[int, tuple[int, int]] = {
+            rn: (a, b) for rn, (a, _b) in tick_map.items()
+            if rn in set(global_rounds) and a is not None and b is not None
+            and int(b) > int(a)
+        }
+        tick_start_to_rn: dict[int, int] = {
+            int(a): rn for rn, (a, _b) in span_by_rn.items()
+        }
+        ordered_seqs = sorted(seqs, key=_seq_num)
+        pending: list[Path] = []
+        for seq in ordered_seqs:
             m = _SEQ_RENDER_RE.match(seq.name)
             tick_s = int(m.group(2))
             rn = tick_start_to_rn.get(tick_s)
-            if rn is not None and rn in set(global_rounds):
-                dst = output_dir / f"round-{rn:03d}-tick-{m.group(2)}-to-{m.group(3)}.mp4"
+            if rn is not None and rn in set(global_rounds) \
+                    and rn not in salvaged:
+                dst = output_dir / \
+                    f"round-{rn:03d}-tick-{m.group(2)}-to-{m.group(3)}.mp4"
                 if _copy_and_verify(seq, dst):
                     salvaged.add(rn)
-            else:
-                # Fallback: sequential pairing with rescued rounds only
-                pass
-        # Fallback: any seqs we couldn't tick-map, pair sequentially with
-        # remaining unmapped global_rounds
-        unmapped_gr = [gr for gr in global_rounds if gr not in salvaged]
-        unmapped_seqs = [
-            s for s in seqs
-            if s.parent == output_dir and s.name.startswith("sequence-")
-        ]
-        for seq, gr in zip(sorted(unmapped_seqs), unmapped_gr):
+                continue
+            pending.append(seq)
+        # Overlap match: each surviving seq belongs to the requested round
+        # whose analysis span it overlaps most (CSDM windows sit inside).
+        unmatched: list[Path] = []
+        for seq in pending:
+            m = _SEQ_RENDER_RE.match(seq.name)
+            a, b = int(m.group(2)), int(m.group(3))
+            best_rn, best_ov = None, 0
+            for rn in sorted(set(global_rounds) - salvaged):
+                sa, sb = span_by_rn.get(rn, (0, 0))
+                ov = _spans_overlap(a, b, int(sa), int(sb))
+                if ov > best_ov:
+                    best_rn, best_ov = rn, ov
+            if best_rn is not None:
+                dst = output_dir / \
+                    f"round-{best_rn:03d}-tick-{m.group(2)}-to-{m.group(3)}.mp4"
+                if _copy_and_verify(seq, dst):
+                    salvaged.add(best_rn)
+                    continue
+            unmatched.append(seq)
+        # Last resort: positional pairing in NUMERIC (never lexicographic)
+        # order, and say so loudly.
+        unmapped_gr = sorted(set(global_rounds) - salvaged)
+        for seq, gr in zip(sorted(unmapped_seqs, key=_seq_num),
+                            unmapped_gr):
             m = _SEQ_RENDER_RE.match(seq.name)
             a, b = m.group(2), m.group(3)
+            print(f"  [WARN] tick-unmatched {seq.name} -> round {gr} "
+                  f"(positional guess, VERIFY)")
             dst = output_dir / f"round-{gr:03d}-tick-{a}-to-{b}.mp4"
             if _copy_and_verify(seq, dst):
                 salvaged.add(gr)
@@ -258,6 +362,98 @@ def resolve_output_dir(output: str | None, first_demo_path: str, steam_id: str) 
 
 def abs_cfg_path() -> Path:
     return (_PROJECT_ROOT / "assets" / "cs2_pov.cfg").resolve()
+
+
+def _load_analysis(output_dir: Path, demo_path: str | None = None) -> dict:
+    p = output_dir / "csdm_analysis.json"
+    if p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if data.get("rounds"):
+                return data
+        except (OSError, json.JSONDecodeError):
+            pass
+    if not demo_path:
+        return {}
+    with tempfile.TemporaryDirectory() as tmp:
+        cmd = [CSDM, "json", demo_path, "--output-folder", tmp]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        err = (r.stderr or "") + (r.stdout or "")
+        if "unknown demo source" in err.lower():
+            cmd += ["--source", "challengermode"]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        jf = list(Path(tmp).glob("*.json"))
+        if not jf:
+            return {}
+        data = json.loads(jf[0].read_text(encoding="utf-8"))
+        p.write_text(json.dumps(data), encoding="utf-8")
+        return data
+
+
+def _cfg_without_comments() -> str:
+    lines = []
+    for line in abs_cfg_path().read_text(encoding="utf-8").splitlines():
+        stripped = line.split("//", 1)[0].strip()
+        if stripped:
+            lines.append(stripped)
+    return "\n".join(lines) + "\n"
+
+
+def _pov_ffmpeg_settings() -> dict:
+    return {
+        "constantRateFactor": 10,
+        "videoContainer": "mp4",
+        "videoCodec": "h264_nvenc",
+        "audioCodec": "aac",
+        "audioBitrate": 256,
+        "inputParameters": "",
+        # p5 not p7: mezzanine never ships (final overlay export re-encodes at
+        # p7 CQ15). Preset sets NVENC speed, CQ sets quality — p5 is faster
+        # for identical input frames at this bitrate.
+        "outputParameters": (
+            "-cq 10 -preset p5 -maxrate 200M -bufsize 400M "
+            "-profile:v high -pix_fmt yuv420p -level 5.1"
+        ),
+        "customLocationEnabled": True,
+        "customExecutableLocation": FFMPEG_PATH,
+    }
+
+
+def _render_trimmed_windows(
+    demo_path: str,
+    output_dir: Path,
+    steam_id: str,
+    items: list[tuple[int, object]],
+    args,
+) -> None:
+    """Record trimmed round tick windows via CSDM --config-file (not --event rounds)."""
+    cfg_text = _cfg_without_comments()
+    sequences = []
+    global_rounds = []
+    overrides: dict[int, tuple[int, int]] = {}
+    for i, (gr, window) in enumerate(items, start=1):
+        sequences.append(sequence(
+            i, window.start_tick, window.end_tick, steam_id, cfg_text,
+            player_voices=True,
+        ))
+        global_rounds.append(gr)
+        overrides[gr] = (window.start_tick, window.end_tick)
+        print(f"  [trim] round {gr}: ticks {window.start_tick}-{window.end_tick} "
+              f"({window.reason})")
+    payload = tick_range_config(
+        Path(demo_path), output_dir, sequences,
+        width=args.width, height=args.height, framerate=args.framerate,
+        ffmpeg_settings=_pov_ffmpeg_settings(),
+    )
+    cfg_path = output_dir / "_trimmed_rounds.json"
+    cfg_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    cmd = [CSDM, "video", "--config-file", str(cfg_path)]
+    run_csdm(cmd, f"trimmed rounds {global_rounds[0]}-{global_rounds[-1]}",
+             expected=None,
+             hook_timeout=args.hook_timeout,
+             hook_retries=args.hook_retries,
+             output_dir=output_dir)
+    _rename_sequence_files(output_dir, global_rounds, tick_overrides=overrides)
 
 
 def find_demo_parts(demo_path: str) -> list[str]:
@@ -475,7 +671,85 @@ def _get_player_crosshair(steam_id: str, demo_parts: list[str]) -> list[str]:
     return []
 
 
-def _write_render_autoexec(cvars: list[str], rename_map: dict[str, str] | None = None) -> None:
+SPEC_LOCK_SNIPPET = "mirv_script_spec_lock_name.js"
+
+
+def _hlae_snippets_dirs() -> list[Path]:
+    """All known HLAE snippet dirs (CSDM-managed versions + standalone)."""
+    dirs = sorted(Path.home().glob(".csdm/hlae-versions/*/resources/AfxHookSource2/snippets"))
+    standalone = Path("C:/Program Files (x86)/HLAE/resources/AfxHookSource2/snippets")
+    if standalone.is_dir():
+        dirs.append(standalone)
+    return [d for d in dirs if d.is_dir()]
+
+
+def _ensure_spec_lock_snippet() -> int:
+    """Install our name-based spec-lock snippet into every HLAE install.
+
+    Returns the number of installs updated. Idempotent (copies only when
+    content differs) so HLAE updates don't silently drop the fix.
+    """
+    src = _PROJECT_ROOT / "assets" / SPEC_LOCK_SNIPPET
+    if not src.is_file():
+        print(f"  [WARN] spec-lock snippet missing: {src}")
+        return 0
+    want = src.read_bytes()
+    updated = 0
+    for d in _hlae_snippets_dirs():
+        dst = d / SPEC_LOCK_SNIPPET
+        try:
+            if dst.is_file() and dst.read_bytes() == want:
+                continue
+            dst.write_bytes(want)
+            updated += 1
+        except OSError:
+            continue
+    if updated:
+        print(f"  [spec-lock] installed snippet into {updated} HLAE dir(s)")
+    return updated
+
+
+def _write_spec_lock_cfg(player_name: str | None) -> None:
+    """Write game csgo/cfg/spec_lock.cfg (exec'd from cs2_pov.cfg per sequence).
+
+    Launch-time autoexec mirv_* lines don't take effect; the per-sequence
+    cfg under CSDM/HLAE is the live path. Empty target releases the lock.
+    """
+    if player_name:
+        safe = player_name.replace('"', '')
+        content = (f'mirv_script_load "{SPEC_LOCK_SNIPPET}"\n'
+                   f'mirv_script_spec_lock_name "{safe}"\n'
+                   'spec_mode 1\n')
+    else:
+        content = 'mirv_script_spec_lock_name off\n'
+    try:
+        (GAME_CFG / "spec_lock.cfg").write_text(content, encoding="utf-8")
+    except OSError as e:
+        print(f"  [WARN] could not write spec_lock.cfg: {e}")
+
+
+def _demo_player_name(steam_id: str, demo_parts: list[str]) -> str | None:
+    """In-demo nickname for a steam_id (may differ from canonical pro name)."""
+    for p in demo_parts:
+        with tempfile.TemporaryDirectory() as tmp:
+            cmd = [CSDM, "json", p, "--output-folder", tmp]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if r.returncode != 0:
+                continue
+            jf = list(Path(tmp).glob("*.json"))
+            if not jf:
+                continue
+            data = json.loads(jf[0].read_text(encoding="utf-8"))
+            for pl in data.get("players", []):
+                if str(pl.get("steamId")) == str(steam_id):
+                    name = (pl.get("name") or "").strip()
+                    if name:
+                        return name
+    return None
+
+
+def _write_render_autoexec(cvars: list[str], rename_map: dict[str, str] | None = None,
+                           player_name: str | None = None) -> None:
     # cl_chatfilters 63: hide ALL chat — cl_chatfilters is unreliable for
     # demo/GOTV relayed admin/system lines (48 didn't catch them), so kill the
     # chat box entirely; HUD/banners untouched. Must match assets/cs2_pov.cfg —
@@ -489,7 +763,8 @@ def _write_render_autoexec(cvars: list[str], rename_map: dict[str, str] | None =
              "snd_mute_losefocus 0", "voice_enable 1", "voice_modenable 1",
              "tv_listen_voice_indices -1",
              "tv_listen_voice_indices_h -1",
-             "tv_relaytextchat 2"] + cvars
+             "tv_relaytextchat 2",
+             "spec_autodirector 0"] + cvars
 
     # HLAE name override (mirv_replace_name, HLAE 2.184+). This cfg is exec'd
     # in the CS2 console under HLAE, so mirv_* commands are available. byXuid
@@ -498,6 +773,18 @@ def _write_render_autoexec(cvars: list[str], rename_map: dict[str, str] | None =
     for steamid, name in (rename_map or {}).items():
         xuid = f"x{steamid}" if not str(steamid).startswith("x") else str(steamid)
         lines.append(f'mirv_replace_name byXuid add {xuid} "{name}"')
+
+    # Spec lock (mirv_script_spec_lock_name): re-issues spec_player for the
+    # POV player EVERY frame, so the camera stays on their deathcam after
+    # they die instead of the auto-director cutting to a teammate's clutch.
+    # Console spec commands are broken in cs2 1.41.6.2+ and spec_autodirector
+    # is ignored during demo playback (advancedfx#1172); this HLAE-side lock
+    # is the only working primitive. Name must be the IN-DEMO nickname.
+    if player_name:
+        safe = player_name.replace('"', '')
+        lines.append(f'mirv_script_load "{SPEC_LOCK_SNIPPET}"')
+        lines.append(f'mirv_script_spec_lock_name "{safe}"')
+        lines.append("spec_mode 1")
 
     content = "\n".join(lines) + "\n"
     AUTOEXEC_RENDER.write_text(content, encoding="utf-8")
@@ -697,14 +984,22 @@ def main() -> None:
             f"{sid} -> {name}" for sid, name in rename_map.items()
         ))
 
-    if cvars or rename_map:
+    _ensure_spec_lock_snippet()
+    demo_name = _demo_player_name(args.steam_id, parts)
+    if demo_name:
+        print(f"  [spec-lock] POV target: {demo_name}")
+    else:
+        print("  [WARN] could not resolve in-demo nickname — no spec lock")
+    _write_spec_lock_cfg(demo_name)
+
+    if cvars or rename_map or demo_name:
         print(f"  Player crosshair/viewmodel ({len(cvars)} cvars)"
               + (f", {len(rename_map)} name override(s)" if rename_map else ""))
-        _write_render_autoexec(cvars, rename_map)
+        _write_render_autoexec(cvars, rename_map, demo_name)
         _swap_autoexec(AUTOEXEC_RENDER)
         print(f"  Swapped {AUTOEXEC_RENDER.name} -> {AUTOEXEC_MAIN.name}")
     else:
-        print("  [WARN] No crosshair/viewmodel and no --rename — keeping current autoexec.cfg")
+        print("  [WARN] No crosshair/viewmodel, no --rename, no spec target — keeping current autoexec.cfg")
 
     print(f"Output:  {output_dir}")
     total_rounds = sum(get_round_count(p) for p in parts)
@@ -813,18 +1108,15 @@ def main() -> None:
                 # address each round deterministically, and concat_rounds.py can
                 # read the real per-round tick spans for per_round_ticks.
                 global_rounds = [global_round + r for r in batch]
-                already = {
-                    int(_ROUND_RENDER_RE.match(p.name).group(1))
-                    for p in output_dir.glob("round-*-tick-*-to-*.mp4")
-                    if p.stat().st_size >= 1_048_576
-                }
+                already = rendered_rounds(output_dir)
                 # --skip-failed-rounds: treat previously failed rounds as "done"
                 already |= skipped_rounds
                 missing_global = [gr for gr in global_rounds if gr not in already]
                 if not missing_global:
+                    wanted = set(global_rounds)
                     existing = [
                         p for p in output_dir.glob("round-*-tick-*-to-*.mp4")
-                        if int(_ROUND_RENDER_RE.match(p.name).group(1)) in set(global_rounds)
+                        if (m := _ROUND_RENDER_RE.match(p.name)) and int(m.group(1)) in wanted
                     ]
                     mb_total = sum(p.stat().st_size for p in existing) / 1024 / 1024
                     all_via_skip = set(global_rounds) <= skipped_rounds and not existing
@@ -835,41 +1127,80 @@ def main() -> None:
                         total_rendered += len(batch)
                     continue
 
-                # Resume: only ask csdm for the missing local rounds in this batch.
-                missing_local = [gr - global_round for gr in missing_global]
-                cmd = [
-                    CSDM, "video", str(Path(part).resolve()),
-                    "--steamids", args.steam_id,
-                    "--event", "rounds",
-                    "--rounds", ",".join(str(r) for r in missing_local),
-                    "--output", str(output_dir),
-                    "--framerate", str(args.framerate),
-                    "--width", str(args.width),
-                    "--height", str(args.height),
-                    "--cfg", str(abs_cfg_path()),
-                ] + BASE_FLAGS
+                analysis = _load_analysis(output_dir, part)
+                planned = plan_round_windows(analysis) if analysis else []
+                by_local = {w.number: w for w in planned}
+                voided_g: set[int] = set()
+                trimmed_items: list[tuple[int, object]] = []
+                event_g: list[int] = []
+                for gr in missing_global:
+                    window = by_local.get(gr - global_round)
+                    if window is not None and window.skip:
+                        voided_g.add(gr)
+                    elif window is not None and window.trimmed:
+                        trimmed_items.append((gr, window))
+                    else:
+                        event_g.append(gr)
+                if voided_g:
+                    write_voided_rounds(
+                        output_dir, load_voided_rounds(output_dir) | voided_g)
+                    print(f"  [skip] voided tech/draw rounds: {sorted(voided_g)}")
+                missing_global = event_g
+                if not missing_global and not trimmed_items:
+                    if voided_g:
+                        print(f"  [SKIP] rounds {sorted(voided_g)} voided (no winner)")
+                    continue
 
-                # csdm writes per-round sequence files; we rename them below.
+                # Resume: only ask csdm for the missing local rounds in this batch.
+                # Clear crash debris first so stale sequence dirs can't collide
+                # with this run's positional seq_num -> round mapping.
+                _clear_stale_sequences(output_dir)
                 failed_this_batch: list[int] = []
                 csdm_crashed = False
-                try:
-                    run_csdm(cmd, f"rounds {missing_global[0]}-{missing_global[-1]}",
-                             expected=None,
-                             hook_timeout=args.hook_timeout,
-                             hook_retries=args.hook_retries,
-                             output_dir=output_dir)
-                except SystemExit:
-                    csdm_crashed = True
-                    if not args.skip_failed_rounds:
-                        raise
+                if missing_global:
+                    missing_local = [gr - global_round for gr in missing_global]
+                    cmd = [
+                        CSDM, "video", str(Path(part).resolve()),
+                        "--steamids", args.steam_id,
+                        "--event", "rounds",
+                        "--rounds", ",".join(str(r) for r in missing_local),
+                        "--output", str(output_dir),
+                        "--framerate", str(args.framerate),
+                        "--width", str(args.width),
+                        "--height", str(args.height),
+                        "--cfg", str(abs_cfg_path()),
+                    ] + BASE_FLAGS
 
-                # Always attempt salvage: even after a csdm crash, partial
-                # sequence outputs may exist. Best-effort rename by tick span;
-                # any round with no >=1 MB round-*.mp4 goes to the skip list.
-                salvaged = _rename_sequence_files(output_dir, missing_global)
-                if csdm_crashed:
-                    print(f"  [WARN] csdm crashed (rounds {missing_global}); "
-                          f"salvaged {len(salvaged)} rounds after crash")
+                    # csdm writes per-round sequence files; we rename them below.
+                    try:
+                        run_csdm(cmd, f"rounds {missing_global[0]}-{missing_global[-1]}",
+                                 expected=None,
+                                 hook_timeout=args.hook_timeout,
+                                 hook_retries=args.hook_retries,
+                                 output_dir=output_dir)
+                    except SystemExit:
+                        csdm_crashed = True
+                        if not args.skip_failed_rounds:
+                            raise
+
+                    # Always attempt salvage: even after a csdm crash, partial
+                    # sequence outputs may exist. Best-effort rename by tick span;
+                    # any round with no >=1 MB round-*.mp4 goes to the skip list.
+                    salvaged = _rename_sequence_files(output_dir, missing_global)
+                    if csdm_crashed:
+                        print(f"  [WARN] csdm crashed (rounds {missing_global}); "
+                              f"salvaged {len(salvaged)} rounds after crash")
+
+                if trimmed_items:
+                    _clear_stale_sequences(output_dir)
+                    try:
+                        _render_trimmed_windows(
+                            part, output_dir, args.steam_id, trimmed_items, args)
+                    except SystemExit:
+                        csdm_crashed = True
+                        if not args.skip_failed_rounds:
+                            raise
+                    missing_global = missing_global + [gr for gr, _ in trimmed_items]
 
                 still = [
                     gr for gr in missing_global

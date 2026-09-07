@@ -31,6 +31,7 @@ import sys
 import tempfile
 import time
 from bisect import bisect_right
+import threading
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
@@ -170,6 +171,28 @@ REQUIRED_TICK_FIELDS = (
 # Cache: flight clip path -> duration in seconds. Probing once per clip is
 # cheap (~50ms) and skips repeated ffprobe calls for shared clips.
 _CLIP_DUR_CACHE: dict[str, float] = {}
+
+_COPY_EXACT_TOL_S = 0.25  # max accepted stream-copy duration drift per batch
+
+
+def _segment_copy_exact(path: Path, expected_s: float) -> bool:
+    """True if a stream-copied batch matches its expected duration.
+
+    Copy cuts land on keyframes, so a snapped cut runs long. Anything past
+    tolerance would shift every downstream batch, so callers must re-encode
+    instead. Header probe only (no decode, ~ms).
+    """
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if r.returncode != 0:
+            return False
+        return abs(float(r.stdout.strip()) - expected_s) <= _COPY_EXACT_TOL_S
+    except Exception:
+        return False
 
 
 
@@ -852,19 +875,29 @@ def run_overlay(
         round_start_tick, _ = round_tick_ranges[first_round]
         _log(f"First round {first_round} start tick: {round_start_tick}")
 
-    # -- Step 1: Keyboard states -------------------------------------------------
+    # -- Step 1: Keyboard states (background thread) -----------------------------
+    # demoparser2 extraction is pure CPU on the .dem; the flight-clip render
+    # below is a CS2 subprocess. Run them overlapped: submit the extract now,
+    # join it only where its result is first needed (keyboard filter build,
+    # after the flight render). Same inputs -> same per_sig as the old serial
+    # order; no output change. Daemon thread: early return/exit never hangs.
     t1 = time.time()
-    _log(f"Extracting keyboard states via demoparser2 (DEMOPARSER_TICK_FIELDS)...")
-    per_sig = _extract_keyboard_states(
-        demo_path, steam_id, frame_count, fps,
-        round_offsets=round_offsets or None,
-        round_tick_ranges=round_tick_ranges or None,
-        round_video_duration=round_video_duration or None,
-    )
-    if not per_sig or all(len(v) == 0 for v in per_sig.values()):
-        _log("[WARN] No keyboard states extracted — rendering utility-only overlay")
-        per_sig = {s: [] for s in _OVERLAY_SIGNALS}
-    _log(f"Keyboard: {len(next(iter(per_sig.values())))} frames x {len(per_sig)} signals ({time.time()-t1:.1f}s)")
+    _log(f"Extracting keyboard states via demoparser2 (DEMOPARSER_TICK_FIELDS, background)...")
+    _kb_box: dict[str, Any] = {}
+
+    def _kb_target() -> None:
+        try:
+            _kb_box["per_sig"] = _extract_keyboard_states(
+                demo_path, steam_id, frame_count, fps,
+                round_offsets=round_offsets or None,
+                round_tick_ranges=round_tick_ranges or None,
+                round_video_duration=round_video_duration or None,
+            )
+        except BaseException as e:  # re-raised at join
+            _kb_box["error"] = e
+
+    _kb_thread = threading.Thread(target=_kb_target, name="kb-extract", daemon=True)
+    _kb_thread.start()
 
     # -- Step 2: Generate keyboard sprite PNGs -----------------------------------
     if work_dir is not None:
@@ -885,20 +918,11 @@ def run_overlay(
         png_inputs = overlay_png_input_paths(assets)
         _log(f"{len(png_inputs)} PNGs ({time.time()-t2:.1f}s)")
 
-        keyboard_fc, keyboard_out_label = build_png_overlay_filter(
-            per_sig,
-            assets=assets,
-            placement="bottom-center",
-            video_width=width,
-            video_height=height,
-            pressed_release_fade_frames=0,
-            pressed_release_fade_steps=0,
-            video_label="[0:v]",
-            png_input_offset=1,
-        )
-        if not keyboard_fc:
-            keyboard_fc = ""
-            keyboard_out_label = "[0:v]"
+        # Keyboard filter graph is built AFTER the flight render (join below),
+        # so the demoparser extract overlaps the CS2 subprocess. Placeholder
+        # until then.
+        keyboard_fc = ""
+        keyboard_out_label = "[0:v]"
 
         # Pre-render rounded-corner masks for the PiP. Two masks are shared by
         # every PiP in every batch/pass: an INNER one (size = content area) to
@@ -975,6 +999,32 @@ def run_overlay(
                      f"--allow-missing-util-cams to force a keyboard-only overlay.")
                 sys.exit(1)
 
+        # Join the background keyboard extract (re-raises thread errors here).
+        # The CS2 flight render above ran concurrently with the extract.
+        _kb_thread.join()
+        if "error" in _kb_box:
+            raise _kb_box["error"]
+        per_sig = _kb_box.get("per_sig")
+        if not per_sig or all(len(v) == 0 for v in per_sig.values()):
+            _log("[WARN] No keyboard states extracted — rendering utility-only overlay")
+            per_sig = {s: [] for s in _OVERLAY_SIGNALS}
+        _log(f"Keyboard: {len(next(iter(per_sig.values())))} frames x {len(per_sig)} signals "
+             f"({time.time()-t1:.1f}s wall, overlapped with flight render)")
+
+        keyboard_fc, keyboard_out_label = build_png_overlay_filter(
+            per_sig,
+            assets=assets,
+            placement="bottom-center",
+            video_width=width,
+            video_height=height,
+            pressed_release_fade_frames=0,
+            pressed_release_fade_steps=0,
+            video_label="[0:v]",
+            png_input_offset=1,
+        )
+        if not keyboard_fc:
+            keyboard_fc = ""
+            keyboard_out_label = "[0:v]"
 
         if batches > 0 and round_offsets:
             _log(f"Batched overlay: {batches} round(s) per batch")
@@ -1069,7 +1119,19 @@ def run_overlay(
                         combined_fc = pip_fc
                         out_label = pip_label
                     else:
-                        _log(f"  [batch] {batch_name} no overlay, re-encoding segment for codec consistency")
+                        # Fast path first: stream copy (no re-encode). Falls
+                        # back to null re-encode when the copy is inexact
+                        # (keyframe snap) so downstream batch sync never drifts.
+                        _ffmpeg_segment_copy(
+                            Path(video_path), batch_start_sec, batch_end_sec,
+                            batch_path,
+                        )
+                        if _segment_copy_exact(batch_path, batch_end_sec - batch_start_sec):
+                            _log(f"  [batch] {batch_name} no overlay, stream-copied")
+                            continue
+                        _log(f"  [batch] {batch_name} copy inexact "
+                             f"(keyframe snap), re-encoding for exact sync")
+                        batch_path.unlink(missing_ok=True)
                         _ffmpeg_encode(
                             str(video_path), [],
                             ["-filter_complex", "[0:v]null[outv]"],

@@ -114,18 +114,26 @@ def main() -> None:
         img.save(frame_path)
 
         print(f"  Encoding {DURATION}s silent outro to {out_path.name}...", end=" ", flush=True)
+        # NVENC, same params as the overlay final export (overlay_encode.py):
+        # the pipeline appends this clip via stream-copy concat, so codec /
+        # pix_fmt / profile / GOP must match the main video. libx264 here
+        # was slower AND a concat-mismatch risk.
         r = subprocess.run(
             [FFMPEG, "-y", "-loop", "1", "-i", str(frame_path),
-             "-c:v", "libx264", "-t", str(DURATION),
+             "-c:v", "h264_nvenc", "-t", str(DURATION),
              "-r", str(fps),
              "-pix_fmt", "yuv420p",
              "-profile:v", "high",
              "-level", "5.1",
              "-vf", f"scale={w}:{h}",
-             "-preset", "medium",
-             "-crf", "15",
+             "-preset", "p7", "-b:v", "0", "-cq", "15",
+             "-maxrate", "60M", "-bufsize", "120M",
+             "-color_range", "tv", "-colorspace", "bt709",
+             "-color_primaries", "bt709", "-color_trc", "bt709",
+             "-g", "60", "-keyint_min", "60",
+             "-movflags", "+faststart",
              str(out_path)],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, timeout=300,
         )
         if r.returncode != 0:
             print("FAILED")

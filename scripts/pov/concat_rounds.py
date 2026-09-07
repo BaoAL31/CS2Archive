@@ -20,6 +20,7 @@ from pathlib import Path
 # parents[1]=scripts.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from config import settings
+from round_windows import load_voided_rounds
 
 FFMPEG = settings.ffmpeg_exe
 FFPROBE = settings.ffprobe_exe
@@ -302,6 +303,10 @@ def validate_round_offsets_sidecar(
 
 
 def concat_rounds(folder: Path, allow_gaps: bool = False) -> Path:
+    voided = load_voided_rounds(folder)
+    if voided and not allow_gaps:
+        print(f"  [voided] rounds {sorted(voided)} skipped (tech/draw); allowing gaps")
+        allow_gaps = True
     combined = folder / "combined.mp4"
     offset_path = folder / "combined.round_offsets.json"
     resuming = combined.exists()
@@ -432,7 +437,10 @@ def concat_rounds(folder: Path, allow_gaps: bool = False) -> Path:
         # may be missing—that's OK, we still write the per-round data.
         covers_all = (
             len(seq_rounds) > 0
-            and seq_rounds == list(range(seq_rounds[0], seq_rounds[-1] + 1))
+            and (
+                seq_rounds == list(range(seq_rounds[0], seq_rounds[-1] + 1))
+                or allow_gaps
+            )
             and (not round_offsets or seq_rounds[-1] >= max(round_offsets))
         )
         if covers_all:
@@ -667,7 +675,9 @@ def _encode_scaled(src: Path, dst: Path, w: int, h: int, scaling_mode: str,
         ]
         pix_args = []
     cmd += [
-        "-c:v", "h264_nvenc", "-preset", "p7", "-b:v", "0", "-cq", "8",
+        # p5 not p7: scale output is mezzanine (overlay re-encodes final at
+        # p7 CQ15). Same frames, faster NVENC pass.
+        "-c:v", "h264_nvenc", "-preset", "p5", "-b:v", "0", "-cq", "8",
         "-maxrate", "200M", "-bufsize", "400M",
         "-profile:v", "high", *pix_args, "-level", "5.1",
         "-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
@@ -710,30 +720,12 @@ def _encode_scaled(src: Path, dst: Path, w: int, h: int, scaling_mode: str,
     print(f"OK ({elapsed:.0f}s, {mb:.0f} MB)")
 
 
-def _preserve_native(folder: Path, combined: Path) -> Path:
-    """Copy the native (pre-scale) combined.mp4 to combined.native.mp4.
-
-    The scale step overwrites ``combined.mp4`` in place, destroying the native
-    source — so re-baking the voice shade (which lives in the scale step)
-    previously forced a full re-render. Keeping a native copy lets step 3 be
-    re-run alone to re-bake the shade. Returns the native copy path.
-    """
-    native = folder / "combined.native.mp4"
-    if not native.exists() or native.stat().st_size < 1_000_000:
-        import shutil
-        shutil.copy2(combined, native)
-        print(f"  [Preserve] saved native source -> {native.name}")
-    return native
-
-
 def _build_shade_for_scale(args, folder: Path,
                            src: Path | None = None) -> dict | None:
     """Build the shade data dict for the scale step, or None if not requested.
 
     The shade must be computed against the NATIVE combined.mp4 (pre-scale) so the
     box coords are native and stretch together with the video during upscale.
-    ``src`` lets callers pass a preserved native copy when re-baking the shade
-    from a source other than the (already-scaled) ``combined.mp4``.
     """
     if not args.voice_shade_demo:
         return None
@@ -814,31 +806,10 @@ def main() -> None:
         sys.exit(1)
 
     combined = folder / "combined.mp4"
-    native_copy = folder / "combined.native.mp4"
     has_clips = any(folder.glob("batch-*.mp4")) or any(folder.glob("round-*.mp4"))
     if combined.exists() and combined.stat().st_size >= 1_000_000 and not has_clips:
         vid_w, vid_h = _get_resolution(combined)
         at_target = (vid_w, vid_h) == (args.width, args.height)
-        # Re-bake the shade (and re-scale) whenever the native source is still
-        # around — so changing the shade/fade or fixing the shade logic only
-        # needs a step-3 re-run, not a full re-render.
-        if at_target and native_copy.exists() and native_copy.stat().st_size >= 1_000_000 \
-                and args.voice_shade_demo:
-            print(f"  [Re-bake shade] combined.mp4 is {vid_w}x{vid_h}; re-scaling "
-                  f"from {native_copy.name} to re-bake the shade...")
-            shade = _build_shade_for_scale(args, folder, src=native_copy)
-            scaled = folder / "_scaled.mp4"
-            for p in folder.glob("_scaled*"):
-                if not _is_valid_video(p):
-                    p.unlink(missing_ok=True)
-            if scaled.exists():
-                scaled.unlink(missing_ok=True)  # stale shade -> re-encode
-            _encode_scaled(native_copy, scaled, args.width, args.height,
-                           args.scaling_mode, shade=shade)
-            scaled.replace(combined)
-            mb = combined.stat().st_size / 1024 / 1024
-            print(f"\nDone. {combined} ({mb:.0f} MB)")
-            return
         if at_target:
             print(f"  [Skip] combined.mp4 already {vid_w}x{vid_h}, no clips left")
             mb = combined.stat().st_size / 1024 / 1024
@@ -847,8 +818,7 @@ def main() -> None:
         print(f"  [Resume scale] combined.mp4 is {vid_w}x{vid_h}, scaling to "
               f"{args.width}x{args.height}...")
         # Sidecar already exists on resume (combined.mp4 was built with it), so
-        # the shade can be built here before scaling. Preserve native first.
-        _preserve_native(folder, combined)
+        # the shade can be built here before scaling.
         shade = _build_shade_for_scale(args, folder)
         scaled = folder / "_scaled.mp4"
         for p in folder.glob("_scaled*"):
@@ -867,10 +837,6 @@ def main() -> None:
     except FileNotFoundError as e:
         print(f"[ERROR] {e}")
         sys.exit(1)
-
-    # Preserve the native combined.mp4 before the scale step overwrites it, so
-    # the voice shade can be re-baked later via a step-3 re-run (no re-render).
-    _preserve_native(folder, combined)
 
     # One encode: stretch/pillarbox + upscale to final 16:9 size (no 1080p middle).
     shade = _build_shade_for_scale(args, folder)
