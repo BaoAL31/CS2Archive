@@ -36,6 +36,15 @@ console = Console(force_terminal=True)
 AVATAR_DIR = settings.demo_storage_dir / "avatars"
 MIN_RES = 300  # Reject images smaller than 300×300
 
+# Standard avatar framing: every cached avatar is normalized to this chest-up
+# canvas so thumbnails render consistent head sizes regardless of how HLTV
+# framed the source photo (chest-up vs waist-up). See normalize_avatar_image.
+AVATAR_CANVAS_W, AVATAR_CANVAS_H = 400, 417
+AVATAR_HEAD_W = 100
+AVATAR_HEAD_TOP = 12
+AVATAR_ALPHA_MIN = 8
+AVATAR_SCALE_MIN, AVATAR_SCALE_MAX = 0.7, 1.8
+
 CLOAK_PROFILE = Path(".sessions/hltv-cloak")
 
 
@@ -113,6 +122,60 @@ def _cutout_bg(img_bytes: bytes) -> Image.Image:
     return remove(Image.open(BytesIO(img_bytes)).convert("RGBA"))
 
 
+def _trim_avatar(im: Image.Image) -> Image.Image:
+    alpha = im.getchannel("A").point(
+        lambda p, t=AVATAR_ALPHA_MIN: 255 if p >= t else 0
+    )
+    bbox = alpha.getbbox()
+    if not bbox:
+        return im
+    return im.crop(bbox)
+
+
+def _avatar_head_width(im: Image.Image) -> float | None:
+    """Median opaque width across temple-level rows (10-25% of height).
+
+    Front-facing bodyshot assumption: the topmost blob is the head."""
+    alpha = im.getchannel("A")
+    w, h = im.size
+    px = alpha.load()
+    widths: list[int] = []
+    for y in range(int(h * 0.10), int(h * 0.25)):
+        xs = [x for x in range(w) if px[x, y] >= AVATAR_ALPHA_MIN]
+        if xs:
+            widths.append(xs[-1] - xs[0] + 1)
+    if len(widths) < 5:
+        return None
+    widths.sort()
+    return float(widths[len(widths) // 2])
+
+
+def normalize_avatar_image(im: Image.Image) -> Image.Image | None:
+    """Normalize a cutout to the standard chest-up canvas.
+
+    Returns the normalized RGBA image, or None when the input is unusable
+    (opaque, empty, no head silhouette). Idempotent: already-standard images
+    come back effectively unchanged. Pure function, no I/O."""
+    im = im.convert("RGBA")
+    if im.getchannel("A").getextrema()[0] > 0:
+        return None
+    t = _trim_avatar(im)
+    if t.size[0] <= 0 or t.size[1] <= 0:
+        return None
+    hw = _avatar_head_width(t)
+    if not hw:
+        return None
+    w, h = t.size
+    s = AVATAR_HEAD_W / hw
+    s = min(max(s, AVATAR_SCALE_MIN), AVATAR_SCALE_MAX)
+    s = min(s, AVATAR_CANVAS_W / w)  # fit width, never crop sides
+    nw, nh = max(1, int(w * s)), max(1, int(h * s))
+    t = t.resize((nw, nh), Image.LANCZOS)
+    canvas = Image.new("RGBA", (AVATAR_CANVAS_W, AVATAR_CANVAS_H), (0, 0, 0, 0))
+    canvas.paste(t, ((AVATAR_CANVAS_W - nw) // 2, AVATAR_HEAD_TOP), t)
+    return canvas
+
+
 def _is_acceptable(im: Image.Image) -> bool:
     if im.size[0] < MIN_RES or im.size[1] < MIN_RES:
         return False
@@ -143,10 +206,17 @@ def _save_avatar_bytes_sync(raw: bytes, png_path: Path) -> bool:
 
     is_transparent = im.mode == "RGBA" and min(im.getchannel("A").getextrema()) < 255
     if is_transparent:
-        im.save(png_path, "PNG")
+        final_im = im.convert("RGBA")
     else:
-        cut = _cutout_bg(raw)
-        cut.save(png_path, "PNG")
+        final_im = _cutout_bg(raw)
+    normalized = normalize_avatar_image(final_im)
+    if normalized is not None:
+        final_im = normalized
+    else:
+        console.print(
+            f"[yellow]   [WARN] {png_path.name}: normalize skipped, saving raw cutout[/yellow]"
+        )
+    final_im.save(png_path, "PNG")
 
     s = png_path.stat().st_size / 1024
     console.print(

@@ -22,6 +22,18 @@ STROKE_WIDTH = 2
 
 AVATAR_HEIGHT_RATIO = 0.90
 
+# Head-width normalization: HLTV bodyshots vary in framing (chest-up vs
+# waist-up), so scaling by full-body height makes heads inconsistent
+# (e.g. zont1x waist-up rendered ~75% of donk chest-up). Instead scale by the
+# silhouette width at temple level (~10-25% below bbox top), which is stable
+# across adults and framing-independent. Calibrated so donk.png renders at
+# ~its current size (head_w 101px * 1.584 ~= 160).
+TARGET_HEAD_WIDTH = 160
+# Clamp so extreme framings (profile, caps, square headshots) can't blow
+# past the frame or shrink to nothing. Height fallback when no head found.
+MAX_AVATAR_HEIGHT = 700
+MIN_AVATAR_HEIGHT = 480
+
 
 def _load_font(size: int) -> ImageFont.FreeTypeFont:
     if FONT_PATH.exists():
@@ -57,12 +69,38 @@ def _trim_transparent(player: Image.Image, alpha_min: int = 8) -> Image.Image:
     return player.crop(bbox)
 
 
+def _estimate_head_width(player: Image.Image) -> float | None:
+    """Median opaque width across temple-level rows (10-25% of bbox height).
+
+    Front-facing bodyshot assumption: the topmost blob is the head. Returns
+    None when the silhouette is unusable (too few opaque rows)."""
+    alpha = player.getchannel("A") if player.mode == "RGBA" else None
+    if alpha is None:
+        return None
+    w, h = player.size
+    px = alpha.load()
+    widths: list[int] = []
+    for y in range(int(h * 0.10), int(h * 0.25)):
+        xs = [x for x in range(w) if px[x, y] > 0]
+        if xs:
+            widths.append(xs[-1] - xs[0] + 1)
+    if len(widths) < 5:
+        return None
+    widths.sort()
+    return float(widths[len(widths) // 2])
+
+
 def scale_player(player: Image.Image, target_height: int) -> Image.Image:
     player = _trim_transparent(player)
     w, h = player.size
     if h <= 0:
         return player
     ratio = target_height / h
+    head_w = _estimate_head_width(player)
+    if head_w and head_w > 0:
+        ratio = min(TARGET_HEAD_WIDTH / head_w, MAX_AVATAR_HEIGHT / h)
+        if h * ratio < MIN_AVATAR_HEIGHT:
+            ratio = target_height / h  # framing too extreme, use height fallback
     new_w = max(1, int(w * ratio))
     new_h = max(1, int(h * ratio))
     return player.resize((new_w, new_h), Image.LANCZOS)
