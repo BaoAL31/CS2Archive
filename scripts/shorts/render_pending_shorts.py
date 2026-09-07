@@ -84,6 +84,9 @@ def _short_output_path(out_dir: Path, short: dict) -> Path:
     elif st=="clutch":
         cnt = short.get("clutch_initial_count","XvX")
         base = f"{cnt}_clutch-{nick}-t{tick}"
+    elif st=="clutch_attempt":
+        cnt = short.get("clutch_initial_count","XvX")
+        base = f"{cnt}_attempt-{nick}-t{tick}"
     else:
         base = f"{st}-{nick}-t{tick}"
     tags = short.get("punch_up_tags") or []

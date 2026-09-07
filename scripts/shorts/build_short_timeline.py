@@ -46,6 +46,7 @@ from faceit_names import known_pro_steam_ids  # noqa: E402
 _PRE_KILL_TICK_MARGIN = 320  # 5s floor before first kill (at 64 tick)
 _POST_KILL_TICK_MARGIN = 128  # 2s after last kill (at 64 tick)
 _POST_DEATH_TICK_MARGIN = 128  # 2s after POV death (at 64 tick)
+_POST_ROUND_END_TICKS = 128  # hold past round end (win banner / loss aftermath)
 _SHORT_TICK_DURATION = 1280  # 20s target total short length (20 * 64 tick)
 _CLUTCH_MIN_DURATION_TICKS = 640  # 10s of playing at a disadvantage for a clutch
 # CT clock expiry (and hostage-time equivalent). Surviving 1vX until the
@@ -1366,6 +1367,7 @@ def detect_shorts(
             win_tick = None
             win_event = None
             win_player = None
+            clutch_lost = False
 
             # Pick the LAST win event for this team at or after the clutch
             # trigger. Plant/explode can fire mid-round, before the team is
@@ -1392,16 +1394,55 @@ def detect_shorts(
                     and team_by_sid.get(we["player_sid"]) != team
                     for we in round_win_events.get(roundn, [])
                 )
-                if exploded_by_other:
-                    continue  # bomb detonated for the other side => not a clutch
-            if win_tick is None and winner_by_round and roundn in winner_by_round:
+                clutch_lost = bool(exploded_by_other)
+            else:
+                clutch_lost = False
+            if not clutch_lost and win_tick is None and winner_by_round and roundn in winner_by_round:
                 if winner_by_round[roundn] != team:
-                    continue  # clutch team did NOT win => skip
-                win_tick = round_ends.get(roundn, 0)
-                win_event = "team_win"
+                    clutch_lost = True  # clutch team did NOT win => attempt, not clutch
+                else:
+                    win_tick = round_ends.get(roundn, 0)
+                    win_event = "team_win"
 
             if (win_reason_by_round or {}).get(roundn) in _CT_TIME_WIN_REASONS:
                 continue  # CT (or hostage) clock win is not a clutch
+
+            # --- Failed attempt: clutch team lost — show the ending anyway ---
+            # A 1vX that falls short still wants its conclusion on screen, so
+            # build a clutch_attempt short running to the round end instead of
+            # dropping the trigger. Needs 2+ POV kills (a scoreless lockdown
+            # is not short-worthy) and a known round end.
+            if clutch_lost:
+                round_end = (round_ends or {}).get(roundn, 0)
+                if round_end and round_end > trigger["start_tick"]:
+                    team_kills: dict[str, list[dict]] = {}
+                    for k in round_kills:
+                        ka = k.get("attacker_sid")
+                        if ka and team_by_sid.get(ka) == team:
+                            team_kills.setdefault(ka, []).append(k)
+                    if team_kills:
+                        def _last_death(a: str) -> int:
+                            return max(
+                                (int(k["tick"]) for k in round_kills
+                                 if k.get("victim_sid") == a), default=-1)
+                        pov = max(team_kills,
+                                  key=lambda a: (len(team_kills[a]), _last_death(a)))
+                        pk_ticks = sorted(int(k["tick"]) for k in team_kills[pov])
+                        if len(pk_ticks) >= 2:
+                            shorts.append({
+                                "short_type": "clutch_attempt",
+                                "pov_steam_id": pov,
+                                "pov_nick": nickname_by_sid.get(pov, "Unknown"),
+                                "start_tick": min(trigger["start_tick"],
+                                                  pk_ticks[0] - _PRE_KILL_TICK_MARGIN),
+                                "end_tick": round_end + _POST_ROUND_END_TICKS,
+                                "clutch_initial_count": trigger["type"],
+                                "round_win_tick": round_end,
+                                "win_event": "round_end",
+                                "kill_ticks": pk_ticks,
+                                "punch_up_tags": _punch_up_tags(team_kills[pov]),
+                            })
+                continue
 
             # --- 2v5 special: require 4k from POV, switch to survivor if POV dies ---
             if trigger["type"] == "2v5":
@@ -1450,7 +1491,7 @@ def detect_shorts(
                     "pov_steam_id": win_player,
                     "pov_nick": nickname_by_sid.get(win_player, "Unknown"),
                     "start_tick": start_tick,
-                    "end_tick": win_tick,
+                    "end_tick": win_tick + _POST_ROUND_END_TICKS,
                     "clutch_initial_count": trigger["type"],
                     "round_win_tick": win_tick,
                     "win_event": win_event,
@@ -1494,7 +1535,7 @@ def detect_shorts(
                     "pov_steam_id": win_player,
                     "pov_nick": nickname_by_sid.get(win_player, "Unknown"),
                     "start_tick": start_tick,
-                    "end_tick": win_tick,
+                    "end_tick": win_tick + _POST_ROUND_END_TICKS,
                     "clutch_initial_count": trigger["type"],
                     "round_win_tick": win_tick,
                     "win_event": win_event,
@@ -1518,13 +1559,15 @@ def detect_shorts(
             kept.append(s)
         shorts = kept
 
-    # Prioritise clutches over overlapping multikills: when a clutch short's
-    # [trigger, win] window overlaps a 4K short, keep the clutch, drop the 4K.
-    clutches = [s for s in shorts if s["short_type"] == "clutch"]
+    # Prioritise clutches (and attempts) over overlapping multikills: when a
+    # clutch short's [trigger, win] window overlaps a 4K short, keep the
+    # clutch, drop the 4K. Attempts show the kills plus the round ending, so
+    # they win the same dedup.
+    clutches = [s for s in shorts if s["short_type"] in ("clutch", "clutch_attempt")]
     if clutches:
         shorts = [
             s for s in shorts
-            if s["short_type"] == "clutch"
+            if s["short_type"] in ("clutch", "clutch_attempt")
             or not any(
                 s["start_tick"] <= c["end_tick"] and c["start_tick"] <= s["end_tick"]
                 for c in clutches

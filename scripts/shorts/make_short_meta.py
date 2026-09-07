@@ -31,13 +31,24 @@ except ModuleNotFoundError:
 
 _TAGS = ["Shorts"]
 
-# Folder event-slug substring -> tournament hashtag base (no '#', no year).
+# Folder event-slug substring -> display name + hashtag base (no '#', no year).
 # Matched against the demo's parent folder name (e.g. "...-esports-world-cup").
 _EVENT_TAGS = {
-    "esports-world-cup": "esportworldcup",
-    "blast-open-porto": "blastopenporto",
-    "blast-bounty": "blastbounty",
+    "esports-world-cup": ("Esports World Cup", "esportworldcup"),
+    "blast-open-porto": ("BLAST Open Porto", "blastopenporto"),
+    "blast-bounty": ("BLAST Bounty", "blastbounty"),
 }
+
+
+def _tournament_names(demo_path: str, year: str = "2026") -> tuple[str, str]:
+    """Return (display name, hashtag) for the demo's event, e.g.
+    ("BLAST Open Porto 2026", "#blastopenporto2026"). Unknown events
+    yield ("", "") so callers fall back to generic wording."""
+    folder = os.path.basename(os.path.dirname(str(demo_path))).lower()
+    for slug, (display, base) in _EVENT_TAGS.items():
+        if slug in folder:
+            return f"{display} {year}", f"#{base}{year}"
+    return "", ""
 
 
 def _tournament_hashtag(demo_path: str, year: str = "2026", override: str | None = None) -> str:
@@ -49,7 +60,7 @@ def _tournament_hashtag(demo_path: str, year: str = "2026", override: str | None
     if override:
         return override if override.startswith("#") else f"#{override}"
     folder = os.path.basename(os.path.dirname(str(demo_path))).lower()
-    for slug, base in _EVENT_TAGS.items():
+    for slug, (display, base) in _EVENT_TAGS.items():
         if slug in folder:
             return f"#{base}{year}"
     return ""
@@ -134,9 +145,18 @@ def _gun(punch_tags: list[str] | None) -> str:
     return punch_tags[0].replace("_punch_up", "").upper()
 
 
+def _clean_nick(nick: str) -> str:
+    """Title-safe nickname: strip trailing -/_ (e.g. huNter- -> huNter).
+
+    Stylised suffixes read as typos in titles and break plain-text search.
+    Description keeps the official spelling; only the title is cleaned."""
+    return str(nick).rstrip("-_")
+
+
 def _make_title(nick: str, short_type: str, opp: str | None, mname: str, tournament_tag: str = "", clutch: str | None = None, kills: int = 0, punch_tags: list[str] | None = None, start_tick: int = 0) -> tuple[str, str]:
     # Format hash ignores the live opponent string so filling in a top-10 org
     # does not reshuffle the skeleton (onic stays hyphen-hook, Vitality is spliced in).
+    nick = _clean_nick(nick)
     key = f"{nick}|{short_type}|{clutch}|{kills}|None|{mname}|{punch_tags}|{start_tick}"
     vs = _vs_bit(opp, mname, key)
     gun = _gun(punch_tags)
@@ -144,7 +164,14 @@ def _make_title(nick: str, short_type: str, opp: str | None, mname: str, tournam
     clutch_s = clutch or "1v3"
     nk = f"{kills}K" if kills else ""
 
-    if "clutch" in short_type.lower():
+    if short_type == "clutch_attempt":
+        base = clutch_s
+        formats = (
+            ("possessive", f"{nick}'s {base} attempt falls short {vs}"),
+            ("gerund", f"{nick} almost clutches the {base} {vs}"),
+            ("kind-lead", f"So close - {nick}'s {base} attempt {vs}"),
+        )
+    elif "clutch" in short_type.lower():
         if opp:
             formats = (
                 ("hook-rest", f"{clutch_s} against {opp}? No problem for {nick}"),
@@ -184,7 +211,7 @@ def _make_title(nick: str, short_type: str, opp: str | None, mname: str, tournam
             ("possessive", f"{nick}'s {kind} {vs}"),
             ("gerund", f"{nick} dropping a {kind} {vs}"),
             ("kind-lead", f"{kadj} {kind} from {nick} {vs}"),
-            ("casual-drop", f"{nick} casually drops a {kind} {vs}"),
+            ("casual-drop", f"{nick} drops a {kind} {vs}"),
         )
     elif kills >= 5:
         ace = f"{gun} ACE" if gun else "ACE"
@@ -194,7 +221,7 @@ def _make_title(nick: str, short_type: str, opp: str | None, mname: str, tournam
             f"{nick} looking {looking} - {ace} {vs}",
         ))
         formats = (
-            ("casual-drop", f"{nick} casually drops an {ace} {vs}"),
+            ("casual-drop", f"{nick} drops an {ace} {vs}"),
             ("gerund", f"{nick} dropping an {ace} {vs}"),
             ("possessive", f"{nick}'s {ace} {vs}"),
             ("kind-lead", f"{kadj} {ace} from {nick} {vs}"),
@@ -212,7 +239,7 @@ def _make_title(nick: str, short_type: str, opp: str | None, mname: str, tournam
             ("possessive", f"{nick}'s {kind} {vs}"),
             ("gerund", f"{nick} dropping a {kind} {vs}"),
             ("kind-lead", f"{kadj} {kind} from {nick} {vs}"),
-            ("casual-drop", f"{nick} casually drops a {kind} {vs}"),
+            ("casual-drop", f"{nick} drops a {kind} {vs}"),
             ("hyphen-hook", hook),
             ("hook-emoji", f"{kind}? Easy for {nick} {vs}"),
         )
@@ -226,8 +253,10 @@ def _make_title(nick: str, short_type: str, opp: str | None, mname: str, tournam
     return title, fmt
 
 
-def _make_description(nick: str, pov_org: str | None, opp: str | None, mname: str, short_type: str, clutch: str | None = None, kills: int = 0, punch_tags: list[str] | None = None) -> str:
-    if "clutch" in short_type.lower():
+def _make_description(nick: str, pov_org: str | None, opp: str | None, mname: str, short_type: str, event_name: str = "", clutch: str | None = None, kills: int = 0, punch_tags: list[str] | None = None) -> str:
+    if short_type == "clutch_attempt":
+        kind = f"{clutch or '1v3'} attempt (falls short)" if clutch else "clutch attempt (falls short)"
+    elif "clutch" in short_type.lower():
         kind = f"{clutch or '1v3'} clutch" if clutch else "1v3 clutch"
     elif short_type == "wallbang":
         kind = "wallbang"
@@ -247,7 +276,8 @@ def _make_description(nick: str, pov_org: str | None, opp: str | None, mname: st
             kind = f"{kind} ({weapons} punch-up)" if weapons else kind
     vs = opp if opp else "the opponent"
     org = f" ({pov_org})" if pov_org else ""
-    return f"Esports World Cup 2026 highlight - {nick}{org} with the {kind} against {vs} on {mname}."
+    event = event_name or "CS2 highlight"
+    return f"{event} - {nick}{org} with the {kind} against {vs} on {mname}."
 
 
 def make_meta(folder: str, tournament: str | None = None, year: str = "2026") -> dict:
@@ -264,6 +294,9 @@ def make_meta(folder: str, tournament: str | None = None, year: str = "2026") ->
     pov_org = pov_org or None
     opp_org = opp_org or None
     tournament_tag = _tournament_hashtag(demo, year=year, override=tournament)
+    event_name, auto_tag = _tournament_names(demo, year=year)
+    if not tournament_tag:
+        tournament_tag = auto_tag
 
     vids = sorted(f for f in os.listdir(folder) if f.endswith(".mp4"))
     video = os.path.abspath(os.path.join(folder, vids[-1])) if vids else ""
@@ -280,7 +313,7 @@ def make_meta(folder: str, tournament: str | None = None, year: str = "2026") ->
         "video_path": video,
         "title": title,
         "title_format": title_format,
-        "description": _make_description(nick, pov_org, opp_org, mname, short_type, clutch=clutch, kills=kills, punch_tags=punch_tags),
+        "description": _make_description(nick, pov_org, opp_org, mname, short_type, event_name=event_name, clutch=clutch, kills=kills, punch_tags=punch_tags),
         "privacy": "private",
         "publish_at": "auto",
         "tags": _TAGS,

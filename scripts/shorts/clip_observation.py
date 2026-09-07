@@ -184,7 +184,9 @@ def kinds_from_cut(short: dict) -> tuple[str, ...]:
     clutch_raw = str(short.get("clutch_initial_count") or "").lower().replace(" ", "")
     nkill = len(short.get("kill_ticks") or [])
     kinds: list[str] = []
-    clutch_kind = _CLUTCH_FROM_CUT.get(clutch_raw) or _CLUTCH_FROM_CUT.get(st)
+    # Failed attempts carry a clutch count but are NOT won clutches.
+    clutch_kind = None if st == "clutch_attempt" else (
+        _CLUTCH_FROM_CUT.get(clutch_raw) or _CLUTCH_FROM_CUT.get(st))
     if clutch_kind:
         kinds.append(clutch_kind)
     if nkill >= 5:
