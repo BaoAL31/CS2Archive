@@ -712,6 +712,7 @@ def build_short_timeline(demo_path: Path, player: str | None = None,
         round_start=round_start,
         freeze_end=freeze_end,
         round_end=round_end,
+        round_end_winner=round_end_winner,
         info=info,
         bomb_plant=bomb_plant,
         bomb_defuse=bomb_defuse,
@@ -956,6 +957,18 @@ def detect_shorts(
         round_ends = _re
     elif round_ends is None:
         round_ends = {}
+    # Backfill rounds missing an officially_ended tick (e.g. the demo's last
+    # round) from the round_end winner event, mapped by tick the same way.
+    # Without this, a won clutch in such a round gets win_tick 0 and drops
+    # silently (e.g. a real 1v4 never becoming a short).
+    if round_end_winner is not None and not round_end_winner.empty:
+        for _, row in round_end_winner.sort_values("tick").iterrows():
+            tick = int(row["tick"])
+            if first_freeze is not None and tick < first_freeze:
+                continue
+            rn = _round_for_tick(tick, round_starts, first_freeze)
+            if rn > 0 and rn not in round_ends:
+                round_ends[rn] = tick
 
     # --- Winner per round (authoritative) ---
     # CS2's `round_end` event carries the actual winner side ('T'/'CT').
