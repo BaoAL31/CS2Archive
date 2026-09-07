@@ -45,6 +45,7 @@ from faceit_names import known_pro_steam_ids  # noqa: E402
 
 _PRE_KILL_TICK_MARGIN = 320  # 5s floor before first kill (at 64 tick)
 _POST_KILL_TICK_MARGIN = 128  # 2s after last kill (at 64 tick)
+_POST_DEATH_TICK_MARGIN = 128  # 2s after POV death (at 64 tick)
 _SHORT_TICK_DURATION = 1280  # 20s target total short length (20 * 64 tick)
 _CLUTCH_MIN_DURATION_TICKS = 640  # 10s of playing at a disadvantage for a clutch
 # CT clock expiry (and hostage-time equivalent). Surviving 1vX until the
@@ -147,8 +148,29 @@ def _is_zeus(weapon: str) -> bool:
     return str(weapon or "").strip().lower() in ("zeus", "zeus x27")
 
 
-def _one_kill_window(tick: int) -> tuple[int, int]:
-    end_tick = tick + _POST_KILL_TICK_MARGIN
+def _extend_past_pov_death(end_tick: int, rkills: list[dict] | None,
+                           pov_sid: str | None, ref_tick: int) -> int:
+    """Push end_tick past the POV's death so the clip keeps 2s after dying.
+
+    Windows end 2s after the last kill — but when the POV dies right after
+    the final kill (traded), the death eats that buffer and the clip cuts on
+    the death frame. Extend to death + 2s instead. No-op when the POV
+    survives (no victim row) or data is missing.
+    """
+    if not rkills or not pov_sid:
+        return end_tick
+    try:
+        death = min(int(k["tick"]) for k in rkills
+                    if k.get("victim_sid") == pov_sid and int(k["tick"]) > ref_tick)
+    except Exception:
+        return end_tick
+    return max(end_tick, death + _POST_DEATH_TICK_MARGIN)
+
+
+def _one_kill_window(tick: int, rkills: list[dict] | None = None,
+                     pov_sid: str | None = None) -> tuple[int, int]:
+    end_tick = _extend_past_pov_death(
+        tick + _POST_KILL_TICK_MARGIN, rkills, pov_sid, tick)
     start_tick = min(
         end_tick - _SHORT_TICK_DURATION,
         tick - _PRE_KILL_TICK_MARGIN,
@@ -1067,7 +1089,8 @@ def detect_shorts(
             if len(kills) == 4 and _perfect_fire_kills(kills, fires_by_player):
                 continue
             ticks = sorted(k["tick"] for k in kills)
-            end_tick = ticks[-1] + _POST_KILL_TICK_MARGIN
+            end_tick = _extend_past_pov_death(
+                ticks[-1] + _POST_KILL_TICK_MARGIN, rkills, aid, ticks[-1])
             start_tick = min(
                 end_tick - _SHORT_TICK_DURATION,
                 ticks[0] - _PRE_KILL_TICK_MARGIN,
@@ -1104,7 +1127,7 @@ def detect_shorts(
             if not aid:
                 continue
             tick = int(k["tick"])
-            start_tick, end_tick = _one_kill_window(tick)
+            start_tick, end_tick = _one_kill_window(tick, rkills, aid)
             shorts.append({
                 "short_type": "wallbang",
                 "pov_steam_id": aid,
@@ -1129,7 +1152,7 @@ def detect_shorts(
             if not aid:
                 continue
             tick = int(k["tick"])
-            start_tick, end_tick = _one_kill_window(tick)
+            start_tick, end_tick = _one_kill_window(tick, rkills, aid)
             shorts.append({
                 "short_type": "knife",
                 "pov_steam_id": aid,
@@ -1155,7 +1178,8 @@ def detect_shorts(
             continue
         begin = int(ev.get("begin_tick") or tick - _PRE_KILL_TICK_MARGIN)
         start_tick = begin - _PRE_KILL_TICK_MARGIN
-        end_tick = tick + _POST_KILL_TICK_MARGIN
+        end_tick = _extend_past_pov_death(
+            tick + _POST_KILL_TICK_MARGIN, kills_by_round.get(rn, []), aid, tick)
         shorts.append({
             "short_type": "defuse",
             "pov_steam_id": aid,
@@ -1181,7 +1205,8 @@ def detect_shorts(
             if not _perfect_fire_kills(kills, fires_by_player):
                 continue
             ticks = sorted(k["tick"] for k in kills)
-            end_tick = ticks[-1] + _POST_KILL_TICK_MARGIN
+            end_tick = _extend_past_pov_death(
+                ticks[-1] + _POST_KILL_TICK_MARGIN, rkills, aid, ticks[-1])
             start_tick = min(
                 end_tick - _SHORT_TICK_DURATION,
                 ticks[0] - _PRE_KILL_TICK_MARGIN,
@@ -1210,7 +1235,7 @@ def detect_shorts(
                 continue
             if not _is_gun_kill(k):
                 continue
-            start_tick, end_tick = _one_kill_window(tick)
+            start_tick, end_tick = _one_kill_window(tick, rkills, aid)
             shorts.append({
                 "short_type": "flick",
                 "pov_steam_id": aid,
@@ -1289,7 +1314,8 @@ def detect_shorts(
             if punch_up < 2:
                 continue
             ticks = sorted(k["tick"] for k in kills)
-            end_tick = ticks[-1] + _POST_KILL_TICK_MARGIN
+            end_tick = _extend_past_pov_death(
+                ticks[-1] + _POST_KILL_TICK_MARGIN, rk, aid, ticks[-1])
             start_tick = min(
                 end_tick - _SHORT_TICK_DURATION,
                 ticks[0] - _PRE_KILL_TICK_MARGIN,
