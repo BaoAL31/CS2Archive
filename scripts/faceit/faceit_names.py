@@ -44,6 +44,10 @@ def _load() -> None:
                 if fn:
                     _FACEIT_NICK[nick] = fn
                     _FACEIT_NICK[nick.lower()] = fn
+                    # Live FACEIT nick drifts on rename (s1mpleWRLD ->
+                    # s1mplecsgod). Alias it so demo headers / stats keys
+                    # still resolve to canonical nick.
+                    _CANON.setdefault(fn.lower(), nick)
             fid = p.get("faceit_id")
             if isinstance(fid, str) and fid and fid != "-1":
                 _FACEIT_IDS[fid] = nick

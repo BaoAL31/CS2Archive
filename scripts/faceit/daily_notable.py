@@ -237,10 +237,15 @@ def _format_pick(c: dict) -> str:
 
 
 def card_for_pick(pick: dict, *, root: Path = ROOT) -> Path | None:
-    """Backlog card written for this pick's player + FACEIT match id."""
+    """Backlog card written for this pick's FACEIT match id + faceit_id.
+
+    Identity is the stable FACEIT player id (rename-proof). Nickname
+    comparison is legacy fallback for picks/cards without faceit_id.
+    """
     match_id = str(pick.get("match_id") or "")
+    fid = str(pick.get("faceit_id") or "").strip()
     player = str(pick.get("player") or "").casefold()
-    if not match_id or not player:
+    if not match_id or (not fid and not player):
         return None
     for faceit in (root / "faceit", root / "backlog" / "faceit"):
         if not faceit.is_dir():
@@ -251,6 +256,10 @@ def card_for_pick(pick: dict, *, root: Path = ROOT) -> Path | None:
             except (OSError, json.JSONDecodeError):
                 continue
             if str(meta.get("faceit_match_id") or "") != match_id:
+                continue
+            if fid:
+                if str(meta.get("faceit_id") or "").strip() == fid:
+                    return path
                 continue
             nicks = {
                 str(meta.get("player") or "").casefold(),

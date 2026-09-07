@@ -76,10 +76,13 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("demo_path")
-    ap.add_argument("--player", required=True,
+    ap.add_argument("--player", default="",
                     help="POV player nickname (single POV, not whole match)")
     ap.add_argument("--map", default="", help="Map display name (auto-detected if omitted)")
-    ap.add_argument("--steam-id", default="")
+    ap.add_argument("--steam-id", default="",
+                    help="POV steam64 (stable; preferred over --player)")
+    ap.add_argument("--faceit-id", default="",
+                    help="POV FACEIT player id (stable; preferred over --player)")
     ap.add_argument("--tournament", default="")
     ap.add_argument("--match-id", default="",
                     help="FACEIT match id (auto-resolved from download history if omitted)")
@@ -93,11 +96,15 @@ def main() -> None:
                     help="Keep shorts for any player (default: Recognised Pros only)")
     args = ap.parse_args()
 
+    if not (args.player or args.steam_id or args.faceit_id):
+        ap.error("one of --player, --steam-id, --faceit-id is required")
+
     backlog_file = create_faceit_backlog(
         demo_path=args.demo_path,
         player=args.player,
         map=args.map,
         steam_id=args.steam_id,
+        faceit_id=args.faceit_id,
         tournament=args.tournament,
         match_id=args.match_id,
         priority=args.priority,

@@ -120,6 +120,26 @@ def _line_won(line: dict) -> bool:
     return bool(r)
 
 
+def _find_pro_line(stats: dict, fid: str, nick: str) -> dict | None:
+    """Resolve a pro's stat line by player_id, falling back to nick.
+
+    Stats lines are keyed by live FACEIT nick, which drifts on rename
+    (s1mpleWRLD -> s1mplecsgod). player_id is stable — prefer it.
+    Candidate keeps canonical nick (demand index + backlog keys use it).
+    """
+    players = stats.get("players", {})
+    for line in players.values():
+        if isinstance(line, dict) and line.get("player_id") == fid:
+            return line
+    if nick in players:
+        return players[nick]
+    low = nick.lower()
+    for key, line in players.items():
+        if key.lower() == low:
+            return line
+    return None
+
+
 def rescore_stored(c: dict) -> dict:
     """Rebuild current bonuses from a persisted candidate's stats."""
     out = dict(c)
@@ -177,6 +197,7 @@ def make_player_candidates(rec: dict, stream: str, ranking: dict | None = None) 
             "id": f"{rec['id']}:{nick}",
             "match_id": rec["id"],
             "player": nick,
+            "faceit_id": str(line.get("player_id") or ""),
             "stream": stream,
             "map": rec.get("map", "?"),
             "score": rec.get("score", ""),
@@ -259,6 +280,7 @@ async def collect(*, hours: int, count: int, min_pros: int,
     client = FACEITClient()
     try:
         match_pros: dict[str, set] = {}
+        match_fids: dict[str, dict[str, str]] = {}  # mid -> {faceit_id: nick}
         match_meta: dict[str, dict] = {}
         now = as_of or datetime.now()
         cutoff = now - timedelta(hours=hours)
@@ -282,6 +304,7 @@ async def collect(*, hours: int, count: int, min_pros: int,
                         and m.date and m.date >= today_start:
                     continue
                 match_pros.setdefault(m.match_id, set()).add(nick)
+                match_fids.setdefault(m.match_id, {})[fid] = nick
                 match_meta.setdefault(m.match_id, {
                     "id": m.match_id, "date": m.date,
                     "team1": m.team1, "team2": m.team2,
@@ -305,8 +328,11 @@ async def collect(*, hours: int, count: int, min_pros: int,
             stats = await get_stats(mid)
             if not stats:
                 continue
-            pro = next(iter(single[mid]))
-            line = stats.get("players", {}).get(pro)
+            fid_nicks = match_fids.get(mid, {})
+            if not fid_nicks:
+                continue
+            fid, pro = next(iter(fid_nicks.items()))
+            line = _find_pro_line(stats, fid, pro)
             if not line:
                 continue
             if _is_notable_perf(line, perf_kd, perf_adr, perf_kills):
@@ -355,8 +381,11 @@ async def collect(*, hours: int, count: int, min_pros: int,
         for mid, ps in ranked_multi:
             stats = stats_cache.get(mid, {})
             meta = match_meta.get(mid, {})
-            players = {nick: stats.get("players", {}).get(nick)
-                       for nick in ps if stats.get("players", {}).get(nick)}
+            players = {}
+            for fid, nick in match_fids.get(mid, {}).items():
+                line = _find_pro_line(stats, fid, nick)
+                if line:
+                    players[nick] = line
             avg, n, tot = await lobby_elos(mid)
             multi_out.append({
                 "id": mid, "pros": sorted(ps), "players": players,

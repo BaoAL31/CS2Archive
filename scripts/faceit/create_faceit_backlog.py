@@ -86,6 +86,60 @@ def _demo_players(demo_path: Path) -> list[dict]:
     return out
 
 
+def _resolve_steam_id(demo_path: Path, nick: str, *, steam_id: str = "",
+                      faceit_id: str = "") -> str:
+    """Resolve a player's steam64, stable ids first, nick last.
+
+    1. Explicit --steam-id (verified present in demo).
+    2. Explicit --faceit-id -> account steam_id (verified present in demo).
+    3. Account steam_id for the nick, when present in demo (rename-proof:
+       s1mple's demo header says s1mplecsgod, account nick says s1mple).
+    4. Legacy: in-game demo name match (manual use with current nick).
+    """
+    try:
+        demo_steam_ids = _demo_steam_ids(demo_path)
+    except Exception as e:
+        print(f"  [WARN] steam id resolve failed: {e}")
+        return steam_id.strip()
+    if steam_id.strip():
+        if steam_id.strip() in demo_steam_ids:
+            return steam_id.strip()
+        print(f"  [WARN] --steam-id {steam_id.strip()} not in demo")
+        return ""
+    try:
+        data = json.loads((PROJECT_ROOT / ".data" / "player_accounts.json").read_text(encoding="utf-8"))
+        players = data if isinstance(data, list) else data.get("players", [])
+    except Exception:
+        players = []
+    if faceit_id.strip():
+        for acct in players:
+            if str(acct.get("faceit_id") or "").strip() == faceit_id.strip():
+                sid = str(acct.get("steam_id") or "").strip()
+                if sid in demo_steam_ids:
+                    return sid
+                print(f"  [WARN] --faceit-id account steam {sid} not in demo")
+                return ""
+        print(f"  [WARN] --faceit-id {faceit_id.strip()} not a Recognised Pro")
+        return ""
+    # account-first: any Recognised-Pro account whose steam id is in the
+    # demo and whose nickname matches (covers renames via stored steam).
+    for acct in players:
+        if str(acct.get("nickname") or "").strip().lower() == nick.lower():
+            sid = str(acct.get("steam_id") or "").strip()
+            if sid in demo_steam_ids:
+                return sid
+    # legacy: raw in-game name match
+    try:
+        import demoparser2 as dp
+        info = dp.DemoParser(str(demo_path)).parse_player_info()
+        for _, row in info.iterrows():
+            if str(row.get("name", "")).strip().lower() == nick.lower():
+                return str(row.get("steamid", "")).strip()
+    except Exception:
+        pass
+    return ""
+
+
 def _kd_from_demo(demo_path: Path, steam_id: str) -> tuple[int, int] | None:
     """(kills, deaths) for one player from the demo's player_death events.
 
@@ -120,31 +174,11 @@ def _kd_from_demo(demo_path: Path, steam_id: str) -> tuple[int, int] | None:
     return kills, deaths_n
 
 
-def _resolve_steam_id(demo_path: Path, nick: str) -> str:
-    """Resolve a player's steam64 from the demo, by in-game name first, then
-    by Recognised-Pro canonical nickname (.data/player_accounts.json)."""
-    try:
-        import demoparser2 as dp
-        info = dp.DemoParser(str(demo_path)).parse_player_info()
-        demo_steam_ids = [str(r.get("steamid", "")).strip() for _, r in info.iterrows()]
-        for _, row in info.iterrows():
-            if str(row.get("name", "")).strip().lower() == nick.lower():
-                return str(row.get("steamid", "")).strip()
-    except Exception as e:
-        print(f"  [WARN] steam id resolve failed: {e}")
-        return ""
-    # canonical nick fallback: account nickname -> steam id present in demo
-    try:
-        data = json.loads((PROJECT_ROOT / ".data" / "player_accounts.json").read_text(encoding="utf-8"))
-        players = data if isinstance(data, list) else data.get("players", [])
-        for acct in players:
-            if str(acct.get("nickname") or "").strip().lower() == nick.lower():
-                sid = str(acct.get("steam_id") or "").strip()
-                if sid in demo_steam_ids:
-                    return sid
-    except Exception:
-        pass
-    return ""
+def _demo_steam_ids(demo_path: Path) -> list[str]:
+    """All steam64s present in the demo header."""
+    import demoparser2 as dp
+    info = dp.DemoParser(str(demo_path)).parse_player_info()
+    return [str(r.get("steamid", "")).strip() for _, r in info.iterrows()]
 
 
 async def _match_elo(demo_path: Path, pov_steam_id: str) -> dict:
@@ -207,9 +241,10 @@ def _match_id_from_history(demo: Path) -> str:
     return ""
 
 
-def create_faceit_backlog(*, demo_path, player, map="", steam_id="",
-                          tournament="", match_id="", priority="high",
-                          match_date=None, no_elo=False) -> Path:
+def create_faceit_backlog(*, demo_path, player="", map="", steam_id="",
+                          faceit_id="", tournament="", match_id="",
+                          priority="high", match_date=None,
+                          no_elo=False) -> Path:
     """Build a single-POV FACEIT backlog card.
 
     Not a standalone entry — call via scripts/faceit/extract_backlogs.py.
@@ -220,7 +255,8 @@ def create_faceit_backlog(*, demo_path, player, map="", steam_id="",
         print(f"[ERR] demo not found: {demo}")
         sys.exit(1)
 
-    steam_id = steam_id or _resolve_steam_id(demo, player)
+    steam_id = _resolve_steam_id(
+        demo, player, steam_id=steam_id, faceit_id=faceit_id)
     if not steam_id:
         print(f"[ERR] player '{player}' not found in demo")
         sys.exit(1)
@@ -252,7 +288,10 @@ def create_faceit_backlog(*, demo_path, player, map="", steam_id="",
         meta["kd"] = f"{kills}-{deaths}"
 
     acct = load_accounts_by_steam().get(steam_id, {})
-    faceit_id = str(acct.get("faceit_id") or "").strip()
+    # Canonical display name comes from the account record (stable steam
+    # key), never from the CLI nick or demo header — rename-proof.
+    player = str(acct.get("nickname") or "").strip() or player
+    faceit_id = faceit_id.strip() or str(acct.get("faceit_id") or "").strip()
     if faceit_id == "-1":
         faceit_id = ""
     meta["faceit_id"] = faceit_id
