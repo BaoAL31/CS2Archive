@@ -914,7 +914,7 @@ def run_overlay(
         t4 = time.time()
         t2 = time.time()
         _log(f"Generating key cap sprites...")
-        assets = generate_key_assets(work_dir / "sprites")
+        assets = generate_key_assets(work_dir / "sprites", video_height=height)
         png_inputs = overlay_png_input_paths(assets)
         _log(f"{len(png_inputs)} PNGs ({time.time()-t2:.1f}s)")
 

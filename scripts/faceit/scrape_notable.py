@@ -80,17 +80,16 @@ def _is_notable_perf(line: dict, kd_min: float, adr_min: float, kills_min: int) 
 
 
 FACEIT_DEMAND_FLOOR = 1.0
+FACEIT_KD_FLOOR = 1.5
 
 
 def is_good_faceit_pov(c: dict) -> bool:
-    """Plus-K/D win from a player on the YouTube demand index (>= 1.0).
+    """Watchable FACEIT POV: K/D >= 1.5 from a demand-index player.
 
-    Org rank is not a qualifier. Smash lines from names with no measured
-    demand (blameF 27/9 vs ~2500) stay out.
+    Result does not matter — a 21/14 loss still qualifies. Org rank is not a
+    qualifier. Smash lines from names with no measured demand stay out.
     """
-    if not c.get("won"):
-        return False
-    if _num(c.get("kd"), float) < 1.0:
+    if _num(c.get("kd"), float) < FACEIT_KD_FLOOR:
         return False
     nick = (c.get("player") or "").casefold()
     if not nick:

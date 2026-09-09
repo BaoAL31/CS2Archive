@@ -45,16 +45,17 @@ from demoparser2 import DemoParser  # noqa: E402
 from overlay._common import _log  # noqa: E402
 from avatar_boxes import boxes_for_resolution  # noqa: E402
 from mix_team_voice import (  # noqa: E402
-    SAMPLE_RATE,
-    _TICKRATE,
-    decode_player_packets,
-    detect_channels,
-    group_voice_rows,
-    load_offsets,
-    load_team_map,
-    load_voice,
-    tick_to_time,
-)
+        SAMPLE_RATE,
+        _TICKRATE,
+        _as_steamid,
+        decode_player_packets,
+        detect_channels,
+        group_voice_rows,
+        load_offsets,
+        load_team_map,
+        load_voice,
+        tick_to_time,
+    )
 
 
 
@@ -81,7 +82,7 @@ def _probe_video_info(video: Path) -> tuple[int, int, float, float]:
 
 
 def _player_talk_segments(demo: Path, offsets: dict, pov_team: int,
-                          tickrate: int) -> dict[str, list[tuple[float, float]]]:
+                          steam_id: str, tickrate: int) -> dict[str, list[tuple[float, float]]]:
     """Return {steamid: [(start_sec, end_sec), ...]} for POV-team players.
 
     Talk segments come from RAW packet activity, not decoded-PCM RMS: a player
@@ -92,7 +93,7 @@ def _player_talk_segments(demo: Path, offsets: dict, pov_team: int,
     tracks the actual mic state (the in-game speaker indicator uses the same).
     """
     rows = load_voice(demo)
-    team_map = load_team_map(demo)
+    team_map = load_team_map(demo, steam_id)
     out: dict[str, list[tuple[float, float]]] = {}
     for sid in {r["steamid"] for r in rows}:
         if team_map.get(sid) != pov_team:
@@ -219,7 +220,7 @@ def _pov_first_half_side(demo: Path, steam_id: str) -> str:
     return "right"
 
 
-def _map_boxes(demo: Path, pov_team: int, side: str, boxes: dict) -> dict[str, tuple[int, int, int, int]]:
+def _map_boxes(demo: Path, pov_team: int, steam_id: str, side: str, boxes: dict) -> dict[str, tuple[int, int, int, int]]:
     """Map each POV-team player to its avatar box rect {steamid: (x0,y0,x1,y1)}.
 
     Within a team, box position (left->right) equals parse_player_info slot
@@ -227,9 +228,9 @@ def _map_boxes(demo: Path, pov_team: int, side: str, boxes: dict) -> dict[str, t
     block is the given ``side``.
     """
     info = DemoParser(str(demo)).parse_player_info()
-    team_map = load_team_map(demo)
-    slot_order = [str(r["steamid"]) for _, r in info.iterrows()
-                  if team_map.get(str(r["steamid"])) == pov_team]
+    team_map = load_team_map(demo, steam_id)
+    slot_order = [_as_steamid(r["steamid"]) for _, r in info.iterrows()
+                  if team_map.get(_as_steamid(r["steamid"])) == pov_team]
     x_ranges = boxes.get(side.upper(), [])
     y0, y1 = boxes["y0"], boxes["y1"]
     out: dict[str, tuple[int, int, int, int]] = {}
@@ -298,20 +299,20 @@ def build_voice_shade_data(
     scale_x = w / nw
     scale_y = h / nh
 
-    team_map = load_team_map(demo)
-    pov_team = team_map.get(steam_id)
+    team_map = load_team_map(demo, steam_id)
+    pov_team = team_map.get(_as_steamid(steam_id))
     if pov_team is None:
         _log(f"[ERROR] steam id {steam_id} not found in demo player info")
         sys.exit(1)
 
-    pcms = _player_talk_segments(demo, offsets, pov_team, tickrate)
+    pcms = _player_talk_segments(demo, offsets, pov_team, steam_id, tickrate)
     # The POV team's scoreboard block flips at halftime: it is on the first-half
     # side before the flip and the opposite side after. Auto-detect the first-half
     # side from the demo (CT=LEFT, T=RIGHT). Build box maps for BOTH sides.
     first_side = _pov_first_half_side(demo, steam_id)
     second_side = "left" if first_side == "right" else "right"
-    first_map = _map_boxes(demo, pov_team, first_side, boxes)
-    second_map = _map_boxes(demo, pov_team, second_side, boxes)
+    first_map = _map_boxes(demo, pov_team, steam_id, first_side, boxes)
+    second_map = _map_boxes(demo, pov_team, steam_id, second_side, boxes)
     if not first_map or not second_map:
         _log(f"[ERROR] could not map any POV player to a box "
              f"(first={first_side}, second={second_side})")

@@ -19,7 +19,10 @@ from _pathsetup import ensure  # noqa: E402
 
 ensure()
 
-from hltv.update_team_demand import (canonical_team, extract_fixture_teams, team_lookup)
+from shorts.popular_events import is_popular_event  # noqa: E402
+from hltv.update_team_demand import (  # noqa: E402
+    canonical_team, extract_fixture_teams, team_lookup,
+)
 
 _LOOKUP = team_lookup()
 
@@ -48,14 +51,29 @@ _MAP_RES = (
     ("overpass", re.compile(r"\boverpass\b", re.I)),
     ("vertigo", re.compile(r"\bvertigo\b", re.I)),
 )
-_S_TIER = ("katowice", "cologne", "world final", "world cup", "pro league",
-           "blast premier", "epicenter", "starladder")
+_RAW_VS_RE = re.compile(
+    r"\bvs\.?\s+([A-Za-z0-9 .'\-]{2,32}?)(?:\s*[\(\|#!]|\s*$)", re.I)
+
+
+def _title_for_fixture(title: str) -> str:
+    """Drop hashtags so #navi after vs cannot steal team2."""
+    return re.sub(r"#\S+", " ", title or "")
+
+
+def same_team(a: str | None, b: str | None) -> bool:
+    if not a or not b:
+        return False
+    if _norm(a) == _norm(b):
+        return True
+    left, right = canonical_team(a, _LOOKUP), canonical_team(b, _LOOKUP)
+    return bool(left and right and left == right)
 
 
 def parse_pro_title(title: str) -> dict:
     """Teams, event text, stage bucket, title K-D, map from a pro POV title."""
     text = title or ""
-    fixture = extract_fixture_teams(text, _LOOKUP)
+    cleaned = _title_for_fixture(text)
+    fixture = extract_fixture_teams(cleaned, _LOOKUP)
     title_rating = None
     hit = _RATING_RE.search(text)
     if hit:
@@ -69,6 +87,15 @@ def parse_pro_title(title: str) -> dict:
             opp = canonical_team(single.group(1).strip(), _LOOKUP)
             if opp:
                 fixture = ("", opp)
+    if not fixture:
+        from hltv.update_team_demand import _match_team
+        raw = _RAW_VS_RE.search(cleaned)
+        if raw:
+            token = raw.group(1).strip()
+            opp = canonical_team(token, _LOOKUP) or token
+            mine = _match_team(cleaned[: raw.start()], _LOOKUP, prefer="last")
+            if opp and (not mine or not same_team(mine, opp)):
+                fixture = (mine or "", opp)
     stage = "other"
     for name, rx in _STAGE_RES:
         if rx.search(text):
@@ -93,10 +120,11 @@ def parse_pro_title(title: str) -> dict:
 
 
 def event_tier(*texts: str) -> str:
-    blob = " ".join(texts).lower()
-    if "major" in blob:
+    blob = " ".join(t for t in texts if t)
+    if re.search(r"\bmajor\b", blob, re.I):
         return "major"
-    if any(token in blob for token in _S_TIER):
+    slug = re.sub(r"[^a-z0-9]+", "-", blob.lower()).strip("-")
+    if is_popular_event(slug, blob):
         return "s-tier"
     return "regular"
 

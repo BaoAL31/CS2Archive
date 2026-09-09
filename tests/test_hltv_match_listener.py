@@ -93,6 +93,35 @@ def test_parse_match_links_keeps_only_requested_headline_dates():
     assert [m.match_id for m in recent] == ["10"]
 
 
+def test_parse_match_links_keeps_featured_results_when_dating():
+    html = """
+    <div class="results-holder">
+      <div class="standard-headline">Featured results</div>
+      <div class="result-con">
+        <a href="/matches/2396950/mouz-vs-vitality-blast-open-porto-2026">x</a>
+        <span class="event-name">BLAST Open Porto 2026</span>
+      </div>
+      <div class="result-con">
+        <a href="/matches/2396949/spirit-vs-falcons-blast-open-porto-2026">x</a>
+        <span class="event-name">BLAST Open Porto 2026</span>
+      </div>
+      <div class="standard-headline">Results for September 6th 2026</div>
+      <div class="result-con">
+        <a href="/matches/20/today-vs-today">x</a>
+        <span class="event-name">BLAST Open Porto 2026</span>
+      </div>
+      <div class="standard-headline">Results for August 31st 2026</div>
+      <div class="result-con">
+        <a href="/matches/2396941/vitality-vs-legacy-blast-open-porto-2026">x</a>
+        <span class="event-name">BLAST Open Porto 2026</span>
+      </div>
+    </div>
+    """
+    recent = parse_match_links(
+        html, on_dates={date(2026, 9, 6), date(2026, 9, 5)})
+    assert [m.match_id for m in recent] == ["2396950", "2396949", "20"]
+
+
 def test_event_and_team_filter():
     matches = parse_match_links(RESULTS)
     selected = select_matches(matches, {"100"}, ["Team Alpha"])

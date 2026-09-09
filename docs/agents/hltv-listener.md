@@ -8,8 +8,9 @@ The default event is BLAST Open Porto 2026. The default poll interval is five
 minutes. One card per match is queued from `backlog/<match>/{high,medium}/`
 (rating >= 1.0), picked by **weight** (not raw HLTV rating). HLTV's
 `/results?date=` query is a no-op (the SPA always returns the latest-results
-dump), so the listener reads on-page date headlines and keeps only **today
-and yesterday**. Group-stage matches still sitting on that dump are ignored.
+dump), so the listener reads on-page date headlines and keeps **Featured
+results** plus **today and yesterday**. Older dated groups on that dump
+(group stage, etc.) are ignored.
 Matches that already have backlog cards on disk are marked done and not
 rendered again. The worker runs
 one `scripts/pov/pipeline.py` process at a time, **up to 3 uploads per local
@@ -29,10 +30,10 @@ The listener also reads upcoming / live matches from the event page (and the
 event matches tab when the overview has no timestamps). If nothing is live
 and nothing starts in the next 12 hours, it **keeps polling FACEIT** (same
 loop as HLTV, 15-minute scrape cooldown) for watchable Recognised-Pro POVs
-from the last 24 hours. A POV qualifies only if it is a **plus-K/D win**
-from a player on the YouTube **demand index** (>= 1.0). Org rank is not
-required. High K/D or ADR from a name with no measured demand does not
-qualify. Those are queued as they appear, one
+from the last 24 hours. A POV qualifies only if it is a **K/D >= 1.5** line
+from a player on the YouTube **demand index** (>= 1.0). A loss still
+qualifies. Org rank is not required. High K/D or ADR from a name with no
+measured demand does not qualify. Those are queued as they appear, one
 player/match, up to the remaining daily slots. Weak leftover games are
 not used to pad the day to 3.
 Demos are downloaded and a single-POV backlog card is built, then the same
@@ -87,6 +88,12 @@ The first command checks the filters and state flow without downloading or
 rendering. State is stored in `.listener/hltv.json`; a lock file beside it
 prevents two listeners from using the same CloakBrowser profile or render
 worker.
+
+Every launch runs a queue clean: missing card files are dropped, and
+FACEIT cards duplicating a completed YouTube upload (same player + demo +
+scoreline, e.g. same game re-scraped under a new room id) are skipped and
+their dup files + stale render state deleted. Source cards of completed
+uploads are dropped from the queue but their files are kept.
 
 Useful commands:
 

@@ -1,6 +1,6 @@
 """Build the pro POV dataset: one row per LIM pro POV video.
 
-Target: views / views_per_day. Features: player, org, map, opp, opp_tier,
+Target: 21-day plateau views. Features: player, org, map, opp, opp_tier,
 rating (HLTV ratings join), stage, tier. Writes .data/pro_pov_dataset.jsonl.
 
 Usage:
@@ -21,13 +21,17 @@ from _pathsetup import ensure  # noqa: E402
 
 ensure()
 
+from shorts.demo_pov_features import (  # noqa: E402
+    features_for_row, index_local_demos, load_feature_cache,
+)
 from shorts.fit_clip_weights import load_roster_orgs  # noqa: E402
+from shorts.fit_pov_weights import opp_tier_of  # noqa: E402
 from shorts.pro_context import recognised_aliases  # noqa: E402
 from shorts.pro_context import (derby_heat, event_tier, index_ratings,
                                 kd_bucket, load_match_scores, lookup_rating,
                                 normalize_stage, parse_kd_ratio,
                                 parse_pro_title, rating_bucket,
-                                series_context)
+                                same_team, series_context)
 
 # LIM pro only: multi-channel (CAL/EDCS/own) lost on both val loss
 # (0.237 vs 0.119) and top-20 overlap (7 vs 12). Revisit at 3x rows.
@@ -57,6 +61,8 @@ def build() -> tuple[list[dict], dict]:
         ranking = {}
     ratings = index_ratings()
     scores = load_match_scores()
+    demo_index = index_local_demos()
+    demo_cache = load_feature_cache()
     try:
         from hltv.update_team_demand import load_team_demand
         fixtures = load_team_demand().get("fixtures") or []
@@ -90,10 +96,15 @@ def build() -> tuple[list[dict], dict]:
             parsed = parse_pro_title(str(source.get("title") or ""))
             game_map = parsed["map"] or str(source.get("map") or "").lower()
             team1, team2 = parsed["team1"], parsed["team2"]
-            mine = (org or "").lower()
+            mine = org or ""
             opp = ""
             if team1 and team2:
-                opp = team2 if team1.lower() == mine else team1
+                if same_team(team1, mine):
+                    opp = team2
+                elif same_team(team2, mine):
+                    opp = team1
+                else:
+                    opp = team2
             elif team2:
                 opp = team2
             stats, file_stage, entry = lookup_rating(ratings, team1, team2,
@@ -113,10 +124,20 @@ def build() -> tuple[list[dict], dict]:
             series = series_context(entry, scores, org)
             heat = derby_heat(team1, team2, fixtures)
             rank = ranking.get(opp or "", 0) or 0
-            opp_tier = ("top5" if rank and rank <= 5 else
-                        "top10" if rank and rank <= 10 else
-                        "top20" if rank and rank <= 20 else
-                        "top30" if rank else "unranked")
+            if not rank and opp:
+                lowered = {str(k).casefold(): v for k, v in ranking.items()}
+                rank = lowered.get(opp.casefold(), 0) or 0
+            opp_tier = opp_tier_of(rank)
+            demo_row = {
+                "player": player, "org": org, "opp": opp or "unknown",
+                "map": game_map or "unknown",
+            }
+            demo_feats = features_for_row(demo_row, demo_cache, demo_index)
+            if demo_feats.get("demo_kd") is not None:
+                kd = demo_feats["demo_kd"]
+            if demo_feats.get("demo_won") in ("yes", "no"):
+                series = dict(series)
+                series["won"] = demo_feats["demo_won"]
             rows.append({
                 "video_id": source.get("video_id"),
                 "channel": source.get("channel"),
@@ -143,6 +164,7 @@ def build() -> tuple[list[dict], dict]:
                 "stage": stage,
                 "tier": event_tier(str(source.get("title") or "")),
                 "title": source.get("title"),
+                "multi": demo_feats.get("multi") or "unknown",
             })
     return rows, skipped
 
@@ -154,7 +176,9 @@ def main() -> int:
         for row in rows:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
     with_rating = sum(1 for r in rows if r["rating"] is not None)
-    print(f"rows={len(rows)} with_hltv_rating={with_rating} skipped={skipped}")
+    with_multi = sum(1 for r in rows if r.get("multi") not in (None, "unknown"))
+    print(f"rows={len(rows)} with_hltv_rating={with_rating} "
+          f"with_demo_multi={with_multi} skipped={skipped}")
     print(OUT)
     return 0
 

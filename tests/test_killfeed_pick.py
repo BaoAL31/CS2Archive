@@ -66,6 +66,27 @@ def test_steam_id_int_vs_str():
     assert ranked[0][1] == 1
 
 
+def test_attacker_steamid_demo_column():
+    kills = [{"attacker_steamid": SID, "tick": 80}]
+    ranked = rank_killfeed_kills(kills, SID, RATE)
+    assert ranked[0][0]["tick"] == 80
+
+
+def test_sidecar_from_round_spans_scales_to_video():
+    from thumbnail.utils import sidecar_from_round_spans, demo_tick_to_video_seconds
+
+    side = sidecar_from_round_spans(
+        [(1, 1000, 2000), (2, 3000, 5000)],
+        video_duration=30.0,
+        tickrate=100,
+    )
+    assert side["approximate"] is True
+    assert side["total_duration_seconds"] == 30.0
+    # Round 1 is 10s of ticks, round 2 is 20s → 10s and 20s of a 30s video.
+    assert demo_tick_to_video_seconds(side, 1500) == 5.0
+    assert demo_tick_to_video_seconds(side, 4000) == 20.0
+
+
 def test_attacker_steam_id_from_shorts_timeline():
     kills = [
         {"attacker_steam_id": SID, "tick": 100},
@@ -109,4 +130,4 @@ def test_demo_tick_to_video_seconds_linear_in_round():
 
 
 def test_killfeed_after_seconds_is_settle():
-    assert KILLFEED_AFTER_SECONDS == 0.4
+    assert KILLFEED_AFTER_SECONDS == 0.25

@@ -265,10 +265,10 @@ def test_select_picks_only_one_pov_per_match():
 
 def test_is_good_faceit_pov_requires_player_demand():
     donk = {
-        "player": "donk", "won": True, "kd": 1.2, "adr": 85.0, "kills": 18,
+        "player": "donk", "won": True, "kd": 1.5, "adr": 85.0, "kills": 18,
     }
     s1mple = {
-        "player": "s1mple", "won": True, "kd": 1.4, "adr": 96.2, "kills": 28,
+        "player": "s1mple", "won": True, "kd": 1.6, "adr": 96.2, "kills": 28,
         "raw_star_bonus": 0,
     }
     blamef = {
@@ -281,12 +281,16 @@ def test_is_good_faceit_pov_requires_player_demand():
     minus_kd = {
         "player": "donk", "won": True, "kd": 0.9, "adr": 90.0, "kills": 12,
     }
+    barely_plus = {
+        "player": "donk", "won": True, "kd": 1.49, "adr": 90.0, "kills": 19,
+    }
     assert sn.is_good_faceit_pov(donk)
     assert sn.is_good_faceit_pov(s1mple)
     assert not sn.is_good_faceit_pov(blamef)
     assert not sn.is_good_faceit_pov(smash_unknown)
     assert not sn.is_good_faceit_pov(minus_kd)
-    assert not sn.is_good_faceit_pov({**donk, "won": False})
+    assert not sn.is_good_faceit_pov(barely_plus)
+    assert sn.is_good_faceit_pov({**donk, "won": False})
 
 
 def test_choose_picks_prefers_fresh_over_heavier_pool():

@@ -4,7 +4,7 @@ CS2Archive — Backlog Creator
 Downloads demos, scrapes ratings + tournament, resolves steam IDs,
 fetches avatars, and writes backlog entries as JSON.
 
-Usage: python scripts/pov/create_backlog.py <hltv_url> [--no-shorts]
+Usage: python scripts/pov/create_backlog.py <hltv_url> [--no-shorts] [--no-ingest]
 """
 
 from __future__ import annotations
@@ -303,6 +303,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(r"{PROJECT_ROOT_ABS}")
 os.chdir(str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 players = {json.dumps(players)}
 match_url = {json.dumps(match_url)}
@@ -338,6 +339,77 @@ with CloakAvatarFetcher(headless=False) as fetcher:
             time.sleep(2)
 '''.strip(), encoding="utf-8")
     return script
+
+
+def _write_ingest_worker(demos: list[Path]) -> Path:
+    """Write self-contained worker running CS2UtilArchive ingest in its own process.
+
+    Produces throws.parquet + input_overlay.parquet per demo under
+    ``<cs2util>/results/auto_extracted/data/demo=<id>/`` — the same dir the
+    overlay step (`_ensure_cs2util_data`) reads, so step 4 never re-parses.
+    Isolated process avoids the `scripts` package clash (both repos own one).
+    Idempotent: demos with input_overlay.parquet already on disk are skipped."""
+    script = PROJECT_ROOT / "tmp" / "_ingest_worker.py"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    demo_list = json.dumps([str(Path(d).resolve()) for d in demos])
+    root_abs = str(PROJECT_ROOT).replace(chr(92), "/")
+    script.write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"PROJECT_ROOT = Path(r\"{root_abs}\")\n"
+        "import os\n"
+        "os.chdir(str(PROJECT_ROOT))\n"
+        "sys.path.insert(0, str(PROJECT_ROOT))\n"
+        "sys.path.insert(0, str(PROJECT_ROOT / 'scripts'))\n"
+        f"demos = {demo_list}\n"
+        "from config import settings\n"
+        "from scripts.overlay._common import prefer_cs2util_scripts\n"
+        "prefer_cs2util_scripts()\n"
+        "from scripts.demo_ids import default_demo_id_from_path\n"
+        "from scripts.extract_utils import process_demo\n"
+        "from scripts.extract_input_overlay import extract_input_overlay\n"
+        "cs2_root = Path(settings.cs2util_root)\n"
+        "output_root = cs2_root / 'results' / 'auto_extracted' / 'data'\n"
+        "for dem_s in demos:\n"
+        "    dem = Path(dem_s)\n"
+        "    try:\n"
+        "        demo_id = default_demo_id_from_path(dem)\n"
+        "        data_dir = output_root / ('demo=' + demo_id)\n"
+        "        if (data_dir / 'input_overlay.parquet').is_file():\n"
+        "            print('INGEST_SKIP:' + demo_id, flush=True)\n"
+        "            continue\n"
+        "        summary = process_demo(str(dem), output_dir=str(output_root), demo_id=demo_id)\n"
+        "        throws = output_root / ('demo=' + demo_id) / 'throws.parquet'\n"
+        "        io = extract_input_overlay(str(dem), str(throws), str(output_root), demo_id=demo_id)\n"
+        "        n_throws = (summary or {}).get('n_throws', 0)\n"
+        "        n_rows = (io or {}).get('n_rows', 0)\n"
+        "        print('INGEST_OK:' + demo_id + ':throws=' + str(n_throws) + ':rows=' + str(n_rows), flush=True)\n"
+        "    except Exception as e:\n"
+        "        print('INGEST_FAIL:' + dem.name + ':' + type(e).__name__ + ':' + str(e), flush=True)\n"
+    )
+    return script
+
+
+def _ingest_corpus(demos: list[Path]) -> None:
+    """Run CS2UtilArchive throw+overlay ingest for each demo (best-effort).
+
+    Failures only warn — backlog cards + shorts must still land even when
+    the sibling checkout is missing or a demo fails to parse."""
+    worker = _write_ingest_worker(demos)
+    try:
+        import subprocess as _subprocess
+        print(f"[INGEST] CS2UtilArchive corpus ingest for {len(demos)} demo(s)...")
+        _result = _subprocess.run(
+            [sys.executable, str(worker)],
+            capture_output=True, text=True, timeout=1800, cwd=str(PROJECT_ROOT),
+        )
+        print(_result.stdout)
+        if _result.stderr:
+            print(_result.stderr, file=sys.stderr)
+        if _result.returncode != 0:
+            print(f"  [WARN] Ingest worker exited {_result.returncode}")
+    except Exception as e:
+        print(f"  [WARN] Corpus ingest failed: {e}")
 
 
 def _extract_shorts(demos: list[Path]) -> None:
@@ -564,6 +636,10 @@ async def main() -> None:
                 avatar_rel=avatar_cache.get(nick, ""),
                 demo_steamids=demo_steamids,
             )
+
+    if "--no-ingest" not in sys.argv:
+        print("[INGEST] Extracting CS2UtilArchive throw corpus...")
+        _ingest_corpus(existing_demos)
 
     if "--no-shorts" not in sys.argv:
         print("[SHORTS] Extracting short timelines (Recognised Pros only)...")

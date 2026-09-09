@@ -145,7 +145,7 @@ def get_slug_from_url(url: str) -> str | None:
 # POV-involved killfeed rows last 7.5s (5s lifetime × 1.5 local-player mod).
 KILLFEED_POV_SECONDS = 7.5
 # Capture after the last kill so the new row is actually on the HUD.
-KILLFEED_AFTER_SECONDS = 0.4
+KILLFEED_AFTER_SECONDS = 0.25
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -154,6 +154,7 @@ def _kill_attacker_id(kill: dict) -> str:
         kill.get("killerSteamId")
         or kill.get("attacker_steam_id")
         or kill.get("attacker_sid")
+        or kill.get("attacker_steamid")
         or ""
     )
 
@@ -179,12 +180,11 @@ def rank_killfeed_kills(
     steam_id: str,
     tickrate: float = 64,
 ) -> list[tuple[dict, int]]:
-    """POV kills ranked by how full the killfeed is at that kill.
+    """POV kills ranked by how many of *this player's* rows are on the feed.
 
     Each POV kill is scored as the number of POV kills in the preceding
     ``KILLFEED_POV_SECONDS`` (inclusive). Capture at the last kill of the
-    densest window so those rows are still on screen. Ties prefer the later
-    tick. Returns ``(kill, feed_count)`` best-first; empty if no POV kills.
+    densest window. Ties prefer the later tick.
     """
     want = str(steam_id)
     pov = [k for k in kills if _kill_attacker_id(k) == want]
@@ -222,6 +222,103 @@ def killfeed_chain_start_tick(
         and last_tick - window <= int(k["tick"]) <= last_tick
     )
     return ticks[0] if ticks else last_tick
+
+
+def probe_video_duration(video: Path) -> float:
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(video)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if probe.returncode != 0:
+            return 0.0
+        return float(probe.stdout.strip() or 0)
+    except Exception:
+        return 0.0
+
+
+def sidecar_from_round_spans(
+    spans: list[tuple[int, int, int]],
+    video_duration: float,
+    tickrate: float = 64,
+) -> dict:
+    """Distribute video time across round tick spans (sidecar fallback)."""
+    usable = [(int(n), int(a), int(b)) for n, a, b in spans if int(b) > int(a)]
+    weights = [(b - a) / max(float(tickrate), 1.0) for _, a, b in usable]
+    total_w = sum(weights) or 1.0
+    scale = float(video_duration) / total_w
+    offsets: dict[str, float] = {}
+    ticks: dict[str, list[int]] = {}
+    durs: dict[str, float] = {}
+    t = 0.0
+    for (n, a, b), w in zip(usable, weights):
+        d = w * scale
+        offsets[str(n)] = round(t, 3)
+        ticks[str(n)] = [a, b]
+        durs[str(n)] = round(d, 3)
+        t += d
+    return {
+        "round_offsets": offsets,
+        "per_round_ticks": ticks,
+        "per_round_durations": durs,
+        "total_duration_seconds": round(float(video_duration), 3),
+        "approximate": True,
+    }
+
+
+def kills_from_demo(demo_path: str | Path) -> tuple[list[dict], float] | None:
+    """player_death rows as killfeed kills. Knife-round / suicides kept;
+    rank_killfeed_kills filters by steam id."""
+    try:
+        import demoparser2 as dp
+        parser = dp.DemoParser(str(demo_path))
+        deaths = parser.parse_event("player_death")
+    except Exception as e:
+        print(f"  [bg] demo kill parse failed: {e}", flush=True)
+        return None
+    if deaths is None or len(deaths) == 0:
+        return None
+    tickrate = 64.0
+    try:
+        header = parser.parse_header()
+        if isinstance(header, dict):
+            tickrate = float(header.get("tickrate") or header.get("tick_rate") or 64)
+    except Exception:
+        pass
+    kills: list[dict] = []
+    for _, row in deaths.iterrows():
+        att = str(row.get("attacker_steamid", "")).strip()
+        vic = str(row.get("user_steamid", "")).strip()
+        if not att or att.lower() == "nan" or att == vic:
+            continue
+        kills.append({
+            "killerSteamId": att,
+            "tick": int(row["tick"]),
+            "weaponName": str(row.get("weapon") or row.get("weapon_name") or "?"),
+            "victimName": str(row.get("user_name") or row.get("victim_name") or "?"),
+        })
+    if not kills:
+        return None
+    return kills, tickrate
+
+
+def round_spans_from_demo(
+    demo_path: str | Path,
+    steam_id: str,
+) -> list[tuple[int, int, int]]:
+    """(round, start_tick, end_tick) matching CSDM's recorded POV window."""
+    try:
+        from overlay.overlay_pov import _load_pov_play_tick_ranges
+        ranges = _load_pov_play_tick_ranges(Path(demo_path), str(steam_id))
+    except Exception as e:
+        print(f"  [bg] round-span parse failed: {e}", flush=True)
+        return []
+    out: list[tuple[int, int, int]] = []
+    for rn, (a, b) in sorted(ranges.items()):
+        if int(b) > int(a):
+            out.append((int(rn), int(a), int(b)))
+    return out
 
 
 def find_round_offsets_sidecar(
@@ -285,12 +382,39 @@ def extract_killfeed_frame(
     video = Path(video_path)
     if not video.is_file():
         return None
+
+    extras = list(extra_sidecars or [])
+    if demo_path:
+        stem = Path(demo_path).stem
+        renders = _PROJECT_ROOT / "renders"
+        if renders.is_dir():
+            for d in renders.glob(f"pov-{stem}_*"):
+                extras.append(d / "combined.round_offsets.json")
+                if analysis_path is None:
+                    ap = d / "csdm_analysis.json"
+                    if ap.is_file():
+                        analysis_path = ap
+
     side_p = Path(sidecar_path) if sidecar_path else find_round_offsets_sidecar(
-        video, extra=extra_sidecars,
+        video, extra=extras,
     )
-    if side_p is None or not side_p.is_file():
+    sidecar: dict | None = None
+    if side_p is not None and side_p.is_file():
+        sidecar = json.loads(side_p.read_text(encoding="utf-8"))
+    elif demo_path and steam_id:
+        spans = round_spans_from_demo(demo_path, steam_id)
+        dur = probe_video_duration(video)
+        if spans and dur > 1:
+            sidecar = sidecar_from_round_spans(spans, dur)
+            cache = video.parent / "video.round_offsets.json"
+            try:
+                cache.write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
+                print(f"  [bg] synthesized sidecar ({len(spans)} rounds) -> {cache.name}",
+                      flush=True)
+            except OSError:
+                pass
+    if sidecar is None:
         return None
-    sidecar = json.loads(side_p.read_text(encoding="utf-8"))
 
     loaded = load_kill_timeline(demo_path) if demo_path else None
     if loaded:
@@ -299,6 +423,11 @@ def extract_killfeed_frame(
         data = json.loads(Path(analysis_path).read_text(encoding="utf-8"))
         tickrate = float(data.get("tickrate", 64) or 64)
         kills = data.get("kills", [])
+    elif demo_path:
+        parsed = kills_from_demo(demo_path)
+        if not parsed:
+            return None
+        kills, tickrate = parsed
     else:
         return None
 
@@ -309,27 +438,48 @@ def extract_killfeed_frame(
     seek_t = None
     picked = None
     feed_n = 0
+    missed = 0
     for kill, n in ranked:
         t = demo_tick_to_video_seconds(sidecar, int(kill["tick"]))
         if t is None:
+            missed += 1
             continue
         seek_t = t + KILLFEED_AFTER_SECONDS
         picked = kill
         feed_n = n
         break
     if seek_t is None or picked is None:
+        print(
+            f"  [bg] no tick mapped ({missed}/{len(ranked)} POV kills outside round spans)",
+            flush=True,
+        )
         return None
 
     total = float(sidecar.get("total_duration_seconds") or 0)
     if total > 0:
         seek_t = min(total - 0.05, seek_t)
+        # Round-win / scoreboard often replaces the feed in the last couple
+        # of seconds of a round clip — skip those if an earlier kill maps.
+        if seek_t >= total - 2.0:
+            alt = None
+            for kill, n in ranked:
+                t = demo_tick_to_video_seconds(sidecar, int(kill["tick"]))
+                if t is None:
+                    continue
+                cand = min(total - 0.05, max(0.0, t + KILLFEED_AFTER_SECONDS))
+                if cand < total - 2.0:
+                    alt = (cand, kill, n)
+                    break
+            if alt is not None:
+                seek_t, picked, feed_n = alt
     seek_t = max(0.0, seek_t)
 
     weapon = picked.get("weaponName") or picked.get("weapon") or "?"
     victim = picked.get("victimName") or picked.get("victim") or "?"
+    approx = " approx" if sidecar.get("approximate") else ""
     print(
         f"  [bg] kill frame @ {seek_t:.2f}s (tick {picked['tick']}, "
-        f"{feed_n} POV on feed, {weapon} -> {victim})",
+        f"{feed_n} POV on feed, {weapon} -> {victim}{approx})",
         flush=True,
     )
 
@@ -345,8 +495,8 @@ def extract_killfeed_frame(
         ["ffmpeg", "-y", "-loglevel", "error",
          "-ss", f"{seek_t:.3f}", "-i", str(video),
          "-frames:v", "1",
-         "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,"
-                "pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+         "-vf", "scale=1920:1080:force_original_aspect_ratio=increase,"
+                "crop=1920:1080:(in_w-1920)/2:0",
          str(dest)],
         capture_output=True, text=True, timeout=120,
     )

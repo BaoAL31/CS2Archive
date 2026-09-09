@@ -1,13 +1,12 @@
-"""Poll HLTV results and render the highest-weighted POV per match.
+"""Poll HLTV results and render the top-rated POV per map.
 
-Cards are scored with highlight-channel team demand, POV-channel player
-demand, org rank, and HLTV rating. One card per match is queued from
-``backlog/<match>/{high,medium}/``.
+Cards are picked by HLTV Rating 3.0 only: one card per map/demo from
+``backlog/<match>/{high,medium}/`` (highest ``rating`` wins).
 
 Cap is 3 uploads per local calendar day (the YouTube long-form slots).
 When the configured event has nothing live and nothing starting in the
 next 12 hours, the listener keeps polling FACEIT for watchable POVs
-(plus-K/D win from a player on the YouTube demand index). It queues those
+(K/D >= 1.5 from a player on the YouTube demand index). It queues those
 as they appear, up
 to the remaining daily slots, and does not pad with weak games.
 
@@ -49,12 +48,6 @@ for _p in (str(ROOT), str(_SCRIPTS), str(_SCRIPTS / "faceit")):
 os.chdir(ROOT)
 
 from config import settings  # noqa: E402
-from hltv.score_cards import (  # noqa: E402
-    attach_scores,
-    format_score,
-    load_indexes,
-    maybe_refresh_indexes,
-)
 from scrapers.hltv_acquire import (  # noqa: E402
     fetch_hltv_page_html,
     match_id_from_url,
@@ -474,6 +467,22 @@ def _mark_existing_backlog_done(record: dict, cards: list[str]) -> None:
     record["last_error"] = None
 
 
+def _rating(meta: dict) -> float:
+    """HLTV Rating 3.0 as float (missing/invalid -> 0.0)."""
+    try:
+        return float(meta.get("rating") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _map_group(meta: dict, path: str) -> str:
+    """Group key: one pick per map/demo."""
+    demo = str(meta.get("demo_path") or "").strip()
+    if demo:
+        return demo
+    return str(meta.get("map") or path).strip().lower()
+
+
 def _candidate_cards(match: Match, indexes: dict | None = None) -> list[str]:
     match_slug = match_slug_from_url(match.url)
     root = ROOT / "backlog" / match_slug
@@ -488,52 +497,49 @@ def _candidate_cards(match: Match, indexes: dict | None = None) -> list[str]:
             except (OSError, json.JSONDecodeError):
                 continue
             cards.append((str(path.relative_to(ROOT)).replace("\\", "/"), meta))
-    scored = attach_scores(
-        cards, indexes=indexes, fixture_teams=(match.team1, match.team2)
-    )
-    selected = select_best_card(scored)
+    selected = select_best_per_map(cards)
     for path, meta in selected:
         print(
-            f"[score] {meta.get('player')} {meta.get('map')} "
-            f"{format_score(meta)} ({path})",
+            f"[pick] {meta.get('player')} {meta.get('map')} "
+            f"rating={meta.get('rating')} ({path})",
             flush=True,
         )
     return [path for path, _ in selected]
 
 
-def _card_rank(meta: dict) -> tuple[float, float, float]:
-    """Model predicted views, then algo weight, then rating."""
-    try:
-        model = float(meta.get("model_log_views") or 0)
-    except (TypeError, ValueError):
-        model = 0.0
-    try:
-        weight = float(meta.get("weight") or 0)
-    except (TypeError, ValueError):
-        weight = 0.0
-    try:
-        rating = float(meta.get("rating") or 0)
-    except (TypeError, ValueError):
-        rating = 0.0
-    return (model, weight, rating)
+def _card_rank(meta: dict) -> tuple[float]:
+    """Rating only."""
+    return (_rating(meta),)
+
+
+def select_best_per_map(
+    cards: list[tuple[str, dict]],
+) -> list[tuple[str, dict]]:
+    """Highest-rated card per map/demo."""
+    best: dict[str, tuple[str, dict]] = {}
+    for path, meta in cards:
+        if not str(meta.get("map", "")).strip():
+            continue
+        key = _map_group(meta, path)
+        cur = best.get(key)
+        if cur is None or (_rating(meta), path) > (_rating(cur[1]), cur[0]):
+            # tie: keep deterministic order — smaller path wins
+            if cur is not None and _rating(meta) == _rating(cur[1]) and path > cur[0]:
+                continue
+            best[key] = (path, meta)
+    return [best[key] for key in sorted(best)]
 
 
 def select_best_card(
     cards: list[tuple[str, dict]],
 ) -> list[tuple[str, dict]]:
-    """Select the single highest-weighted card (one POV per match)."""
-    best: tuple[str, dict] | None = None
-    for path, meta in cards:
-        if not str(meta.get("map", "")).strip():
-            continue
-        if best is None:
-            best = (path, meta)
-            continue
-        cand = _card_rank(meta)
-        cur = _card_rank(best[1])
-        if cand > cur or (cand == cur and path < best[0]):
-            best = (path, meta)
-    return [best] if best else []
+    """Highest-rated single card (compat wrapper)."""
+    per_map = select_best_per_map(cards)
+    if not per_map:
+        return []
+    # callers expecting one card per group get the top-rated across maps
+    per_map.sort(key=lambda item: (-_rating(item[1]), item[0]))
+    return [per_map[0]]
 
 
 def _prune_queue(cards: list[str], indexes: dict | None = None) -> list[str]:
@@ -546,26 +552,29 @@ def _prune_queue(cards: list[str], indexes: dict | None = None) -> list[str]:
         except (OSError, json.JSONDecodeError):
             passthrough.append(path)
             continue
-        group = (
-            str(meta.get("hltv_url") or "").strip()
-            or str(meta.get("faceit_match_id") or "").strip()
-            or str(full.parent.parent)
-        )
+        if _is_faceit_card(path, meta):
+            group = str(meta.get("faceit_match_id") or "").strip() or path
+        else:
+            group = _map_group(meta, path)
+            base = (
+                str(meta.get("hltv_url") or "").strip()
+                or str(full.parent.parent)
+            )
+            group = f"{base}#{group}"
         groups.setdefault(group, []).append((path, meta))
     selected = [
         path
         for group in groups.values()
-        for path, _ in select_best_card(attach_scores(group, indexes=indexes))
+        for path, _ in select_best_card(group)
     ]
     return passthrough + selected
 
 
 def sort_card_records(cards: list[tuple[str, dict]]) -> list[str]:
-    """Order queued cards by model, then weight, then rating, then path."""
+    """Order queued cards by rating desc, then path."""
     def key(record: tuple[str, dict]) -> tuple:
         path, meta = record
-        model, weight, rating = _card_rank(meta)
-        return (-model, -weight, -rating, path)
+        return (-_rating(meta), path)
 
     return [path for path, _ in sorted(cards, key=key)]
 
@@ -580,8 +589,6 @@ def _sort_queue(cards: list[str], indexes: dict | None = None) -> list[str]:
             passthrough.append(path)
             continue
         records.append((path, meta))
-    if records:
-        records = attach_scores(records, indexes=indexes)
     return sort_card_records(records) + passthrough
 
 
@@ -702,6 +709,7 @@ async def _maybe_queue_faceit(args, state: State, indexes: dict | None) -> None:
     missing = [pick for pick in picks if rel_card_for_pick(pick) is None]
     if missing:
         await asyncio.to_thread(download_and_backlog, missing)
+    done = _completed_faceit_keys()
     cards: list[str] = []
     queued_picks: list[dict] = []
     for pick in picks:
@@ -712,6 +720,14 @@ async def _maybe_queue_faceit(args, state: State, indexes: dict | None) -> None:
                 f"{pick.get('match_id')}",
                 flush=True,
             )
+            continue
+        if done and _faceit_dup_of_completed(card, done):
+            print(
+                f"[faceit-notable] already uploaded "
+                f"{pick.get('player')} {pick.get('match_id')}",
+                flush=True,
+            )
+            _delete_dup_card(card)
             continue
         cards.append(card)
         queued_picks.append(pick)
@@ -865,6 +881,137 @@ def _start_upload_after_pipeline(card: str, dry_run: bool) -> None:
         _spawn_upload_terminal(cmd, dry_run=False)
 
 
+def _completed_faceit_keys() -> set[tuple]:
+    """(player, demo stem, kills, deaths) for FACEIT cards with a completed upload.
+
+    FACEIT rooms can re-appear under a new room id for the same game (or a
+    failed download can fall back to an already-used demo). Those dup cards
+    get a new ``faceit_match_id`` so the run-id lookup misses — match them
+    by player + demo file + scoreline instead."""
+    keys: set[tuple] = set()
+    for base in (ROOT / "faceit", ROOT / "backlog" / "faceit"):
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*.json"):
+            try:
+                meta = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not (meta.get("is_faceit") or meta.get("faceit_match_id")):
+                continue
+            run_id = _youtube_run_id_for_meta(meta)
+            if not run_id:
+                continue
+            for sub in (f"{run_id}_overlay", run_id):
+                try:
+                    data = json.loads(
+                        (ROOT / "youtube" / sub / "upload_meta.json")
+                        .read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if (data.get("upload_status") == "completed"
+                        and data.get("youtube_id")):
+                    keys.add(_faceit_dup_key(meta))
+    return keys
+
+
+def _faceit_dup_key(meta: dict) -> tuple:
+    return (
+        str(meta.get("player") or "").casefold(),
+        str(Path(meta.get("demo_path") or "").stem).casefold(),
+        str(meta.get("kills") or ""),
+        str(meta.get("deaths") or ""),
+    )
+
+
+def _faceit_dup_of_completed(card: str, keys: set[tuple]) -> bool:
+    try:
+        meta = json.loads((ROOT / card).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not _is_faceit_card(card, meta):
+        return False
+    return _faceit_dup_key(meta) in keys
+
+
+def _own_run_completed(meta: dict) -> bool:
+    """This card's own run id already has a completed upload."""
+    run_id = _youtube_run_id_for_meta(meta)
+    if not run_id:
+        return False
+    for sub in (f"{run_id}_overlay", run_id):
+        try:
+            data = json.loads(
+                (ROOT / "youtube" / sub / "upload_meta.json")
+                .read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if (data.get("upload_status") == "completed"
+                and data.get("youtube_id")):
+            return True
+    return False
+
+
+def _delete_dup_card(card: str) -> None:
+    """Remove a dup-of-uploaded card plus its stale render state.
+
+    Keeps the file when the card itself is the source of the completed
+    upload (caller still drops it from the queue) — only true dups
+    (new room id, no own upload) lose their file."""
+    try:
+        meta = json.loads((ROOT / card).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        meta = {}
+    if meta and _own_run_completed(meta):
+        print(f"[queue-clean] already uploaded, leaving source card: {card}",
+              flush=True)
+        return
+    print(f"[queue-clean] already uploaded, deleting dup: {card}", flush=True)
+    try:
+        (ROOT / card).unlink()
+    except OSError:
+        pass
+    player = str(meta.get("player") or "").strip()
+    dem_stem = str(Path(meta.get("demo_path") or "").stem)
+    if player and dem_stem:
+        renders = ROOT / "renders" / f"pov-{dem_stem}_{player}"
+        if renders.is_dir():
+            import shutil
+            shutil.rmtree(renders, ignore_errors=True)
+    run_id = _youtube_run_id_for_meta(meta) if meta else None
+    if run_id:
+        pipe = ROOT / ".pipeline"
+        if pipe.is_dir():
+            for path in pipe.glob(f"{run_id}*"):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
+
+def _clean_queue_on_start(state: State) -> None:
+    """Startup sweep: drop missing cards and dups of completed uploads.
+
+    Runs on every launch so a restart never re-renders an already-uploaded
+    POV (e.g. same FACEIT game re-scraped under a new room id)."""
+    queue = list(state.data.get("queue") or [])
+    if not queue:
+        return
+    done = _completed_faceit_keys()
+    kept: list[str] = []
+    for card in queue:
+        if not (ROOT / card).exists():
+            print(f"[queue-clean] missing card, dropping: {card}", flush=True)
+            continue
+        if done and _faceit_dup_of_completed(card, done):
+            _delete_dup_card(card)
+            continue
+        kept.append(card)
+    if len(kept) != len(queue):
+        state.data["queue"] = kept
+        state.save()
+
+
 def _retry_ready(record: dict) -> bool:
     retry_at = record.get("next_retry_at")
     if not retry_at:
@@ -922,9 +1069,7 @@ async def poll_once(args, state: State) -> None:
     event_url = args.event_url
     state.data["event_url"] = event_url
     _daily(state)
-    if not args.dry_run:
-        maybe_refresh_indexes(scrape=True)
-    indexes = load_indexes()
+    indexes = None
     if args.refresh_teams or not state.data["teams"]:
         html = await asyncio.to_thread(fetch_hltv_page_html, args.rankings_url,
                                         headless=True, wait_selector=None)
@@ -1109,6 +1254,9 @@ async def main(args) -> None:
             state.data["result_baseline_initialized"] = False
             state.data["queue"] = []
             state.save()
+        # Every launch: drop missing cards + dups of completed uploads so a
+        # restart never re-renders an already-uploaded POV.
+        _clean_queue_on_start(state)
         while True:
             try:
                 await poll_once(args, state)

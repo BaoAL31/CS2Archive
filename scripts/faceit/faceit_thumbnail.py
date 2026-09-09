@@ -6,8 +6,8 @@ their avatar is cached. ELO is not drawn — K/D is the proof line.
 
 Usage:
     python scripts/faceit/faceit_thumbnail.py <demo_path> --player <nick> --map <map>
-                                  [--video <mp4>] [--steam-id <id>] [--elo <int>]
-                                  [--opp-elo <int>] [--variant raw|overlay]
+                                  [--video <mp4>] [--steam-id <id>]
+                                  [--variant raw|overlay]
                                   --output <youtube_dir>
 """
 
@@ -158,8 +158,6 @@ def main() -> None:
     ap.add_argument("--player", required=True)
     ap.add_argument("--map", required=True)
     ap.add_argument("--steam-id", default="")
-    ap.add_argument("--elo", type=int, default=None, help="POV player's FACEIT ELO")
-    ap.add_argument("--opp-elo", type=int, default=None, help="Average FACEIT ELO of the opposing team")
     ap.add_argument("--kd", default=None, help="K/D line for the POV player, e.g. '38/9'")
     ap.add_argument("--background", default=None,
                     help="Reuse a cached background frame (jpg) instead of extracting from --video")
@@ -173,9 +171,11 @@ def main() -> None:
 
     from faceit_names import avatar_path, canonical_nick
 
+    from thumbnail.generator import prepare_thumb_avatar
+
     player = canonical_nick(args.player)
-    av_path = avatar_path(args.player)
-    if av_path is None:
+    av_src = avatar_path(args.player)
+    if av_src is None:
         sys.exit(f"[ERR] No avatar for {player} — style-01 needs a cutout PNG")
 
     demo = Path(args.demo_path)
@@ -185,22 +185,32 @@ def main() -> None:
 
     pairs = lobby_costars(demo, args.steam_id, player)
     costar_nicks = [n for n, _ in pairs]
-    right = pairs[0][1] if pairs else None
+    temps: list[Path] = []
+    av_path = prepare_thumb_avatar(av_src)
+    temps.append(av_path)
+    right = None
+    if pairs:
+        right = prepare_thumb_avatar(pairs[0][1])
+        temps.append(right)
     score = (args.kd or "0-0").replace("/", "-")
     sub = style01_sub(costar_nicks)
     badge = BADGE_DEFAULT if args.variant == "overlay" else ""
 
     out = out_dir / "thumbnail.jpg"
-    render_style_01(
-        bg=bg,
-        main_avatar=av_path,
-        name=player,
-        score=score,
-        dest=out,
-        sub=sub,
-        costar_right=right,
-        badge=badge,
-    )
+    try:
+        render_style_01(
+            bg=bg,
+            main_avatar=av_path,
+            name=player,
+            score=score,
+            dest=out,
+            sub=sub,
+            costar_right=right,
+            badge=badge,
+        )
+    finally:
+        for tmp in temps:
+            tmp.unlink(missing_ok=True)
     print(f"[OK] FACEIT thumbnail (style-01): {out}")
     if costar_nicks:
         print(f"  costars: {', '.join(costar_nicks)}")

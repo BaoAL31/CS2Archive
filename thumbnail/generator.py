@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
+import os
+import tempfile
 
 FONT_PATH = Path(__file__).parent.parent / "assets" / "fonts" / "Montserrat-Bold.ttf"
 
@@ -43,8 +45,20 @@ def _load_font(size: int) -> ImageFont.FreeTypeFont:
 
 def load_background(bg_path: Path) -> Image.Image:
     img = Image.open(bg_path).convert("RGB")
-    img = img.resize((WIDTH, HEIGHT), Image.LANCZOS)
-    return img
+    # Cover-crop to 16:9 around the center — never stretch or pillarbox.
+    # 4:3 POV frames (e.g. 1280x960 stretched captures) must fill the thumb
+    # like native 16:9 footage instead of gaining black side bars.
+    sw, sh = img.size
+    target = WIDTH / HEIGHT
+    if sw / sh > target:  # too wide -> crop x
+        nw = max(1, int(sh * target))
+        x0 = (sw - nw) // 2
+        img = img.crop((x0, 0, x0 + nw, sh))
+    elif sw / sh < target:  # too tall -> crop y
+        nh = max(1, int(sw / target))
+        y0 = (sh - nh) // 2
+        img = img.crop((0, y0, sw, y0 + nh))
+    return img.resize((WIDTH, HEIGHT), Image.LANCZOS)
 
 
 def cutout_player(avatar_path: Path) -> Image.Image:
@@ -104,6 +118,25 @@ def scale_player(player: Image.Image, target_height: int) -> Image.Image:
     new_w = max(1, int(w * ratio))
     new_h = max(1, int(h * ratio))
     return player.resize((new_w, new_h), Image.LANCZOS)
+
+
+def prepare_thumb_avatar(src: Path, dest: Path | None = None) -> Path:
+    """Trim + crop to chest-up + head-width scale (HLTV bodyshot framing)."""
+    player = _trim_transparent(cutout_player(Path(src)))
+    w, h = player.size
+    if h > 0 and w / h < 0.85:
+        # Full-body / seated shots: drop legs/chair, keep head + torso.
+        player = player.crop((0, 0, w, max(1, int(h * 0.62))))
+    img = scale_player(player, int(HEIGHT * AVATAR_HEIGHT_RATIO))
+    if dest is None:
+        fd, name = tempfile.mkstemp(prefix="thumb_av_", suffix=".png")
+        os.close(fd)
+        dest = Path(name)
+    else:
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+    img.save(dest, "PNG")
+    return dest
 
 
 def draw_text(

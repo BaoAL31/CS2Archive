@@ -176,78 +176,82 @@ def place_into_buffer(buf: np.ndarray, rows_sorted: list[dict], offsets: dict,
 
 # ── demo voice extraction ──────────────────────────────────────────────────
 
+def _as_steamid(value) -> str:
+    """Steam64 as a digit string. Do not go through float (IDs lose precision)."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return ""
+    try:
+        import numbers
+        if isinstance(value, numbers.Integral):
+            return str(int(value))
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none"}:
+        return ""
+    if text.endswith(".0") and text[:-2].lstrip("-").isdigit():
+        return text[:-2]
+    if text.lstrip("+-").isdigit():
+        return text.lstrip("+")
+    return text
+
+
 def load_voice(demo: Path) -> list[dict]:
     p = DemoParser(str(demo))
     rows = p.parse_voice()
     out = []
     for r in rows:
+        sid = _as_steamid(r["steamid"])
+        if not sid:
+            continue
         out.append({
             "tick": int(r["tick"]),
-            "steamid": str(r["steamid"]),
+            "steamid": sid,
             "bytes": bytes(r["bytes"]),
         })
     out.sort(key=lambda r: r["tick"])
     return out
 
 
-def load_team_map(demo: Path) -> dict[str, int]:
-    """Return {steamid: stable_team_id} for every player in the demo.
+def teammate_voice_map(
+    players: list[tuple[object, object]], pov_steamid: str,
+) -> dict[str, int]:
+    """Keep only the POV player's five. ``players`` is (steamid, team_number)."""
+    by: dict[str, int] = {}
+    for sid_raw, team in players:
+        sid = _as_steamid(sid_raw)
+        if not sid or team is None:
+            continue
+        tn = int(team)
+        if tn in (0, 1):
+            continue
+        by[sid] = tn
+    pov_team = by.get(_as_steamid(pov_steamid))
+    if pov_team is None:
+        return {}
+    return {sid: tn for sid, tn in by.items() if tn == pov_team}
 
-    ``parse_player_info().team_number`` is the CURRENT T/CT side (2=CT, 3=T),
-    which FLIPS at halftime — so it is NOT a stable team identity and cannot be
-    used to group teammates across the whole match (it would mix the POV team's
-    voice with the opponents' in one half). Here we derive a stable id from each
-    player's side in the FIRST half (before the swap). Because both teams swap
-    sides at halftime, a player's first-half side uniquely identifies their team:
-    teammates share the POV player's first-half side, opponents have the other.
+
+def load_team_map(demo: Path, steam_id: str | None = None) -> dict[str, int]:
+    """Return {steamid: team_number} for the POV player's teammates only.
+
+    ``parse_player_info().team_number`` is the current T/CT side (flips at
+    half), but the five people on the POV player's side are the same five
+    all match. Omitting everyone else drops the other team's voice packages.
     """
     p = DemoParser(str(demo))
-    # Sample the per-player side over the whole match so we can (a) detect the
-    # halftime flip and (b) read the first-half side for every player.
-    header = p.parse_header()
-    total = int(header.get("map_ticks") or 0)
-    # map_ticks may not be present; fall back to a wide tick range.
-    ticks = list(range(0, 2_000_000, 20000))
-    if total and total > 0:
-        ticks = list(range(0, total, max(1, total // 60)))
-    try:
-        side = p.parse_ticks(
-            ["CCSPlayerController.m_iTeamNum", "CCSPlayerController.m_steamID"],
-            ticks=ticks,
-        )
-    except Exception:
-        side = None
-    if side is None or side.empty:
-        # Fallback: parse_player_info snapshot (pre-halftime if we can pick the
-        # earliest). Usually this is fine when ticks aren't available.
-        info = p.parse_player_info()
-        mapping: dict[str, int] = {}
-        for _, row in info.iterrows():
-            sid = str(row.get("steamid", ""))
-            tn = row.get("team_number")
-            if sid and tn is not None and sid not in mapping:
-                mapping[sid] = int(tn)
-        return mapping
-
-    # Stable team id for each player = their side in the earliest half. We take
-    # the side at the EARLIEST sampled tick (first half) as the stable id. To be
-    # robust to edge ticks, use the mode of the first 40% of that player's rows
-    # (all pre-halftime since halftime is ~mid-match).
-    from collections import Counter
-    per_player: dict[str, list[int]] = {}
-    for _, row in side.iterrows():
-        sid = str(row.get("CCSPlayerController.m_steamID", ""))
-        tn = row.get("CCSPlayerController.m_iTeamNum")
-        if sid and tn is not None and tn not in (0,):
-            per_player.setdefault(sid, []).append(int(tn))
-
+    info = p.parse_player_info()
+    players = [(row.get("steamid"), row.get("team_number"))
+               for _, row in info.iterrows()]
+    if steam_id:
+        return teammate_voice_map(players, steam_id)
     mapping: dict[str, int] = {}
-    for sid, teams in per_player.items():
-        if not teams:
-            continue
-        half = teams[: max(1, len(teams) // 3)]  # earliest ~1/3 rows = first half
-        stable = Counter(half).most_common(1)[0][0]
-        mapping[sid] = stable
+    for sid_raw, team in players:
+        sid = _as_steamid(sid_raw)
+        if sid and team is not None and int(team) not in (0, 1):
+            mapping[sid] = int(team)
     return mapping
 
 
@@ -259,11 +263,11 @@ def pov_team_voice_seconds(demo: Path, steam_id: str) -> float:
     there is "enough" comms to warrant enabling voice (shade + comms mix).
     """
     try:
-        tm = load_team_map(demo)
+        tm = load_team_map(demo, steam_id)
     except Exception as e:  # noqa: BLE001
         print(f"[warn] pov_team_voice_seconds: could not build team map ({e}); returning 0")
         return 0.0
-    pov_team = tm.get(str(steam_id))
+    pov_team = tm.get(_as_steamid(steam_id))
     if pov_team is None:
         print(f"[warn] pov_team_voice_seconds: POV steamid {steam_id} not in team map")
         return 0.0
@@ -350,14 +354,23 @@ def main() -> None:
     if not rows:
         print("[voice] no voice data in demo")
         sys.exit(1)
-    team_map = load_team_map(demo)
-    pov_team = team_map.get(args.steam_id)
+    pov_sid = _as_steamid(args.steam_id)
+    team_map = load_team_map(demo, pov_sid)
+    pov_team = team_map.get(pov_sid)
     if pov_team is None:
         print(f"[voice] steam id {args.steam_id} not found in demo player info")
         sys.exit(1)
-    team_rows = [r for r in rows if team_map.get(r["steamid"]) == pov_team]
+    keep = set(team_map)
+    team_rows = [r for r in rows if r["steamid"] in keep]
+    dropped: dict[str, int] = {}
+    for r in rows:
+        if r["steamid"] not in keep:
+            dropped[r["steamid"]] = dropped.get(r["steamid"], 0) + 1
     print(f"[voice] {len(rows)} voice packets total, "
-          f"{len(team_rows)} from POV team (team {pov_team})")
+          f"{len(team_rows)} from POV team (team {pov_team}, {len(keep)} players)")
+    if dropped:
+        parts = ", ".join(f"{sid} ({n} pkts)" for sid, n in sorted(dropped.items()))
+        print(f"[voice] dropped other-team packages: {parts}")
     if not team_rows:
         print(f"[ERROR] No voice data for the POV team (team {pov_team}) in {demo.name}. "
               f"Voice comms/indicators require per-player voice in the demo. "

@@ -14,6 +14,7 @@ generator, and the util-cam flight renderer.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -42,8 +43,24 @@ CS2_APP_ID = "730"
 STEAM_DIR = Path(r"D:\Steam")
 CS2_GAME_DIR = STEAM_DIR / "steamapps" / "common" / "Counter-Strike Global Offensive"
 CSDM_SETTINGS = Path.home() / ".csdm" / "settings.json"
-_OVERLAY_DLLS = ("GameOverlayRenderer64.dll", "GameOverlayRenderer.dll")
-_STEAM_LAUNCH_FLAGS = ("-steam", "-insecure")
+_OVERLAY_DLLS = (
+    "GameOverlayRenderer64.dll",
+    "GameOverlayRenderer.dll",
+    "SteamOverlayVulkanLayer64.dll",
+    "SteamOverlayVulkanLayer.dll",
+)
+_STEAM_LAUNCH_FLAGS = (
+    "-steam",
+    "-insecure",
+    "-allow_third_party_software",
+)
+_APPID_BYTES = b"730\n"
+_APPID_OK = {b"730", b"730\n", b"730\r\n"}
+_STEAM_OVERLAY_ENV = {
+    "DISABLE_VK_LAYER_VALVE_steam_overlay_1": "1",
+    "SteamAppId": CS2_APP_ID,
+    "SteamGameId": CS2_APP_ID,
+}
 
 
 def _taskkill_tree(image_name: str) -> bool:
@@ -80,20 +97,24 @@ def _steam_appid_dirs(game_dir: Path) -> list[Path]:
 
 
 def ensure_steam_appid(game_dir: Path = CS2_GAME_DIR) -> list[Path]:
-    """Write steam_appid.txt (730) next to cs2.exe so SteamAPI will not relaunch."""
+    """Write steam_appid.txt (730) next to cs2.exe so SteamAPI will not relaunch.
+
+    Compared as raw bytes: a trailing NUL (CS2/SteamAPI C-string write) is not
+    ``730`` and must be rewritten. ``read_text`` can hide that NUL.
+    """
     written: list[Path] = []
     for folder in _steam_appid_dirs(game_dir):
         if not folder.is_dir():
             continue
         path = folder / "steam_appid.txt"
         try:
-            current = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+            current = path.read_bytes() if path.is_file() else b""
         except OSError:
-            current = ""
-        if current.strip().split()[0:1] == [CS2_APP_ID]:
+            current = b""
+        if current in _APPID_OK:
             continue
         try:
-            path.write_text(CS2_APP_ID + "\n", encoding="ascii")
+            path.write_bytes(_APPID_BYTES)
         except OSError as e:
             print(f"  [WARN] steam_appid.txt {path}: {e}", flush=True)
             continue
@@ -101,29 +122,45 @@ def ensure_steam_appid(game_dir: Path = CS2_GAME_DIR) -> list[Path]:
     return written
 
 
+def _overlay_search_dirs(steam_dir: Path) -> list[Path]:
+    return [steam_dir, steam_dir / "bin"]
+
+
+def _live_overlay_dlls(steam_dir: Path) -> list[str]:
+    live: list[str] = []
+    for folder in _overlay_search_dirs(steam_dir):
+        for name in _OVERLAY_DLLS:
+            if (folder / name).is_file():
+                live.append(name)
+    return live
+
+
 def block_steam_overlay(steam_dir: Path = STEAM_DIR) -> list[Path]:
     """Rename Steam overlay DLLs so they cannot inject into cs2.exe."""
     blocked: list[Path] = []
     if sys.platform != "win32" or not steam_dir.is_dir():
         return blocked
-    for name in _OVERLAY_DLLS:
-        src = steam_dir / name
-        dst = steam_dir / (name + ".blocked")
-        if not src.is_file():
+    for folder in _overlay_search_dirs(steam_dir):
+        if not folder.is_dir():
             continue
-        try:
-            if dst.is_file():
-                dst.unlink()
-            src.replace(dst)
-        except OSError as e:
-            print(f"  [WARN] could not block {src.name}: {e}", flush=True)
-            continue
-        blocked.append(dst)
+        for name in _OVERLAY_DLLS:
+            src = folder / name
+            dst = folder / (name + ".blocked")
+            if not src.is_file():
+                continue
+            try:
+                if dst.is_file():
+                    dst.unlink()
+                src.replace(dst)
+            except OSError as e:
+                print(f"  [WARN] could not block {src}: {e}", flush=True)
+                continue
+            blocked.append(dst)
     return blocked
 
 
 def ensure_csdm_steam_launch(settings_path: Path = CSDM_SETTINGS) -> bool:
-    """Append -steam -insecure to CSDM playback.launchParameters (HLAE cmdLine)."""
+    """Keep HLAE CS2 flags on CSDM playback.launchParameters (appended to -cmdLine)."""
     if not settings_path.is_file():
         return False
     try:
@@ -138,6 +175,9 @@ def ensure_csdm_steam_launch(settings_path: Path = CSDM_SETTINGS) -> bool:
         if flag not in tokens:
             tokens.append(flag)
             changed = True
+    if "+sv_lan" not in tokens:
+        tokens.extend(["+sv_lan", "1"])
+        changed = True
     if not changed:
         return False
     playback["launchParameters"] = " ".join(tokens)
@@ -147,6 +187,21 @@ def ensure_csdm_steam_launch(settings_path: Path = CSDM_SETTINGS) -> bool:
         print(f"  [WARN] CSDM settings.json: {e}", flush=True)
         return False
     return True
+
+
+def _csdm_launch_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(_STEAM_OVERLAY_ENV)
+    return env
+
+
+def _warn_rtss() -> None:
+    if _process_running("RTSS.exe") or _process_running("MSIAfterburner.exe"):
+        print(
+            "  [WARN] RTSS/Afterburner is running — RTSSHooks64.dll hooks DXGI "
+            "Present and fights HLAE (listed in trustedlaunch.cfg)",
+            flush=True,
+        )
 
 
 def prepare_steam_hlae(
@@ -159,15 +214,25 @@ def prepare_steam_hlae(
     appids = ensure_steam_appid(game_dir)
     overlay = block_steam_overlay(steam_dir)
     launch = ensure_csdm_steam_launch(settings_path)
-    if appids or overlay or launch:
-        bits = []
-        if appids:
-            bits.append(f"steam_appid.txt x{len(appids)}")
-        if overlay:
-            bits.append("overlay DLLs blocked")
-        if launch:
-            bits.append("CSDM -steam -insecure")
-        print(f"  [HLAE] Steam preflight: {', '.join(bits)}", flush=True)
+    still_live = _live_overlay_dlls(steam_dir) if steam_dir.is_dir() else []
+    bits = []
+    if appids:
+        bits.append(f"steam_appid.txt x{len(appids)}")
+    if overlay:
+        bits.append("overlay DLLs blocked")
+    if launch:
+        bits.append("CSDM -steam -insecure +sv_lan 1")
+    if still_live:
+        bits.append(f"STILL LIVE {', '.join(still_live)}")
+        print(
+            f"  [WARN] Steam overlay DLL still present (injects when Steam is online): "
+            f"{', '.join(still_live)}",
+            flush=True,
+        )
+    if not bits:
+        bits.append("ok")
+    print(f"  [HLAE] Steam preflight: {', '.join(bits)}", flush=True)
+    _warn_rtss()
 
 
 def kill_stale_processes() -> None:
@@ -274,11 +339,13 @@ def run_csdm_hook_aware(
     last_err = ""
     print(f"  [{label}] pre-launch cleanup of stale render processes...", flush=True)
     kill_stale_processes()
-    prepare_steam_hlae()
     for attempt in range(1, hook_retries + 2):
         suffix = f" (attempt {attempt}/{hook_retries + 1})" if hook_retries else ""
         print(f"  [{label}]{suffix}...", end=" ", flush=True)
         t0 = time.time()
+        if attempt > 1:
+            kill_stale_processes()
+        prepare_steam_hlae()
 
         if on_attempt_start:
             try:
@@ -297,6 +364,7 @@ def run_csdm_hook_aware(
             with open(log_path, "w", encoding="utf-8") as logf:
                 proc = subprocess.Popen(
                     cmd, stdout=logf, stderr=subprocess.STDOUT, text=True,
+                    env=_csdm_launch_env(),
                 )
 
                 # Poll for the hook to engage (a new video appears) or the

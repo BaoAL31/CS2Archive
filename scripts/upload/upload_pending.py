@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -82,6 +83,74 @@ def find_pending(youtube_dir: Path, also_bilibili: bool = False) -> list[Path]:
             continue
         pending.append(meta_path)
     return pending
+
+
+def _run_id_for_meta_dir(meta_dir: Path) -> str:
+    """youtube/{run_id}[_overlay]/ -> {run_id} (matches .pipeline/{run_id}.json)."""
+    name = meta_dir.name
+    if name.endswith("_overlay"):
+        name = name[: -len("_overlay")]
+    return name
+
+
+def _sibling_metas_pending(run_id: str, youtube_root: Path,
+                           also_bilibili: bool) -> list[str]:
+    """Pending meta dirs (raw + overlay variants) sharing this run_id."""
+    pending: list[str] = []
+    for cand in (youtube_root / run_id, youtube_root / f"{run_id}_overlay"):
+        meta_path = cand / "upload_meta.json"
+        if not meta_path.is_file():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if _needs_upload(meta, also_bilibili):
+            pending.append(cand.name)
+    return pending
+
+
+def maybe_purge_renders(meta_path: Path, also_bilibili: bool,
+                        dry_run: bool = False) -> None:
+    """Delete renders/pov-* once EVERY variant of the run is uploaded.
+
+    Render intermediates are the only repair path (re-overlay, re-scale),
+    so purge only when neither raw nor overlay variant still needs uploading.
+    The render dir comes from .pipeline/{run_id}.json (written by pipeline.py).
+    """
+    meta_dir = meta_path.parent
+    # youtube_root: parent of the variant dir, unless --dir pointed deeper.
+    youtube_root = meta_dir.parent
+    run_id = _run_id_for_meta_dir(meta_dir)
+    still = _sibling_metas_pending(run_id, youtube_root, also_bilibili)
+    if still:
+        print(f"  [keep-renders] {run_id}: still pending: {', '.join(still)}")
+        return
+    state_path = PROJECT_ROOT / ".pipeline" / f"{run_id}.json"
+    render_dir = None
+    if state_path.is_file():
+        try:
+            render_dir = (json.loads(state_path.read_text(encoding="utf-8"))
+                            .get("data", {}).get("render_dir"))
+        except Exception:
+            render_dir = None
+    if not render_dir:
+        return
+    rd = Path(render_dir)
+    if not rd.is_absolute():
+        rd = PROJECT_ROOT / rd
+    if not rd.exists():
+        return
+    if dry_run:
+        print(f"  [dry-run] would purge renders: {rd.name}")
+        return
+    try:
+        freed = sum(f.stat().st_size for f in rd.rglob("*") if f.is_file())
+        shutil.rmtree(rd)
+        print(f"  [purge-renders] removed {rd.name}/ "
+              f"({freed / 1e9:.1f} GB) — all variants uploaded")
+    except OSError as e:
+        print(f"  [WARN] render purge failed (non-fatal): {e}")
 
 
 def upload_one(meta_path: Path, meta: dict, dry_run: bool, also_bilibili: bool) -> bool:
@@ -193,6 +262,14 @@ def main() -> None:
         help="Base delay in seconds before the first retry; delay grows linearly "
              "per attempt (default: 10).")
     parser.add_argument(
+        "--purge-renders", dest="purge_renders", action="store_true",
+        default=True,
+        help="Delete renders/pov-* once every variant of the run is uploaded "
+             "(default: on).")
+    parser.add_argument(
+        "--keep-renders", dest="purge_renders", action="store_false",
+        help="Keep render intermediates after upload (repair path).")
+    parser.add_argument(
         "--check-schedule", action="store_true",
         help="Show next available YouTube publish slot and exit")
     args = parser.parse_args()
@@ -260,6 +337,11 @@ def main() -> None:
 
         if uploaded_ok:
             ok += 1
+            if args.purge_renders and not args.dry_run:
+                try:
+                    maybe_purge_renders(meta_path, args.also_bilibili)
+                except Exception as e:
+                    print(f"  [WARN] post-upload purge failed (non-fatal): {e}")
         elif not args.dry_run:
             failed += 1
 

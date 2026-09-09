@@ -36,6 +36,7 @@ import asyncio
 import json
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -58,6 +59,42 @@ DEMO_DIR = ROOT / "demos" / "faceit"
 PY = sys.executable
 DEFAULT_PICKS = 3
 DEFAULT_HOURS = 24
+# Only used when FACEIT history has not caught up yet after a successful
+# download. Must match the pick's map in the filename and be freshly written.
+_HISTORY_LAG_S = 180
+
+
+def fallback_demo_if_history_lagged(
+    map_name: str,
+    *,
+    demo_dir: Path = DEMO_DIR,
+    now: float | None = None,
+    demos: list[Path] | None = None,
+) -> Path | None:
+    """Newest .dem that looks like this map and was written in the last few minutes.
+
+    Used only after a *successful* download whose match-id is not in history
+    yet. Never grab an older leftover (e.g. last night's Mirage for today's
+    Dust2 timeout).
+    """
+    token = str(map_name or "").replace("de_", "").strip().lower()
+    if not token:
+        return None
+    stamp = time.time() if now is None else now
+    newest: Path | None = None
+    newest_mtime = 0.0
+    for path in (demos if demos is not None else demo_dir.glob("*.dem")):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if mtime < stamp - _HISTORY_LAG_S:
+            continue
+        if token not in path.name.lower():
+            continue
+        if newest is None or mtime > newest_mtime:
+            newest, newest_mtime = path, mtime
+    return newest
 
 
 # ---------- selection ----------
@@ -360,6 +397,7 @@ def download_and_backlog(picks: list[dict]) -> None:
             print(f"[DL] {mid} already on disk: {demo}")
         else:
             print(f"[DL] {mid} ({c['map']}) ...")
+            download_ok = False
             try:
                 r = subprocess.run(
                     [PY, str(ROOT / "main.py"), "faceit", "match", mid],
@@ -367,18 +405,20 @@ def download_and_backlog(picks: list[dict]) -> None:
                     text=True, encoding="utf-8", errors="replace")
                 out = r.stdout or ""
                 if out:
-                    print("\n".join(out.splitlines()[-4:]))
+                    safe = "\n".join(out.splitlines()[-4:]).encode(
+                        sys.stdout.encoding or "utf-8", errors="replace").decode(
+                        sys.stdout.encoding or "utf-8", errors="replace")
+                    print(safe)
                 if r.returncode != 0:
                     err = (r.stderr or "").strip().splitlines()[-1:] or ["download failed"]
                     print(f"  [ERR] download exited {r.returncode}: {err[0]}")
+                else:
+                    download_ok = True
             except Exception as e:
                 print(f"  [ERR] download failed: {e}")
             demo = is_already_downloaded(mid, DemoSource.FACEIT)
-        if demo is None:
-            # fallback: newest .dem (history may lag the browser scrape)
-            candidates = sorted(DEMO_DIR.glob("*.dem"),
-                                key=lambda p: p.stat().st_mtime, reverse=True)
-            demo = candidates[0] if candidates else None
+            if demo is None and download_ok:
+                demo = fallback_demo_if_history_lagged(str(c.get("map") or ""))
         if not demo:
             print(f"  [ERR] demo not located for {mid}")
             continue
@@ -396,7 +436,10 @@ def download_and_backlog(picks: list[dict]) -> None:
                 cmd += ["--map", map_name]
             r = subprocess.run(
                 cmd, cwd=str(ROOT), timeout=1200, capture_output=True, text=True)
-            print("\n".join(r.stdout.splitlines()[-6:]))
+            safe = "\n".join(r.stdout.splitlines()[-6:]).encode(
+                sys.stdout.encoding or "utf-8", errors="replace").decode(
+                sys.stdout.encoding or "utf-8", errors="replace")
+            print(safe)
         except Exception as e:
             print(f"  [ERR] backlog failed: {e}")
 

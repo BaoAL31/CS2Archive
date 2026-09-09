@@ -87,6 +87,16 @@ def test_concat_gap_detected() -> None:
             assert "gap" in str(e).lower()
 
 
+def test_concat_voided_round_allows_gap() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = Path(tmp)
+        _make_fake_round(folder, "round-001-tick-1-to-2.mp4")
+        _make_fake_round(folder, "round-003-tick-3-to-4.mp4")
+        (folder / ".voided_rounds.json").write_text("[2]", encoding="utf-8")
+        concat_rounds.concat_rounds(folder)
+        assert (folder / "combined.mp4").exists()
+
+
 def test_concat_overlap_detected() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         folder = Path(tmp)

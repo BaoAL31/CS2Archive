@@ -10,11 +10,7 @@ from thumbnail.generator import (
     FONT_SIZES,
     FONT_PATH,
     AVATAR_HEIGHT_RATIO,
-    SHADOW_COLOR,
-    SHADOW_OFFSET,
-    STROKE_WIDTH,
     TEXT_COLOR,
-    _load_font,
     cutout_player,
     draw_text,
     load_background,
@@ -22,22 +18,11 @@ from thumbnail.generator import (
 )
 
 LINE_GAP = 1.15
-ELO_TAG_SIZE_KEY = "tiny"
-ELO_TAG_GAP = 6
 LOGO_SLOT_TOP_GAP = 26  # px breathing room above the tournament logo
 
 
 def _line_height(size: int) -> int:
     return int(size * LINE_GAP)
-
-
-def _elo_row_height(size: int) -> int:
-    """Full height of the ELO row including the tag line beneath it.
-
-    Keeps the same pitch as two normal rows so the following line (map name)
-    stays in place; only the tag line's position inside the row changes.
-    """
-    return _line_height(size) + _line_height(FONT_SIZES[ELO_TAG_SIZE_KEY]) + ELO_TAG_GAP
 
 
 def _draw_pill(
@@ -126,99 +111,6 @@ def _draw_overlay_badge(img: Image.Image) -> None:
     )
 
     img.paste(overlay, (0, 0), overlay)
-
-
-def _draw_text_custom(
-    draw: ImageDraw.ImageDraw,
-    text: str,
-    x: int,
-    y: int,
-    font,
-    fill: tuple,
-    anchor: str = "mm",
-) -> None:
-    """Draw stroked text with a custom fill (draw_text is white-only)."""
-    draw.text(
-        (x + SHADOW_OFFSET, y + SHADOW_OFFSET), text, font=font,
-        fill=SHADOW_COLOR, anchor=anchor,
-        stroke_width=STROKE_WIDTH, stroke_fill=SHADOW_COLOR,
-    )
-    draw.text(
-        (x, y), text, font=font, fill=fill, anchor=anchor,
-        stroke_width=STROKE_WIDTH, stroke_fill=SHADOW_COLOR,
-    )
-
-
-def _draw_elo_line(
-    draw: ImageDraw.ImageDraw,
-    elo: int,
-    opp_elo: int,
-    x: int,
-    y: int,
-    font_size: int,
-) -> None:
-    """Two-tone ELO line: POV player's ELO highlighted, opponent avg white.
-
-    Layout::
-
-        5512 vs ~3740s
-         (ELO)
-
-    The POV player's ELO is always the highlighted (fav) number on the LEFT and
-    carries the ``(ELO)`` tag beneath it. The opponent's average is shown inline
-    as ``~<avg>s`` on the RIGHT (self-labelled, so no separate ``(AVG)`` tag).
-    The opponent being higher-rated does NOT swap which side is highlighted —
-    the POV player is the subject of the video.
-    """
-    fav_fill = (250, 90, 30, 255)     # red/orange accent
-    dog_fill = (255, 255, 255, 255)
-    mid_fill = (220, 220, 220, 255)
-    tag_fill = (235, 235, 235, 255)
-
-    font = _load_font(font_size)
-    tag_size = FONT_SIZES[ELO_TAG_SIZE_KEY]
-    small_font = _load_font(tag_size)
-
-    def _w(f, t: str) -> int:
-        b = draw.textbbox((0, 0), t, font=f)
-        return b[2] - b[0]
-
-    mid = " vs "
-    elo_tag = "(ELO)"
-    opp_str = f"~{opp_elo}s"
-
-    # POV player's ELO always on the left (highlighted); opponent avg on right.
-    left_str, right_str = str(elo), opp_str
-    left_fill, right_fill = fav_fill, dog_fill
-
-    # Pad the shorter side so both numbers take equal width, keeping "vs"
-    # centered exactly on ``x``.
-    def _pad_side(shorter: str, target_w: int) -> str:
-        sp_w = max(1, _w(font, " ")) or 1
-        pad = " " * max(0, round((target_w - _w(font, shorter)) / sp_w))
-        return shorter if not pad else pad + shorter
-
-    wl, wm, wr = _w(font, left_str), _w(font, mid), _w(font, right_str)
-    if wl < wr:
-        left_str = _pad_side(left_str, wr)
-    elif wr < wl:
-        right_str = _pad_side(right_str, wl)
-    wl, wm, wr = _w(font, left_str), _w(font, mid), _w(font, right_str)
-    total = wl + wm + wr
-    left = x - total // 2
-
-    lx = left + wl // 2
-    mx = left + wl + wm // 2
-    rx = left + wl + wm + wr // 2
-
-    _draw_text_custom(draw, left_str, lx, y, font, left_fill)
-    _draw_text_custom(draw, mid, mx, y, font, mid_fill)
-    _draw_text_custom(draw, right_str, rx, y, font, right_fill)
-
-    # Tag line beneath the numbers: (ELO) under the player's number only.
-    # The opponent average is now self-labelled ("~3257s"), so no (AVG) tag.
-    tag_y = y + font_size - ELO_TAG_GAP
-    _draw_text_custom(draw, elo_tag, mx, tag_y, small_font, tag_fill)
 
 
 def _draw_text_scrim(img: Image.Image) -> None:
@@ -321,83 +213,17 @@ def generate(
     if tournament_logo is not None:
         lines.append((None, FONT_SIZES["tiny"], TEXT_COLOR, LOGO_SLOT_TOP_GAP))
 
-    total = sum(_line_height(s) for _, s, _f, _g in lines)
-    current_y = text_y_center - total // 2
-
-    for text, size, fill, gap in lines:
-        current_y += gap
+    heights = [_line_height(s) for _, s, _f, _g in lines]
+    total = sum(heights) + sum(g for _, _, _, g in lines)
+    # anchor="mm" draws around the given CENTER, so y is the row middle.
+    cursor = text_y_center - total // 2
+    for (text, size, fill, gap), h in zip(lines, heights):
+        cursor += gap
         if text is None and tournament_logo is not None:
-            _draw_tournament_logo(bg, tournament_logo, text_x, current_y)
+            _draw_tournament_logo(bg, tournament_logo, text_x, cursor)
         else:
-            draw_text(draw, text, text_x, current_y, size, anchor="mm", fill=fill)
-        current_y += _line_height(size)
-
-    if variant == "overlay":
-        _draw_overlay_badge(bg)
-
-    return bg
-
-
-def generate_faceit(
-    bg_path: Path,
-    player_name: str,
-    map_name: str,
-    elo: int | None = None,
-    opp_elo: int | None = None,
-    kd: str | None = None,
-    variant: str = "raw",
-    avatar_path: Path | None = None,
-) -> Image.Image:
-    """FACEIT thumbnail: blurred kill-frame background + text overlay.
-
-    Avatar is composited when available (mirrors the HLTV layout). FACEIT
-    demos carry no HLTV-style ratings, so instead of a ratings line the POV
-    player's K/D and ELO vs the opposing team's average ELO are shown when
-    provided (e.g. "38/9" then "5512 vs 3470").
-    """
-    bg = load_background(bg_path)
-
-    if avatar_path is not None:
-        try:
-            player_img = cutout_player(avatar_path)
-            target_h = int(HEIGHT * AVATAR_HEIGHT_RATIO)
-            player_img = scale_player(player_img, target_h)
-            pw, ph = player_img.size
-            px = 48
-            py = HEIGHT - ph + 40  # clear the overlay pills (hair was under badge)
-            bg.paste(player_img, (px, py), player_img)
-        except Exception as e:
-            print(f"  [WARN] faceit avatar composite failed: {e}")
-
-    draw = ImageDraw.Draw(bg)
-
-    # Soft dark gradient behind the right text block so text pops on a busy bg.
-    _draw_text_scrim(bg)
-
-    text_x = int(WIDTH * 0.68)
-    text_y_center = HEIGHT // 2
-    lines = [
-        (player_name, FONT_SIZES["player"]),
-    ]
-    if kd:
-        lines.append((kd, FONT_SIZES["stat"]))
-    elo_size = FONT_SIZES["stat"]
-    if elo is not None and opp_elo is not None:
-        lines.append((None, elo_size))
-    lines.append((map_name, FONT_SIZES["small"]))
-
-    total = sum(
-        _elo_row_height(s) if text is None else _line_height(s)
-        for text, s in lines
-    )
-    current_y = text_y_center - total // 2
-    for text, size in lines:
-        if text is None:
-            _draw_elo_line(draw, elo, opp_elo, text_x, current_y, size)
-            current_y += _elo_row_height(size)
-        else:
-            draw_text(draw, text, text_x, current_y, size, anchor="mm")
-            current_y += _line_height(size)
+            draw_text(draw, text, text_x, cursor + h // 2, size, anchor="mm", fill=fill)
+        cursor += h
 
     if variant == "overlay":
         _draw_overlay_badge(bg)

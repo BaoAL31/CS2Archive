@@ -26,7 +26,7 @@ def test_html_matches_proof_css():
     assert "height: 720px" in html
     assert "font-size: 84px" in html
     assert "font-size: 142px" in html
-    assert "width: 480px; height: 640px; left: 130px; bottom: -22px" in html
+    assert "width: auto; height: 680px; left: 36px; bottom: -28px" in html
     assert "width: 300px; height: 400px; left: -20px; bottom: -14px" in html
     assert "width: 300px; height: 400px; left: 520px; bottom: -14px" in html
     assert "#efc34f" in html

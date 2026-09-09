@@ -54,8 +54,52 @@ def cameras_for_util_type(util_type: str) -> str:
     return "flight,detonate" if str(util_type).lower() in SMOKE_CAMERAS else "flight"
 
 
+# Below the byte floor but above this, ask ffprobe — short flash/HE flights
+# are legitimately small (e.g. 119 frames / 993 KB) and must not be rejected.
+MIN_PROBE_BYTES = 50_000
+MIN_PROBE_FRAMES = 10
+
+
+def _clip_has_frames(path: Path) -> bool:
+    """True when ffprobe sees a decodable video stream with frames."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=nb_frames,avg_frame_rate,duration",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        streams = json.loads(r.stdout).get("streams", [])
+        if not streams:
+            return False
+        s = streams[0]
+        try:
+            n = int(s.get("nb_frames") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n >= MIN_PROBE_FRAMES:
+            return True
+        # nb_frames often missing for h264 — fall back to duration × fps.
+        try:
+            num, den = (s.get("avg_frame_rate", "0/1").split("/") + ["1"])[:2]
+            fps = float(num) / float(den) if float(den) else 0.0
+            dur = float(s.get("duration") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        return dur * fps >= MIN_PROBE_FRAMES
+    except Exception:
+        return False
+
+
 def clip_is_done(path: Path, min_bytes: int = MIN_CLIP_BYTES) -> bool:
-    return path.is_file() and path.stat().st_size >= min_bytes
+    if not path.is_file():
+        return False
+    size = path.stat().st_size
+    if size >= min_bytes:
+        return True
+    if size >= MIN_PROBE_BYTES and _clip_has_frames(path):
+        return True
+    return False
 
 
 def _pip_body(video_height: int, max_simultaneous: int | None = None) -> int:

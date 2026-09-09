@@ -48,6 +48,13 @@ PROJECT_ROOT = ensure()
 
 from assign_playlist import normalize_playlist_name
 from config import settings, apply_runtime_env
+from round_windows import (
+    DEADAIR_SPAN_TICKS,
+    dump_round_windows,
+    load_voided_rounds,
+    plan_round_windows,
+    write_voided_rounds,
+)
 
 apply_runtime_env()
 from huggingface_hub import hf_hub_download
@@ -247,6 +254,83 @@ def _parse_backlog(path: str) -> dict:
 
     return meta
 
+
+DEATH_CUT_TICKS = 256  # 4s of post-death action -> director cuts away
+RESTART_GAP_TICKS = 2_880  # 45s after a restart-marker cluster = voided attempt
+
+
+def _kill_list(data: dict) -> list[dict]:
+    kills = data.get("kills", [])
+    if isinstance(kills, dict):
+        kills = list(kills.values())
+    return [k for k in kills if isinstance(k, dict)]
+
+
+def flag_round_risks(data: dict, pov_names: set[str]) -> list[str]:
+    """Warn-only scan for rounds that will break/surprise the render.
+
+    - Oversize spans (halftime/tech dead air): HLAE emits "Raw files not
+      found" on huge sequences — trim to the action window instead.
+    - POV death long before the last kill: the auto-director cuts to a
+      teammate and no working lock exists on current builds (see gotchas).
+    - Restart-marker clusters (simultaneous self-kills) followed by a long
+      gap: voided tech attempt inside the span — review trim_manifest.
+    Returns human-readable warnings; never fails.
+    """
+    names = {str(n).casefold() for n in pov_names if n}
+    rounds = {}
+    for r in data.get("rounds", []):
+        try:
+            rounds[int(r.get("number"))] = (int(r.get("startTick", 0)),
+                                              int(r.get("endTick", 0)))
+        except (TypeError, ValueError):
+            continue
+    real: dict[int, list[int]] = {}
+    markers: dict[int, list[int]] = {}
+    for k in _kill_list(data):
+        try:
+            rn, tick = int(k.get("roundNumber")), int(k.get("tick"))
+        except (TypeError, ValueError):
+            continue
+        if not tick:
+            continue
+        if (k.get("killerName") or "") == (k.get("victimName") or ""):
+            markers.setdefault(rn, []).append(tick)
+        else:
+            entry = (tick, str(k.get("victimName") or "").casefold())
+            real.setdefault(rn, []).append(entry)
+    warns: list[str] = []
+    for rn, (a, b) in sorted(rounds.items()):
+        ticks = sorted(t for t, _ in real.get(rn, []))
+        if b - a > DEADAIR_SPAN_TICKS:
+            warns.append(
+                f"round {rn}: span {a}-{b} ({(b - a) / 64:.0f}s) — halftime/tech "
+                f"dead air, HLAE will fail; trim to action window")
+        deaths = sorted(t for t, v in real.get(rn, []) if v in names)
+        if deaths and ticks and ticks[-1] - deaths[0] > DEATH_CUT_TICKS:
+            warns.append(
+                f"round {rn}: POV dies at {deaths[0]}, action runs to "
+                f"{ticks[-1]} ({(ticks[-1] - deaths[0]) / 64:.0f}s later) — "
+                f"director will cut away, no working lock on current build")
+        clust = {}
+        for t in markers.get(rn, []):
+            clust[t] = clust.get(t, 0) + 1
+        seen_first_cluster = False
+        for t, n in sorted(clust.items()):
+            if n < 3 or not (a + 128 < t < b - 128):
+                continue
+            if not seen_first_cluster:
+                # Earliest cluster = legitimate round-start markers
+                # (e.g. after halftime); only later clusters are restarts.
+                seen_first_cluster = True
+                continue
+            after = [x for x in ticks if x > t]
+            if after and after[0] - t > RESTART_GAP_TICKS:
+                warns.append(
+                    f"round {rn}: {n}x restart markers at {t}, next action "
+                    f"{(after[0] - t) / 64:.0f}s later — possible voided "
+                    f"tech attempt, review trim_manifest")
+    return warns
 
 class Pipeline:
     def __init__(self, args):
@@ -508,6 +592,16 @@ class Pipeline:
             print(f"  [warn] failed to set up log redirection to {log_path}: {exc}")
         return log_path
 
+    def should_purge_after_run(self) -> bool:
+        """True only when renders may be deleted at end of run.
+
+        Requires reaching at least step 6 (thumbnail — the youtube video
+        exists) AND an explicit --cleanup. Partial --until N runs and
+        default runs keep renders (repair path; upload_pending.py purges
+        after every variant is uploaded).
+        """
+        return self.end_step >= 6 and not getattr(self.args, "no_cleanup", True)
+
     def run(self) -> None:
         log_path = PROJECT_ROOT / "logs" / f"{self.run_id}.log"
         print(f"Pipeline log -> {log_path.resolve()}")
@@ -533,14 +627,25 @@ class Pipeline:
                 fail(step_num, f"STEP_{step_name.upper()}_EXCEPTION",
                      f"{e} | {tb.strip().splitlines()[-1] if tb else ''}")
 
-        print(f"\n  [OK] Pipeline complete -> {self.youtube_dir}/")
-        # Video is youtube-ready (thumbnail + upload_meta written): the render
-        # folder is pure dead weight now — purge it unless opted out.
-        print("\n  [cleanup] purging render intermediates...")
-        try:
-            self._purge_render_intermediates(full=True)
-        except Exception as e:
-            print(f"  [WARN] post-run cleanup failed (non-fatal): {e}")
+        if self.should_purge_after_run():
+            print(f"\n  [OK] Pipeline complete -> {self.youtube_dir}/")
+            # Render cleanup moved to post-upload (upload_pending.py purges
+            # renders/pov-* once every variant is uploaded). The render folder
+            # is the only repair path (re-overlay, re-scale), so the pipeline
+            # keeps it by default; pass --cleanup for the old purge-at-end
+            # behavior (or run step 7).
+            print("\n  [cleanup] purging render intermediates...")
+            try:
+                self._purge_render_intermediates(full=True)
+            except Exception as e:
+                print(f"  [WARN] post-run cleanup failed (non-fatal): {e}")
+        elif self.end_step >= 6:
+            print(f"\n  [OK] Pipeline complete -> {self.youtube_dir}/")
+            print(f"\n  [keep-renders] {self.render_dir.name}/ kept — "
+                  f"purged after upload by upload_pending.py")
+        else:
+            print(f"\n  [OK] Steps {self.start_step}-{self.end_step} done; "
+                  f"youtube video not ready yet — keeping render intermediates.")
 
     def _run_py(self, args: list[str], **kwargs):
         env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
@@ -548,6 +653,7 @@ class Pipeline:
         if kwargs.get("text") and "encoding" not in kwargs:
             kwargs["encoding"] = "utf-8"
         return subprocess.run([PY] + args, **kwargs)
+
 
     # ── Step 1: Analyze ──────────────────────────────────────────────────
 
@@ -597,6 +703,34 @@ class Pipeline:
             analysis_path = self.render_dir / "csdm_analysis.json"
             analysis_path.write_text(json.dumps(data), encoding="utf-8")
             self.state["data"]["analysis_json"] = str(analysis_path)
+            # Warn-only risk scan (dead-air spans, post-death director cuts,
+            # voided tech attempts) — surfaces problems BEFORE the render
+            # burns hours. Never fails the step.
+            pov_names = {(self.meta.get("player") or "").strip()}
+            for pl in data.get("players", []):
+                if str(pl.get("steamId")) == str(self.steam_id):
+                    pov_names.add((pl.get("name") or "").strip())
+            risks = flag_round_risks(data, pov_names)
+            for w in risks:
+                print(f"  [risk] {w}")
+            if risks:
+                print(f"  [risk] {len(risks)} round risk(s) flagged — review before render")
+            self.state["data"]["round_risks"] = risks
+            windows = plan_round_windows(data)
+            dump_round_windows(windows, self.render_dir / "round_windows.json")
+            skipped = [w for w in windows if w.skip]
+            trimmed = [w for w in windows if w.trimmed]
+            for w in skipped:
+                print(f"  [skip] round {w.number}: {w.reason}")
+            for w in trimmed:
+                print(f"  [trim] round {w.number}: {w.reason} "
+                      f"(ticks {w.start_tick}-{w.end_tick})")
+            if skipped or trimmed:
+                print(f"  [ok] {len(skipped)} voided round(s) skipped, "
+                      f"{len(trimmed)} oversize round(s) trimmed for HLAE")
+            write_voided = {w.number for w in skipped}
+            write_voided_rounds(self.render_dir, write_voided)
+            self.state["data"]["voided_rounds"] = sorted(write_voided)
 
     # ── Step 2: Render ───────────────────────────────────────────────────
 
@@ -703,7 +837,9 @@ class Pipeline:
 
         if round_files:
             nums = [int(round_re.match(f.name).group(1)) for f in round_files]
-            missing = [n for n in range(1, (round_count or max(nums)) + 1) if n not in set(nums)]
+            voided = load_voided_rounds(self.render_dir)
+            missing = [n for n in range(1, (round_count or max(nums)) + 1)
+                       if n not in set(nums) and n not in voided]
             total_mb = sum(f.stat().st_size for f in round_files) / 1024 / 1024
             if missing:
                 if skip_failed:
@@ -884,7 +1020,7 @@ class Pipeline:
             print("  [warn] analysis missing rounds/tickrate; skipping concat validation")
             return
 
-        expected_rounds = len(rounds)
+        expected_rounds = len(rounds) - len(load_voided_rounds(self.render_dir))
 
         # Combined round count (prefer the concat sidecar, else batch files).
         offsets = self._find_round_offsets()
@@ -1050,6 +1186,7 @@ class Pipeline:
         shutil.copy2(str(overlay), str(target))
         print(f"  [OK] Copied overlay video.mp4 "
               f"({target.stat().st_size / 1e9:.1f} GB)")
+        self._copy_round_offsets(self.youtube_dir)
 
     def step_concat(self) -> None:
         if not self.render_dir.exists():
@@ -1064,7 +1201,7 @@ class Pipeline:
         scaling = (self.meta.get("scaling_mode") or "").strip()
         if scaling:
             concat_args += ["--scaling-mode", scaling]
-        if skip_failed:
+        if skip_failed or load_voided_rounds(self.render_dir):
             concat_args += ["--allow-gaps"]
         # Voice is ONE feature: the shade indicator AND the comms audio always
         # go together. --enable-voice-comms turns on both. (--voice-shade is a
@@ -1285,7 +1422,7 @@ class Pipeline:
             list_path = f.name
 
         r = subprocess.run(
-            [settings.ffmpeg_exe, "-f", "concat", "-safe", "0", "-i", list_path,
+            [settings.ffmpeg_exe, "-y", "-f", "concat", "-safe", "0", "-i", list_path,
              "-c", "copy", str(temp)],
             capture_output=True, text=True, timeout=3600,
         )
@@ -1410,8 +1547,8 @@ class Pipeline:
                 [settings.ffmpeg_exe, "-y", "-loglevel", "error",
                  "-ss", f"{seek_t:.3f}", "-i", str(overlay_video),
                  "-frames:v", "1",
-                 "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,"
-                        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+                 "-vf", "scale=1920:1080:force_original_aspect_ratio=increase,"
+                        "crop=1920:1080",
                  str(tmp)],
                 capture_output=True, text=True, timeout=120,
             )
@@ -1465,10 +1602,9 @@ class Pipeline:
         thumb = youtube_dir / "thumbnail.jpg"
 
         if self.is_faceit:
-            # FACEIT path: style-01 (proof_01 HTML) via faceit_thumbnail.py.
-            # ELO / K-D come from the backlog card; portraits from demos/avatars.
-            # Background: kill-moment frame from the finished youtube video
-            # (overlay-only = keyboard + util cam, player's render cfg).
+            # FACEIT thumbs are style-01 only (proof_01 HTML via
+            # faceit_thumbnail.py). Name + K/D; ELO/map live in the title.
+            # Background: kill-moment frame from the finished youtube video.
             faceit_bg: Path | None = None
             pov_vid = youtube_dir / "video.mp4"
             if pov_vid.is_file():
@@ -1485,10 +1621,6 @@ class Pipeline:
                 cmd += ["--video", str(pov_vid)]
             if self.steam_id:
                 cmd += ["--steam-id", self.steam_id]
-            elo = self.meta.get("elo")
-            opp_elo = self.meta.get("opp_avg_elo")
-            if elo is not None and opp_elo is not None:
-                cmd += ["--elo", str(elo), "--opp-elo", str(opp_elo)]
             kd = self._faceit_kd()
             if kd is not None:
                 kills, deaths = kd
@@ -1800,10 +1932,10 @@ def main() -> None:
         dest="keep_intermediates",
         action="store_true",
         default=False,
-        help="Keep renders/ intermediates after the video is youtube-ready "
-             "(default: per-round clips + native source are deleted after "
-             "overlay; the whole renders/pov-* folder is deleted once the "
-             "pipeline completes step 6).",
+        help="Keep renders/ intermediates (default: kept until upload_pending.py "
+             "purges renders/pov-* after every variant is uploaded; per-round "
+             "clips + native source are still freed after overlay unless this "
+             "is passed).",
     )
     parser.add_argument(
         "--cleanup",

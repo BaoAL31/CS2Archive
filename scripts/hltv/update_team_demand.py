@@ -72,6 +72,7 @@ HIGHLIGHT_ALIASES = {
     "parivision": "PARIVISION",
     "faze": "FaZe",
     "fazelan": "FaZe",
+    "nrg": "NRG",
 }
 
 VS_RE = re.compile(r"\s+(?:vs\.?|v\.?)\s+", re.IGNORECASE)

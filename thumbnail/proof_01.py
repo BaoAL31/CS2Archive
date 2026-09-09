@@ -16,7 +16,9 @@ BADGE_DEFAULT = "INPUTS + UTIL CAMS"
 
 # Solo / 3-up (locked by tests/test_proof_01.py). Duo (one costar) matches
 # html_examples.html #proof: POV far left, teammate at 360px — not under the K-D.
-_MAIN_SOLO = "width: 480px; height: 640px; left: 130px; bottom: -22px;"
+# Between the old 480px study box (too small for FACEIT full-body) and the
+# 920px overflow (too big). Height ~680, left inset, slight bottom overflow.
+_MAIN_SOLO = "width: auto; height: 680px; left: 36px; bottom: -28px;"
 _MAIN_DUO = "width: 560px; height: 700px; left: -20px; bottom: -20px;"
 _LEFT_3UP = "width: 300px; height: 400px; left: -20px; bottom: -14px;"
 _RIGHT_3UP = "width: 300px; height: 400px; left: 520px; bottom: -14px;"
@@ -41,7 +43,7 @@ _TEMPLATE = """<!doctype html>
     height: 720px;
     overflow: hidden;
     color: white;
-    background: url("{bg}") center / cover no-repeat;
+    background: url("{bg}") center top / cover no-repeat;
   }}
   .thumb::before {{
     content: "";
