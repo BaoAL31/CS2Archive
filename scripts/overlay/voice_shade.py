@@ -117,6 +117,27 @@ def _player_talk_segments(demo: Path, offsets: dict, pov_team: int,
     return out
 
 
+def last_first_half_round(
+    half_tick: int, per_round_ticks: dict[int, list[int]] | dict[int, tuple[int, int]],
+) -> int | None:
+    """Round number that is still first half, given ``round_announce_last_round_half``.
+
+    That event fires *before* the last first-half round plays — usually in that
+    round's freeze, which HLAE trims off the clip, so the tick sits in the gap
+    between round N-1's end and round N's start. The HUD only swaps T/CT sides
+    when the *next* round begins. Mapping the event tick with
+    ``start_tick >= half_tick`` therefore paints the last first-half round
+    (always round 12 in MR12) onto the enemy scoreboard block.
+    """
+    rounds = sorted(int(r) for r in per_round_ticks)
+    prt = {int(k): (int(v[0]), int(v[1])) for k, v in per_round_ticks.items()}
+    for r in rounds:
+        _start, end = prt[r]
+        if end >= half_tick:
+            return r
+    return None
+
+
 def _halftime_frame(demo: Path, pov_steamid: str, offsets: dict, fps: float,
                     tickrate: int = _TICKRATE) -> int:
     """Return the video frame index where the POV team switches T<->CT side.
@@ -124,8 +145,8 @@ def _halftime_frame(demo: Path, pov_steamid: str, offsets: dict, fps: float,
     The scoreboard team block flips at halftime: the POV team is on the RIGHT
     block when T and LEFT when CT (per CS2 HUD). We use the demo's
     ``round_announce_last_round_half`` event (the authoritative halftime marker)
-    and map its tick to video time via the concat sidecar, then to a frame.
-    Returns the total frame count if no half marker is found.
+    and map it to the *first second-half round* in the concat sidecar, then to
+    a frame. Returns 0 if no half marker is found (no flip).
     """
     try:
         from demoparser2 import DemoParser
@@ -139,21 +160,18 @@ def _halftime_frame(demo: Path, pov_steamid: str, offsets: dict, fps: float,
     if half is None or half.empty:
         return 0
     half_tick = int(half.iloc[0]["tick"])
-    # Map the half tick to a round boundary in the sidecar. Keys may be int or
-    # str depending on whether the caller used load_offsets() or raw JSON.
     prt = {int(k): [int(a), int(b)] for k, (a, b) in offsets["per_round_ticks"].items()}
     ro = {int(k): float(v) for k, v in offsets["round_offsets"].items()}
     rounds = sorted(prt)
-    # find the first round whose start tick is >= the half tick -> 2nd half
-    second_half_round = None
-    for r in rounds:
-        if prt[r][0] >= half_tick:
-            second_half_round = r
-            break
-    if second_half_round is not None:
-        video_s = ro.get(second_half_round, 0.0)
-        return int(round(video_s * fps))
-    return 0  # no flip -> shade on default side all match
+    last_first = last_first_half_round(half_tick, prt)
+    if last_first is None:
+        return 0
+    try:
+        second_half_round = rounds[rounds.index(last_first) + 1]
+    except (ValueError, IndexError):
+        return 0
+    video_s = ro.get(second_half_round, 0.0)
+    return int(round(video_s * fps))
 
 
 def _box_alpha_timeline(segments: list[tuple[float, float]], n_frames: int, fps: float,
