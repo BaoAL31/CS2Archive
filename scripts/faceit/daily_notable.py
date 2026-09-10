@@ -405,7 +405,14 @@ def download_and_backlog(picks: list[dict]) -> None:
                     text=True, encoding="utf-8", errors="replace")
                 out = r.stdout or ""
                 if out:
-                    safe = "\n".join(out.splitlines()[-4:]).encode(
+                    lines = out.splitlines()
+                    keep = [ln for ln in lines if any(
+                        tag in ln for tag in
+                        ("[AUTH]", "[ERR]", "[DL]", "[CDP]", "[WARN]", "[FAIL]",
+                         "Watch Demo", "Clicking")
+                    )]
+                    shown = keep[-16:] if keep else lines[-8:]
+                    safe = "\n".join(shown).encode(
                         sys.stdout.encoding or "utf-8", errors="replace").decode(
                         sys.stdout.encoding or "utf-8", errors="replace")
                     print(safe)

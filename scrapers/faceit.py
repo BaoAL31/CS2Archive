@@ -6,6 +6,7 @@ No FACEIT API key required for downloads. Uses a CDP-debuggable Chrome
 cookies from the main logged-in Chrome profile) to open the match room, click
 "Watch Demo", and capture the browser download to disk. Some matches start the
 download directly from "Watch Demo"; others open a Demo 1/Demo 2 dropdown.
+Debug Chrome is launched for the scrape and quit when it finishes.
 
 Cloudflare blocks automation browsers, so the launched context uses the system
 Chrome channel and reuses an authenticated profile. Pages are created in the
@@ -365,7 +366,7 @@ def download_demo_api(match_id: str) -> Optional[Path]:
     client = FACEITDownloadsClient()
     return asyncio.run(client.download_match(match_id, out_dir))
 
-DOWNLOAD_BUTTON_TEXTS = ["watch demo", "download demo", "download", "demo"]
+DOWNLOAD_BUTTON_TEXTS = ["watch demo"]
 
 def _resolve_match_id(room_or_id: str) -> str:
     """Accept a full room URL or a bare match id."""
@@ -373,12 +374,145 @@ def _resolve_match_id(room_or_id: str) -> str:
         return room_or_id.rstrip("/").split("/room/")[-1]
     return room_or_id.strip()
 
+
+def _os_downloads_dir() -> Path:
+    """Windows Downloads folder (FOLDERID_Downloads), else ~/Downloads."""
+    try:
+        import ctypes
+        import uuid
+
+        class _GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", ctypes.c_ulong),
+                ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        _fd = _GUID()
+        _u = uuid.UUID("{374de290-123f-4565-9164-39c4925e467b}")
+        _fd.Data1, _fd.Data2, _fd.Data3 = _u.time_low, _u.time_mid, _u.time_hi_version
+        _fd.Data4 = (ctypes.c_ubyte * 8)(*_u.bytes[8:])
+        _get = ctypes.windll.shell32.SHGetKnownFolderPath
+        _get.argtypes = [
+            ctypes.POINTER(_GUID), ctypes.c_ulong,
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p),
+        ]
+        _get.restype = ctypes.c_long
+        _p = ctypes.c_wchar_p()
+        if _get(ctypes.byref(_fd), 0, None, ctypes.byref(_p)) == 0 and _p.value:
+            d = Path(_p.value)
+            try:
+                ctypes.windll.ole32.CoTaskMemFree(_p)
+            except Exception:
+                pass
+            return d
+    except Exception:
+        pass
+    return Path.home() / "Downloads"
+
+
+def _watch_dirs_for(out_dir: Optional[Path] = None) -> list[Path]:
+    dirs: list[Path] = []
+    for d in (out_dir, _os_downloads_dir()):
+        if d is None:
+            continue
+        p = Path(d)
+        if p not in dirs:
+            dirs.append(p)
+    return dirs
+
+
+def _is_partial_download(path: Path) -> bool:
+    n = path.name.lower()
+    return (
+        n.endswith(".crdownload")
+        or n.endswith(".tmp")
+        or n.endswith(".partial")
+        or n.startswith("unconfirmed ")
+    )
+
+
+def _match_download_files(match_id: str, dirs: Optional[list[Path]] = None) -> list[Path]:
+    hits: list[Path] = []
+    if not match_id:
+        return hits
+    for d in dirs or _watch_dirs_for():
+        if not d.is_dir():
+            continue
+        try:
+            names = list(d.iterdir())
+        except OSError:
+            continue
+        for p in names:
+            if p.is_file() and match_id in p.name:
+                hits.append(p)
+    return hits
+
+
+def _finished_match_archive(match_id: str, dirs: Optional[list[Path]] = None) -> Optional[Path]:
+    """Largest finished demo archive for this match already on disk."""
+    best: Optional[Path] = None
+    best_sz = 0
+    for p in _match_download_files(match_id, dirs):
+        if _is_partial_download(p):
+            continue
+        name = p.name.lower()
+        if not any(tok in name for tok in (".dem", ".zst", ".gz", ".zip", ".rar")):
+            continue
+        try:
+            sz = p.stat().st_size
+        except OSError:
+            continue
+        if sz < 1_000_000:
+            continue
+        if sz > best_sz:
+            best, best_sz = p, sz
+    return best
+
+
+def _inflight_match_archive(match_id: str, dirs: Optional[list[Path]] = None) -> Optional[Path]:
+    for p in _match_download_files(match_id, dirs):
+        if _is_partial_download(p):
+            return p
+    return None
+
+
+def _wait_for_match_archive(match_id: str, timeout: float = 600.0,
+                            dirs: Optional[list[Path]] = None) -> Optional[Path]:
+    """Wait until a finished archive exists (or an in-flight .crdownload completes)."""
+    dirs = dirs or _watch_dirs_for()
+    deadline = time.monotonic() + timeout
+    last_log = 0.0
+    saw_inflight = False
+    while time.monotonic() < deadline:
+        done = _finished_match_archive(match_id, dirs)
+        if done:
+            return done
+        inflight = _inflight_match_archive(match_id, dirs)
+        if inflight:
+            saw_inflight = True
+            if time.monotonic() - last_log >= 15:
+                try:
+                    mb = inflight.stat().st_size / 1e6
+                except OSError:
+                    mb = 0
+                console.print(
+                    f"  [DL] already downloading {inflight.name} ({mb:.1f} MB) — waiting..."
+                )
+                last_log = time.monotonic()
+        elif saw_inflight:
+            # Chrome renamed .crdownload → final name between polls.
+            continue
+        time.sleep(2)
+    return _finished_match_archive(match_id, dirs)
+
 def _launch_context():
     """Launch the authenticated Chrome context via CDP debug Chrome.
 
     Runs ``scripts/misc/launch-debug-chrome.ps1`` which seeds cookies from the
     main logged-in Chrome profile (``Profile 2``) into ``~/.chrome-debug`` and
-    launches a CDP-debuggable Chrome on port 9223. We then connect over CDP so
+    launches a CDP-debuggable Chrome on port 9221. We then connect over CDP so
     the FACEIT room renders authenticated (Watch Demo button present) using the
     main profile's live session — no separate FACEIT login needed.
 
@@ -400,34 +534,79 @@ def _launch_context():
             time.sleep(1)
     if browser is None:
         pw.stop()
-        raise RuntimeError("Could not connect to debug Chrome on CDP port 9223")
+        raise RuntimeError("Could not connect to debug Chrome on CDP port 9221")
     return pw, browser
 
 
+def _kill_debug_chrome() -> None:
+    """Quit the ~/.chrome-debug instance only (not the user's main Chrome)."""
+    import subprocess
+    subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" |"
+            " Where-Object { $_.CommandLine -match 'chrome-debug' } |"
+            " ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
+        ],
+        timeout=30,
+        capture_output=True,
+    )
+
+
+def _disconnect_cdp(pw, page=None, browser=None) -> None:
+    """Close the room tab and quit debug Chrome when the download/scrape is done."""
+    if page is not None:
+        try:
+            page.close()
+        except Exception:
+            pass
+    if browser is not None:
+        try:
+            browser.close()
+        except Exception:
+            pass
+    try:
+        pw.stop()
+    except Exception:
+        pass
+    _kill_debug_chrome()
+
+
 def _auth_page(browser) -> Any:
-    """Return a page in the existing authenticated context.
+    """Open a new tab in the existing authenticated context.
 
     ``browser.new_page()`` on a CDP-connected Chrome creates a page in a brand-new
     context that does NOT share the logged-in profile's cookies — it hits the
     FACEIT login wall. Pages must be created in ``browser.contexts[0]`` (the
     seeded, authenticated context from launch-debug-chrome.ps1).
+
+    Always open a new tab instead of hijacking ``pages[0]`` (that tab may be a
+    chrome:// page or a room the user is looking at).
     """
     if not browser.contexts:
         return browser.new_page()
-    ctx = browser.contexts[0]
-    if ctx.pages:
-        return ctx.pages[0]
-    return ctx.new_page()
+    return browser.contexts[0].new_page()
+
+
+def _login_button(page):
+    try:
+        return page.get_by_role("button", name=re.compile(r"^log in$", re.I))
+    except Exception:
+        return None
 
 
 def _is_authenticated(page) -> bool:
-    """True if the FACEIT page shows a logged-in session (no login wall)."""
+    """True if the FACEIT page is not showing the Log in wall."""
+    loc = _login_button(page)
     try:
-        body = page.inner_text("body").lower()
+        if loc is not None and loc.count() > 0:
+            box = loc.first.bounding_box()
+            if box and box.get("width", 0) > 0:
+                return False
     except Exception:
-        return False
-    if "log in" in body and "sign out" not in body and "log out" not in body:
-        return False
+        pass
     return True
 
 
@@ -437,10 +616,10 @@ _CDP_PORT = int(__import__("os").environ.get("FACEIT_CDP_PORT", "9221"))
 def _ensure_cdp_chrome() -> None:
     """Launch the CDP debug Chrome (idempotent), detached so it survives.
 
-    Reuses an already-running debug Chrome on port 9223 if present. Otherwise
+    Reuses an already-running debug Chrome on port 9221 if present. Otherwise
     runs ``launch-debug-chrome.ps1``, which seeds cookies from the main logged-in
     Chrome profile into ``~/.chrome-debug`` and starts Chrome (detached) on port
-    9223. Launching detached (not tied to this process) means the debug Chrome
+    9221. Launching detached (not tied to this process) means the debug Chrome
     stays up across runs, so subsequent downloads reconnect instantly instead of
     relaunching a fresh browser.
     """
@@ -463,7 +642,7 @@ def _ensure_cdp_chrome() -> None:
         if _port_open(_CDP_PORT):
             return
         time.sleep(1)
-    console.print("[red]   [CDP] Debug Chrome did not open CDP port 9223[/red]")
+    console.print("[red]   [CDP] Debug Chrome did not open CDP port 9221[/red]")
 
 
 def _port_open(port: int) -> bool:
@@ -485,6 +664,7 @@ def get_match_details(match_id: str) -> MatchInfo:
     room_url = f"https://www.faceit.com/en/cs2/room/{match_id}"
 
     pw, browser = _launch_context()
+    page = None
     try:
         page = _auth_page(browser)
         api_url = f"https://www.faceit.com/api/match/v4/match/{match_id}"
@@ -515,23 +695,19 @@ def get_match_details(match_id: str) -> MatchInfo:
             url=room_url,
         )
     finally:
-        browser.close()
-        pw.stop()
+        _disconnect_cdp(pw, page, browser)
 
 DOWNLOAD_START_TIMEOUT = 120  # seconds to wait for the download to begin
 # (FACEIT's demo server can be slow to start — allow up to 2 min)
 DOWNLOAD_MAX_RETRIES = 3     # restart attempts if the download doesn't start
 
-def _find_demo_button(page, txt: str):
-    """Locate the FACEIT 'Watch Demo' button via several selector strategies.
-    Returns a locator or None if not found."""
+def _find_demo_button(page):
+    """Locate the FACEIT 'Watch Demo' control. Do not match the header Download link."""
+    name = re.compile(r"watch\s*demo", re.I)
     strategies = [
-        lambda: page.get_by_text(txt, exact=False),
-        lambda: page.locator(f"a:has-text('{txt}')"),
-        lambda: page.get_by_role("link", name=txt),
-        lambda: page.get_by_role("button", name=txt),
-        lambda: page.locator(f"a[href*='{txt}']"),
-        lambda: page.locator("a[href*='demo'], a[href*='download']"),
+        lambda: page.get_by_role("button", name=name),
+        lambda: page.get_by_role("link", name=name),
+        lambda: page.get_by_text(name),
     ]
     for strat in strategies:
         try:
@@ -584,7 +760,8 @@ def _reload(page, room_url: Optional[str]) -> bool:
         console.print(f"[yellow]   [WARN] Reload failed: {e}[/yellow]")
         return False
 
-def _click_demo_and_save(page, out_dir: Path, room_url: Optional[str] = None) -> Optional[Path]:
+def _click_demo_and_save(page, out_dir: Path, room_url: Optional[str] = None,
+                         match_id: str = "") -> Optional[Path]:
     """Click Watch Demo -> dropdown -> a demo option, then wait for the download.
 
     Expected FACEIT behavior:
@@ -594,9 +771,13 @@ def _click_demo_and_save(page, out_dir: Path, room_url: Optional[str] = None) ->
         starts (the CDN response routes to the browser download, landing in the
         OS default Downloads folder). The blank page is the signal a download is
         imminent.
-      * The blank page can take up to ~2 minutes to appear; wait that long
-        before giving up and restarting.
+      * After click the button often becomes a spinner for a while before the
+        file appears — that is in-flight, not a miss. Do not click again.
+      * If this match already has a .crdownload / finished archive on disk,
+        wait for that file instead of starting a second download.
     """
+    if not match_id and room_url:
+        match_id = _resolve_match_id(room_url)
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
         cdp = page.context.new_cdp_session(page)
@@ -610,44 +791,18 @@ def _click_demo_and_save(page, out_dir: Path, room_url: Optional[str] = None) ->
     # The download lands in the OS default Downloads folder (the CDN request
     # bypasses page-level CDP routing). Watch BOTH out_dir and the OS Downloads
     # folder so a download is never missed (and never double-clicked).
-    watch_dirs = [out_dir]
-    try:
-        # Resolve the real OS Downloads folder (FOLDERID_Downloads) — the CDN
-        # download lands there, bypassing CDP's page-level routing.
-        import ctypes
-        import uuid
+    watch_dirs = _watch_dirs_for(out_dir)
 
-        class _GUID(ctypes.Structure):
-            _fields_ = [
-                ("Data1", ctypes.c_ulong),
-                ("Data2", ctypes.c_ushort),
-                ("Data3", ctypes.c_ushort),
-                ("Data4", ctypes.c_ubyte * 8),
-            ]
-
-        _fd = _GUID()
-        _u = uuid.UUID("{374de290-123f-4565-9164-39c4925e467b}")
-        _fd.Data1, _fd.Data2, _fd.Data3 = _u.time_low, _u.time_mid, _u.time_hi_version
-        _fd.Data4 = (ctypes.c_ubyte * 8)(*_u.bytes[8:])
-        _get = ctypes.windll.shell32.SHGetKnownFolderPath
-        _get.argtypes = [
-            ctypes.POINTER(_GUID), ctypes.c_ulong,
-            ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p),
-        ]
-        _get.restype = ctypes.c_long
-        _p = ctypes.c_wchar_p()
-        if _get(ctypes.byref(_fd), 0, None, ctypes.byref(_p)) == 0 and _p.value:
-            watch_dirs.append(Path(_p.value))
-            try:
-                ctypes.windll.ole32.CoTaskMemFree(_p)
-            except Exception:
-                pass
-    except Exception:
-        # Last-resort fallback: the conventional user Downloads path.
-        try:
-            watch_dirs.append(Path.home() / "Downloads")
-        except Exception:
-            pass
+    already = _finished_match_archive(match_id, watch_dirs)
+    if already:
+        console.print(f"[yellow]   [SKIP] Archive already on disk: {already.name}[/yellow]")
+        return already
+    inflight = _inflight_match_archive(match_id, watch_dirs)
+    if inflight:
+        console.print(
+            f"[yellow]   [SKIP] Download already in progress: {inflight.name}[/yellow]"
+        )
+        return _wait_for_match_archive(match_id, timeout=600.0, dirs=watch_dirs)
 
     def _snapshot() -> dict[Path, int]:
         snap: dict[Path, int] = {}
@@ -665,65 +820,97 @@ def _click_demo_and_save(page, out_dir: Path, room_url: Optional[str] = None) ->
         return [p for p, _ in _snapshot().items() if p not in before]
 
     def _download_started() -> Optional[Path]:
-        """True once any new file appears — .crdownload counts as started."""
+        """In-flight or finished archive for this match, or any new file."""
+        done = _finished_match_archive(match_id, watch_dirs)
+        if done:
+            return done
+        inflight = _inflight_match_archive(match_id, watch_dirs)
+        if inflight:
+            return inflight
         files = _new_files()
         if not files:
             return None
-        done = [p for p in files if p.suffix != ".crdownload"]
-        return (done or files)[0]
+        done_new = [p for p in files if not _is_partial_download(p)]
+        return (done_new or files)[0]
 
     def _wait_for_download(timeout: float = 600.0) -> Optional[Path]:
         """Wait until a download completes in a watched dir; return its path."""
         deadline = time.monotonic() + timeout
         last_log = time.monotonic()
         while time.monotonic() < deadline:
+            done = _finished_match_archive(match_id, watch_dirs)
+            if done:
+                return done
             dest = _download_started()
-            if dest is not None and dest.suffix != ".crdownload" and dest.stat().st_size > 0:
+            if dest is not None and not _is_partial_download(dest) and dest.stat().st_size > 0:
                 return dest
-            # periodic progress so it's clear we're waiting, not hung
-            if time.monotonic() - last_log >= 30:
-                live = _new_files()
-                console.print(f"  [DL] waiting for download to complete ({len(live)} new file(s) seen)...")
+            if time.monotonic() - last_log >= 15:
+                inflight = _inflight_match_archive(match_id, watch_dirs)
+                console.print(
+                    f"  [DL] waiting for download to complete "
+                    f"(inflight={inflight.name if inflight else '-'}, "
+                    f"{len(_new_files())} new file(s))..."
+                )
                 last_log = time.monotonic()
-            time.sleep(3)
-        return None
+            time.sleep(2)
+        return _finished_match_archive(match_id, watch_dirs)
+
+    def _demo_spinner() -> bool:
+        """True if Watch Demo was clicked and FACEIT is preparing the file."""
+        loc = _find_demo_button(page)
+        if loc is None:
+            return False
+        try:
+            txt = (loc.first.inner_text() or "").strip().lower()
+            if "watch demo" not in txt:
+                return True
+            if loc.first.get_attribute("aria-busy") == "true":
+                return True
+            if loc.first.get_attribute("disabled") is not None:
+                return True
+        except Exception:
+            return True
+        return False
 
     def _open_dropdown(attempt: int) -> str:
-        """Click 'Watch Demo'; return 'dropdown', 'direct', or ''.
+        """Click 'Watch Demo' once; return 'dropdown', 'direct', or ''.
 
         Some matches (single-demo, or no multi-map dropdown) start the download
         immediately when 'Watch Demo' is clicked. Others open a dropdown with
-        'Demo 1'/'Demo 2' to pick from. Returns:
-          - 'dropdown': a Demo 1/Demo 2 option is visible (caller clicks it)
-          - 'direct':   a download/blank page already started (caller skips the
-                        demo-option click and waits for the download)
-          - '':         neither appeared; retry/restart.
+        'Demo 1'/'Demo 2' to pick from. A spinner after click means the demo is
+        already being fetched — do not click again.
         """
-        for _ in range(3):
-            try:
-                page.keyboard.press("Escape")
-                page.wait_for_timeout(500)
-            except Exception:
-                pass
-            loc = _find_demo_button(page, "watch demo") or _find_demo_button(page, "demo")
-            if loc is None:
-                return ""
-            bbox = loc.first.bounding_box()
-            if not bbox:
-                return ""
-            console.print(f"[cyan]   [DL] Clicking 'Watch Demo' (attempt {attempt})...[/cyan]")
-            _human_click(page, bbox["x"] + bbox["width"] / 2, bbox["y"] + bbox["height"] / 2)
-            page.wait_for_timeout(2500)
+        if _download_started() is not None or _demo_spinner():
+            return "direct"
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(500)
+        except Exception:
+            pass
+        loc = _find_demo_button(page)
+        if loc is None:
+            return ""
+        try:
+            loc.first.scroll_into_view_if_needed(timeout=2000)
+        except Exception:
+            pass
+        bbox = loc.first.bounding_box()
+        if not bbox:
+            return ""
+        console.print(f"[cyan]   [DL] Clicking 'Watch Demo' (attempt {attempt})...[/cyan]")
+        _human_click(page, bbox["x"] + bbox["width"] / 2, bbox["y"] + bbox["height"] / 2)
+        # After a click, FACEIT often sits on a spinner for >10s before the
+        # .crdownload appears. Treat that as in-flight: wait for the file,
+        # do not click again or reload (reload aborts the CDN fetch).
+        for _ in range(12):
+            page.wait_for_timeout(500)
             if page.locator("text=Demo 1").count() > 0 or page.locator("text=Demo 2").count() > 0:
                 return "dropdown"
-            # No dropdown appeared: a single-demo match may have started the
-            # download (or opened the blank CDN page) directly from 'Watch Demo'.
-            if _download_started() is not None:
+            if _download_started() is not None or _demo_spinner():
                 return "direct"
-            # A blank popup page opening is also the direct-download signal.
             if len([pg for pg in page.context.pages[page_count_before:] if pg != page]) > 0:
                 return "direct"
-        return ""
+        return "direct"
 
     page_count_before = len(page.context.pages)
 
@@ -731,10 +918,13 @@ def _click_demo_and_save(page, out_dir: Path, room_url: Optional[str] = None) ->
         try:
             dropdown_state = _open_dropdown(attempt)
             if dropdown_state == "":
-                console.print(f"[yellow]   [DL] Could not open demo dropdown (attempt {attempt}/{DOWNLOAD_MAX_RETRIES}) — restarting...[/yellow]")
-                if not _reload(page, room_url):
-                    return None
-                continue
+                if _download_started() is not None:
+                    dropdown_state = "direct"
+                else:
+                    console.print(f"[yellow]   [DL] Could not open demo dropdown (attempt {attempt}/{DOWNLOAD_MAX_RETRIES}) — restarting...[/yellow]")
+                    if not _reload(page, room_url):
+                        return None
+                    continue
 
             blank_page: Optional[Any] = None
             if dropdown_state == "dropdown":
@@ -806,6 +996,14 @@ def _click_demo_and_save(page, out_dir: Path, room_url: Optional[str] = None) ->
                         pass
                 return dest
 
+            if _inflight_match_archive(match_id, watch_dirs):
+                console.print(
+                    "[yellow]   [DL] Download still in progress — not reloading.[/yellow]"
+                )
+                dest = _wait_for_download(timeout=600.0)
+                if dest is not None:
+                    return dest
+
             console.print(
                 f"[yellow]   [WARN] No download within {DOWNLOAD_START_TIMEOUT}s "
                 f"(attempt {attempt}/{DOWNLOAD_MAX_RETRIES}) — restarting...[/yellow]"
@@ -871,42 +1069,8 @@ def _finalize_download(match_info, saved, started) -> DownloadResult:
     # CDN request bypasses CDP routing). After we've moved the .dem into the
     # project's demos/ dir, clean up any leftover downloaded archive there so it
     # isn't left behind in the user's Downloads folder.
-    def _downloads_dir() -> Optional[Path]:
-        try:
-            import ctypes
-            import uuid
-
-            class _GUID(ctypes.Structure):
-                _fields_ = [
-                    ("Data1", ctypes.c_ulong),
-                    ("Data2", ctypes.c_ushort),
-                    ("Data3", ctypes.c_ushort),
-                    ("Data4", ctypes.c_ubyte * 8),
-                ]
-
-            _fd = _GUID()
-            _u = uuid.UUID("{374de290-123f-4565-9164-39c4925e467b}")
-            _fd.Data1, _fd.Data2, _fd.Data3 = _u.time_low, _u.time_mid, _u.time_hi_version
-            _fd.Data4 = (ctypes.c_ubyte * 8)(*_u.bytes[8:])
-            _get = ctypes.windll.shell32.SHGetKnownFolderPath
-            _get.argtypes = [
-                ctypes.POINTER(_GUID), ctypes.c_ulong,
-                ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p),
-            ]
-            _get.restype = ctypes.c_long
-            _p = ctypes.c_wchar_p()
-            if _get(ctypes.byref(_fd), 0, None, ctypes.byref(_p)) == 0 and _p.value:
-                d = Path(_p.value)
-                try:
-                    ctypes.windll.ole32.CoTaskMemFree(_p)
-                except Exception:
-                    pass
-                return d
-        except Exception:
-            pass
-        return Path.home() / "Downloads"
     try:
-        dl_dir = _downloads_dir()
+        dl_dir = _os_downloads_dir()
         for p in dl_dir.iterdir():
             if p.is_file() and match_info.match_id in p.name and p.name != organized.name:
                 p.unlink(missing_ok=True)
@@ -928,10 +1092,22 @@ def _finalize_download(match_info, saved, started) -> DownloadResult:
 
 def _download_demo_browser(match_id: str, match_info: MatchInfo, started) -> DownloadResult:
     """Fallback: open room (authed) → click demo → extract → organize."""
+    leftover = _finished_match_archive(match_id)
+    if leftover:
+        console.print(f"[yellow]   [SKIP] Archive already on disk: {leftover}[/yellow]")
+        return _finalize_download(match_info, leftover, started)
+    inflight = _inflight_match_archive(match_id)
+    if inflight:
+        console.print(f"[yellow]   [SKIP] Download already in progress: {inflight.name}[/yellow]")
+        done = _wait_for_match_archive(match_id, timeout=600.0)
+        if done:
+            return _finalize_download(match_info, done, started)
+
     room_url = f"https://www.faceit.com/en/cs2/room/{match_id}"
 
     try:
         pw, browser = _launch_context()
+        page = None
         try:
             page = _auth_page(browser)
             api_url = f"https://www.faceit.com/api/match/v4/match/{match_id}"
@@ -945,7 +1121,12 @@ def _download_demo_browser(match_id: str, match_info: MatchInfo, started) -> Dow
             page.on("response", _cap)
             page.goto(room_url, wait_until="domcontentloaded")
             console.print("[cyan]   [..] Waiting for Cloudflare + page load...[/cyan]")
-            page.wait_for_timeout(8000)
+            # Room is an SPA; Watch Demo appears after match payload, not at DOMContentLoaded.
+            deadline = time.monotonic() + 25
+            while time.monotonic() < deadline:
+                if _find_demo_button(page) is not None:
+                    break
+                page.wait_for_timeout(500)
 
             # Auth check: the Watch Demo button only renders when logged in. If
             # the debug Chrome isn't authenticated, give clear guidance instead
@@ -988,7 +1169,7 @@ def _download_demo_browser(match_id: str, match_info: MatchInfo, started) -> Dow
 
             out_dir = settings.temp_dir
             out_dir.mkdir(parents=True, exist_ok=True)
-            saved = _click_demo_and_save(page, out_dir, room_url=room_url)
+            saved = _click_demo_and_save(page, out_dir, room_url=room_url, match_id=match_id)
 
             if not saved:
                 console.print("[red]   [ERR] Could not find a demo download button.[red]")
@@ -1022,8 +1203,7 @@ def _download_demo_browser(match_id: str, match_info: MatchInfo, started) -> Dow
                 started_at=started, completed_at=datetime.now(),
             )
         finally:
-            browser.close()
-            pw.stop()
+            _disconnect_cdp(pw, page, browser)
 
     except Exception as e:
         console.print(f"[bold red]   [ERR] Error: {e}[/bold red]")
