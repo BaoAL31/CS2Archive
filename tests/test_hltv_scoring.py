@@ -142,12 +142,12 @@ def test_score_card_chip_math():
         highlight_players={},
         fixtures=[],
     )
-    assert scored["star_bonus"] == 200_000
+    assert scored["star_bonus"] == 300_000
     assert scored["market_demand_bonus"] == 132_500
     assert scored["match_team_bonus"] == 125_000 + 100_000
     assert scored["rating_bonus"] == 24_000
     assert scored["match_highlight_bonus"] == 0
-    assert scored["weight"] == 581_500
+    assert scored["weight"] == 681_500
 
 
 def test_score_card_resolves_event_suffix_from_fixture_slug():
@@ -202,7 +202,7 @@ def test_minus_kd_keeps_org_star():
         player_demand={},
         team_demand={},
     )
-    assert scored["star_bonus"] == 200_000
+    assert scored["star_bonus"] == 153_846
     assert scored["rating_bonus"] == 48_000
 
 

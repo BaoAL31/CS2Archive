@@ -28,6 +28,7 @@ from round_windows import (
     plan_round_windows,
     write_voided_rounds,
 )
+from verify_pov import death_ticks_by_round, verify_round_clip
 
 apply_runtime_env()
 
@@ -454,6 +455,64 @@ def _render_trimmed_windows(
              hook_retries=args.hook_retries,
              output_dir=output_dir)
     _rename_sequence_files(output_dir, global_rounds, tick_overrides=overrides)
+
+
+def _render_event_rounds_cli(demo_part: str, output_dir: Path, steam_id: str,
+                             missing_local: list[int], missing_global: list[int],
+                             args) -> None:
+    """One CLI --event rounds attempt. Raises SystemExit via run_csdm on failure."""
+    cmd = [
+        CSDM, "video", str(Path(demo_part).resolve()),
+        "--steamids", steam_id,
+        "--event", "rounds",
+        "--rounds", ",".join(str(r) for r in missing_local),
+        "--output", str(output_dir),
+        "--framerate", str(args.framerate),
+        "--width", str(args.width),
+        "--height", str(args.height),
+        "--cfg", str(abs_cfg_path()),
+    ] + BASE_FLAGS
+    # csdm writes per-round sequence files; caller renames them below.
+    run_csdm(cmd, f"rounds {missing_global[0]}-{missing_global[-1]}",
+             expected=None,
+             hook_timeout=args.hook_timeout,
+             hook_retries=args.hook_retries,
+             output_dir=output_dir)
+
+
+def _verify_round_clips(output_dir: Path, round_nums: list[int],
+                        analysis: dict, steam_id: str,
+                        global_offset: int) -> list[int]:
+    """POV-check freshly rendered round clips. Returns bad global rounds.
+
+    Only the POV-ALIVE window is checked (death tick from analysis) —
+    post-death director footage is out of scope (tier 2). Missing/small
+    files are skipped here (the missing-file path handles those).
+    """
+    if not round_nums:
+        return []
+    tickrate = int(analysis.get("tickrate") or 64)
+    deaths = death_ticks_by_round(analysis, steam_id)
+    bad: list[int] = []
+    for gr in sorted(set(round_nums)):
+        clips = sorted(
+            (p for p in output_dir.glob(f"round-{gr:03d}-tick-*-to-*.mp4")
+             if p.stat().st_size >= 1_048_576),
+            key=lambda p: p.stat().st_mtime,
+        )
+        if not clips:
+            continue
+        m = _ROUND_RENDER_RE.match(clips[-1].name)
+        if not m:
+            continue
+        v = verify_round_clip(clips[-1], int(m.group(2)), int(m.group(3)),
+                              deaths.get(gr - global_offset), tickrate)
+        print(f"  [{'VERIFY-OK' if v.ok else 'VERIFY-BAD'}] round {gr}: "
+              f"{v.reason} (weapon {v.weapon_rate:.0%}, "
+              f"frozen {v.frozen_share:.0%}, n={v.n_samples})")
+        if not v.ok:
+            bad.append(gr)
+    return bad
 
 
 def find_demo_parts(demo_path: str) -> list[str]:
@@ -897,6 +956,11 @@ def main() -> None:
     parser.add_argument("--viewmodel-offset-y", type=float, default=None)
     parser.add_argument("--viewmodel-offset-z", type=float, default=None)
     parser.add_argument("--viewmodel-presetpos", type=int, default=None)
+    parser.add_argument("--no-verify", action="store_true", default=False,
+                        help="Skip post-render POV verification (viewmodel + motion "
+                             "check per round clip with one auto re-render). "
+                             "Verification is cheap (~1 min/batch) and refuses to "
+                             "ship freecam/third-person rounds silently.")
     parser.add_argument("--skip-failed-rounds", action="store_true", default=False,
                         help="[DANGER] Skip round batches that fail instead of aborting the entire "
                              "render. Only use when a specific demo file is broken and you want to "
@@ -1159,25 +1223,9 @@ def main() -> None:
                 csdm_crashed = False
                 if missing_global:
                     missing_local = [gr - global_round for gr in missing_global]
-                    cmd = [
-                        CSDM, "video", str(Path(part).resolve()),
-                        "--steamids", args.steam_id,
-                        "--event", "rounds",
-                        "--rounds", ",".join(str(r) for r in missing_local),
-                        "--output", str(output_dir),
-                        "--framerate", str(args.framerate),
-                        "--width", str(args.width),
-                        "--height", str(args.height),
-                        "--cfg", str(abs_cfg_path()),
-                    ] + BASE_FLAGS
-
-                    # csdm writes per-round sequence files; we rename them below.
                     try:
-                        run_csdm(cmd, f"rounds {missing_global[0]}-{missing_global[-1]}",
-                                 expected=None,
-                                 hook_timeout=args.hook_timeout,
-                                 hook_retries=args.hook_retries,
-                                 output_dir=output_dir)
+                        _render_event_rounds_cli(part, output_dir, args.steam_id,
+                                               missing_local, missing_global, args)
                     except SystemExit:
                         csdm_crashed = True
                         if not args.skip_failed_rounds:
@@ -1201,6 +1249,44 @@ def main() -> None:
                         if not args.skip_failed_rounds:
                             raise
                     missing_global = missing_global + [gr for gr, _ in trimmed_items]
+
+                if missing_global and not args.no_verify and not args.skip_failed_rounds:
+                    bad = _verify_round_clips(output_dir, missing_global,
+                                              analysis, args.steam_id, global_round)
+                    if bad:
+                        print(f"  [VERIFY] {len(bad)} round(s) failed POV check: "
+                              f"{bad} — deleting + re-rendering once")
+                        for gr in bad:
+                            for p in output_dir.glob(f"round-{gr:03d}-tick-*-to-*.mp4"):
+                                try:
+                                    p.unlink()
+                                except OSError:
+                                    pass
+                        bad_event = [gr for gr in bad if gr in event_g]
+                        bad_trimmed = [(gr, w) for (gr, w) in trimmed_items if gr in bad]
+                        try:
+                            if bad_event:
+                                _clear_stale_sequences(output_dir)
+                                _render_event_rounds_cli(
+                                    part, output_dir, args.steam_id,
+                                    [gr - global_round for gr in bad_event],
+                                    bad_event, args)
+                                _rename_sequence_files(output_dir, bad_event)
+                            if bad_trimmed:
+                                _clear_stale_sequences(output_dir)
+                                _render_trimmed_windows(part, output_dir,
+                                                        args.steam_id, bad_trimmed, args)
+                        except SystemExit:
+                            csdm_crashed = True
+                            raise
+                        bad2 = _verify_round_clips(output_dir, bad, analysis,
+                                                   args.steam_id, global_round)
+                        if bad2:
+                            print(f"[ERROR] VERIFY_ROUNDS_FAILED rounds {bad2} "
+                                  f"failed the POV check twice; refusing to ship "
+                                  f"broken footage")
+                            sys.exit(1)
+                        print(f"  [VERIFY] retry healed: {bad}")
 
                 still = [
                     gr for gr in missing_global

@@ -10,7 +10,7 @@ or starting within 12 hours) and queues only watchable POVs — it does not
 pad the day to 3. Manual CLI still works.
 
 ``pick_for_day`` is idempotent per calendar day. The listener uses
-``discover_good_povs`` instead, which re-scrapes and only returns heaters
+``discover_good_povs`` instead, which re-scrapes and only returns star POVs
 not already in ``used``.
 
 State file: .data/notable_daily.json

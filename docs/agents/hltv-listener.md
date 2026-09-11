@@ -30,10 +30,10 @@ The listener also reads upcoming / live matches from the event page (and the
 event matches tab when the overview has no timestamps). If nothing is live
 and nothing starts in the next 12 hours, it **keeps polling FACEIT** (same
 loop as HLTV, 15-minute scrape cooldown) for watchable Recognised-Pro POVs
-from the last 24 hours. A POV qualifies only if it is a **K/D >= 1.5** line
-from a player on the YouTube **demand index** (>= 1.0). A loss still
-qualifies. Org rank is not required. High K/D or ADR from a name with no
-measured demand does not qualify. Those are queued as they appear, one
+from the last 24 hours. A POV qualifies if the player is a
+**demand-index star** (>= 1.25). Extra Recognised Pros add a costar
+chip; K/D scales star bonus. Neither is a gate. A loss still qualifies.
+A nocries-level demand line does not. Those are queued as they appear, one
 player/match, up to the remaining daily slots. Weak leftover games are
 not used to pad the day to 3.
 Demos are downloaded and a single-POV backlog card is built, then the same

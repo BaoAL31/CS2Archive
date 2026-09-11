@@ -74,6 +74,19 @@ For rendering a player's POV with full HUD (radar, health, ammo) and no x-ray, i
 
 Use `python scripts/pov/render_pov.py <demo_path> <steam_id>` instead — it wraps the above command with auto round-detection, p1/p2 split handling, and batch output naming.
 
+## POV verification (auto, tier 1)
+
+Every batch is POV-checked after rendering (`scripts/pov/verify_pov.py`):
+samples each round clip across the POV-ALIVE window only (death tick from
+analysis, +2s grace), scoring viewmodel-corner edge density + inter-frame
+motion, skipping flashed/smoked/scoped frames. Frozen majority (>50%) or
+weapon pass-rate (<40%) = BAD → clip deleted + re-rendered once → still bad
+= `VERIFY_ROUNDS_FAILED` loud fail (never ships silently). Validated
+2026-09-11: kensizor broken r1 flagged (frozen 78%, weapon 16%), good/death
+rounds pass. Blind spots (need nameplate OCR): director cuts to a teammate
+clutch, third-person chase with visible viewmodel. Opt out with
+`render_pov.py --no-verify`.
+
 All scripts pass `--cfg assets/cs2_pov.cfg` which configures HUD and restores keybinds via `exec autoexec`. The crosshair comes from CS2's `autoexec.cfg` in the game's `csgo/cfg/` directory — `render_pov.py` swaps `autoexec_render.cfg` (pro's crosshair, extracted from demo) and `autoexec_personal.cfg` (your crosshair) before/after rendering.
 
 ## Split demos (p1, p2)

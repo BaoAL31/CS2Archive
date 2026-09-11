@@ -6,7 +6,8 @@ Cards are picked by HLTV Rating 3.0 only: one card per map/demo from
 Cap is 3 uploads per local calendar day (the YouTube long-form slots).
 When the configured event has nothing live and nothing starting in the
 next 12 hours, the listener keeps polling FACEIT for watchable POVs
-(K/D >= 1.5 from a player on the YouTube demand index). It queues those
+(demand-index star >= 1.25; extra Recognised Pros and K/D are scoring
+chips, not a gate). It queues those
 as they appear, up
 to the remaining daily slots, and does not pad with weak games.
 

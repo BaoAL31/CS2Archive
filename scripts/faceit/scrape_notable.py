@@ -79,23 +79,23 @@ def _is_notable_perf(line: dict, kd_min: float, adr_min: float, kills_min: int) 
     return kd >= kd_min or adr >= adr_min or kills >= kills_min
 
 
-FACEIT_DEMAND_FLOOR = 1.0
-FACEIT_KD_FLOOR = 1.5
+FACEIT_STAR_FLOOR = 1.25
 
 
 def is_good_faceit_pov(c: dict) -> bool:
-    """Watchable FACEIT POV: K/D >= 1.5 from a demand-index player.
+    """Watchable FACEIT POV: demand-index star only.
 
-    Result does not matter — a 21/14 loss still qualifies. Org rank is not a
-    qualifier. Smash lines from names with no measured demand stay out.
+    Qualifies when the POV player's YouTube demand index is
+    >= FACEIT_STAR_FLOOR (live CS2ArchiveStarRefresh file, else the
+    research table). Extra Recognised Pros are a costar chip, not a
+    gate. K/D scales star bonus, not eligibility. nocries (below the
+    floor) stays out; a solo s1mple does not.
     """
-    if _num(c.get("kd"), float) < FACEIT_KD_FLOOR:
-        return False
     nick = (c.get("player") or "").casefold()
     if not nick:
         return False
     index = load_player_demand_index().get(nick)
-    return index is not None and float(index) >= FACEIT_DEMAND_FLOOR
+    return index is not None and float(index) >= FACEIT_STAR_FLOOR
 
 
 def load_player_demand_index():
@@ -106,7 +106,7 @@ def market_demand_bonus(nick: str) -> int:
     return _scoring.market_demand_bonus(nick, DEMAND_INDEX_PATH)
 
 
-SCORE_VERSION = 5
+SCORE_VERSION = 7
 
 
 def _line_won(line: dict) -> bool:
@@ -151,6 +151,8 @@ def rescore_stored(c: dict) -> dict:
         stored_star = _num(c.get("star_bonus"), int)
         raw = stored_star * 4 if stored_star in (100_000, 62_500, 30_000, 15_000) else stored_star
     nick = c.get("player") or ""
+    if raw <= 0:
+        raw = _scoring.demand_as_raw_star(nick, DEMAND_INDEX_PATH)
     star = star_bonus(raw, won, kd)
     demand = market_demand_bonus(nick)
     elo = lobby_elo_bonus(c.get("avg_elo") or 0)
@@ -187,6 +189,8 @@ def make_player_candidates(rec: dict, stream: str, ranking: dict | None = None) 
         kills = _num(line.get("kills"), int)
         won = _line_won(line)
         raw_star = star_bonus_for_pros([nick], ranking)
+        if raw_star <= 0:
+            raw_star = _scoring.demand_as_raw_star(nick, DEMAND_INDEX_PATH)
         star = star_bonus(raw_star, won, kd)
         demand = market_demand_bonus(nick)
         elo = lobby_elo_bonus(_num(rec.get("avg_elo"), float))

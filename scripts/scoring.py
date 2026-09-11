@@ -66,6 +66,15 @@ def demand_points(index: float) -> int:
     return round(max(0.0, float(index) - 1.0) * DEMAND_SCALE)
 
 
+def demand_as_raw_star(nick: str, path: Path | None = None) -> int:
+    """Demand chip in org-rank raw units so ``star_bonus`` * K/D still applies.
+
+    ``star_bonus`` does ``raw // 2``; this is ``market_demand_bonus * 2``.
+    Used when HLTV org rank is 0 (unranked FACEIT stars like s1mple).
+    """
+    return market_demand_bonus(nick, path) * 2
+
+
 def lobby_elo_bonus(avg_elo: int | float) -> int:
     """Scale 2500-4000 average lobby ELO into a 0-300k quality signal."""
     return round(max(0.0, min(1.0, (avg_elo - 2500) / 1500)) * 300_000)
@@ -80,16 +89,19 @@ def costar_bonus(pros: list[str]) -> int:
 
 
 def star_bonus(raw_star: int, won: bool = False, kd: float = 1.0) -> int:
-    """Org rank is who the POV is, not how one map went.
+    """Org-rank chip, scaled by this map's K/D.
 
-    No K/D gate: a minus map does not erase the badge (YEKINDAR Cache
-    17-22 still carries FURIA #3). ``won``/``kd`` accepted for call-site
-    compatibility and not used.
+    ``won`` is accepted for call-site compatibility and not used. A star
+    with a 2.0 K/D is worth twice a 1.0; a minus map still pays, just less.
     """
-    del won, kd
+    del won
     if raw_star <= 0:
         return 0
-    return raw_star // 2
+    try:
+        ratio = max(float(kd), 0.0)
+    except (TypeError, ValueError):
+        ratio = 1.0
+    return round((raw_star // 2) * ratio)
 
 
 def perf_bonus(kd: float, adr: float, kills: int, won: bool) -> int:

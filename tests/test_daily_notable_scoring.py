@@ -90,11 +90,11 @@ def test_performance_win_is_the_watchable_gate():
     assert sn._perf_bonus(5.0, 200, 60, True) == 255_000
 
 
-def test_star_bonus_pays_on_org_alone_regardless_of_kd():
+def test_star_bonus_scales_with_kd():
     assert sn.star_bonus(400_000, True) == 200_000
-    assert sn.star_bonus(400_000, False, kd=1.5) == 200_000
-    assert sn.star_bonus(400_000, True, kd=0.77) == 200_000
-    assert sn.star_bonus(250_000, True, kd=1.13) == 125_000
+    assert sn.star_bonus(400_000, False, kd=1.5) == 300_000
+    assert sn.star_bonus(400_000, True, kd=0.77) == 154_000
+    assert sn.star_bonus(250_000, True, kd=1.13) == 141_250
     assert sn.star_bonus(0, True, kd=2.0) == 0
 
 
@@ -118,14 +118,14 @@ def test_candidate_weight_keeps_explainable_components(monkeypatch):
 
     candidate = sn.make_player_candidates(record, "solo", {})[0]
 
-    assert candidate["score_version"] == 5
+    assert candidate["score_version"] == 7
     assert candidate["raw_star_bonus"] == 120_000
-    assert candidate["star_bonus"] == 60_000
+    assert candidate["star_bonus"] == 120_000
     assert candidate["market_demand_bonus"] == 125_000
     assert candidate["lobby_elo_bonus"] == 200_000
     assert candidate["costar_bonus"] == 0
     assert candidate["perf_bonus"] == 190_000
-    assert candidate["weight"] == 575_000
+    assert candidate["weight"] == 635_000
 
 
 def test_winning_carry_beats_losing_org_star_in_same_lobby(monkeypatch):
@@ -157,8 +157,8 @@ def test_winning_carry_beats_losing_org_star_in_same_lobby(monkeypatch):
     ranked = sn.make_player_candidates(rec, "multi", {})
     ranked.sort(key=lambda c: -c["weight"])
     assert [c["player"] for c in ranked] == ["HeavyGod", "apEX"]
-    assert ranked[0]["star_bonus"] == 125_000
-    assert ranked[1]["star_bonus"] == 200_000
+    assert ranked[0]["star_bonus"] == 141_250
+    assert ranked[1]["star_bonus"] == 214_000
     assert ranked[0]["won"] is True
     assert ranked[1]["won"] is False
 
@@ -227,7 +227,10 @@ def test_score_candidates_ranks_by_weight(monkeypatch):
     ranked = sn.score_candidates(multi, solo, {})
     assert [c["player"] for c in ranked] == ["ropz", "magixx"]
     assert ranked[0]["market_demand_bonus"] == 172_500
+    assert ranked[0]["raw_star_bonus"] == 345_000
+    assert ranked[0]["star_bonus"] == 345_000
     assert ranked[1]["market_demand_bonus"] == 0
+    assert ranked[1]["star_bonus"] == 0
 
 
 def test_select_picks_only_one_pov_per_match():
@@ -263,7 +266,7 @@ def test_select_picks_only_one_pov_per_match():
     ]
 
 
-def test_is_good_faceit_pov_requires_player_demand():
+def test_is_good_faceit_pov_is_demand_only():
     donk = {
         "player": "donk", "won": True, "kd": 1.5, "adr": 85.0, "kills": 18,
     }
@@ -271,26 +274,60 @@ def test_is_good_faceit_pov_requires_player_demand():
         "player": "s1mple", "won": True, "kd": 1.6, "adr": 96.2, "kills": 28,
         "raw_star_bonus": 0,
     }
+    nocries = {
+        "player": "nocries", "won": True, "kd": 1.92, "adr": 132.0, "kills": 25,
+        "pros": ["nocries"],
+    }
+    stacked = {
+        "player": "s1mple", "won": False, "kd": 1.56, "adr": 108.0, "kills": 25,
+        "pros": ["mzinho", "s1mple"],
+    }
+    stacked_sidekick = {
+        "player": "mzinho", "won": False, "kd": 1.2, "adr": 80.0, "kills": 18,
+        "pros": ["mzinho", "s1mple"],
+    }
+    stacked_donk = {
+        "player": "donk", "won": True, "kd": 0.9, "adr": 90.0, "kills": 12,
+        "pros": ["donk", "magixx"],
+    }
     blamef = {
         "player": "blameF", "won": True, "kd": 3.0, "adr": 142.7, "kills": 27,
-        "raw_star_bonus": 60_000,
+        "raw_star_bonus": 60_000, "pros": ["blameF", "device"],
     }
     smash_unknown = {
         "player": "Neityu", "won": True, "kd": 4.0, "adr": 133.3, "kills": 20,
-    }
-    minus_kd = {
-        "player": "donk", "won": True, "kd": 0.9, "adr": 90.0, "kills": 12,
-    }
-    barely_plus = {
-        "player": "donk", "won": True, "kd": 1.49, "adr": 90.0, "kills": 19,
+        "pros": ["Neityu", "s1mple"],
     }
     assert sn.is_good_faceit_pov(donk)
     assert sn.is_good_faceit_pov(s1mple)
+    assert sn.is_good_faceit_pov(stacked)
+    assert not sn.is_good_faceit_pov(stacked_sidekick)
+    assert sn.is_good_faceit_pov(stacked_donk)
+    assert not sn.is_good_faceit_pov(nocries)
     assert not sn.is_good_faceit_pov(blamef)
     assert not sn.is_good_faceit_pov(smash_unknown)
-    assert not sn.is_good_faceit_pov(minus_kd)
-    assert not sn.is_good_faceit_pov(barely_plus)
     assert sn.is_good_faceit_pov({**donk, "won": False})
+
+
+def test_unranked_faceit_star_uses_demand_times_kd(monkeypatch):
+    monkeypatch.setattr(sn, "star_bonus_for_pros", lambda pros, ranking: 0)
+    rec = {
+        "id": "1-58e04f44",
+        "pros": ["mzinho", "s1mple"],
+        "date": datetime(2026, 9, 10),
+        "map": "Mirage",
+        "score": "13 / 16",
+        "avg_elo": 3400,
+        "players": {
+            "s1mple": {
+                "kd": 1.56, "adr": 108.0, "kills": 25, "deaths": 16, "result": "0",
+            },
+        },
+    }
+    cand = sn.make_player_candidates(rec, "multi", {})[0]
+    assert cand["raw_star_bonus"] == 250_000
+    assert cand["star_bonus"] == 195_000
+    assert cand["market_demand_bonus"] == 125_000
 
 
 def test_choose_picks_prefers_fresh_over_heavier_pool():
@@ -298,11 +335,13 @@ def test_choose_picks_prefers_fresh_over_heavier_pool():
         "id": "f:s1mple", "match_id": "f", "player": "s1mple",
         "weight": 100, "date": "2026-09-01",
         "won": True, "kd": 4.0, "adr": 133.0, "kills": 20,
+        "pros": ["s1mple", "mzinho"],
     }]
     pool = [{
         "id": "p:donk", "match_id": "p", "player": "donk",
         "weight": 9999, "date": "2026-08-25",
         "won": True, "kd": 3.0, "adr": 120.0, "kills": 28,
+        "pros": ["donk", "magixx"],
     }]
     picks, used = dn.choose_picks(
         {"used": [], "pool": pool}, fresh, 1, "2026-09-01")
@@ -315,11 +354,13 @@ def test_choose_picks_does_not_pad_with_pool():
         "id": "f:s1mple", "match_id": "f", "player": "s1mple",
         "weight": 100, "date": "2026-09-01",
         "won": True, "kd": 4.0, "adr": 133.0, "kills": 20,
+        "pros": ["s1mple", "mzinho"],
     }]
     pool = [{
         "id": "p:donk", "match_id": "p", "player": "donk",
         "weight": 50, "date": "2026-08-25",
         "won": True, "kd": 3.0, "adr": 120.0, "kills": 25,
+        "pros": ["donk", "magixx"],
     }]
     picks, _ = dn.choose_picks(
         {"used": [], "pool": pool}, fresh, 2, "2026-09-01")

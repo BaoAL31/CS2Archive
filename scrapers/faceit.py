@@ -702,7 +702,7 @@ DOWNLOAD_START_TIMEOUT = 120  # seconds to wait for the download to begin
 DOWNLOAD_MAX_RETRIES = 3     # restart attempts if the download doesn't start
 
 def _find_demo_button(page):
-    """Locate the FACEIT 'Watch Demo' control. Do not match the header Download link."""
+    """Visible 'Watch Demo' control only. Hidden/empty matches are ignored."""
     name = re.compile(r"watch\s*demo", re.I)
     strategies = [
         lambda: page.get_by_role("button", name=name),
@@ -712,10 +712,21 @@ def _find_demo_button(page):
     for strat in strategies:
         try:
             loc = strat()
-            if loc.count() > 0:
-                return loc
+            n = loc.count()
         except Exception:
             continue
+        for i in range(n):
+            el = loc.nth(i)
+            try:
+                box = el.bounding_box()
+                if not box or box["width"] < 8 or box["height"] < 8:
+                    continue
+                txt = (el.inner_text() or "").strip().lower()
+                if "watch demo" not in txt:
+                    continue
+                return el
+            except Exception:
+                continue
     return None
 
 def _human_click(page, x: float, y: float, variance: float = 3.0) -> None:
@@ -856,21 +867,8 @@ def _click_demo_and_save(page, out_dir: Path, room_url: Optional[str] = None,
         return _finished_match_archive(match_id, watch_dirs)
 
     def _demo_spinner() -> bool:
-        """True if Watch Demo was clicked and FACEIT is preparing the file."""
-        loc = _find_demo_button(page)
-        if loc is None:
-            return False
-        try:
-            txt = (loc.first.inner_text() or "").strip().lower()
-            if "watch demo" not in txt:
-                return True
-            if loc.first.get_attribute("aria-busy") == "true":
-                return True
-            if loc.first.get_attribute("disabled") is not None:
-                return True
-        except Exception:
-            return True
-        return False
+        """True if the visible Watch Demo label is gone (FACEIT preparing the file)."""
+        return _find_demo_button(page) is None
 
     def _open_dropdown(attempt: int) -> str:
         """Click 'Watch Demo' once; return 'dropdown', 'direct', or ''.
@@ -880,7 +878,10 @@ def _click_demo_and_save(page, out_dir: Path, room_url: Optional[str] = None,
         'Demo 1'/'Demo 2' to pick from. A spinner after click means the demo is
         already being fetched — do not click again.
         """
-        if _download_started() is not None or _demo_spinner():
+        # Only skip the click if a file for this match is already on disk.
+        # Do not treat a stale/hidden locator as a spinner — that skips the
+        # click and sits on the room until the subprocess times out.
+        if _finished_match_archive(match_id, watch_dirs) or _inflight_match_archive(match_id, watch_dirs):
             return "direct"
         try:
             page.keyboard.press("Escape")
@@ -889,28 +890,61 @@ def _click_demo_and_save(page, out_dir: Path, room_url: Optional[str] = None,
             pass
         loc = _find_demo_button(page)
         if loc is None:
+            console.print("[yellow]   [DL] Watch Demo not visible yet[/yellow]")
             return ""
         try:
-            loc.first.scroll_into_view_if_needed(timeout=2000)
+            loc.scroll_into_view_if_needed(timeout=2000)
         except Exception:
             pass
-        bbox = loc.first.bounding_box()
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+        bbox = loc.bounding_box()
         if not bbox:
             return ""
         console.print(f"[cyan]   [DL] Clicking 'Watch Demo' (attempt {attempt})...[/cyan]")
-        _human_click(page, bbox["x"] + bbox["width"] / 2, bbox["y"] + bbox["height"] / 2)
-        # After a click, FACEIT often sits on a spinner for >10s before the
-        # .crdownload appears. Treat that as in-flight: wait for the file,
-        # do not click again or reload (reload aborts the CDN fetch).
-        for _ in range(12):
-            page.wait_for_timeout(500)
+
+        def _click_watch() -> None:
+            try:
+                loc.click(timeout=4000, delay=60)
+            except Exception as e:
+                console.print(f"[yellow]   [DL] locator.click failed ({e}); mouse fallback[/yellow]")
+                box = loc.bounding_box() or bbox
+                _human_click(page, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+
+        def _started() -> str:
             if page.locator("text=Demo 1").count() > 0 or page.locator("text=Demo 2").count() > 0:
                 return "dropdown"
-            if _download_started() is not None or _demo_spinner():
+            if _download_started() is not None:
                 return "direct"
-            if len([pg for pg in page.context.pages[page_count_before:] if pg != page]) > 0:
+            extras = [pg for pg in page.context.pages[page_count_before:] if pg != page]
+            if extras:
                 return "direct"
-        return "direct"
+            try:
+                txt = (loc.inner_text() or "").strip().lower()
+                if "watch demo" not in txt:
+                    return "direct"
+            except Exception:
+                return "direct"
+            return ""
+
+        _click_watch()
+        for _ in range(8):
+            page.wait_for_timeout(500)
+            state = _started()
+            if state:
+                return state
+        # FACEIT often swallows the first click (focus only). Click again.
+        console.print("[cyan]   [DL] No download yet — clicking Watch Demo again[/cyan]")
+        _click_watch()
+        for _ in range(20):
+            page.wait_for_timeout(500)
+            state = _started()
+            if state:
+                return state
+        console.print("[yellow]   [DL] Click did not start a download — will retry[/yellow]")
+        return ""
 
     page_count_before = len(page.context.pages)
 

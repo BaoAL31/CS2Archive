@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts" / "upl
 from _backlog_common import pipeline_cmd, write_card
 from variant import resolve_skip_overlay, youtube_dir_name
 from overlay._common import cameras_for_util_type, clip_is_done
-from scoring import market_demand_bonus, star_bonus
+from scoring import demand_as_raw_star, market_demand_bonus, star_bonus
 from upload_youtube import youtube_upload_completed
 
 
@@ -83,8 +83,15 @@ def test_write_card_fills_pipeline_cmd(tmp_path: Path):
 
 
 def test_star_bonus_still_pays_plus_kd_losses():
-    assert star_bonus(400_000, False, kd=1.5) == 200_000
-    assert star_bonus(400_000, True, kd=0.77) == 0
+    assert star_bonus(400_000, False, kd=1.5) == 300_000
+    assert star_bonus(400_000, True, kd=0.77) == 154_000
+
+
+def test_demand_as_raw_star_is_double_the_demand_chip(tmp_path: Path):
+    missing = tmp_path / "no-index.json"
+    assert demand_as_raw_star("s1mple", path=missing) == 250_000
+    assert star_bonus(demand_as_raw_star("s1mple", path=missing), False, kd=1.56) == 195_000
+    assert demand_as_raw_star("unmeasured", path=missing) == 0
 
 
 def test_market_demand_bonus_research_table(tmp_path: Path):
