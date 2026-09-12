@@ -18,6 +18,24 @@ if ($RefreshTeams) { $Args += "--refresh-teams" }
 
 Set-Location $Root
 $env:PYTHONPATH = "$Root\scripts;$Root"
+
+# Single-owner guard: kill any other listener before starting. The lock file
+# alone only makes the loser crash-loop (exit 1 every 30s); this ensures
+# only one owner exists. Skips this wrapper's own PID.
+$MyPid = $PID
+Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object {
+    $_.CommandLine -match 'match_listener\.py'
+} | ForEach-Object {
+    Write-Warning ("Killing stale listener python PID {0}" -f $_.ProcessId)
+    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+}
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object {
+    $_.ProcessId -ne $MyPid -and $_.CommandLine -match 'run_match_listener\.ps1'
+} | ForEach-Object {
+    Write-Warning ("Killing stale listener wrapper PID {0}" -f $_.ProcessId)
+    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+}
+Start-Sleep -Seconds 2
 $LogDir = Join-Path $Root ".listener"
 New-Item -ItemType Directory -Force $LogDir | Out-Null
 $Transcript = Join-Path $LogDir "listener.log"

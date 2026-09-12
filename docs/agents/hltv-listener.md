@@ -84,6 +84,18 @@ From the repository root:
 Use `--no-rebaseline` when switching events so already-completed matches can
 still be actioned (launch normally re-baselines everything currently visible).
 
+**Single owner — never two listeners.** The `.listener/hltv.lock` only makes
+the loser crash-loop (exit 1 every 30s). Always stop others first:
+
+```powershell
+.\scripts\hltv\stop_match_listener.ps1
+.\scripts\hltv\run_match_listener.ps1
+```
+
+`run_match_listener.ps1` also kills stale listener processes on start (skips
+its own PID). Agents launching via `bg_run` must run the same check-and-kill
+(python `match_listener.py` + `run_match_listener.ps1` wrappers) before start.
+
 The first command checks the filters and state flow without downloading or
 rendering. State is stored in `.listener/hltv.json`; a lock file beside it
 prevents two listeners from using the same CloakBrowser profile or render

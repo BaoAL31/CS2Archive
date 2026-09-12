@@ -30,9 +30,18 @@ venv/
 
 # Temp files
 tmp/
+.tmp/
 tmp_*/
 tmp_*.py
 tmp_*.png
+# Agent scratch / working notes (intermediate memos, tickets)
+.scratch/
+# Windows NUL redirect artifact + stray root outputs
+NUL
+out_*.txt
+*.nohup.out
+# Generated POV-market analysis output (youtube_long.csv stays tracked)
+exports/pov_market/
 
 # Vault
 vault/
@@ -89,14 +98,15 @@ backlog/
 # Local logs
 logs/
 *.log
-.upload_*.shtoken_youtube_readonly.json
+.upload_*.sh
 token_youtube_readonly.json
 
 # Rust build output (button_extract)
 tools/**/target/
 
-# reasonix local state
+# reasonix local state (retired — no code refs left)
 .reasonix/
+reasonix.toml
 
 # CloakBrowser profile (Instagram-friendly automation)
 .cloak-instagram-profile/
