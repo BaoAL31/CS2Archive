@@ -9,10 +9,9 @@ the upload/schedule on all remaining platforms and writes status back into the
 same meta file.
 
 Resume-safe: a meta whose YouTube (upload_status=completed + youtube_id),
-TikTok (tiktok_status=scheduled), and Instagram (instagram_status=scheduled)
-are all done is skipped. Auto-schedule occupies both daily Shorts slots on any
-date that POV already has a Short booked, so the same player is never queued
-twice on one calendar day.
+TikTok (tiktok_status=scheduled), Instagram (queued/published), and Facebook
+(scheduled/published) are all done is skipped. Instagram Graph cannot natively
+schedule, so a queued Reel is a one-shot Windows task at the YouTube slot.
 
 Usage:
     python scripts/upload/upload_pending_shorts.py              # upload all pending
@@ -49,11 +48,15 @@ def _platform_pending(meta: dict) -> dict[str, bool]:
         meta.get("upload_status") == "completed" and meta.get("youtube_id")
     )
     tt_done = skipped or meta.get("tiktok_status") == "scheduled"
-    ig_done = skipped or meta.get("instagram_status") == "scheduled"
+    ig_done = skipped or meta.get("instagram_status") in {
+        "scheduled", "published", "queued",
+    }
+    fb_done = skipped or meta.get("facebook_status") in {"scheduled", "published"}
     return {
         "youtube": not yt_done,
         "tiktok": not tt_done,
         "instagram": not ig_done,
+        "facebook": not fb_done,
     }
 
 
@@ -110,7 +113,13 @@ def _mark_skipped_low_demand(meta_path: Path, meta: dict) -> None:
     _mark_skipped(meta_path, meta, "low_demand")
 
 
-def _needs_upload(meta: dict, *, skip_tiktok: bool, skip_instagram: bool) -> bool:
+def _needs_upload(
+    meta: dict,
+    *,
+    skip_tiktok: bool,
+    skip_instagram: bool,
+    skip_facebook: bool = False,
+) -> bool:
     pending = _platform_pending(meta)
     if pending["youtube"]:
         return True
@@ -118,10 +127,18 @@ def _needs_upload(meta: dict, *, skip_tiktok: bool, skip_instagram: bool) -> boo
         return True
     if not skip_instagram and pending["instagram"]:
         return True
+    if not skip_facebook and pending["facebook"]:
+        return True
     return False
 
 
-def find_pending(root: Path, *, skip_tiktok: bool, skip_instagram: bool) -> list[Path]:
+def find_pending(
+    root: Path,
+    *,
+    skip_tiktok: bool,
+    skip_instagram: bool,
+    skip_facebook: bool = False,
+) -> list[Path]:
     """Return paths of upload_meta_shorts.json files that still need work."""
     pending: list[Path] = []
     for meta_path in sorted(root.rglob(SHORTS_META_NAME)):
@@ -130,7 +147,12 @@ def find_pending(root: Path, *, skip_tiktok: bool, skip_instagram: bool) -> list
         except Exception as e:
             print(f"  [skip] could not parse {meta_path}: {e}")
             continue
-        if not _needs_upload(meta, skip_tiktok=skip_tiktok, skip_instagram=skip_instagram):
+        if not _needs_upload(
+            meta,
+            skip_tiktok=skip_tiktok,
+            skip_instagram=skip_instagram,
+            skip_facebook=skip_facebook,
+        ):
             continue
         video = meta.get("video_path")
         if not video or not Path(video).exists():
@@ -142,9 +164,23 @@ def find_pending(root: Path, *, skip_tiktok: bool, skip_instagram: bool) -> list
     return pending
 
 
-def upload_one(meta_path: Path, meta: dict, dry_run: bool, *, skip_tiktok: bool, skip_instagram: bool) -> bool:
+def upload_one(
+    meta_path: Path,
+    meta: dict,
+    dry_run: bool,
+    *,
+    skip_tiktok: bool,
+    skip_instagram: bool,
+    skip_facebook: bool = False,
+) -> bool:
     video = Path(meta["video_path"])
     pending = _platform_pending(meta)
+    if skip_tiktok:
+        pending["tiktok"] = False
+    if skip_instagram:
+        pending["instagram"] = False
+    if skip_facebook:
+        pending["facebook"] = False
 
     if dry_run:
         parts = [name for name, p in pending.items() if p]
@@ -159,6 +195,8 @@ def upload_one(meta_path: Path, meta: dict, dry_run: bool, *, skip_tiktok: bool,
         cmd.append("--skip-tiktok")
     if skip_instagram:
         cmd.append("--skip-instagram")
+    if skip_facebook:
+        cmd.append("--skip-facebook")
 
     print(f"  Uploading: {video}")
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
@@ -173,6 +211,12 @@ def upload_one(meta_path: Path, meta: dict, dry_run: bool, *, skip_tiktok: bool,
         updated = {}
 
     remaining = _platform_pending(updated)
+    if skip_tiktok:
+        remaining["tiktok"] = False
+    if skip_instagram:
+        remaining["instagram"] = False
+    if skip_facebook:
+        remaining["facebook"] = False
     still = [name for name, p in remaining.items() if p]
     if still:
         print(f"  [WARN] still pending after upload ({', '.join(still)}): {video}")
@@ -199,6 +243,9 @@ def main() -> None:
     parser.add_argument(
         "--skip-instagram", action="store_true",
         help="Treat Instagram as done / don't require it (passes --skip-instagram to uploader)")
+    parser.add_argument(
+        "--skip-facebook", action="store_true",
+        help="Treat Facebook as done / don't require it (passes --skip-facebook to uploader)")
     args = parser.parse_args()
 
     root = Path(args.dir)
@@ -206,7 +253,12 @@ def main() -> None:
         print(f"[ERROR] directory not found: {root}")
         sys.exit(1)
 
-    pending = find_pending(root, skip_tiktok=args.skip_tiktok, skip_instagram=args.skip_instagram)
+    pending = find_pending(
+        root,
+        skip_tiktok=args.skip_tiktok,
+        skip_instagram=args.skip_instagram,
+        skip_facebook=args.skip_facebook,
+    )
     print(f"Found {len(pending)} pending short upload(s) under {root}")
     if args.limit > 0:
         pending = pending[:args.limit]
@@ -215,33 +267,18 @@ def main() -> None:
         print("Nothing to upload.")
         return
 
-    # preflight: check social sessions before wasting 10min per upload
+    # preflight: TikTok still uses the browser session. Instagram/Facebook use Graph.
     if pending and not args.dry_run:
         need_tt = any(json.loads(p.read_text(encoding="utf-8-sig")).get("tiktok_status") != "scheduled" for p in pending) and not args.skip_tiktok
-        need_ig = any(json.loads(p.read_text(encoding="utf-8-sig")).get("instagram_status") != "scheduled" for p in pending) and not args.skip_instagram
-        if need_tt or need_ig:
+        if need_tt:
             try:
-                import sys as _sys
-                _util = PROJECT_ROOT.parent / "CS2UtilArchive" / "scripts"
-                if str(_util) not in _sys.path:
-                    _sys.path.insert(0, str(_util))
-                from social_session_check import check_instagram, check_tiktok
-                if need_tt:
-                    tt_profile = _util.parent / ".cloak-tiktok-profile" if (_util.parent / ".cloak-tiktok-profile").exists() else PROJECT_ROOT.parent / "CS2UtilArchive" / ".cloak-tiktok-profile"
-                    # canonical util root
-                    from pathlib import Path as _P
-                    tt_dir = _P(r"D:\Projects\CS2UtilArchive") / ".cloak-tiktok-profile"
-                    ok, msg = check_tiktok(tt_dir)
-                    print(f"[preflight tiktok] {msg}", flush=True)
-                    if not ok:
-                        print("  -> TikTok not logged in. Fix then re-run, or use --skip-tiktok", flush=True)
-                if need_ig:
-                    ig_dir = _P(r"D:\Projects\CS2UtilArchive") / ".cloak-instagram-profile"
-                    ok, msg = check_instagram(ig_dir)
-                    print(f"[preflight instagram] {msg}", flush=True)
-                    if not ok:
-                        print("  -> Instagram not logged in. Fix: python D:\\Projects\\CS2UtilArchive\\scripts\\upload_instagram_browser.py --profile-dir D:\\Projects\\CS2UtilArchive\\.cloak-instagram-profile login --isolated-profile --cloak-chrome --timeout 600", flush=True)
-                        print("  -> or skip with --skip-instagram", flush=True)
+                from pathlib import Path as _P
+                from social_session_check import check_tiktok
+                tt_dir = _P(r"D:\Projects\CS2UtilArchive") / ".cloak-tiktok-profile"
+                ok, msg = check_tiktok(tt_dir)
+                print(f"[preflight tiktok] {msg}", flush=True)
+                if not ok:
+                    print("  -> TikTok not logged in. Fix then re-run, or use --skip-tiktok", flush=True)
             except Exception as e:
                 print(f"[preflight warn] {e}", flush=True)
 
@@ -271,8 +308,12 @@ def main() -> None:
                 _mark_skipped(meta_path, meta, reason)
             skipped += 1
             continue
-        if upload_one(meta_path, meta, args.dry_run,
-                      skip_tiktok=args.skip_tiktok, skip_instagram=args.skip_instagram):
+        if upload_one(
+            meta_path, meta, args.dry_run,
+            skip_tiktok=args.skip_tiktok,
+            skip_instagram=args.skip_instagram,
+            skip_facebook=args.skip_facebook,
+        ):
             ok += 1
         else:
             if not args.dry_run:

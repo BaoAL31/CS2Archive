@@ -16,6 +16,9 @@ renders/
 client_secret.json
 token_youtube.json
 token_youtube_thumb.json
+tmp_meta_token.json
+.tmp_meta_token*.json
+.cloak-instagram-profile/
 
 # App data
 .data/
@@ -107,6 +110,3 @@ tools/**/target/
 # reasonix local state (retired — no code refs left)
 .reasonix/
 reasonix.toml
-
-# CloakBrowser profile (Instagram-friendly automation)
-.cloak-instagram-profile/

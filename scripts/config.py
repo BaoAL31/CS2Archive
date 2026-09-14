@@ -20,6 +20,13 @@ class Settings(BaseSettings):
     faceit_api_key: str = Field(default="", description="FACEIT Data API v4 key (player/match lookup only)")
     faceit_downloads_token: str = Field(default="", description="FACEIT Downloads API token (demo file download)")
     youtube_api_key: str = Field(default="", description="YouTube Data API v3 key")
+    meta_app_id: str = Field(default="", description="Meta app id (cs2povarchive)")
+    meta_business_id: str = Field(default="", description="Meta Business portfolio id")
+    meta_page_id: str = Field(default="", description="Facebook Page id")
+    meta_ig_user_id: str = Field(default="", description="Instagram professional account id")
+    meta_system_user_id: str = Field(default="", description="Meta system user id")
+    meta_system_user_token: str = Field(default="", description="Never-expiring system user Graph token")
+    meta_page_access_token: str = Field(default="", description="Page access token derived from the system user")
 
     # ── Paths ─────────────────────────────────────────────────────────────
     demo_storage_dir: Path = Field(default=Path("./demos"), description="Root directory for downloaded demos")
@@ -96,6 +103,10 @@ class Settings(BaseSettings):
     @property
     def has_faceit_downloads_token(self) -> bool:
         return bool(self.faceit_downloads_token and self.faceit_downloads_token != "your_downloads_token_here")
+
+    @property
+    def has_meta_graph(self) -> bool:
+        return bool(self.meta_system_user_token and self.meta_page_id and self.meta_ig_user_id)
 
 
 # Singleton settings instance

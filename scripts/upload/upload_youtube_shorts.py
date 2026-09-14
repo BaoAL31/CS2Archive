@@ -1,8 +1,10 @@
 """
-Upload a YouTube Short (plus TikTok and Instagram by default).
+Upload a YouTube Short (plus TikTok, Instagram, and Facebook Page by default).
 
-Schedules on YouTube, TikTok, and Instagram using the shared
-CS2UtilArchive slot pool (17:30 Australia/Sydney, once daily). Resume-safe: a
+YouTube and TikTok schedule via their own APIs/UIs against the shared
+CS2UtilArchive slot pool. Facebook Page Reels use Graph native schedule at
+the same ``publish_at_utc``. Instagram Graph cannot schedule, so a one-shot
+Windows task runs ``publish_due_social.py`` at that slot. Resume-safe: a
 completed platform upload is skipped on re-run.
 
 Usage:
@@ -27,7 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -90,6 +92,11 @@ def main() -> None:
         "--skip-instagram",
         action="store_true",
         help="Skip the Instagram upload (default: upload to Instagram after YouTube)",
+    )
+    parser.add_argument(
+        "--skip-facebook",
+        action="store_true",
+        help="Skip the Facebook Page Reel upload (default: Graph publish after Instagram)",
     )
     parser.add_argument(
         "--publish-at",
@@ -257,11 +264,18 @@ def main() -> None:
         except Exception as exc:
             print(f"  [warn] could not convert slot for browser UIs: {exc}", flush=True)
 
+    slot_utc = None
+    meta_now = _read_meta(meta_path)
+    slot_utc = meta_now.get("publish_at_utc") or publish_at_utc
+
     if not args.skip_tiktok:
         _run_tiktok(video, title, browser_date, browser_time, meta_file_path)
 
     if not args.skip_instagram:
-        _run_instagram(video, title, browser_date, browser_time, meta_file_path)
+        _run_instagram(video, title, meta_file_path, publish_at_utc=slot_utc)
+
+    if not args.skip_facebook:
+        _run_facebook(video, title, description, meta_file_path, publish_at_utc=slot_utc)
 
 
 def _read_meta(meta_path: Path) -> dict:
@@ -285,6 +299,17 @@ def _utc_to_local_publish(publish_at_utc: str, tz: str) -> tuple[str, str]:
     utc_dt = datetime.fromisoformat(publish_at_utc.replace("Z", "+00:00"))
     local_dt = utc_dt.astimezone(ZoneInfo(tz))
     return local_dt.strftime("%Y-%m-%d"), local_dt.strftime("%H:%M")
+
+
+def _aware_utc(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+_FB_SCHEDULE_MIN = timedelta(minutes=10)
+_FB_SCHEDULE_MAX = timedelta(days=29)
+_IG_IMMEDIATE = timedelta(seconds=90)
 
 
 def _run_tiktok(
@@ -340,55 +365,123 @@ def _run_tiktok(
 def _run_instagram(
     video: Path,
     title: str,
-    browser_date: str | None,
-    browser_time: str | None,
     meta_file_path: str,
+    *,
+    publish_at_utc: str | None,
 ) -> None:
-    """Schedule the Short as an Instagram Reel. Resume-safe."""
+    """Queue or publish an Instagram Reel via Graph. Resume-safe.
+
+    Graph cannot natively schedule Reels. Future slots register a one-shot
+    Windows task that runs ``publish_due_social.py`` at the YouTube time.
+    """
     meta_path = Path(meta_file_path)
     meta_now = _read_meta(meta_path)
-    if meta_now.get("instagram_status") == "scheduled":
-        print("  [instagram] already scheduled", flush=True)
-        return
-    if not browser_date or not browser_time:
-        print("  [instagram] no schedule slot; skipping", flush=True)
+    if meta_now.get("instagram_status") == "published":
+        print("  [instagram] already published", flush=True)
         return
 
-    from instagram_business_navigator import (
-        DEFAULT_ASSET_ID,
-        DEFAULT_BUSINESS_ID,
-        DEFAULT_PROFILE_DIR as DEFAULT_INSTAGRAM_PROFILE_DIR,
-        run_schedule_flow as run_instagram_schedule_flow,
-    )
-    profile_dir = _UTIL_ROOT / DEFAULT_INSTAGRAM_PROFILE_DIR
-    # preflight: fail fast if Business Suite not logged in
+    slot = _aware_utc(publish_at_utc)
+    now = datetime.now(timezone.utc)
+    due_now = slot is None or slot <= now + _IG_IMMEDIATE
+    if (
+        meta_now.get("instagram_status") == "queued"
+        and not due_now
+        and meta_now.get("instagram_due_task")
+    ):
+        print(f"  [instagram] already queued for {publish_at_utc}", flush=True)
+        return
+
+    if due_now:
+        from meta_graph import MetaGraph
+
+        print("Publishing Instagram Reel via Graph...", flush=True)
+        result = MetaGraph().publish_ig_reel_file(video, caption=title)
+        ig_id = result.get("id")
+        _write_meta(meta_path, instagram_status="published", instagram_id=ig_id)
+        print(f"  Instagram published id={ig_id}", flush=True)
+        return
+
+    from publish_due_social import schedule_due_meta
+
+    assert slot is not None
     try:
-        from social_session_check import check_instagram
-        ok, msg = check_instagram(profile_dir)
-        if not ok:
-            print(f"  [instagram] {msg}", flush=True)
-            print("  [instagram] skipping — fix login then re-run upload_pending_shorts", flush=True)
-            return
-        print(f"  [instagram] preflight OK: {msg}", flush=True)
-    except Exception as e:
-        print(f"  [instagram] preflight warn (continuing): {e}", flush=True)
-    print("Scheduling Instagram Reel...", flush=True)
-    run_instagram_schedule_flow(
-        video_path=video,
-        schedule_date=browser_date,
-        schedule_time=browser_time,
-        profile_dir=profile_dir,
-        headed=False,
-        hold_seconds=0,
-        upload_timeout_seconds=SOCIAL_UPLOAD_TIMEOUT_SECONDS,
-        submit=True,
-        asset_id=DEFAULT_ASSET_ID,
-        business_id=DEFAULT_BUSINESS_ID,
-        caption=title,
-        output_path=None,
+        task_name = schedule_due_meta(meta_path, slot)
+    except Exception as exc:
+        print(f"  [instagram] Windows task failed: {exc}", flush=True)
+        print(
+            "  [instagram] queued anyway — run "
+            f"python scripts/upload/publish_due_social.py --meta {meta_path} at the slot",
+            flush=True,
+        )
+        task_name = None
+    _write_meta(
+        meta_path,
+        instagram_status="queued",
+        instagram_due_task=task_name,
+        video_path=str(video.resolve()),
+        title=title,
+        publish_at_utc=publish_at_utc,
     )
-    _write_meta(meta_path, instagram_status="scheduled")
-    print("  Instagram scheduled", flush=True)
+    local = slot.astimezone()
+    print(
+        f"  Instagram queued for {local:%Y-%m-%d %H:%M} ({local.tzname()})"
+        + (f" task={task_name}" if task_name else ""),
+        flush=True,
+    )
+
+
+def _run_facebook(
+    video: Path,
+    title: str,
+    description: str,
+    meta_file_path: str,
+    *,
+    publish_at_utc: str | None,
+) -> None:
+    """Schedule a Facebook Page Reel via Graph (same slot as YouTube). Resume-safe."""
+    meta_path = Path(meta_file_path)
+    meta_now = _read_meta(meta_path)
+    if meta_now.get("facebook_status") in {"scheduled", "published"}:
+        print("  [facebook] already scheduled", flush=True)
+        return
+
+    from meta_graph import MetaGraph
+
+    slot = _aware_utc(publish_at_utc)
+    now = datetime.now(timezone.utc)
+    scheduled_ts = None
+    if slot is not None:
+        delta = slot - now
+        if _FB_SCHEDULE_MIN <= delta <= _FB_SCHEDULE_MAX:
+            scheduled_ts = int(slot.timestamp())
+        elif delta > timedelta(0):
+            print(
+                "  [facebook] slot is under 10 minutes away; Graph cannot "
+                "schedule a Page Reel that soon — publishing now",
+                flush=True,
+            )
+
+    if scheduled_ts:
+        print("Scheduling Facebook Page Reel via Graph...", flush=True)
+    else:
+        print("Publishing Facebook Page Reel via Graph...", flush=True)
+    result = MetaGraph().publish_page_reel_file(
+        video,
+        description=description or title,
+        title=title,
+        scheduled_publish_time=scheduled_ts,
+    )
+    fb_id = result.get("video_id") or result.get("id")
+    status = "scheduled" if scheduled_ts else "published"
+    _write_meta(meta_path, facebook_status=status, facebook_id=fb_id)
+    if scheduled_ts and slot is not None:
+        local = slot.astimezone()
+        print(
+            f"  Facebook Page scheduled id={fb_id} for {local:%Y-%m-%d %H:%M} ({local.tzname()})",
+            flush=True,
+        )
+    else:
+        print(f"  Facebook Page published id={fb_id}", flush=True)
 
 
 if __name__ == "__main__":

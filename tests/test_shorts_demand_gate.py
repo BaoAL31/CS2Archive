@@ -234,7 +234,9 @@ def test_skipped_meta_is_not_pending() -> None:
     }
     assert not ups._needs_upload(meta, skip_tiktok=False, skip_instagram=False)
     pending = ups._platform_pending(meta)
-    assert pending == {"youtube": False, "tiktok": False, "instagram": False}
+    assert pending == {
+        "youtube": False, "tiktok": False, "instagram": False, "facebook": False,
+    }
 
 
 def test_upload_gate_reads_nick_and_folder(tmp_path: Path) -> None:
