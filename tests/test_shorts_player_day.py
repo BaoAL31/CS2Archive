@@ -7,7 +7,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts" / "upload"))
+sys.path.insert(0, str(Path(r"D:\Projects\CS2UtilArchive\scripts")))
 
+from publish_schedule import SLOT_TIMES
 from shorts_player_day import meta_publish_date_local, player_blocked_slots, pov_nick_from_meta_path
 
 
@@ -20,7 +22,7 @@ def test_pov_nick_from_timeline(tmp_path: Path) -> None:
     assert pov_nick_from_meta_path(meta) == "m0NESY"
 
 
-def test_blocks_both_slots_on_player_date(tmp_path: Path) -> None:
+def test_blocks_daily_slot_on_player_date(tmp_path: Path) -> None:
     a = tmp_path / "a"
     a.mkdir()
     (a / "short_timeline.json").write_text(
@@ -38,10 +40,10 @@ def test_blocks_both_slots_on_player_date(tmp_path: Path) -> None:
     exclude.write_text(json.dumps({"publish_at": "auto"}), encoding="utf-8")
 
     blocked = player_blocked_slots(
-        tmp_path, "donk", "Australia/Sydney", ["12:00", "18:00"],
+        tmp_path, "donk", "Australia/Sydney", SLOT_TIMES,
         exclude_meta=exclude,
     )
-    assert blocked == {("2026-09-02", "12:00"), ("2026-09-02", "18:00")}
+    assert blocked == {("2026-09-02", t) for t in SLOT_TIMES}
 
 
 def test_other_player_does_not_block() -> None:

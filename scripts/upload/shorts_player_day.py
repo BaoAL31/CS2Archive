@@ -1,8 +1,8 @@
 """One Short per player per calendar day.
 
-When auto-assigning CS2UtilArchive slots (12:00 / 18:00), occupy *both* slots
-on any date this POV already has a Short scheduled so a second donk/m0NESY
-clip cannot land the same day.
+When auto-assigning the shared CS2UtilArchive slot (18:00, one Short/day),
+occupy that date's slot(s) if this POV already has a Short scheduled so a
+second donk/m0NESY clip cannot land the same day.
 """
 
 from __future__ import annotations

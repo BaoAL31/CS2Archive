@@ -166,8 +166,8 @@ def main() -> None:
                 else set()
             )
             # One Short per player per calendar day: if this POV already has a
-            # Short booked that date, occupy both daily slots so the next clip
-            # of theirs lands on a later day.
+            # Short booked that date, occupy the daily 18:00 slot so the next
+            # clip of theirs lands on a later day.
             from publish_schedule import SLOT_TIMES, find_next_upload_slot
             nick = pov_nick_from_meta_path(meta_path)
             if nick:
