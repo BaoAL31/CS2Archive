@@ -726,7 +726,7 @@ class Pipeline:
             if risks:
                 print(f"  [risk] {len(risks)} round risk(s) flagged — review before render")
             self.state["data"]["round_risks"] = risks
-            windows = plan_round_windows(data)
+            windows = plan_round_windows(data, steam_id=str(self.steam_id or ""))
             dump_round_windows(windows, self.render_dir / "round_windows.json")
             skipped = [w for w in windows if w.skip]
             trimmed = [w for w in windows if w.trimmed]
@@ -737,7 +737,7 @@ class Pipeline:
                       f"(ticks {w.start_tick}-{w.end_tick})")
             if skipped or trimmed:
                 print(f"  [ok] {len(skipped)} voided round(s) skipped, "
-                      f"{len(trimmed)} oversize round(s) trimmed for HLAE")
+                      f"{len(trimmed)} round(s) trimmed for HLAE")
             write_voided = {w.number for w in skipped}
             write_voided_rounds(self.render_dir, write_voided)
             self.state["data"]["voided_rounds"] = sorted(write_voided)

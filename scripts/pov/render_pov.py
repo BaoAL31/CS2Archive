@@ -1208,7 +1208,10 @@ def main() -> None:
                     continue
 
                 analysis = _load_analysis(output_dir, part)
-                planned = plan_round_windows(analysis) if analysis else []
+                planned = (
+                    plan_round_windows(analysis, steam_id=str(args.steam_id or ""))
+                    if analysis else []
+                )
                 by_local = {w.number: w for w in planned}
                 voided_g: set[int] = set()
                 trimmed_items: list[tuple[int, object]] = []
