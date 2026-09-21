@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 import os
 import re
@@ -104,10 +105,8 @@ BASE_FLAGS = [
     "--no-show-only-death-notices",
     "--show-assists",
     "--record-audio",
-    # CSDM defaults to --no-player-voices, which pushes `voice_enable 0` during
-    # the render (kills voice + talking indicators). Keep player voice on; the
-    # in-game cfg (cl_mute_enemy_team 1) drops the enemy, so only the POV
-    # team's comms + indicators land in the recorded audio.
+    # CSDM's CS2 voice setting controls playback masks, not speaker HUD state.
+    # Swift's display-only HUD is mounted separately when requested.
     "--player-voices",
     # NOTE: --concatenate-sequences intentionally omitted. Without it CSDM
     # emits one sequence-{i}-tick-{A}-to-{B}.mp4 per round. We keep those files
@@ -449,12 +448,23 @@ def _render_trimmed_windows(
     cfg_path = output_dir / "_trimmed_rounds.json"
     cfg_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     cmd = [CSDM, "video", "--config-file", str(cfg_path)]
-    run_csdm(cmd, f"trimmed rounds {global_rounds[0]}-{global_rounds[-1]}",
-             expected=None,
-             hook_timeout=args.hook_timeout,
-             hook_retries=args.hook_retries,
-             output_dir=output_dir)
+    with _voice_hud_session(demo_path, output_dir, steam_id, args):
+        run_csdm(cmd, f"trimmed rounds {global_rounds[0]}-{global_rounds[-1]}",
+                 expected=None,
+                 hook_timeout=args.hook_timeout,
+                 hook_retries=args.hook_retries,
+                 output_dir=output_dir)
     _rename_sequence_files(output_dir, global_rounds, tick_overrides=overrides)
+
+
+def _voice_hud_session(demo_path: str, output_dir: Path, steam_id: str, args):
+    style = getattr(args, "voice_indicators", "off")
+    if style not in ("swift", "legacy"):
+        return nullcontext()
+    from overlay.swift_demoui import prepare, mounted_hud
+    names = json.loads(args.rename) if getattr(args, "rename", "") else {}
+    menu, session = prepare(Path(demo_path), steam_id, output_dir, names, native=(style == "swift"))
+    return mounted_hud(GAME_CFG.parent, menu, session)
 
 
 def _render_event_rounds_cli(demo_part: str, output_dir: Path, steam_id: str,
@@ -473,11 +483,12 @@ def _render_event_rounds_cli(demo_part: str, output_dir: Path, steam_id: str,
         "--cfg", str(abs_cfg_path()),
     ] + BASE_FLAGS
     # csdm writes per-round sequence files; caller renames them below.
-    run_csdm(cmd, f"rounds {missing_global[0]}-{missing_global[-1]}",
-             expected=None,
-             hook_timeout=args.hook_timeout,
-             hook_retries=args.hook_retries,
-             output_dir=output_dir)
+    with _voice_hud_session(demo_part, output_dir, steam_id, args):
+        run_csdm(cmd, f"rounds {missing_global[0]}-{missing_global[-1]}",
+                 expected=None,
+                 hook_timeout=args.hook_timeout,
+                 hook_retries=args.hook_retries,
+                 output_dir=output_dir)
 
 
 def _verify_round_clips(output_dir: Path, round_nums: list[int],
@@ -816,8 +827,8 @@ def _write_render_autoexec(cvars: list[str], rename_map: dict[str, str] | None =
     # Voice stays fully ON during render. These MUST be in the game's
     # autoexec.cfg (runs at launch, BEFORE the demo loads) — if set later they
     # don't apply to demo playback. tv_listen_voice_indices -1 (both halves =
-    # 64-slot bitmask all-set) enables hearing + showing the talking indicator
-    # for every player; tv_relaytextchat 2 shows the player text chat.
+    # 64-slot bitmask all-set) enables hearing every recorded player.
+    # It does not repair the native speaker HUD; Swift handles that separately.
     lines = ["crosshair 1", "cl_chatfilters 63", "snd_mvp_volume 0",
              "snd_mute_losefocus 0", "voice_enable 1", "voice_modenable 1",
              "tv_listen_voice_indices -1",
@@ -931,6 +942,9 @@ def main() -> None:
                              "(default: 2). 0 disables hook detection entirely.")
     parser.add_argument("--rounds", type=str, default="",
                     help="Comma-separated list of specific rounds to render, e.g. '1,3,5' or '2-4,7'. If omitted, all rounds are rendered.")
+    parser.add_argument("--voice-indicators", choices=("swift", "legacy", "off"), default="off",
+                        help="Mount Swift DemoUI Pro speaker HUD during capture. "
+                             "swift is the native in-game rows; legacy keeps Swift's dark-bar chrome.")
 
     parser.add_argument("--no-minimize-cs2", action="store_true",
                         help="Disable auto-minimize CS2 when it launches (default: enabled)")
@@ -1026,6 +1040,8 @@ def main() -> None:
 
     output_dir = resolve_output_dir(args.output, parts[0], args.steam_id)
     output_dir.mkdir(parents=True, exist_ok=True)
+    from overlay.swift_demoui import validate_render_profile
+    validate_render_profile(output_dir, args.voice_indicators, args.steam_id)
 
     cvars = _get_player_crosshair(args.steam_id, parts)
     vm_cvars = _viewmodel_cvars_from_args(args)

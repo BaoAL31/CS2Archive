@@ -548,11 +548,7 @@ class Pipeline:
         # Step 3: no combined.mp4 yet → keep at user's start_step
 
     def _voice_enabled(self) -> bool:
-        """Whether voice comms (shade + comms mix) should run for this card.
-
-        Policy: FACEIT POVs always carry team voice comms (always on);
-        HLTV POVs never do (always off). Explicit flags can still force it on.
-        """
+        """Enable comms and the selected HUD for qualifying FACEITs or explicit flags."""
         if getattr(self.args, "enable_voice_comms", False) or getattr(
             self.args, "voice_shade", False
         ):
@@ -564,6 +560,20 @@ class Pipeline:
         # record zero team voice packets — mixing those would refuse with
         # VOICE_COMMS_FAILED rather than emit a silent 'comms' result.
         return _faceit_voice_enabled(self.demo_path, self.steam_id)
+
+    def _voice_indicator_style(self) -> str:
+        return getattr(self.args, "voice_indicators", "swift")
+
+    def _check_voice_capture(self, step: int) -> None:
+        if self._voice_enabled() and self._voice_indicator_style() in ("swift", "legacy"):
+            from overlay.swift_demoui import require_swift_capture
+            try:
+                require_swift_capture(
+                    self.render_dir, self.steam_id,
+                    native=self._voice_indicator_style() == "swift",
+                )
+            except (ValueError, RuntimeError) as exc:
+                fail(step, "VOICE_INDICATOR_CAPTURE_REQUIRED", str(exc))
 
     def _setup_logging(self) -> Path:
         """Redirect all output (Python prints + subprocess stdout/stderr) to
@@ -779,6 +789,8 @@ class Pipeline:
             "--hook-timeout", str(getattr(self.args, "hook_timeout", 150.0)),
             "--hook-retries", str(getattr(self.args, "hook_retries", 2)),
         ]
+        if self._voice_enabled() and self._voice_indicator_style() in ("swift", "legacy"):
+            render_args += ["--voice-indicators", self._voice_indicator_style()]
         if skip_failed:
             render_args += ["--skip-failed-rounds"]
         cap_w = int(self.meta.get("capture_width") or 0)
@@ -1191,6 +1203,7 @@ class Pipeline:
     def step_concat(self) -> None:
         if not self.render_dir.exists():
             fail(3, "CONCAT_RENDER_DIR_MISSING", f"render dir not found: {self.render_dir}")
+        self._check_voice_capture(3)
         skip_failed = getattr(self.args, "skip_failed_rounds", False)
 
         concat_args = ["scripts/pov/concat_rounds.py", str(self.render_dir)]
@@ -1203,16 +1216,13 @@ class Pipeline:
             concat_args += ["--scaling-mode", scaling]
         if skip_failed or load_voided_rounds(self.render_dir):
             concat_args += ["--allow-gaps"]
-        # Voice is ONE feature: the shade indicator AND the comms audio always
-        # go together. --enable-voice-comms turns on both. (--voice-shade is a
-        # legacy alias kept for backward-compat; it implies the same.)
-        # The shade is applied at NATIVE res in the SCALE step so it stretches
-        # together with the video (boxes stay locked to avatars).
+        # Swift indicators are already in the captured frames. Only the legacy
+        # style adds scoreboard shading during the native-resolution scale pass.
         # FACEIT demos carry packet-aligned team voice; they enable voice by
         # default only when the demo has enough real team voice (see
         # _voice_enabled / VOICE_AUTO_MIN_TEAM_SECONDS).
         enable_voice = self._voice_enabled()
-        if enable_voice and self.demo_path and self.demo_path.exists():
+        if enable_voice and self._voice_indicator_style() == "shade" and self.demo_path and self.demo_path.exists():
             cap_w = int(self.meta.get("capture_width") or 0)
             cap_h = int(self.meta.get("capture_height") or 0)
             concat_args += [
@@ -1248,12 +1258,10 @@ class Pipeline:
             print("  [skip] Raw-only mode: overlay step disabled")
             return
 
-        # Voice is ONE feature: the comms AUDIO mix runs here in step 4
-        # (the shade indicator was applied at native res in the step-3 scale).
-        # --enable-voice-comms turns both on; --voice-shade is a legacy alias.
-        # Keep FACEIT voice shade and team comms inseparable. FACEIT cards
-        # enable this by default only when the demo has enough team voice.
+        # Audio is mixed here; Swift's HUD was captured in step 2, or legacy
+        # shading was added in step 3. Both use the existing voice eligibility.
         enable_voice = self._voice_enabled()
+        self._check_voice_capture(4)
 
         # Skip if the overlay variant already has a valid video (resume from
         # a previous successful run where .overlay_work was cleaned).
@@ -1367,8 +1375,7 @@ class Pipeline:
             return
 
         # -- Voice comms: mix POV-team voice into the overlay audio. ---------
-        # Runs only when voice is enabled, and always together with the shade
-        # (the shade is baked into overlay_sidecar by overlay_pov above). Uses
+        # Runs only when voice is enabled, with the selected speaker HUD. Uses
         # the FIXED packet-aligned decoder; video is stream-copied (no re-encode).
         if enable_voice:
             offsets_for_comms = target_dir / "video.round_offsets.json"
@@ -1899,10 +1906,14 @@ def main() -> None:
         "--enable-voice-comms",
         action="store_true",
         default=False,
-        help="Enable BOTH the voice-activity shade indicator AND the POV-team "
-             "voice comms (they always go together). Folds the shade into the "
-             "batched overlay encode and mixes the team voice into the audio "
-             "(via mix_team_voice.py).",
+        help="Enable POV-team voice comms and speaker indicators. Native in-game "
+             "rows are the default HUD; --voice-indicators legacy keeps Swift's "
+             "dark-bar chrome; shade is the old scoreboard-avatar effect.",
+    )
+    parser.add_argument(
+        "--voice-indicators", choices=("swift", "legacy", "shade"), default="swift",
+        help="Speaker display when voice comms are enabled (default: swift, native HUD). "
+             "legacy keeps Swift's original dark-bar chrome. shade is the old scoreboard effect.",
     )
     parser.add_argument(
         "--voice-shade",
