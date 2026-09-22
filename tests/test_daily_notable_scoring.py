@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from datetime import datetime
@@ -60,13 +61,35 @@ def test_build_index_blends_recent_lift_and_ignores_unknown_names():
     aliases = {"donk": "donk", "device": "device", "dev1ce": "device", "ropz": "ropz"}
     index, details = upd.build_index(long_report, recent_report, aliases)
     assert "smoke" not in index
-    assert index["donk"] == 1.35
+    assert index["donk"] == round(0.3 * 1.2 + 0.7 * 1.8, 2)
     assert index["ropz"] == 1.69
-    assert "device" not in index
-    assert details["device"]["index"] == round(
-        min(1.35, max(0.85, 0.7 * 0.85 + 0.3 * 1.5)), 2
+    assert index["device"] == round(0.3 * 0.85 + 0.7 * 1.5, 2)
+    assert details["device"]["index"] == index["device"]
+    assert details["donk"]["index"] == index["donk"]
+
+
+def test_build_index_recent_cold_streak_can_cut():
+    long_report = {
+        "groups": {
+            "primary_players": [
+                {"label": "donk", "videos": 40, "median_performance_index": 1.6},
+            ]
+        }
+    }
+    recent_report = {
+        "groups": {
+            "primary_players": [
+                {"label": "donk", "videos": 4, "median_performance_index": 0.7},
+            ]
+        }
+    }
+    index, details = upd.build_index(
+        long_report, recent_report, {"donk": "donk"},
     )
-    assert details["donk"]["index"] == 1.35
+    expected = round(0.3 * 1.6 + 0.7 * 0.7, 2)
+    assert details["donk"]["index"] == expected
+    assert expected < 1.08
+    assert "donk" not in index
 
 
 def test_lobby_elo_bonus_is_bounded():
@@ -307,6 +330,151 @@ def test_is_good_faceit_pov_is_demand_only():
     assert not sn.is_good_faceit_pov(blamef)
     assert not sn.is_good_faceit_pov(smash_unknown)
     assert sn.is_good_faceit_pov({**donk, "won": False})
+
+
+def test_org_star_needs_standout_line_for_solo_pov(monkeypatch):
+    """Replay of 1-75510475: TeSeS (Falcons, no measurable demand) with a
+    25/20 mid line must NOT get a solo render — that lobby belongs to the
+    highlight feed. A TeSeS banger still qualifies."""
+    import hltv_ranking
+    monkeypatch.setattr(sn, "load_player_demand_index", lambda *a, **k: {})
+    monkeypatch.setattr(
+        hltv_ranking, "_ROSTER_CACHE",
+        {"teses": "Falcons", "kyousuke": "Falcons"},
+    )
+    monkeypatch.setattr(hltv_ranking, "_load_cache", lambda: {"Falcons": 2})
+    assert sn.is_good_faceit_pov(
+        {"player": "TeSeS", "kd": 2.0, "adr": 110.0, "kills": 28})
+    assert not sn.is_good_faceit_pov(
+        {"player": "TeSeS", "kd": 1.25, "adr": 79.7, "kills": 25})
+    assert not sn.is_good_faceit_pov(
+        {"player": "kyousuke", "kd": 0.96, "adr": 90.0, "kills": 20})
+    # Standout line alone (no org, no demand) is not enough either.
+    assert not sn.is_good_faceit_pov(
+        {"player": "nocries", "kd": 2.5, "adr": 140.0, "kills": 30})
+    assert not sn.is_good_faceit_pov({})
+
+
+def test_org_star_floor_is_top_ten_teams(monkeypatch):
+    monkeypatch.setattr(sn, "load_player_demand_index", lambda *a, **k: {})
+    monkeypatch.setattr(
+        sn, "star_bonus_for_pros",
+        lambda pros, ranking=None: 250_000 if pros[0] == "navi-pro" else 120_000,
+    )
+    assert sn.is_good_faceit_pov(
+        {"player": "navi-pro", "kd": 2.0, "adr": 110.0, "kills": 25})
+    assert not sn.is_good_faceit_pov(
+        {"player": "astralis-pro", "kd": 2.0, "adr": 110.0, "kills": 25})
+
+
+def test_stacked_lobby_with_mid_lines_is_highlight_not_solo(monkeypatch):
+    """1-75510475 as scraped: all-mid lines, 4-pro Spirit/Falcons lobby.
+    Nobody earns a solo render, but the lobby clears the highlight bar."""
+    import hltv_ranking
+    monkeypatch.setattr(sn, "load_player_demand_index", lambda *a, **k: {})
+    monkeypatch.setattr(
+        hltv_ranking, "_ROSTER_CACHE",
+        {"donk": "Spirit", "magixx": "Spirit",
+         "teses": "Falcons", "kyousuke": "Falcons"},
+    )
+    monkeypatch.setattr(
+        hltv_ranking, "_load_cache", lambda: {"Spirit": 1, "Falcons": 2})
+    # 4 x top-2 org starters = 1.6M combined, well over the 800k bar.
+    assert sn.is_highlight_lobby(
+        {"id": "1-75510475", "pros": ["donk", "magixx", "TeSeS", "kyousuke"]})
+    assert not sn.is_highlight_lobby({"id": "solo", "pros": ["donk"]})
+    assert not sn.is_highlight_lobby({"id": "duo", "pros": ["nocries", "x"]})
+
+
+def test_pick_for_day_burns_used_only_for_card_backed_picks(tmp_path, monkeypatch):
+    async def fake_collect(**kwargs):
+        return {"candidates": [
+            {"id": "m:donk", "match_id": "m", "player": "donk",
+             "weight": 500, "date": "2026-09-17", "score_version": 7},
+        ]}
+
+    monkeypatch.setattr(dn, "collect", fake_collect)
+    monkeypatch.setattr(dn, "STATE_FILE", tmp_path / "notable.json")
+    monkeypatch.setattr(dn, "card_for_pick", lambda pick, **kw: None)
+    picks = asyncio.run(dn.pick_for_day(
+        n=1, today="2026-09-17", force=True, skip_youtube_demand=True))
+    assert [p["player"] for p in picks] == ["donk"]
+    state = json.loads((tmp_path / "notable.json").read_text(encoding="utf-8"))
+    assert state["used"] == []
+
+    monkeypatch.setattr(dn, "card_for_pick", lambda pick, **kw: Path("x.json"))
+    asyncio.run(dn.pick_for_day(
+        n=1, today="2026-09-17", force=True, skip_youtube_demand=True))
+    state = json.loads((tmp_path / "notable.json").read_text(encoding="utf-8"))
+    assert state["used"] == ["m:donk"]
+
+
+def test_tracks_split_one_scrape_into_solo_and_highlight(tmp_path, monkeypatch):
+    """One collect call feeds both tracks: donk's POV goes solo, the
+    stacked lobby goes to the highlight feed. No lobby-carried solo."""
+    import hltv_ranking
+    calls = []
+
+    async def fake_collect(**kwargs):
+        calls.append(kwargs)
+        return {
+            "candidates": [
+                {"id": "m:donk", "match_id": "m", "player": "donk",
+                 "weight": 500, "date": "2026-09-17", "score_version": 7,
+                 "kd": 1.0, "adr": 90.0, "kills": 20},
+                {"id": "m:TeSeS", "match_id": "m", "player": "TeSeS",
+                 "weight": 285, "date": "2026-09-17", "score_version": 7,
+                 "kd": 1.25, "adr": 79.7, "kills": 25},
+            ],
+            "multi": [
+                {"id": "m",
+                 "pros": ["donk", "magixx", "TeSeS", "kyousuke"],
+                 "map": "Mirage", "score": "16 / 14",
+                 "date": datetime(2026, 9, 17), "team1": "a", "team2": "b"},
+            ],
+        }
+
+    monkeypatch.setattr(dn, "collect", fake_collect)
+    monkeypatch.setattr(dn, "STATE_FILE", tmp_path / "notable.json")
+    monkeypatch.setattr(
+        hltv_ranking, "_ROSTER_CACHE",
+        {"donk": "Spirit", "magixx": "Spirit",
+         "teses": "Falcons", "kyousuke": "Falcons"},
+    )
+    monkeypatch.setattr(
+        hltv_ranking, "_load_cache", lambda: {"Spirit": 1, "Falcons": 2})
+    picks, lobbies = asyncio.run(dn.discover_faceit_tracks(
+        3, hours=6, skip_youtube_demand=True))
+    assert len(calls) == 1
+    assert calls[0]["hours"] == 6
+    # donk renders solo on personal demand; TeSeS's mid line does not.
+    assert [(p["match_id"], p["player"]) for p in picks] == [("m", "donk")]
+    # The stacked lobby is recorded for highlights regardless of lines.
+    assert [l["id"] for l in lobbies] == ["hl:m"]
+    assert lobbies[0]["lobby_star_bonus"] == 1_600_000
+
+
+def test_record_highlight_lobby_writes_and_dedupes(tmp_path):
+    lob = {"id": "hl:m", "match_id": "m", "map": "Mirage", "score": "16 / 14",
+           "date": "2026-09-17", "pros": ["donk"], "team1": "a", "team2": "b",
+           "lobby_star_bonus": 800000, "score_version": 7}
+    p1 = dn.record_highlight_lobby(lob, tmp_path / "m.dem", root=tmp_path)
+    assert p1 == (tmp_path / "backlog" / "faceit-highlights"
+                  / "2026-09-17" / "m-mirage.json")
+    assert dn.highlight_already_recorded("m", root=tmp_path)
+    assert not dn.highlight_already_recorded("other", root=tmp_path)
+    assert dn.record_highlight_lobby(lob, tmp_path / "m.dem", root=tmp_path) == p1
+    payload = json.loads(p1.read_text(encoding="utf-8"))
+    assert payload["is_faceit_highlight"] is True
+    assert payload["demo_path"] == str(tmp_path / "m.dem")
+
+
+def test_remember_highlight_lobbies_burns_ids_not_picks(tmp_path, monkeypatch):
+    monkeypatch.setattr(dn, "STATE_FILE", tmp_path / "notable.json")
+    dn.remember_highlight_lobbies([{"id": "hl:m"}])
+    state = json.loads((tmp_path / "notable.json").read_text(encoding="utf-8"))
+    assert state["used"] == ["hl:m"]
+    assert state.get("picks", {}) == {}
 
 
 def test_unranked_faceit_star_uses_demand_times_kd(monkeypatch):

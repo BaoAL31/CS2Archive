@@ -9,6 +9,9 @@ retry, otherwise it produces garbage (or nothing) with no error.
 This module provides one reusable wrapper, ``run_csdm_hook_aware``, plus the
 process-kill helpers it needs. It is used by the POV renderer, the thumbnail
 generator, and the util-cam flight renderer.
+
+Long-running Steam-online flake (symptoms, mitigations, unknown):
+``docs/bugs/hlae-steam-online-hook.md``.
 """
 
 from __future__ import annotations
@@ -24,14 +27,43 @@ from pathlib import Path
 # Image names of every process a CSDM/HLAE render spawns. Killing the whole
 # tree (taskkill /t) is essential — csdm launches HLAE which launches ffmpeg,
 # and a plain /im kill leaves the children (especially ffmpeg) running.
-RENDER_PROCESS_NAMES = ("cs2.exe", "HLAE.exe", "ffmpeg.exe", "csdm.exe", "csdm.cmd")
+RENDER_PROCESS_NAMES = (
+    "cs2.exe",
+    "HLAE.exe",
+    "ffmpeg.exe",
+    "csdm.exe",
+    "csdm.cmd",
+)
+
+# Steam often starts a *second* unhooked cs2.exe (stock demo viewer) after HLAE
+# injects or after we kill the hooked process. Reap those so they don't sit on
+# the desktop. Do not touch steam.exe.
+STEAM_RESPAWN_REAP_S = 8.0
+# Stage-A inject grace: AfxHookSource2 must show up in some cs2.exe within this
+# long after launch. It lands in ~5-10s when healthy; absence means the loader
+# failed or CS2 went vanilla -> fail fast instead of watching a dead demo.
+# Stage-B: mirv recording starts ffmpeg. AfxHook without a *new* ffmpeg PID is
+# still vanilla-ish (demo plays, no record). 45s after first AfxHook is enough
+# for HLAE config-file windows; skip-from-demo-start without ffmpeg is a fail.
+HOOK_INJECT_GRACE = 60.0
+FFMPEG_GRACE = 45.0
+# ffmpeg appeared but stalled (no real video). Kill ALL cs2 and retry.
+STRAY_CS2_GRACE = 20.0
+# Dead-loader fail-fast: healthy inject lands in ~5-10s. If after this long
+# there is STILL no AfxHook in any cs2.exe AND no new ffmpeg PID, every cs2
+# on the box is a stray/vanilla squatter (Steam respawn, previous-attempt
+# leftover) holding the game lock. Kill them all immediately and fail the
+# attempt fast instead of staring at a dead demo for the full 60s.
 
 # Error markers that mean "retrying won't help" (fatal, not a hook failure).
+# NOTE: "game error" / "hlae error" are deliberately NOT fatal: they alternate
+# across identical runs (transient loader/game-side flakes), and our own
+# timeout kills also print them into the attempt log. Retries are bounded by
+# hook_retries, so a genuinely broken config still terminates.
 _FATAL_MARKERS = (
     "steam is not running",
     "raw files not found",
     "unknown demo source",
-    "game error",
 )
 
 # Min size for a real encoded sequence/clip. A partially-written file under this
@@ -49,10 +81,16 @@ _OVERLAY_DLLS = (
     "SteamOverlayVulkanLayer64.dll",
     "SteamOverlayVulkanLayer.dll",
 )
+# -nominidumps / -nobreakpad / -nocrashdialog: Steam-online often treats an HLAE
+# inject as a crash and steam://-relaunches a vanilla +playdemo. Offline never
+# does that handshake. 45s ffmpeg fail-fast is unchanged.
 _STEAM_LAUNCH_FLAGS = (
     "-steam",
     "-insecure",
     "-allow_third_party_software",
+    "-nominidumps",
+    "-nobreakpad",
+    "-nocrashdialog",
 )
 _APPID_BYTES = b"730\n"
 _APPID_OK = {b"730", b"730\n", b"730\r\n"}
@@ -77,15 +115,123 @@ def _taskkill_tree(image_name: str) -> bool:
 
 def _process_running(image_name: str) -> bool:
     """True if any process with this image name is still alive."""
+    return bool(_image_pids(image_name))
+
+
+def _image_pids(image_name: str) -> set[int]:
+    """PIDs for an image. Empty if none (or tasklist failed)."""
     try:
         r = subprocess.run(
-            ["tasklist", "/fi", f"IMAGENAME eq {image_name}"],
+            ["tasklist", "/FI", f"IMAGENAME eq {image_name}", "/FO", "CSV", "/NH"],
             capture_output=True, text=True, timeout=15,
         )
-        out = r.stdout or ""
-        return image_name.lower() in out.lower() and "no tasks" not in out.lower()
     except Exception:
-        return True  # assume alive on failure so we retry the kill
+        return set()
+    pids: set[int] = set()
+    needle = image_name.lower()
+    for line in (r.stdout or "").splitlines():
+        parts = [p.strip().strip('"') for p in line.split(",")]
+        if len(parts) < 2 or parts[0].lower() != needle:
+            continue
+        try:
+            pids.add(int(parts[1]))
+        except ValueError:
+            continue
+    return pids
+
+
+def _taskkill_pid(pid: int) -> None:
+    try:
+        subprocess.run(
+            ["taskkill", "/f", "/t", "/pid", str(pid)],
+            capture_output=True, text=True, timeout=15,
+        )
+    except Exception:
+        pass
+
+
+def _ffmpeg_pids() -> set[int]:
+    return _image_pids("ffmpeg.exe")
+
+
+def _afx_pids() -> set[int]:
+    """PIDs that have AfxHookSource2.dll loaded (hooked HLAE CS2)."""
+    try:
+        r = subprocess.run(
+            ["tasklist", "/M", "AfxHookSource2.dll", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except Exception:
+        return set()
+    pids: set[int] = set()
+    for line in (r.stdout or "").splitlines():
+        parts = [p.strip().strip('"') for p in line.split(",")]
+        if len(parts) < 2 or parts[0].lower() != "cs2.exe":
+            continue
+        try:
+            pids.add(int(parts[1]))
+        except ValueError:
+            continue
+    return pids
+
+
+def missing_ffmpeg_after_hook(
+    hooked_at: float | None,
+    now: float,
+    *,
+    new_ffmpeg: bool,
+    grace: float = FFMPEG_GRACE,
+) -> bool:
+    """True when AfxHook was seen but no new ffmpeg PID appeared in ``grace`` s."""
+    if hooked_at is None or new_ffmpeg:
+        return False
+    return (now - hooked_at) >= grace
+
+
+def kill_unhooked_cs2() -> list[int]:
+    """Kill cs2.exe that is *not* HLAE-injected (Steam's vanilla demo viewer).
+
+    HLAE ``-customLoader`` starts one hooked cs2. Steam-online then often
+    launches a second cs2.exe with the same ``+playdemo`` line and no
+    AfxHookSource2.dll — that is the stock demo player left on screen.
+    """
+    hooked = _afx_pids()
+    if not hooked:
+        # Inject is not visible yet. Killing now murders the HLAE cs2 before
+        # AfxHookSource2 shows up in tasklist (that was the 10s Game error).
+        return []
+    killed: list[int] = []
+    for pid in sorted(_image_pids("cs2.exe")):
+        if pid in hooked:
+            continue
+        print(f"  [HLAE] killing vanilla cs2.exe pid={pid} (no AfxHookSource2)", flush=True)
+        _taskkill_pid(pid)
+        killed.append(pid)
+    return killed
+
+
+def reap_steam_respawned_cs2(seconds: float = STEAM_RESPAWN_REAP_S) -> int:
+    """After a render CS2 is killed, Steam may start a vanilla one. Keep killing it."""
+    if seconds <= 0:
+        return 0
+    started = time.time()
+    deadline = started + seconds
+    n = 0
+    quiet_since = started
+    while time.time() < deadline:
+        pids = _image_pids("cs2.exe")
+        if pids:
+            for pid in pids:
+                _taskkill_pid(pid)
+                n += 1
+            print(f"  [HLAE] reaped Steam-respawned cs2.exe {sorted(pids)}", flush=True)
+            quiet_since = time.time()
+        elif n == 0 and time.time() - started >= 1.5:
+            break
+        elif n > 0 and time.time() - quiet_since >= 1.0:
+            break
+        time.sleep(0.4)
+    return n
 
 
 def _steam_appid_dirs(game_dir: Path) -> list[Path]:
@@ -221,7 +367,7 @@ def prepare_steam_hlae(
     if overlay:
         bits.append("overlay DLLs blocked")
     if launch:
-        bits.append("CSDM -steam -insecure +sv_lan 1")
+        bits.append("CSDM -steam -insecure -nominidumps +sv_lan 1")
     if still_live:
         bits.append(f"STILL LIVE {', '.join(still_live)}")
         print(
@@ -257,7 +403,9 @@ def kill_stale_processes() -> None:
     remaining = [n for n in RENDER_PROCESS_NAMES if _process_running(n)]
     if remaining:
         print(f"  [WARN] could not kill: {', '.join(remaining)}")
-    time.sleep(1)
+    # Steam restarts unhooked CS2 after the hooked process dies. Reap it so
+    # the vanilla demo viewer is not left on the desktop.
+    reap_steam_respawned_cs2()
 
 
 def list_videos(output_dir: Path, min_video_bytes: int = _MIN_VIDEO_BYTES) -> set[str]:
@@ -358,6 +506,7 @@ def run_csdm_hook_aware(
         # "new". Already-finalized clips are preserved.
         _purge_partial_sequences(output_dir)
         before = list_videos(output_dir, min_video_bytes)
+        ffmpeg_baseline = _ffmpeg_pids()
 
         log_path = output_dir / f".csdm_hook_attempt_{attempt}.log"
         try:
@@ -367,46 +516,125 @@ def run_csdm_hook_aware(
                     env=_csdm_launch_env(),
                 )
 
-                # Poll for the hook to engage (a new video appears) or the
-                # process to exit on its own.
                 engaged = False
+                fail_reason: str | None = None
+                hooked_at: float | None = None
+                ffmpeg_seen = False
                 poll_start = time.time()
                 while time.time() - poll_start < hook_timeout:
-                    if proc.poll() is not None:
-                        break  # csdm exited on its own
                     if new_video_appeared(output_dir, before, min_video_bytes):
                         engaged = True
                         break
-                    time.sleep(5)
+                    if proc.poll() is not None:
+                        if new_video_appeared(output_dir, before, min_video_bytes):
+                            engaged = True
+                        break
+                    if _afx_pids():
+                        if hooked_at is None:
+                            hooked_at = time.time()
+                            print(
+                                f"hooked (AfxHookSource2 in {hooked_at - poll_start:.0f}s)",
+                                flush=True,
+                            )
+                    elif hooked_at is None and time.time() - poll_start >= HOOK_INJECT_GRACE:
+                        fail_reason = f"no HLAE hook in {HOOK_INJECT_GRACE:.0f}s"
+                        break
+                    # Record when we first spotted a ffmpeg PID so we
+                    # can tell "ffmpeg launched but stalled" from "no
+                    # ffmpeg at all" (the latter = stray cs2 holding the
+                    # game lock).
+                    new_ffmpeg = bool(_ffmpeg_pids() - ffmpeg_baseline)
+                    if new_ffmpeg and not ffmpeg_seen:
+                        ffmpeg_seen = True
+                        ffmpeg_first_seen = time.time()
+                        print(
+                            f"ffmpeg pid in {time.time() - (hooked_at or poll_start):.0f}s",
+                            flush=True,
+                        )
+                    # ffmpeg appeared but no real video after its grace.
+                    if (ffmpeg_seen and not engaged and ffmpeg_first_seen is not None
+                            and time.time() - ffmpeg_first_seen >= FFMPEG_GRACE):
+                        # ffmpeg PID is dead/stalled: HLAE couldn't write.
+                        # Kill ALL cs2 — a stale vanilla demo viewer is
+                        # holding the game lock and blocking the record.
+                        for pid in sorted(_image_pids("cs2.exe")):
+                            _taskkill_pid(pid)
+                        print(
+                            f"ffmpeg stalled: cleared {len(_image_pids('cs2.exe'))} "
+                            f"cs2.exe, retrying",
+                            flush=True,
+                        )
+                        fail_reason = "ffmpeg stalled (stray cs2 cleared)"
+                        break
+                    # HLAE hooked (AfxHookSource2 visible) but ffmpeg
+                    # never materialised after its grace. Stray vanilla
+                    # cs2 is holding the game lock -> clear ALL cs2.
+                    if (hooked_at is not None and not new_ffmpeg
+                            and time.time() - hooked_at >= FFMPEG_GRACE):
+                        for pid in sorted(_image_pids("cs2.exe")):
+                            _taskkill_pid(pid)
+                        print(
+                            f"hooked but no ffmpeg in {FFMPEG_GRACE:.0f}s - "
+                            f"cleared {len(_image_pids('cs2.exe'))} cs2.exe, retrying",
+                            flush=True,
+                        )
+                        fail_reason = "hooked but no ffmpeg (stray cs2 cleared)"
+                        break
+                    if missing_ffmpeg_after_hook(
+                        hooked_at, time.time(), new_ffmpeg=new_ffmpeg,
+                    ):
+                        fail_reason = f"no ffmpeg in {FFMPEG_GRACE:.0f}s"
+                        break
+                    kill_unhooked_cs2()
+                    if (hooked_at is None and not new_ffmpeg
+                            and time.time() - poll_start >= STRAY_CS2_GRACE):
+                        strays = sorted(_image_pids("cs2.exe"))
+                        for pid in strays:
+                            _taskkill_pid(pid)
+                        print(
+                            f"no hook/ffmpeg in {STRAY_CS2_GRACE:.0f}s - "
+                            f"cleared {len(strays)} stray cs2.exe, retrying",
+                            flush=True,
+                        )
+                        fail_reason = (
+                            f"no hook/ffmpeg in {STRAY_CS2_GRACE:.0f}s "
+                            "(stray cs2 cleared)"
+                        )
+                        break
+                    time.sleep(1)
 
                 fatal = False
                 if not engaged:
-                    if proc.poll() is not None:
-                        # Process exited early without producing a video —
-                        # usually a hook failure too (e.g. CS2 opened the
-                        # vanilla viewer and exited). Retry, unless fatal.
-                        log_tail = ""
-                        try:
-                            log_tail = log_path.read_text(encoding="utf-8", errors="replace")
-                        except Exception:
-                            pass
-                        last_err = log_tail
-                        if any(m in log_tail.lower() for m in _FATAL_MARKERS):
-                            fatal = True  # report accurate error, don't retry
-                        else:
-                            print("HOOK-FAIL (exited early, no video) - killing and retrying")
-                            proc.wait(timeout=14400)
-                            kill_stale_processes()
-                            continue
-                    else:
-                        # Still running but no video -> hook failed (vanilla viewer).
-                        print(f"HOOK-FAIL (no video in {hook_timeout:.0f}s) - killing and retrying")
+                    if fail_reason is not None or proc.poll() is None:
+                        if fail_reason is None:
+                            fail_reason = f"no video in {hook_timeout:.0f}s"
+                        print(f"HOOK-FAIL ({fail_reason}) - killing and retrying")
                         kill_stale_processes()
                         try:
-                            proc.kill()
+                            if proc.poll() is None:
+                                proc.kill()
                         except Exception:
                             pass
-                        proc.wait()
+                        try:
+                            proc.wait(timeout=30)
+                        except Exception:
+                            pass
+                        continue
+                    log_tail = ""
+                    try:
+                        log_tail = log_path.read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        pass
+                    last_err = log_tail
+                    if any(m in log_tail.lower() for m in _FATAL_MARKERS):
+                        fatal = True
+                    else:
+                        print("HOOK-FAIL (exited early, no video) - killing and retrying")
+                        try:
+                            proc.wait(timeout=14400)
+                        except Exception:
+                            pass
+                        kill_stale_processes()
                         continue
 
                 if fatal:
@@ -446,10 +674,12 @@ def run_csdm_hook_aware(
         if newest is not None:
             mb = newest.stat().st_size / 1e6
             print(f"OK ({time.time() - t0:.0f}s, {mb:.0f} MB)")
+            reap_steam_respawned_cs2()
             return newest
 
     print(f"[ERROR] CS2 failed to hook after {hook_retries + 1} attempt(s) "
           f"(no video produced in {hook_timeout:.0f}s).")
     if last_err:
         print(last_err[-800:])
+    kill_stale_processes()
     return None

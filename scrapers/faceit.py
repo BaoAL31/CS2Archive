@@ -20,7 +20,7 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 from rich.console import Console
@@ -249,8 +249,48 @@ class FACEITClient:
                         "hs": ps.get("Headshots %", "?"),
                         "result": ps.get("Result", "?"),
                         "player_id": p.get("player_id"),
+                        # Extra keys for form aggregates (Rating-2.0 style);
+                        # existing callers ignore them.
+                        "assists": ps.get("Assists", "?"),
+                        "kr": ps.get("K/R Ratio", "?"),
+                        "double": ps.get("Double Kills", "?"),
+                        "triple": ps.get("Triple Kills", "?"),
+                        "quadro": ps.get("Quadro Kills", "?"),
+                        "penta": ps.get("Penta Kills", "?"),
                     }
         return out
+
+    async def get_history_items(self, player_id: str, limit: int = 30) -> list[dict]:
+        """Raw /history items (results, rosters, region) for win/region math."""
+        data = await self._request("GET", f"/players/{player_id}/history",
+                                   params={"game": "cs2", "offset": 0, "limit": limit})
+        return data.get("items", [])
+
+    async def get_player(self, player_id: str) -> Optional[dict]:
+        """Full player entity: nickname, avatar, country, cs2 elo/skill/region."""
+        try:
+            return await self._request("GET", f"/players/{player_id}")
+        except Exception as e:
+            console.print(f"[yellow]   [WARN] player lookup failed for {player_id}: {e}[/yellow]")
+            return None
+
+    async def get_player_ranking(self, player_id: str, region: str) -> Optional[int]:
+        """Regional leaderboard position (1-based) or None when unavailable."""
+        try:
+            data = await self._request(
+                "GET", f"/rankings/games/cs2/regions/{region}/players/{player_id}")
+            pos = data.get("position")
+            return int(pos) if pos else None
+        except Exception:
+            return None
+
+    async def get_lifetime_stats(self, player_id: str) -> Optional[dict]:
+        """Lifetime segment (Matches, Wins, ADR, ...) or None."""
+        try:
+            data = await self._request("GET", f"/players/{player_id}/stats/cs2")
+            return data.get("lifetime") or None
+        except Exception:
+            return None
 
 # Button text fragments that trigger the demo download on a FACEIT room page.
 class FACEITDownloadsClient:
@@ -506,6 +546,88 @@ def _wait_for_match_archive(match_id: str, timeout: float = 600.0,
             continue
         time.sleep(2)
     return _finished_match_archive(match_id, dirs)
+
+def hold_browser_until_both(*, download_ok: bool, repeek_ok: bool) -> None:
+    """Refuse to treat the room session as done until demo + Repeek both finished."""
+    from scrapers.repeek_snapshot import RepeekCaptureError
+    if not download_ok:
+        raise RepeekCaptureError(
+            "FACEIT_DOWNLOAD",
+            "demo download did not finish; keeping the failure visible",
+        )
+    if not repeek_ok:
+        raise RepeekCaptureError(
+            "REPEEK_INCOMPLETE",
+            "Repeek left/right capture did not finish; browser must stay up until it does",
+        )
+
+
+def _capture_repeek_roster(page: Any, match_id: str) -> Path:
+    from scrapers.repeek_snapshot import capture_from_page, RepeekCaptureError
+    try:
+        page.set_viewport_size({"width": 1920, "height": 1440})
+    except Exception as e:
+        raise RepeekCaptureError("REPEEK_VIEWPORT", str(e)) from e
+    console.print("[cyan]   [REPEEK] waiting for last-30 cards, then snapping left/right...[/cyan]")
+    out = capture_from_page(page, match_id)
+    console.print(f"[green]   [REPEEK] {out / 'repeek_left.png'}[/green]")
+    return out
+
+
+def run_download_then_repeek(
+    page: Any,
+    match_id: str,
+    download_fn: Callable[[Any], Optional[Path]],
+    close_fn: Callable[[], None],
+) -> Path:
+    """Download the demo, then capture Repeek. ``close_fn`` runs only afterwards."""
+    saved: Optional[Path] = None
+    download_ok = False
+    repeek_ok = False
+    try:
+        saved = download_fn(page)
+        download_ok = saved is not None
+        if download_ok:
+            _capture_repeek_roster(page, match_id)
+            repeek_ok = True
+        hold_browser_until_both(download_ok=download_ok, repeek_ok=repeek_ok)
+        return saved  # type: ignore[return-value]
+    finally:
+        close_fn()
+
+
+def _repeek_strips_ready(match_id: str) -> bool:
+    from scrapers.repeek_snapshot import RepeekCaptureError, assert_column_pngs, strips_dir
+    d = strips_dir(match_id)
+    try:
+        assert_column_pngs(d / "repeek_left.png", d / "repeek_right.png")
+        return True
+    except RepeekCaptureError:
+        return False
+
+
+def _ensure_repeek_roster(match_id: str) -> None:
+    """Open the room only to capture left/right (demo already on disk)."""
+    from scrapers.repeek_snapshot import RepeekCaptureError
+    if _repeek_strips_ready(match_id):
+        console.print("[yellow]   [REPEEK] left/right strips already valid — skip[/yellow]")
+        return
+    room_url = f"https://www.faceit.com/en/cs2/room/{match_id}"
+    pw, browser = _launch_context()
+    page = None
+    repeek_ok = False
+    try:
+        page = _auth_page(browser)
+        page.goto(room_url, wait_until="domcontentloaded")
+        console.print("[cyan]   [REPEEK] room open (demo already downloaded); waiting for stats...[/cyan]")
+        _capture_repeek_roster(page, match_id)
+        repeek_ok = True
+        hold_browser_until_both(download_ok=True, repeek_ok=repeek_ok)
+    finally:
+        _disconnect_cdp(pw, page, browser)
+    if not repeek_ok:
+        raise RepeekCaptureError("REPEEK_INCOMPLETE", "Repeek capture did not finish")
+
 
 def _launch_context():
     """Launch the authenticated Chrome context via CDP debug Chrome.
@@ -1066,6 +1188,15 @@ def download_demo(match_id: str) -> DownloadResult:
     existing = is_already_downloaded(match_id, DemoSource.FACEIT)
     if existing:
         console.print(f"[yellow]   [SKIP] Already downloaded: {existing}[/yellow]")
+        try:
+            _ensure_repeek_roster(match_id)
+        except Exception as e:
+            console.print(f"[bold red]   [ERR] {e}[/bold red]")
+            return DownloadResult(
+                match=match_info, status=DownloadStatus.FAILED,
+                demo_path=existing, error=str(e),
+                started_at=started, completed_at=datetime.now(),
+            )
         return DownloadResult(
             match=match_info, status=DownloadStatus.SKIPPED,
             demo_path=existing, file_size_mb=file_size_mb(existing),
@@ -1080,7 +1211,17 @@ def download_demo(match_id: str) -> DownloadResult:
         console.print("[cyan]   [API] Trying FACEIT Downloads API...[/cyan]")
         saved = download_demo_api(match_id)
         if saved:
-            return _finalize_download(match_info, saved, started)
+            result = _finalize_download(match_info, saved, started)
+            try:
+                _ensure_repeek_roster(match_id)
+            except Exception as e:
+                console.print(f"[bold red]   [ERR] {e}[/bold red]")
+                return DownloadResult(
+                    match=match_info, status=DownloadStatus.FAILED,
+                    demo_path=result.demo_path, error=str(e),
+                    started_at=started, completed_at=datetime.now(),
+                )
+            return result
         console.print("[yellow]   [WARN] Downloads API failed; falling back to browser scrape.[/yellow]")
 
     # ── Fallback: browser scrape ───────────────────────────────────────
@@ -1129,13 +1270,33 @@ def _download_demo_browser(match_id: str, match_info: MatchInfo, started) -> Dow
     leftover = _finished_match_archive(match_id)
     if leftover:
         console.print(f"[yellow]   [SKIP] Archive already on disk: {leftover}[/yellow]")
-        return _finalize_download(match_info, leftover, started)
+        result = _finalize_download(match_info, leftover, started)
+        try:
+            _ensure_repeek_roster(match_id)
+        except Exception as e:
+            console.print(f"[bold red]   [ERR] {e}[/bold red]")
+            return DownloadResult(
+                match=match_info, status=DownloadStatus.FAILED,
+                demo_path=result.demo_path, error=str(e),
+                started_at=started, completed_at=datetime.now(),
+            )
+        return result
     inflight = _inflight_match_archive(match_id)
     if inflight:
         console.print(f"[yellow]   [SKIP] Download already in progress: {inflight.name}[/yellow]")
         done = _wait_for_match_archive(match_id, timeout=600.0)
         if done:
-            return _finalize_download(match_info, done, started)
+            result = _finalize_download(match_info, done, started)
+            try:
+                _ensure_repeek_roster(match_id)
+            except Exception as e:
+                console.print(f"[bold red]   [ERR] {e}[/bold red]")
+                return DownloadResult(
+                    match=match_info, status=DownloadStatus.FAILED,
+                    demo_path=result.demo_path, error=str(e),
+                    started_at=started, completed_at=datetime.now(),
+                )
+            return result
 
     room_url = f"https://www.faceit.com/en/cs2/room/{match_id}"
 
@@ -1214,6 +1375,11 @@ def _download_demo_browser(match_id: str, match_info: MatchInfo, started) -> Dow
                 )
 
             console.print(f"[green]   [OK] Downloaded: {saved.name} ({file_size_mb(saved):.1f} MB)[/green]")
+            # Same tab: Repeek has been loading during the transfer. Do not
+            # close until last-30 cards are snapped.
+            _capture_repeek_roster(page, match_id)
+            hold_browser_until_both(download_ok=True, repeek_ok=True)
+
             console.print("[cyan]   [EXTRACT] Extracting .dem...[/cyan]")
             dem_paths = extract_demo(saved, settings.temp_dir)
             dem_path = dem_paths[0]

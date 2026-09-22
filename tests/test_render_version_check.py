@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts" / "pov"))
 
 from render_version_check import (
+    INCOMPATIBLE_DEMO_PATCHES,
     RenderVersionError,
     assert_render_versions,
     check_render_versions,
@@ -64,8 +65,8 @@ def test_check_demo_game_mismatch(tmp_path: Path):
     demo.write_bytes(b"PBDEMS2")
 
     with (
-        patch("render_version_check.read_demo_patch", return_value="1.41.6.8"),
-        patch("render_version_check.read_pe_version", return_value=(2, 192, 0, 0)),
+        patch("render_version_check.read_demo_patch", return_value="1.41.8.1"),
+        patch("render_version_check.read_pe_version", return_value=(3, 20, 0, 0)),
     ):
         result = check_render_versions(
             demo,
@@ -77,6 +78,85 @@ def test_check_demo_game_mismatch(tmp_path: Path):
         )
     assert not result.ok
     assert any(c == "RENDER_DEMO_GAME_MISMATCH" for c, _ in result.errors)
+
+
+def test_incompatible_old_demo_patch(tmp_path: Path):
+    steam_inf = tmp_path / "steam.inf"
+    steam_inf.write_text("PatchVersion=1.41.8.1\n", encoding="utf-8")
+    hlae = tmp_path / "HLAE.exe"
+    csdm = tmp_path / "cs-demo-manager.exe"
+    hlae.write_bytes(b"x")
+    csdm.write_bytes(b"x")
+    demo = tmp_path / "match.dem"
+    demo.write_bytes(b"PBDEMS2")
+    old = next(iter(INCOMPATIBLE_DEMO_PATCHES))
+
+    with (
+        patch("render_version_check.read_demo_patch", return_value=old),
+        patch("render_version_check.read_pe_version", return_value=(3, 20, 0, 0)),
+    ):
+        result = check_render_versions(
+            demo,
+            steam_inf=steam_inf,
+            hlae_exe=hlae,
+            csdm_exe=csdm,
+            min_hlae=(2, 192, 0),
+            min_csdm=(3, 20, 0),
+        )
+    assert not result.ok
+    assert any(c == "RENDER_DEMO_TOO_OLD" for c, _ in result.errors)
+
+
+def test_demo_below_min_renderable_is_too_old(tmp_path: Path):
+    steam_inf = tmp_path / "steam.inf"
+    steam_inf.write_text("PatchVersion=1.41.8.1\n", encoding="utf-8")
+    hlae = tmp_path / "HLAE.exe"
+    csdm = tmp_path / "cs-demo-manager.exe"
+    hlae.write_bytes(b"x")
+    csdm.write_bytes(b"x")
+    demo = tmp_path / "match.dem"
+    demo.write_bytes(b"PBDEMS2")
+
+    with (
+        patch("render_version_check.read_demo_patch", return_value="1.41.5.0"),
+        patch("render_version_check.read_pe_version", return_value=(3, 20, 0, 0)),
+    ):
+        result = check_render_versions(
+            demo,
+            steam_inf=steam_inf,
+            hlae_exe=hlae,
+            csdm_exe=csdm,
+            min_hlae=(2, 192, 0),
+            min_csdm=(3, 20, 0),
+        )
+    assert not result.ok
+    assert any(c == "RENDER_DEMO_TOO_OLD" for c, _ in result.errors)
+
+
+def test_slightly_older_demo_is_allowed(tmp_path: Path):
+    steam_inf = tmp_path / "steam.inf"
+    steam_inf.write_text("PatchVersion=1.41.8.1\n", encoding="utf-8")
+    hlae = tmp_path / "HLAE.exe"
+    csdm = tmp_path / "cs-demo-manager.exe"
+    hlae.write_bytes(b"x")
+    csdm.write_bytes(b"x")
+    demo = tmp_path / "match.dem"
+    demo.write_bytes(b"PBDEMS2")
+
+    with (
+        patch("render_version_check.read_demo_patch", return_value="1.41.6.4"),
+        patch("render_version_check.read_pe_version", return_value=(3, 20, 0, 0)),
+    ):
+        result = check_render_versions(
+            demo,
+            steam_inf=steam_inf,
+            hlae_exe=hlae,
+            csdm_exe=csdm,
+            min_hlae=(2, 192, 0),
+            min_csdm=(3, 20, 0),
+        )
+    assert result.ok
+    assert result.versions["demo"] == "1.41.6.4"
 
 
 def test_check_hlae_outdated(tmp_path: Path):

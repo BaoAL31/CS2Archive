@@ -182,16 +182,26 @@ def _demo_steam_ids(demo_path: Path) -> list[str]:
 
 
 async def _match_elo(demo_path: Path, pov_steam_id: str) -> dict:
-    """Fetch current ELO for every demo player; return
+    """Fetch ELO for the POV player + opponent team only; return
     {elo: <pov elo>, opp_avg_elo: <opponent-team average>} (empty dict when
-    the POV player's ELO can't be resolved)."""
+    the POV player's ELO can't be resolved). Teammates are skipped — the
+    card only needs POV ELO vs opponent average."""
     from scrapers.faceit import FACEITClient
     players = _demo_players(demo_path)
+    pov_team = next((p["team_number"] for p in players
+                     if p["steamid"] == pov_steam_id), 0)
+    if pov_team in (2, 3):
+        wanted = {pov_steam_id} | {
+            p["steamid"] for p in players
+            if p["steamid"] and p["team_number"] != pov_team
+        }
+    else:
+        wanted = {p["steamid"] for p in players if p["steamid"]}
     client = FACEITClient()
     elos: dict[str, int] = {}
     try:
         for p in players:
-            if not p["steamid"]:
+            if not p["steamid"] or p["steamid"] not in wanted:
                 continue
             elo = await client.get_elo_by_steam_id(p["steamid"])
             if elo is not None:
@@ -315,7 +325,7 @@ def create_faceit_backlog(*, demo_path, player="", map="", steam_id="",
     demo_key = re.sub(r"[^a-z0-9]+", "-", demo.stem.lower()).strip("-")
     if demo_key:
         slug = f"{slug}-{demo_key}"
-    backlog_dir = faceit_backlog_dir(BACKLOG_DIR.parent, match_date, priority)
+    backlog_dir = faceit_backlog_dir(BACKLOG_DIR, match_date, priority)
     backlog_dir.mkdir(parents=True, exist_ok=True)
     backlog_file = backlog_dir / f"{slug}.json"
 

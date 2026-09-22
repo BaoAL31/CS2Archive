@@ -393,7 +393,7 @@ def main() -> None:
     parser.add_argument(
         "--publish-at",
         default=None,
-        help="Schedule publish: 'auto' = next future 16:30 in --timezone (default), or wall-clock like '2026-06-12 17:00'",
+        help="Schedule publish: 'auto' = next future 10:00 or 16:30 in --timezone (default), or wall-clock like '2026-06-12 17:00'",
     )
     parser.add_argument(
         "--timezone",

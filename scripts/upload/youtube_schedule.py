@@ -52,7 +52,7 @@ def _detect_local_tz() -> str:
 
 
 DEFAULT_PUBLISH_TZ = _detect_local_tz()
-AUTO_PUBLISH_TIMES = ["10:00", "16:30", "21:00"]
+AUTO_PUBLISH_TIMES = ["10:00", "16:30"]
 AUTO_PUBLISH_MODE = "auto"
 
 _PUBLISH_AT_FORMATS = (
@@ -191,7 +191,7 @@ def resolve_publish_schedule(
 
     Returns (privacy, publish_at_utc, timezone_used, publish_at_local).
     Scheduled uploads force privacy to private (YouTube requirement).
-    ``publish_at="auto"`` uses the next future 10:00, 16:30, or 21:00 slot
+    ``publish_at="auto"`` uses the next future 10:00 or 16:30 slot
     in ``timezone``.
     """
     local = publish_at or meta.get("publish_at")

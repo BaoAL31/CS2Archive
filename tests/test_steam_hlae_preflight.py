@@ -66,5 +66,8 @@ def test_ensure_csdm_steam_launch_merges_flags(tmp_path):
     assert "-steam" in tokens
     assert "-insecure" in tokens
     assert "-allow_third_party_software" in tokens
+    assert "-nominidumps" in tokens
+    assert "-nobreakpad" in tokens
+    assert "-nocrashdialog" in tokens
     assert tokens[tokens.index("+sv_lan") + 1] == "1"
     assert ensure_csdm_steam_launch(settings) is False

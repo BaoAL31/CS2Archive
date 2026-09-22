@@ -15,6 +15,12 @@ Operational deep-dives live in `docs/agents/`; this file is the quick reference:
 | `docs/agents/shorts-titles.md` | YouTube Short title conventions + approved examples (creative, ELO/level-10 opponent labels) |
 | `docs/agents/hltv-listener.md` | HLTV match listener, highlight/POV star weights, queue order |
 
+Long-running **bugs** (open, not a how-to) live in `docs/bugs/`:
+
+| Doc | Contents |
+|---|---|
+| `docs/bugs/hlae-steam-online-hook.md` | Steam-online HLAE inject/record flake (vanilla demo viewer, no ffmpeg) — not solved |
+
 ## Scripts layout
 
 Scripts are grouped by product/concern (not a flat dump):
@@ -113,7 +119,7 @@ Key rules:
 
 **Daily FACEIT notable:** `scripts/faceit/scrape_notable.py` discovers multi-pro + single-pro standout matches and **scores every Recognised-Pro POV**. `daily_notable.discover_good_povs()` is what the listener polls: last **24h**, only watchable POVs (**demand-index star >= 1.25**; extra Recognised Pros and K/D scale bonuses, not the gate), no padding. `--download` fetches each picked demo + builds a single-POV backlog card. Not a Windows scheduled task.
 
-**HLTV match listener:** `scripts/hltv/match_listener.py` polls completed event results and queues **one weighted card per match** from `backlog/<match>/{high,medium}/` (rating >= 1.0). Weight = highlight-channel team demand + POV-channel player demand + org rank + HLTV rating + this fixture's recent highlight views. Cap is **3 uploads per local day**. If the event has nothing live and nothing starting in the next 12 hours, it keeps polling FACEIT for watchable POVs (demand-index star >= 1.25; losses count; extra Recognised Pros are a score chip) and queues them as they appear, up to remaining daily slots — it does not pad with weak games. After each successful pipeline it opens a **new console** running `scripts/upload/upload_pending.py --dir <overlay_dir> --limit 1` for that POV and starts the next render in the same listener process. Refresh stars with `scripts/hltv/refresh_stars.py` (daily 12:00 Windows task `CS2ArchiveStarRefresh`: scrapes competitor POV channels + @cs2povarchive, then highlight channels). Inspect a match with `python scripts/hltv/score_cards.py backlog/<match_slug>`. Details: `docs/agents/hltv-listener.md`.
+**HLTV match listener:** `scripts/hltv/match_listener.py` polls completed event results and queues **one weighted card per match** from `backlog/<match>/{high,medium}/` (rating >= 1.0). Weight = highlight-channel team demand + POV-channel player demand + org rank + HLTV rating + this fixture's recent highlight views. Cap is **2 uploads per local day**. If the event has nothing live and nothing starting in the next 12 hours, it keeps polling FACEIT for watchable POVs (demand-index star >= 1.25; losses count; extra Recognised Pros are a score chip) and queues them as they appear, up to remaining daily slots — it does not pad with weak games. After each successful pipeline it opens a **new console** running `scripts/upload/upload_pending.py --dir <overlay_dir> --limit 1` for that POV and starts the next render in the same listener process. Refresh stars with `scripts/hltv/refresh_stars.py` (daily 12:00 Windows task `CS2ArchiveStarRefresh`: scrapes competitor POV channels + @cs2povarchive, then highlight channels). Inspect a match with `python scripts/hltv/score_cards.py backlog/<match_slug>`. Details: `docs/agents/hltv-listener.md`.
 
 ## CLI Entry Point
 
@@ -169,7 +175,7 @@ Renders via **CSDM** (`C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\csd
 - **Windows PowerShell** — no `&&`, `||`, `tail`; use `; if ($?) {}` and `Select-String -Last 3`. `@'...'@` heredocs broken with f-strings — write Python scripts to files.
 - **RAR extraction** — `rarfile` doesn't work on Windows. Use `patoolib` (via `patool` pip package) which wraps WinRAR.
 - **All async** — every scraper/command is `asyncio.run()`. New commands must follow `async def` + `register_subparser` + `handle` in `commands/`.
-- **YouTube scheduling** — **Long-form** (`upload_pending.py` / pipeline) default `--publish-at auto`: next future **10:00, 16:30, or 21:00 Australia/Sydney** slot via the **YouTube API** (channel uploads playlist), for up to 3 long-form uploads per day. **Shorts** (`upload_youtube_shorts.py`) reuse **CS2UtilArchive's schedule** (`scripts/publish_schedule.py` `SLOT_TIMES = ["18:00"]` + `find_next_upload_slot`, **one Short/day**) against the same occupied-slot pool, so both projects' shorts never double-book. Local ledger (`youtube/.publish_schedule.json`) deprecated. Explicit `--publish-at "YYYY-MM-DD HH:MM"` still schedules exactly.
+- **YouTube scheduling** — **Long-form** (`upload_pending.py` / pipeline) default `--publish-at auto`: next future **10:00 or 16:30 Australia/Sydney** slot via the **YouTube API** (channel uploads playlist), for up to 2 long-form uploads per day. **Shorts** (`upload_youtube_shorts.py`) reuse **CS2UtilArchive's schedule** (`scripts/publish_schedule.py` `SLOT_TIMES = ["18:00"]` + `find_next_upload_slot`, **one Short/day**) against the same occupied-slot pool, so both projects' shorts never double-book. Local ledger (`youtube/.publish_schedule.json`) deprecated. Explicit `--publish-at "YYYY-MM-DD HH:MM"` still schedules exactly.
 - **YouTube verification** — custom thumbnails require a phone-verified account (https://www.youtube.com/verify).
 - **HLTV Cloudflare block** — `net::ERR_CONNECTION_RESET` on HLTV while regular Chrome works = Cloudflare fingerprinting. Fix: Playwright with system Chrome + `ignore_default_args=["--enable-automation"]` (applied in `scrapers/hltv_acquire.py` and `scrapers/hltv.py`). Custom DNS does NOT help.
 - **HLTV demo acquisition** — CloakBrowser, persistent profile `.sessions/hltv-cloak/`. Undersized archives (<1MB) are not cache hits. Fallback: `--demo` with local `.rar`/`.dem`.

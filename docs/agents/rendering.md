@@ -15,6 +15,8 @@ Uses `--recording-system HLAE` — csdm drives HLAE `mirv_streams` to encode dir
 
 HLAE **2.190.1+** required (`C:\Program Files (x86)\HLAE\HLAE.exe`). Disable RTSS/MSI OSD and Steam/Xbox overlays if capture fails. After CS2 updates, if HLAE breaks again, test one round with absolute output before full pipeline runs.
 
+**Steam-online hook flake (long-running):** HLAE sometimes injects (`AfxHookSource2` in `cs2.exe`) but never starts ffmpeg — vanilla `+playdemo` / `Raw files not found`. Mitigations and what is *not* proven live in `docs/bugs/hlae-steam-online-hook.md`. Code: `scripts/hook_aware.py`. Do not toggle Steam offline from an agent.
+
 ## VP9 Trick (sharper YouTube uploads)
 
 Render at **2560×1440** even for 1080p-targeted uploads. YouTube allocates VP9 codec (higher bitrate) to 1440p+ uploads, while 1080p gets H.264. Video looks sharper even when watched at 1080p because YouTube uses better encoding.

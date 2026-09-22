@@ -1,0 +1,62 @@
+--- a/cs2-server-plugin/cs2-server-plugin/main.cpp
++++ b/cs2-server-plugin/cs2-server-plugin/main.cpp
+@@ -566,31 +566,38 @@
+     }
+ }
+ 
++// Called only from engine-thread callbacks / console commands.
++bool EnsureFrameHook()
++{
++    if (originalFrameStageNotify != NULL) return true;
++    if (factory == NULL) return false;
++    auto availableClient = (ISource2Client*)factory("Source2Client002", NULL);
++    auto engine = GetEngine();
++    if (availableClient == NULL || engine == NULL) return false;
++
++    // Set UI mode synchronously before a subsequent startup playdemo command.
++    engine->ExecuteClientCmd(0, "demo_ui_mode 0", true);
++    engine->ExecuteClientCmd(0, "sv_cheats 1", true);
++    client = availableClient;
++    auto vtable = *(void***)client;
++    originalFrameStageNotify = (FrameStageNotifyFn)vtable[36];
++    PatchVTableEntry(vtable, 36, (void*)&NewFrameStageNotify);
++    Log("Hooked FrameStageNotify");
++    return true;
++}
++
+ void NewClientFullyConnect(void* thisptr, int playerSlot)
+ {
+     Log("ClientFullyConnect: playerSlot=%d", playerSlot);
+-    if (client != NULL) {
+-        originalClientFullyConnect(thisptr, playerSlot);
+-        return;
+-    }
+-
+-    // Hook FrameStageNotify to call engine commands from the engine thread since it's not thread safe to call engine
+-    // commands from another thread.
+-    client = (ISource2Client*)factory("Source2Client002", NULL);
+-    if (client != NULL) {
+-        Log("Hooking FrameStageNotify");
+-        auto vtable = *(void***)client;
+-        originalFrameStageNotify = (FrameStageNotifyFn)vtable[36];
+-        PatchVTableEntry(vtable, 36, (void*)&NewFrameStageNotify);
+-        Log("Hooked FrameStageNotify");
+-    }
+-    
+-    // Since the 23/05/2024 CS2 update, the demo playback UI is displayed by default.
+-    // We have to set the demo_ui_mode convar to 0 before starting the playback prevent the UI from being displayed.
+-    QueueEngineCommand("demo_ui_mode 0");
+-    QueueEngineCommand("sv_cheats 1"); // required to unlock commands such as getposcopy
+-
++    EnsureFrameHook();
+     originalClientFullyConnect(thisptr, playerSlot);
++}
++
++CON_COMMAND(csdm_initialize, "Initialize the recording controller independently of a server connection")
++{
++    if (!EnsureFrameHook()) {
++        Log("CSDM initialization failed: client or engine interface unavailable");
++    }
+ }
+ 
+ EXPORT void* CreateInterface(const char* pName, int* pReturnCode)

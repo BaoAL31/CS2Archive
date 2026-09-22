@@ -16,6 +16,16 @@ from pathlib import Path
 MIN_HLAE = (2, 192, 0)
 MIN_CSDM = (3, 20, 0)
 
+# Demo patches HLAE will not record on current CS2 (AfxHook loads, no ffmpeg /
+# "Raw files not found"). Confirmed vs CS2 1.41.8.1: 1.41.3.8 and 1.41.4.1
+# fail; 1.41.6.4 records. Current CS2 may still play a few older patches at or
+# above MIN_RENDERABLE_DEMO_PATCH; it does not have to match steam.inf exactly.
+INCOMPATIBLE_DEMO_PATCHES = frozenset({
+    "1.41.3.8",
+    "1.41.4.1",
+})
+MIN_RENDERABLE_DEMO_PATCH = (1, 41, 6, 4)
+
 HLAE_EXE = Path(r"C:\Program Files (x86)\HLAE\HLAE.exe")
 CSDM_EXE = Path(r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\cs-demo-manager.exe")
 CS2_STEAM_INF = Path(
@@ -66,6 +76,20 @@ def parse_steam_inf_patch(text: str) -> str:
         if line.startswith("PatchVersion="):
             return normalize_patch_version(line.split("=", 1)[1].strip())
     raise ValueError("PatchVersion= not found in steam.inf")
+
+
+def patch_tuple(patch: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in patch.split("."))
+
+
+def demo_patch_too_old(demo_patch: str) -> bool:
+    """True when this demo patch will not record on current CS2/HLAE."""
+    if demo_patch in INCOMPATIBLE_DEMO_PATCHES:
+        return True
+    try:
+        return patch_tuple(demo_patch) < MIN_RENDERABLE_DEMO_PATCH
+    except ValueError:
+        return False
 
 
 def read_cs2_patch(steam_inf: Path = CS2_STEAM_INF) -> str:
@@ -162,14 +186,19 @@ def check_render_versions(
                 raise FileNotFoundError(f"demo not found: {demo}")
             demo_patch = read_demo_patch(demo)
             result.versions["demo"] = demo_patch
-            if cs2 is not None and demo_patch != cs2:
-                # Patched: allow CS2 newer than demo (minor drift) with warning.
-                # Hard-fail only when demo is newer than installed CS2.
+            if demo_patch_too_old(demo_patch):
+                result.ok = False
+                result.errors.append((
+                    "RENDER_DEMO_TOO_OLD",
+                    f"demo patch {demo_patch} is too old for current CS2/HLAE "
+                    f"(need >={format_version(MIN_RENDERABLE_DEMO_PATCH)})",
+                ))
+            elif cs2 is not None and demo_patch != cs2:
+                # Current CS2 can still record a few older patches at/above
+                # MIN_RENDERABLE_DEMO_PATCH. Hard-fail only when the demo is newer.
                 import sys
                 try:
-                    d_parts = tuple(int(x) for x in demo_patch.split("."))
-                    c_parts = tuple(int(x) for x in cs2.split("."))
-                    demo_newer = d_parts > c_parts
+                    demo_newer = patch_tuple(demo_patch) > patch_tuple(cs2)
                 except Exception:
                     demo_newer = demo_patch > cs2
                 if demo_newer:

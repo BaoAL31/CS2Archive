@@ -11,10 +11,9 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEMAND_INDEX_PATH = PROJECT_ROOT / ".data" / "player_demand_index.json"
 
-# Channel-normalized median performance from the 3,012-video longform study
-# (n>=10, index clipped to the 1.08-1.69 band so a tiny-sample spike cannot
-# dominate ELO/star), plus a 2-day recency overlay for 100 Thieves. Missing
-# players use the neutral 1.0 baseline. Team rank still adapts daily.
+# Fallback table if `.data/player_demand_index.json` is missing. Live indexes
+# clip to 1.08–1.80 (thin samples n<8 stop at 1.35) and blend 30% 180-day /
+# 70% last-30-day. Missing players use the neutral 1.0 baseline.
 PLAYER_DEMAND_INDEX = {
     "ropz": 1.69,
     "donk": 1.50,

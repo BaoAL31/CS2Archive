@@ -40,6 +40,13 @@ $LogDir = Join-Path $Root ".listener"
 New-Item -ItemType Directory -Force $LogDir | Out-Null
 $Transcript = Join-Path $LogDir "listener.log"
 Start-Transcript -Path $Transcript -Append | Out-Null
+# Culprit log: who started this wrapper (scheduled task = taskeng.exe,
+# manual console = explorer.exe/WindowsTerminal, agent = pi/bg runner).
+try {
+    $me = Get-CimInstance Win32_Process -Filter "ProcessId=$MyPid"
+    $par = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $me.ParentProcessId) -ErrorAction SilentlyContinue | Select-Object -First 1
+    Write-Host ("[wrapper-parent] pid={0} parent={1} ({2}) cmd={3}" -f $MyPid, $par.Name, $me.ParentProcessId, $par.CommandLine)
+} catch { Write-Host ("[wrapper-parent] lookup failed: {0}" -f $_) }
 try {
     do {
         & $Python @Args

@@ -45,12 +45,16 @@ TEAM_DEMAND_PATH = ROOT / ".data" / "team_demand_index.json"
 
 WINDOW_DAYS = 180
 REFRESH_DAYS = 7
+RECENT_DAYS = 30
 MIN_TEAM_VIDEOS = 4
 MIN_PLAYER_VIDEOS = 3
+RECENT_MIN_VIDEOS = 2
 THIN_SAMPLE = 8
 THIN_CAP = 1.35
 INDEX_FLOOR = 1.08
 INDEX_CAP = 1.80
+LONG_BLEND = 0.3
+SHORT_BLEND = 0.7
 MIN_DURATION_S = 60
 MIN_AGE_DAYS = 2
 
@@ -266,27 +270,38 @@ def build_index(
         vpd = _num(row.get("views_per_day"))
         row["_perf"] = (vpd / base) if base else 0.0
 
-    team_scores: dict[str, list[float]] = {}
-    player_scores: dict[str, list[float]] = {}
+    team_scores: dict[str, list[tuple[float, float]]] = {}
+    player_scores: dict[str, list[tuple[float, float]]] = {}
     for row in durable:
         perf = row["_perf"]
         if perf <= 0:
             continue
+        age = _num(row.get("age_days"))
         if row["_teams"]:
             for team in row["_teams"]:
-                team_scores.setdefault(team, []).append(perf)
+                team_scores.setdefault(team, []).append((perf, age))
         for player in row["_players"]:
-            player_scores.setdefault(player, []).append(perf)
+            player_scores.setdefault(player, []).append((perf, age))
 
     def _finalize(
-        scores: dict[str, list[float]], min_videos: int, key_casefold: bool
+        scores: dict[str, list[tuple[float, float]]], min_videos: int, key_casefold: bool
     ) -> tuple[dict[str, float], dict[str, dict]]:
         index: dict[str, float] = {}
         details: dict[str, dict] = {}
-        for label, values in scores.items():
+        for label, items in scores.items():
+            values = [perf for perf, _age in items]
             n = len(values)
-            value = _clip_index(median(values), n)
-            details[label] = {"videos": n, "index": value}
+            long_median = median(values)
+            recent = [perf for perf, age in items if age <= RECENT_DAYS]
+            value = long_median
+            if len(recent) >= RECENT_MIN_VIDEOS:
+                value = LONG_BLEND * long_median + SHORT_BLEND * median(recent)
+            value = _clip_index(value, n)
+            details[label] = {
+                "videos": n,
+                "index": value,
+                "recent_videos": len(recent),
+            }
             if n < min_videos or value < INDEX_FLOOR:
                 continue
             key = label.casefold() if key_casefold else label
@@ -314,6 +329,9 @@ def build_index(
             "min_team_videos": MIN_TEAM_VIDEOS,
             "min_player_videos": MIN_PLAYER_VIDEOS,
             "thin_sample_cap": THIN_CAP,
+            "recent_days": RECENT_DAYS,
+            "long_blend": LONG_BLEND,
+            "short_blend": SHORT_BLEND,
             "index_floor": INDEX_FLOOR,
             "index_cap": INDEX_CAP,
             "min_duration_s": MIN_DURATION_S,

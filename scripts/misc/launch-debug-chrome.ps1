@@ -42,6 +42,25 @@ if ($SeedCookies) {
     Sync-Cookies
 }
 
+function Seed-Repeek {
+    $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+    $py = "C:\Users\jembo\anaconda3\envs\cs2archive\python.exe"
+    if (-not (Test-Path $py)) {
+        Write-Host "cs2archive python not found; skipping Repeek seed"
+        return
+    }
+    Write-Host "Seeding Repeek into debug Chrome profile..."
+    $env:PYTHONPATH = $repoRoot
+    Push-Location $repoRoot
+    try {
+        & $py -c "from scrapers.repeek_snapshot import seed_repeek_into_debug_profile; print('repeek seeded' if seed_repeek_into_debug_profile() else 'repeek seed failed')"
+    } finally {
+        Pop-Location
+    }
+}
+
+Seed-Repeek
+
 Write-Host "Launching debug Chrome on port $CdpPort..."
 $chromePath = "C:\Program Files\Google\Chrome\Application\chrome.exe"
 if (-not (Test-Path $chromePath)) {

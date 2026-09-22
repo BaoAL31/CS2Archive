@@ -24,7 +24,7 @@ from hltv.match_listener import (
     select_matches,
     event_busy,
     event_matches_url,
-    has_pending_hltv,
+    _faceit_window_hours,
     should_poll_faceit,
     _daily,
     _prune_queue,
@@ -448,20 +448,18 @@ def test_event_idle_when_only_completed_results_remain():
 def test_daily_slots_reset_on_new_day(tmp_path: Path):
     state = State(tmp_path / "listener.json")
     daily = _daily(state)
-    daily["completed"] = ["a", "b", "c"]
+    daily["completed"] = ["a", "b"]
     assert _slots_left(state) == 0
     daily["day"] = "2000-01-01"
     assert _slots_left(state) == DAILY_UPLOAD_LIMIT
     assert _queue_room(state) == DAILY_UPLOAD_LIMIT
 
 
-def test_should_poll_faceit_only_on_idle_hltv_day(tmp_path: Path):
+def test_should_poll_faceit_when_slots_remain(tmp_path: Path):
     state = State(tmp_path / "listener.json")
-    assert should_poll_faceit(state, hltv_busy=False)
-    assert not should_poll_faceit(state, hltv_busy=True)
-    state.data["queue"] = ["backlog/match/high/donk.json"]
-    assert has_pending_hltv(state)
-    assert not should_poll_faceit(state, hltv_busy=False)
+    assert should_poll_faceit(state)
+    _daily(state)["completed"] = ["a", "b"]
+    assert not should_poll_faceit(state)
 
 
 def test_should_poll_faceit_again_when_slots_remain(tmp_path: Path):
@@ -470,15 +468,24 @@ def test_should_poll_faceit_again_when_slots_remain(tmp_path: Path):
     daily["completed"] = ["faceit/2026-09-01/high/neityu-nuke.json"]
     daily["faceit_queued"] = daily["completed"]
     assert _slots_left(state) == DAILY_UPLOAD_LIMIT - 1
-    assert should_poll_faceit(state, hltv_busy=False)
+    assert should_poll_faceit(state)
 
 
 def test_should_not_scrape_faceit_inside_cooldown(tmp_path: Path):
     state = State(tmp_path / "listener.json")
     now = datetime(2026, 9, 1, 21, 0)
     _daily(state)["faceit_last_scrape"] = now.isoformat()
-    assert not should_poll_faceit(state, hltv_busy=False, now=now + timedelta(minutes=5))
-    assert should_poll_faceit(state, hltv_busy=False, now=now + timedelta(minutes=16))
+    assert not should_poll_faceit(state, now=now + timedelta(minutes=5))
+    assert should_poll_faceit(state, now=now + timedelta(minutes=16))
+
+
+def test_faceit_window_stretches_over_render_blocked_gap():
+    now = datetime(2026, 9, 17, 12, 0)
+    assert _faceit_window_hours(None, now) == 1
+    assert _faceit_window_hours("bad", now) == 1
+    assert _faceit_window_hours((now - timedelta(minutes=20)).isoformat(), now) == 1
+    assert _faceit_window_hours((now - timedelta(hours=4)).isoformat(), now) == 5
+    assert _faceit_window_hours((now - timedelta(hours=30)).isoformat(), now) == 24
 
 
 def test_prune_keeps_one_faceit_card_per_match(tmp_path: Path, monkeypatch):

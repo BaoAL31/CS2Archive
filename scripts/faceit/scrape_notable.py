@@ -81,21 +81,66 @@ def _is_notable_perf(line: dict, kd_min: float, adr_min: float, kills_min: int) 
 
 FACEIT_STAR_FLOOR = 1.25
 
+# HLTV top-10 team starters count as stars even when POV channels post too
+# few of their videos to measure demand (support/IGL roles like TeSeS) —
+# but only with a standout line. Lobby context alone routes to the
+# highlight feed, never to a solo render.
+# 250k is the rank_bonus() tier for ranks 6-10; top-5 pay 400k.
+ORG_STAR_RAW_FLOOR = 250_000
+
+# Standout-line bars for the org-star clause (mirror collect() defaults).
+ORG_STANDOUT_KD = 1.5
+ORG_STANDOUT_ADR = 100.0
+ORG_STANDOUT_KILLS = 30
+
+# Lobby-level stardom for the highlight track: combined org-rank bonus
+# across the lobby's Recognised Pros. 800k = two top-5 starters' worth
+# (e.g. donk + magixx vs kyousuke + TeSeS pays 1.6M).
+HIGHLIGHT_LOBBY_RAW_FLOOR = 800_000
+
 
 def is_good_faceit_pov(c: dict) -> bool:
-    """Watchable FACEIT POV: demand-index star only.
+    """Watchable solo POV: demand-index star, or org star + standout line.
 
     Qualifies when the POV player's YouTube demand index is
     >= FACEIT_STAR_FLOOR (live CS2ArchiveStarRefresh file, else the
-    research table). Extra Recognised Pros are a costar chip, not a
-    gate. K/D scales star bonus, not eligibility. nocries (below the
-    floor) stays out; a solo s1mple does not.
+    research table) — any line, losses count — or when they are an HLTV
+    top-10-org starter (>= ORG_STAR_RAW_FLOOR, read from the cached
+    ranking, no network here) *with* a standout line. A mediocre line
+    that only looks interesting because the lobby is stacked belongs to
+    the highlight feed (see is_highlight_lobby), not to a solo render.
+    K/D scales star bonus, not eligibility. nocries (below the floor, no
+    ranked org) stays out; a solo s1mple does not.
     """
     nick = (c.get("player") or "").casefold()
     if not nick:
         return False
     index = load_player_demand_index().get(nick)
-    return index is not None and float(index) >= FACEIT_STAR_FLOOR
+    if index is not None and float(index) >= FACEIT_STAR_FLOOR:
+        return True
+    if not _is_notable_perf(c, ORG_STANDOUT_KD, ORG_STANDOUT_ADR, ORG_STANDOUT_KILLS):
+        return False
+    try:
+        return star_bonus_for_pros([c.get("player") or ""]) >= ORG_STAR_RAW_FLOOR
+    except Exception:
+        return False
+
+
+def is_highlight_lobby(rec: dict) -> bool:
+    """Lobby-level stardom for the highlight track.
+
+    True when a multi-pro lobby's combined HLTV org-rank bonus reaches
+    HIGHLIGHT_LOBBY_RAW_FLOOR. No line requirement — an all-mid-line
+    barnburner between stacked teams is exactly what the highlight path
+    wants. Solo standouts are judged separately by is_good_faceit_pov.
+    """
+    pros = rec.get("pros") or []
+    if len(pros) < 2:
+        return False
+    try:
+        return star_bonus_for_pros(list(pros)) >= HIGHLIGHT_LOBBY_RAW_FLOOR
+    except Exception:
+        return False
 
 
 def load_player_demand_index():
@@ -363,23 +408,10 @@ async def collect(*, hours: int, count: int, min_pros: int,
         for s in solo:
             await get_stats(s["id"])
 
-        # average lobby ELO per match (cached per player)
-        _elo_sem = asyncio.Semaphore(8)
-        _elo_cache: dict[str, tuple] = {}
-
-        async def lobby_elos(mid: str) -> tuple:
-            if mid in _elo_cache:
-                return _elo_cache[mid]
-            stats = stats_cache.get(mid, {})
-            pids = [p.get("player_id") for p in stats.get("players", {}).values()
-                    if p.get("player_id")]
-            async with _elo_sem:
-                els = await asyncio.gather(*[client.get_player_elo(pid) for pid in pids])
-            vals = [e for e in els if e is not None]
-            res = (round(sum(vals) / len(vals)) if vals else None, len(vals), len(pids))
-            _elo_cache[mid] = res
-            return res
-
+        # NOTE: no lobby-ELO fetch here. ELO (POV + opponent avg) is
+        # resolved once per picked match at backlog time (_match_elo in
+        # create_faceit_backlog.py). Fetching ~10 ELOs per candidate
+        # match here was the 429 driver; scrape ranks on pros/demand/perf.
         multi_out = []
         for mid, ps in ranked_multi:
             stats = stats_cache.get(mid, {})
@@ -389,7 +421,7 @@ async def collect(*, hours: int, count: int, min_pros: int,
                 line = _find_pro_line(stats, fid, nick)
                 if line:
                     players[nick] = line
-            avg, n, tot = await lobby_elos(mid)
+            avg, n, tot = None, 0, 0
             multi_out.append({
                 "id": mid, "pros": sorted(ps), "players": players,
                 "map": stats.get("map", "?"), "score": stats.get("score", ""),
@@ -399,10 +431,9 @@ async def collect(*, hours: int, count: int, min_pros: int,
             })
 
         for s in solo:
-            avg, n, tot = await lobby_elos(s["id"])
-            s["avg_elo"] = avg
-            s["elo_n"] = n
-            s["elo_tot"] = tot
+            s["avg_elo"] = None
+            s["elo_n"] = 0
+            s["elo_tot"] = 0
 
         ranking = await fetch_team_ranking()
         candidates = score_candidates(multi_out, solo, ranking)

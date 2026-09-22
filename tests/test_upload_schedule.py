@@ -44,7 +44,7 @@ def test_parse_publish_at_invalid_timezone_raises() -> None:
 
 
 def test_resolve_publish_schedule_auto_uses_next_future_sydney_morning() -> None:
-    # 10:00, 16:30, and 21:00 are the daily slots
+    # 10:00 and 16:30 are the daily slots
     privacy, utc, tz, local = resolve_publish_schedule(
         publish_at="auto",
         timezone=DEFAULT_PUBLISH_TZ,
@@ -98,7 +98,7 @@ def test_resolve_publish_schedule_auto_skips_10am_after_10am() -> None:
 
 
 def test_resolve_publish_schedule_auto_skips_today_after_1630() -> None:
-    # After 16:30 today -> should get 21:00 today
+    # After 16:30 today -> should get 10:00 tomorrow
     privacy, utc, tz, local = resolve_publish_schedule(
         publish_at="auto",
         timezone=DEFAULT_PUBLISH_TZ,
@@ -110,20 +110,20 @@ def test_resolve_publish_schedule_auto_skips_today_after_1630() -> None:
     )
 
     assert privacy == "private"
-    assert utc == "2026-06-19T11:00:00.000Z"  # 21:00 AEST = 11:00 UTC
+    assert utc == "2026-06-20T00:00:00.000Z"  # 10:00 AEST = 00:00 UTC
     assert tz == DEFAULT_PUBLISH_TZ
-    assert local == "2026-06-19 21:00"
+    assert local == "2026-06-20 10:00"
 
 
 def test_resolve_publish_schedule_auto_skips_consecutive_occupied_slots() -> None:
-    # All three slots on 19th occupied -> should get 10:00 on 20th
+    # Both slots on 19th occupied -> should get 10:00 on 20th
     privacy, utc, tz, local = resolve_publish_schedule(
         publish_at="auto",
         timezone=DEFAULT_PUBLISH_TZ,
         meta={},
         privacy="public",
         start_date=date(2026, 6, 19),
-        occupied_dates={"2026-06-19 10:00", "2026-06-19 16:30", "2026-06-19 21:00"},
+        occupied_dates={"2026-06-19 10:00", "2026-06-19 16:30"},
         now=datetime(2026, 6, 19, 9, 0, tzinfo=ZoneInfo(DEFAULT_PUBLISH_TZ)),
     )
 

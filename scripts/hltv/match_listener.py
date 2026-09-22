@@ -1,15 +1,22 @@
-"""Poll HLTV results and render the top-rated POV per map.
+"""Unified match listener: poll HLTV results + FACEIT notables, render top POVs.
 
-Cards are picked by HLTV Rating 3.0 only: one card per map/demo from
+HLTV cards are picked by HLTV Rating 3.0 only: one card per map/demo from
 ``backlog/<match>/{high,medium}/`` (highest ``rating`` wins).
 
-Cap is 3 uploads per local calendar day (the YouTube long-form slots).
-When the configured event has nothing live and nothing starting in the
-next 12 hours, the listener keeps polling FACEIT for watchable POVs
-(demand-index star >= 1.25; extra Recognised Pros and K/D are scoring
-chips, not a gate). It queues those
-as they appear, up
-to the remaining daily slots, and does not pad with weak games.
+FACEIT is polled every cycle via ``daily_notable.discover_faceit_tracks``,
+which splits one scrape into two tracks. Solo POVs (demand-index star
+>= 1.25, or top-10-org starter with a standout line) queue into the
+pipeline as before. Stacked-pro lobbies (combined org-rank bonus) are
+recorded to ``backlog/faceit-highlights/`` for the highlight path instead:
+demo download + lobby record only, no render and no daily-slot charge.
+The scrape lookback stretches from 1h up to 24h to cover time
+blocked inside pipeline renders. Both sources
+share one queue and the daily upload cap below.
+
+Cap is 2 uploads per local calendar day (the YouTube long-form slots).
+HLTV and FACEIT are equal sources: each poll cycle checks HLTV results
+first, then FACEIT notables, and queues whatever is watchable up to the
+remaining daily slots. It does not pad with weak games.
 
 The listener is intentionally a single process and a single pipeline worker.
 It persists state in ``.listener/hltv.json`` so a restart does not repeat
@@ -55,10 +62,13 @@ from scrapers.hltv_acquire import (  # noqa: E402
     match_slug_from_url,
 )
 from daily_notable import (  # noqa: E402
-    DEFAULT_HOURS,
-    discover_good_povs,
+    HIGHLIGHT_PER_SCRAPE,
+    discover_faceit_tracks,
     download_and_backlog,
+    download_faceit_demo,
+    record_highlight_lobby,
     rel_card_for_pick,
+    remember_highlight_lobbies,
     remember_picks,
 )
 
@@ -66,9 +76,11 @@ DEFAULT_EVENT_URL = "https://www.hltv.org/events/8249/blast-open-porto-2026"
 DEFAULT_STATE = ROOT / ".listener" / "hltv.json"
 DEFAULT_RANKINGS_URL = "https://www.hltv.org/ranking/teams"
 MIN_RATING = 1.5
-DAILY_UPLOAD_LIMIT = 3
+DAILY_UPLOAD_LIMIT = 2
 FACEIT_HORIZON = timedelta(hours=12)
 FACEIT_SCRAPE_INTERVAL = timedelta(minutes=15)
+FACEIT_PICK_HOURS = 1
+FACEIT_MAX_WINDOW_HOURS = 24
 
 
 @dataclass
@@ -643,20 +655,8 @@ def _is_faceit_card(path: str, meta: dict | None = None) -> bool:
     return norm.startswith("backlog/faceit/") or norm.startswith("faceit/")
 
 
-def has_pending_hltv(state: State) -> bool:
-    for path in state.data.get("queue") or []:
-        if not _is_faceit_card(path):
-            return True
-    for rec in (state.data.get("matches") or {}).values():
-        if rec.get("status") in {"discovered", "queued", "retry", "running"}:
-            return True
-    return False
-
-
-def should_poll_faceit(state: State, hltv_busy: bool,
-                       now: datetime | None = None) -> bool:
-    if hltv_busy or has_pending_hltv(state):
-        return False
+def should_poll_faceit(state: State, now: datetime | None = None) -> bool:
+    """FACEIT is a first-class source: poll whenever slots + interval allow."""
     if _slots_left(state) <= 0:
         return False
     now = now or datetime.now()
@@ -672,28 +672,64 @@ def should_poll_faceit(state: State, hltv_busy: bool,
     return True
 
 
+def _faceit_window_hours(last_raw: str | None, now: datetime) -> int:
+    """Lookback hours for this FACEIT scrape.
+
+    The listener blocks inside pipeline renders for hours, during which no
+    scrape runs. Stretch the window to cover the blocked gap (capped at 24h)
+    so games played mid-render are still visible at the next scrape.
+    """
+    if not last_raw:
+        return FACEIT_PICK_HOURS
+    try:
+        last = datetime.fromisoformat(last_raw)
+    except ValueError:
+        return FACEIT_PICK_HOURS
+    elapsed = (now - last).total_seconds() / 3600
+    return min(FACEIT_MAX_WINDOW_HOURS, max(FACEIT_PICK_HOURS, int(elapsed) + 1))
+
+
 async def _maybe_queue_faceit(args, state: State, indexes: dict | None) -> None:
     room = _queue_room(state)
     if room <= 0:
         return
     daily = _daily(state)
-    daily["faceit_last_scrape"] = datetime.now().isoformat()
+    now = datetime.now()
+    hours = _faceit_window_hours(daily.get("faceit_last_scrape"), now)
+    daily["faceit_last_scrape"] = now.isoformat()
     if args.dry_run:
         print("[faceit-notable] would scrape FACEIT for watchable POVs",
               flush=True)
         state.save()
         return
     print(
-        f"[faceit-notable] no HLTV match in the next 12h; "
-        f"scraping last {DEFAULT_HOURS}h for watchable POVs "
+        f"[faceit-notable] scraping last {hours}h for watchable POVs "
         f"({room} slot(s))",
         flush=True,
     )
-    picks = await discover_good_povs(
+    picks, hl_lobbies = await discover_faceit_tracks(
         n=room,
-        hours=DEFAULT_HOURS,
+        hours=hours,
         skip_youtube_demand=True,
     )
+    for lob in hl_lobbies[:HIGHLIGHT_PER_SCRAPE]:
+        demo = await asyncio.to_thread(
+            download_faceit_demo, lob["match_id"], lob.get("map") or "")
+        if demo is None:
+            print(
+                f"[faceit-highlight] no demo yet for {lob['match_id']}, "
+                f"retrying next scrape",
+                flush=True,
+            )
+            continue
+        record_highlight_lobby(lob, demo)
+        remember_highlight_lobbies([lob])
+        print(
+            f"[faceit-highlight] recorded {lob['match_id']} "
+            f"({','.join(lob.get('pros', []))} "
+            f"{lob.get('map')} {lob.get('score')})",
+            flush=True,
+        )
     if not picks:
         print("[faceit-notable] no watchable FACEIT POVs this scrape",
               flush=True)
@@ -890,7 +926,7 @@ def _completed_faceit_keys() -> set[tuple]:
     get a new ``faceit_match_id`` so the run-id lookup misses — match them
     by player + demo file + scoreline instead."""
     keys: set[tuple] = set()
-    for base in (ROOT / "faceit", ROOT / "backlog" / "faceit"):
+    for base in (ROOT / "backlog" / "faceit",):
         if not base.is_dir():
             continue
         for path in base.rglob("*.json"):
@@ -1179,7 +1215,7 @@ async def poll_once(args, state: State) -> None:
             record["last_error"] = None
             state.save()
 
-    if should_poll_faceit(state, hltv_busy):
+    if should_poll_faceit(state):
         await _maybe_queue_faceit(args, state, indexes)
 
     while state.data["queue"] and _slots_left(state) > 0:

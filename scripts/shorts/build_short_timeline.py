@@ -363,14 +363,19 @@ def _collect_weapon_fires(parser, first_freeze: int | None) -> list[dict]:
     return fires
 
 
-def _collect_flick_kills(parser, deaths, first_freeze: int | None) -> set[tuple[str, int]]:
-    """Gun-kill ticks whose aim window is a flick. Empty if ticks are missing."""
-    from shorts.flick import PRE_TICKS, is_flick
+def _collect_flick_kills(
+    parser, deaths, first_freeze: int | None, *, converted: bool = False,
+) -> set[tuple[str, int]]:
+    """Gun-kill ticks whose aim window is a flick. Empty if ticks are missing.
+
+    ``converted`` (rewind): snap may finish up to ~0.2s before the kill tick.
+    """
+    from shorts.flick import PRE_TICKS, is_flick, is_flick_converted
 
     out: set[tuple[str, int]] = set()
     if deaths is None or getattr(deaths, "empty", True):
         return out
-    by_attacker: dict[str, list[int]] = {}
+    by_attacker: dict[str, list[tuple[int, str]]] = {}
     for _, row in deaths.iterrows():
         tick = int(row["tick"])
         if first_freeze is not None and tick < first_freeze:
@@ -378,13 +383,14 @@ def _collect_flick_kills(parser, deaths, first_freeze: int | None) -> set[tuple[
         aid = _sid(row.get("attacker_steamid"))
         if not aid:
             continue
-        if not _is_gun_kill({"weapon": str(row.get("weapon", "") or "")}):
+        weapon = str(row.get("weapon", "") or "").strip().lower()
+        if not _is_gun_kill({"weapon": weapon}):
             continue
-        by_attacker.setdefault(aid, []).append(tick)
+        by_attacker.setdefault(aid, []).append((tick, weapon))
     if not by_attacker:
         return out
-    for aid, kill_ticks in by_attacker.items():
-        needed = {t for tick in kill_ticks for t in range(tick - PRE_TICKS, tick + 1)}
+    for aid, kills in by_attacker.items():
+        needed = {t for tick, _w in kills for t in range(tick - PRE_TICKS, tick + 1)}
         try:
             tdf = None
             try:
@@ -410,13 +416,19 @@ def _collect_flick_kills(parser, deaths, first_freeze: int | None) -> set[tuple[
                 samples[int(row["tick"])] = (float(row["yaw"]), float(row["pitch"]))
             except (TypeError, ValueError):
                 continue
-        for tick in kill_ticks:
+        for tick, weapon in kills:
             window = [t for t in range(tick - PRE_TICKS, tick + 1) if t in samples]
             if len(window) < 10:
                 continue
             yaw = [samples[t][0] for t in window]
             pitch = [samples[t][1] for t in window]
-            if is_flick(yaw, pitch):
+            awp = weapon == "awp"
+            ok = (
+                is_flick_converted(yaw, pitch, awp=awp)
+                if converted
+                else is_flick(yaw, pitch, awp=awp)
+            )
+            if ok:
                 out.add((aid, tick))
     return out
 

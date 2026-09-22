@@ -1,0 +1,54 @@
+--- a/cs2-server-plugin/cs2-server-plugin/main.cpp
++++ b/cs2-server-plugin/cs2-server-plugin/main.cpp
+@@ -569,6 +569,9 @@
+ void NewClientFullyConnect(void* thisptr, int playerSlot)
+ {
+     Log("ClientFullyConnect: playerSlot=%d", playerSlot);
++    Log("[CS2ARCHIVE-DIAG] connection callback elapsed_ms=%lld playing_demo=%d",
++        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime).count(),
++        GetEngine() ? GetEngine()->IsPlayingDemo() : -1);
+     if (client != NULL) {
+         originalClientFullyConnect(thisptr, playerSlot);
+         return;
+@@ -652,6 +655,41 @@
+     return original;
+ }
+ 
++CON_COMMAND(csdm_diagnostic_probe, "Read-only startup probe on the engine thread")
++{
++    auto engine = GetEngine();
++    auto availableClient = factory ? factory("Source2Client002", NULL) : NULL;
++    Log("[CS2ARCHIVE-DIAG] startup probe elapsed_ms=%lld client_available=%d frame_hook=%d playing_demo=%d",
++        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime).count(),
++        availableClient != NULL, originalFrameStageNotify != NULL, engine ? engine->IsPlayingDemo() : -1);
++}
++
++CON_COMMAND(csdm_diagnostic_start_early, "Controlled experiment: play before background connection")
++{
++    auto engine = GetEngine();
++    if (engine && demoPath) {
++        Log("[CS2ARCHIVE-DIAG] early playdemo frame_hook=%d", originalFrameStageNotify != NULL);
++        engine->ExecuteClientCmd(0, ("playdemo \"" + string(demoPath) + "\"").c_str(), true);
++    }
++}
++
++CON_COMMAND(csdm_diagnostic_init, "Controlled experiment: initialize on engine thread without a connection")
++{
++    if (client || !factory) return;
++    auto availableClient = (ISource2Client*)factory("Source2Client002", NULL);
++    if (!availableClient) {
++        Log("[CS2ARCHIVE-DIAG] independent initialization: client unavailable");
++        return;
++    }
++    client = availableClient;
++    auto vtable = *(void***)client;
++    originalFrameStageNotify = (FrameStageNotifyFn)vtable[36];
++    PatchVTableEntry(vtable, 36, (void*)&NewFrameStageNotify);
++    QueueEngineCommand("demo_ui_mode 0");
++    QueueEngineCommand("sv_cheats 1");
++    Log("[CS2ARCHIVE-DIAG] independently Hooked FrameStageNotify before connection");
++}
++
+ CON_COMMAND(csdm_info, "Prints CS:DM plugin info")
+ {
+     Log("Tick: %d", currentTick.load());

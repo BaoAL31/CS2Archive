@@ -13,7 +13,7 @@ results** plus **today and yesterday**. Older dated groups on that dump
 (group stage, etc.) are ignored.
 Matches that already have backlog cards on disk are marked done and not
 rendered again. The worker runs
-one `scripts/pov/pipeline.py` process at a time, **up to 3 uploads per local
+one `scripts/pov/pipeline.py` process at a time, **up to 2 uploads per local
 calendar day** (the YouTube long-form slots). When that POV is youtube-ready,
 the listener spawns `scripts/upload/upload_pending.py --dir <overlay> --limit 1`
 for **that** overlay folder in a new console, then immediately starts the next
@@ -24,24 +24,30 @@ only, skip with `--no-shorts`; low-demand POVs without a NAVI / Spirit /
 Vitality hook are dropped). Output is written only when at least one
 short is detected: `renders/shorts/shorts-<demo-stem>/shorts-<slug>/`.
 
-## FACEIT notables (off days)
+## FACEIT notables (two tracks)
 
-The listener also reads upcoming / live matches from the event page (and the
-event matches tab when the overview has no timestamps). If nothing is live
-and nothing starts in the next 12 hours, it **keeps polling FACEIT** (same
-loop as HLTV, 15-minute scrape cooldown) for watchable Recognised-Pro POVs
-from the last 24 hours. A POV qualifies if the player is a
-**demand-index star** (>= 1.25). Extra Recognised Pros add a costar
-chip; K/D scales star bonus. Neither is a gate. A loss still qualifies.
-A nocries-level demand line does not. Those are queued as they appear, one
-player/match, up to the remaining daily slots. Weak leftover games are
-not used to pad the day to 3.
-Demos are downloaded and a single-POV backlog card is built, then the same
-pipeline + upload-spawn path as HLTV cards.
+The listener polls FACEIT every cycle (`discover_faceit_tracks`, one scrape,
+15-minute cooldown, lookback stretches 1h→24h to cover time blocked inside
+renders). Each scrape splits into:
 
-HLTV leftover work (queued or still-discovered matches) is finished before
-FACEIT filler. FACEIT is not mixed into a tournament day just to use empty
-slots. There is no separate Windows 09:00 task.
+- **Solo POVs** → the pipeline, sharing the 2/day cap. A POV qualifies on
+  personal merit: **demand-index star** (>= 1.25, any line — a loss still
+  qualifies) **or** top-10-org starter **with** a standout line (1.5 K/D /
+  30 kills / 100 ADR). A mediocre line that only looks interesting because
+  the lobby is stacked never renders solo.
+- **Highlight lobbies** → `backlog/faceit-highlights/` (record-only feed
+  for the WIP highlight path: demo download + lobby record, no render, no
+  daily slots). A lobby qualifies on lobby stardom: ≥ 2 Recognised Pros
+  with combined org-rank bonus ≥ 800k (two top-5 starters' worth) — no
+  line requirement, so all-mid-line barnburners between stacked teams
+  still land. One entry per match; a lobby can feed both tracks.
+
+Extra Recognised Pros add a costar chip; K/D scales star bonus. Neither is
+a gate. A nocries-level demand line qualifies for neither track. Solo POVs
+are queued as they appear, one player/match, up to the remaining daily
+slots. Demos are downloaded and a single-POV backlog card is built, then
+the same pipeline + upload-spawn path as HLTV cards. Weak leftover games
+are not used to pad the day to 2. There is no separate Windows 09:00 task.
 
 ## Weighting
 

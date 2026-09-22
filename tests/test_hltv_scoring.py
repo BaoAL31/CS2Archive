@@ -109,6 +109,36 @@ def test_build_index_attributes_highlights_to_both_teams():
     assert ("Spirit", "FURIA") in pairs
 
 
+def test_build_index_blends_recent_highlights():
+    now = datetime(2026, 9, 22, tzinfo=timezone.utc)
+    rows = []
+    for i in range(6):
+        rows.append({
+            "title": "Spirit vs FURIA - BLAST",
+            "views": 10_000,
+            "views_per_day": 100,
+            "age_days": 90,
+            "duration_seconds": 600,
+            "channel": "BLAST CS2 Highlights",
+            "video_id": f"old{i}",
+            "published_at": "2026-06-20T00:00:00+00:00",
+        })
+    for i in range(3):
+        rows.append({
+            "title": "Spirit vs FURIA - BLAST",
+            "views": 80_000,
+            "views_per_day": 800,
+            "age_days": 5,
+            "duration_seconds": 600,
+            "channel": "BLAST CS2 Highlights",
+            "video_id": f"new{i}",
+            "published_at": "2026-09-17T00:00:00+00:00",
+        })
+    payload = build_index(rows, aliases={}, lookup=LOOKUP, now=now)
+    assert payload["index"]["Spirit"] > 1.08
+    assert payload["teams"]["Spirit"]["recent_videos"] == 3
+
+
 def test_match_highlight_bonus_log_scale():
     now = datetime(2026, 8, 31, tzinfo=timezone.utc)
     fixtures = [{

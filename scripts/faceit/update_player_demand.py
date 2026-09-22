@@ -3,8 +3,8 @@
 Includes the eight competitor channels plus @cs2povarchive.
 
 Keeps a deduped history (one row per video_id) under exports/pov_market/.
-Scores a rolling 180-day window, with a 14-day overlay that can raise a
-player's index. Writes .data/player_demand_index.json for scrape_notable.
+Scores a rolling 180-day window, blended with a 30-day overlay (recent can
+raise or cut the index). Writes .data/player_demand_index.json for scrape_notable.
 
 Usage:
     python scripts/faceit/update_player_demand.py
@@ -50,13 +50,14 @@ SEED_CSVS = (
 )
 WINDOW_DAYS = 180
 REFRESH_DAYS = 7
-RECENT_DAYS = 14
+RECENT_DAYS = 30
 MIN_VIDEOS = 8
 RECENT_MIN_VIDEOS = 3
+THIN_SAMPLE = 8
 INDEX_FLOOR = 1.08
 INDEX_CAP = 1.80
-LONG_BLEND = 0.7
-SHORT_BLEND = 0.3
+LONG_BLEND = 0.3
+SHORT_BLEND = 0.7
 
 
 def _parse_published(value: str | None) -> datetime | None:
@@ -179,9 +180,9 @@ def build_index(
             and recent_median is not None
             and long_n >= MIN_VIDEOS
         ):
-            value = max(value, LONG_BLEND * long_median + SHORT_BLEND * recent_median)
+            value = LONG_BLEND * long_median + SHORT_BLEND * recent_median
         sample_n = long_n if long_n >= MIN_VIDEOS else recent_n
-        if sample_n < 30:
+        if sample_n < THIN_SAMPLE:
             value = min(value, 1.35)
         value = round(min(INDEX_CAP, max(value, 0.0)), 2)
         details[player] = {
@@ -249,6 +250,9 @@ def refresh(*, scrape: bool = True, days: int = REFRESH_DAYS) -> dict:
             "min_videos": MIN_VIDEOS,
             "recent_min_videos": RECENT_MIN_VIDEOS,
             "thin_sample_cap": 1.35,
+            "thin_sample": THIN_SAMPLE,
+            "long_blend": LONG_BLEND,
+            "short_blend": SHORT_BLEND,
             "index_floor": INDEX_FLOOR,
             "index_cap": INDEX_CAP,
             "excluded_under_5_minutes": long_report["method"]["excluded_under_5_minutes"],

@@ -1,17 +1,17 @@
 """
 Daily FACEIT notable-match selector.
 
-Picks the top N (=3) Recognised-Pro POVs for a calendar day from
-`scrape_notable.collect()`. If the day's scrape cannot fill N, falls back
-to performances left in the persistent pool from previous days.
+Picks the top N (=2) Recognised-Pro POVs for a calendar day from
+`scrape_notable.collect()`. Empty days are allowed (no padding).
 
-The HLTV match listener polls this on off days (no tournament match live
-or starting within 12 hours) and queues only watchable POVs — it does not
-pad the day to 3. Manual CLI still works.
+The HLTV match listener polls ``discover_faceit_tracks`` every cycle: one
+scrape split into solo POV picks (queued into the pipeline, never padded
+to 2) and stacked-pro lobbies (recorded to ``backlog/faceit-highlights/``
+for the highlight path — demo + lobby record only). Manual CLI still works.
 
 ``pick_for_day`` is idempotent per calendar day. The listener uses
-``discover_good_povs`` instead, which re-scrapes and only returns star POVs
-not already in ``used``.
+``discover_faceit_tracks`` instead, which re-scrapes and only returns
+star POVs / unrecorded lobbies not already in ``used``.
 
 State file: .data/notable_daily.json
   {
@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import subprocess
 import sys
 import time
@@ -50,14 +51,16 @@ from scrape_notable import (  # noqa: E402
     SCORE_VERSION,
     collect,
     is_good_faceit_pov,
+    is_highlight_lobby,
     rescore_stored,
+    star_bonus_for_pros,
 )
 from update_player_demand import refresh as refresh_player_demand
 
 STATE_FILE = ROOT / ".data" / "notable_daily.json"
 DEMO_DIR = ROOT / "demos" / "faceit"
 PY = sys.executable
-DEFAULT_PICKS = 3
+DEFAULT_PICKS = 2
 DEFAULT_HOURS = 24
 # Only used when FACEIT history has not caught up yet after a successful
 # download. Must match the pick's map in the filename and be freshly written.
@@ -234,6 +237,26 @@ async def discover_good_povs(
     skip_youtube_demand: bool = True,
 ) -> list[dict]:
     """Scrape the lookback window and return unused watchable POVs (up to n)."""
+    picks, _ = await discover_faceit_tracks(
+        n, hours=hours, count=count, skip_youtube_demand=skip_youtube_demand)
+    return picks
+
+
+async def discover_faceit_tracks(
+    n: int = DEFAULT_PICKS,
+    *,
+    hours: int = DEFAULT_HOURS,
+    count: int = 25,
+    skip_youtube_demand: bool = True,
+) -> tuple[list[dict], list[dict]]:
+    """One scrape, two tracks: (solo POV picks, highlight lobby dicts).
+
+    Solo picks are watchable POVs (demand star, or org star + standout
+    line), one per player and match. Highlight lobbies are stacked-pro
+    lobbies for the (WIP) highlight path — no line requirement, one entry
+    per match, skipped when already recorded (hl:<match_id> in used or a
+    feed file on disk).
+    """
     state = _load_state()
     if not skip_youtube_demand:
         try:
@@ -257,7 +280,105 @@ async def discover_good_povs(
         n,
         today,
     )
-    return picks
+    used = set(state.get("used") or [])
+    lobbies: list[dict] = []
+    for m in data["multi"]:
+        lid = highlight_uid(m["id"])
+        if lid in used or highlight_already_recorded(m["id"]):
+            continue
+        if not is_highlight_lobby(m):
+            continue
+        try:
+            lobby_star = star_bonus_for_pros(list(m.get("pros", [])))
+        except Exception:
+            lobby_star = 0
+        lobbies.append(highlight_lobby_record(m, lobby_star))
+    lobbies.sort(key=lambda l: (-l["lobby_star_bonus"], l.get("date") or ""))
+    return picks, lobbies
+
+
+# ---------- highlight feed (record-only; consumer is the WIP highlight path) ----------
+HIGHLIGHT_DIR = ROOT / "backlog" / "faceit-highlights"
+HIGHLIGHT_PER_SCRAPE = 2  # demo downloads run minutes each; the rest retry next scrape
+
+
+def highlight_uid(match_id: str) -> str:
+    return f"hl:{match_id}"
+
+
+def highlight_lobby_record(match: dict, lobby_star: int) -> dict:
+    """Feed dict for a stacked lobby (id is namespaced so it never collides
+    with solo POV ids in the shared used list)."""
+    raw_date = match.get("date")
+    day = (raw_date.strftime("%Y-%m-%d") if isinstance(raw_date, datetime)
+           else str(raw_date or "")[:10])
+    return {
+        "id": highlight_uid(match["id"]),
+        "match_id": match["id"],
+        "map": match.get("map", "?"),
+        "score": match.get("score", ""),
+        "date": day,
+        "pros": sorted(match.get("pros", [])),
+        "team1": match.get("team1", "?"),
+        "team2": match.get("team2", "?"),
+        "lobby_star_bonus": lobby_star,
+        "score_version": SCORE_VERSION,
+    }
+
+
+def highlight_record_path(
+    match_id: str, map_name: str, day: str, *, root: Path = ROOT,
+) -> Path:
+    safe_map = re.sub(r"[^a-z0-9]+", "-", str(map_name or "?").lower()).strip("-")
+    return (root / "backlog" / "faceit-highlights" / day
+            / f"{match_id}-{safe_map or 'unknown'}.json")
+
+
+def highlight_already_recorded(match_id: str, *, root: Path = ROOT) -> bool:
+    base = root / "backlog" / "faceit-highlights"
+    if not base.is_dir():
+        return False
+    return any(base.rglob(f"{match_id}-*.json"))
+
+
+def record_highlight_lobby(
+    lobby: dict, demo_path: Path | str, *, root: Path = ROOT,
+) -> Path | None:
+    """Write the highlight-feed record. Idempotent per match+map file."""
+    day = str(lobby.get("date") or datetime.now().strftime("%Y-%m-%d"))[:10]
+    path = highlight_record_path(
+        str(lobby.get("match_id")), str(lobby.get("map")), day, root=root)
+    if path.exists():
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        **lobby,
+        "is_faceit_highlight": True,
+        "demo_path": str(demo_path),
+        "recorded_at": datetime.now().isoformat(),
+    }
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def remember_highlight_lobbies(lobbies: list[dict]) -> None:
+    """Burn hl: ids so later scrapes skip recorded lobbies.
+
+    The picks list is untouched — highlight entries are a separate track
+    from solo POV picks.
+    """
+    if not lobbies:
+        return
+    state = _load_state()
+    used = state.setdefault("used", [])
+    changed = False
+    for lob in lobbies:
+        lid = lob.get("id")
+        if lid and lid not in used:
+            used.append(lid)
+            changed = True
+    if changed:
+        _save_state(state)
 
 
 def _format_pick(c: dict) -> str:
@@ -284,7 +405,7 @@ def card_for_pick(pick: dict, *, root: Path = ROOT) -> Path | None:
     player = str(pick.get("player") or "").casefold()
     if not match_id or (not fid and not player):
         return None
-    for faceit in (root / "faceit", root / "backlog" / "faceit"):
+    for faceit in (root / "backlog" / "faceit", root / "faceit"):
         if not faceit.is_dir():
             continue
         for path in faceit.rglob("*.json"):
@@ -355,7 +476,7 @@ async def pick_for_day(
         c for c in state["pool"]
         if c.get("id") and c.get("score_version") == SCORE_VERSION
     ]
-    picks, new_used = choose_picks(
+    picks, _ = choose_picks(
         {"used": state.get("used") or [], "pool": old_pool},
         fresh, n, today,
     )
@@ -370,7 +491,15 @@ async def pick_for_day(
     ]
     survivors.sort(key=lambda c: -c.get("weight", 0))
     state["pool"] = survivors[:150]
-    state["used"].extend(new_used)
+    # Burn used only for picks that actually produced backlog cards. A pick
+    # that was never downloaded/backlogged stays pickable — otherwise the
+    # listener (which honours used) can never queue it again.
+    used = set(state.get("used") or [])
+    for c in picks:
+        pid = c.get("id")
+        if pid and pid not in used and card_for_pick(c) is not None:
+            used.add(pid)
+            state.setdefault("used", []).append(pid)
     state["picks"][today] = picks
     state["last_day"] = today
     if not dry_run:
@@ -385,6 +514,59 @@ async def pick_for_day(
 
 
 # ---------- download + backlog (optional) ----------
+def _run_faceit_download(mid: str, label: str) -> bool:
+    """Run ``main.py faceit match``; True when the downloader exited 0."""
+    print(f"[DL] {mid} ({label}) ...")
+    try:
+        r = subprocess.run(
+            [PY, str(ROOT / "main.py"), "faceit", "match", mid],
+            cwd=str(ROOT), timeout=1800, capture_output=True,
+            text=True, encoding="utf-8", errors="replace")
+    except Exception as e:
+        print(f"  [ERR] download failed: {e}")
+        return False
+    out = r.stdout or ""
+    if out:
+        lines = out.splitlines()
+        keep = [ln for ln in lines if any(
+            tag in ln for tag in
+            ("[AUTH]", "[ERR]", "[DL]", "[CDP]", "[WARN]", "[FAIL]",
+             "Watch Demo", "Clicking")
+        )]
+        shown = keep[-16:] if keep else lines[-8:]
+        safe = "\n".join(shown).encode(
+            sys.stdout.encoding or "utf-8", errors="replace").decode(
+            sys.stdout.encoding or "utf-8", errors="replace")
+        print(safe)
+    if r.returncode != 0:
+        err = (r.stderr or "").strip().splitlines()[-1:] or ["download failed"]
+        print(f"  [ERR] download exited {r.returncode}: {err[0]}")
+        return False
+    return True
+
+
+def download_faceit_demo(match_id: str, map_name: str = "") -> Path | None:
+    """Demo-only download for the highlight track (no backlog cards).
+
+    Returns the demo path, or None when the demo could not be located
+    (caller retries on a later scrape; nothing is burned).
+    """
+    from downloader import is_already_downloaded  # type: ignore
+    from models import DemoSource  # type: ignore
+
+    demo = is_already_downloaded(match_id, DemoSource.FACEIT)
+    if demo:
+        print(f"[DL] {match_id} already on disk: {demo}")
+        return demo
+    download_ok = _run_faceit_download(match_id, map_name or "?")
+    demo = is_already_downloaded(match_id, DemoSource.FACEIT)
+    if demo is None and download_ok:
+        demo = fallback_demo_if_history_lagged(map_name)
+    if demo is None:
+        print(f"  [ERR] demo not located for {match_id}")
+    return demo
+
+
 def download_and_backlog(picks: list[dict]) -> None:
     """Best-effort: download each picked demo, then build its backlog cards."""
     from downloader import is_already_downloaded, get_download_history  # type: ignore
@@ -396,36 +578,11 @@ def download_and_backlog(picks: list[dict]) -> None:
         if demo:
             print(f"[DL] {mid} already on disk: {demo}")
         else:
-            print(f"[DL] {mid} ({c['map']}) ...")
-            download_ok = False
-            try:
-                r = subprocess.run(
-                    [PY, str(ROOT / "main.py"), "faceit", "match", mid],
-                    cwd=str(ROOT), timeout=1800, capture_output=True,
-                    text=True, encoding="utf-8", errors="replace")
-                out = r.stdout or ""
-                if out:
-                    lines = out.splitlines()
-                    keep = [ln for ln in lines if any(
-                        tag in ln for tag in
-                        ("[AUTH]", "[ERR]", "[DL]", "[CDP]", "[WARN]", "[FAIL]",
-                         "Watch Demo", "Clicking")
-                    )]
-                    shown = keep[-16:] if keep else lines[-8:]
-                    safe = "\n".join(shown).encode(
-                        sys.stdout.encoding or "utf-8", errors="replace").decode(
-                        sys.stdout.encoding or "utf-8", errors="replace")
-                    print(safe)
-                if r.returncode != 0:
-                    err = (r.stderr or "").strip().splitlines()[-1:] or ["download failed"]
-                    print(f"  [ERR] download exited {r.returncode}: {err[0]}")
-                else:
-                    download_ok = True
-            except Exception as e:
-                print(f"  [ERR] download failed: {e}")
+            map_name = str(c.get("map") or "")
+            download_ok = _run_faceit_download(mid, map_name)
             demo = is_already_downloaded(mid, DemoSource.FACEIT)
             if demo is None and download_ok:
-                demo = fallback_demo_if_history_lagged(str(c.get("map") or ""))
+                demo = fallback_demo_if_history_lagged(map_name)
         if not demo:
             print(f"  [ERR] demo not located for {mid}")
             continue
@@ -559,6 +716,7 @@ def main() -> None:
 
     if picks and args.download:
         download_and_backlog(picks)
+        remember_picks([p for p in picks if rel_card_for_pick(p) is not None])
 
 
 if __name__ == "__main__":

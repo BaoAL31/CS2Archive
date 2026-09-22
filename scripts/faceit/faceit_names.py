@@ -110,3 +110,28 @@ def known_pros() -> set[str]:
     """Lowercase set of all known pro nicks (from accounts)."""
     _load()
     return set(_CANON.keys())
+
+
+def _alnum_lower(s: str) -> str:
+    return "".join(c for c in s.lower() if c.isalnum())
+
+
+def nick_alias_parts(live: str, canon: str | None = None) -> tuple[str, str | None]:
+    """Lobby nick plus optional canonical name when the nick hides the pro.
+
+    ``donk666`` already contains ``donk`` → no subtitle. ``holaaaa`` vs
+    ``s1mple`` → ``("holaaaa", "s1mple")``. Same name, different casing
+    (``teses`` / ``TeSeS``) is not an alias.
+    """
+    live = (live or "").strip()
+    if canon is None:
+        canon = canonical_nick(live)
+    canon = (canon or "").strip()
+    if not live:
+        return (canon or "?", None)
+    if not canon:
+        return live, None
+    a_live, a_canon = _alnum_lower(live), _alnum_lower(canon)
+    if a_canon == a_live or (a_canon and a_canon in a_live):
+        return live, None
+    return live, canon
