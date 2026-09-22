@@ -28,7 +28,7 @@ Scripts are grouped by product/concern (not a flat dump):
 | Folder | Contents |
 |---|---|
 | `scripts/pov/` | POV Archive pipeline (`pipeline.py`, render, concat, backlog, …) |
-| `scripts/overlay/` | Keyboard + util-cam overlay |
+| `scripts/overlay/` | Util-cam overlay (+ optional keyboard, lineup freeze frames) |
 | `scripts/hltv/` | HLTV match listener, highlight-channel team demand, card scoring |
 | `scripts/faceit/` | FACEIT POV helpers (titles, thumbnails, names, backlog, **daily FACEIT notable** `daily_notable.py`) |
 | `scripts/highlights/` | Highlight Reel / Kill Timeline (Kinocut path — separate from POV) |
@@ -101,14 +101,14 @@ Key rules:
 - **Resume rule:** ALWAYS check `.pipeline/{run_id}.json` before deleting saved progress (combined.mp4, rendered clips, …) — it records the last completed step. Resume with the same backlog + `--step N`.
 - **Uploading is separate.** Pipeline stops at step 6 with `upload_status="pending"`; `upload_pending.py` uploads every pending `youtube/*/upload_meta.json` (resume-safe: skips `completed`).
 - **Intermediates kept until upload (purge moved post-upload):** pipeline keeps `renders/pov-*` after step 6 (repair path for re-overlay/re-scale); `upload_pending.py` purges the render dir once **every** variant (raw + overlay) is uploaded (`--keep-renders` opts out of the purge). Per-round clips are still freed after step 4 (combined.mp4 kept). Opt back into purge-at-end with `pipeline.py --cleanup` (step 7).
-- **Overlay (step 4) runs by default:** keyboard states via CS2UtilArchive + utility throw flight PiP clips (~1–2 min/throw via CSDM/HLAE; 20+ throws ≈ 30–60 min). Skip with `--until 3` or `--raw-only`. `--overlay-only` is a deprecated no-op.
-- **Input overlay source:** keyboard states come from CS2UtilArchive's overlay kernel (usercmd decode), not a local `scripts/overlay/usercmd_extract.py`. The sibling checkout is `settings.cs2util_root` in `scripts/config.py`.
+- **Overlay (step 4) runs by default:** utility throw flight PiP clips (~1–2 min/throw via CSDM/HLAE; 20+ throws ≈ 30–60 min), one PiP per unique lineup (repeat throws from the same release cell show once), plus CS2UtilArchive-style freeze frames in the main POV for non-straightforward lineups (freeze → throw → PiP). Keyboard input overlay is OFF by default — opt in with `--keyboard` (pipeline + `overlay_pov.py`). Skip the whole step with `--until 3` or `--raw-only`. `--overlay-only` is a deprecated no-op.
+- **Input overlay source (only with `--keyboard`):** keyboard states come from CS2UtilArchive's overlay kernel (usercmd decode), not a local `scripts/overlay/usercmd_extract.py`. The sibling checkout is `settings.cs2util_root` in `scripts/config.py`.
 - **`--skip-failed-rounds` — [DANGER] NEVER set by default.** Only for corrupted/incompatible demos (e.g. `100-thieves-vs-spirit-m3-dust2.dem` — fails round 1 with "Game error" for every player). Silently drops failed rounds → incomplete POV. Enabled per-invocation or via backlog `pipeline_cmd` / `skip_failed_rounds: true`.
 - **Demo download:** omit `--demo` to download from `hltv_url` (CloakBrowser), or from HuggingFace if backlog has `hf_root` (single `.dem` from `cs2povarchive/cs2-demos`); pass `.rar`/`.dem` to skip; `--force` re-downloads. HF pull failure → `HF_DOWNLOAD_FAILED`.
 - **Steam ID** comes from the backlog entry, resolved by `create_backlog.py` from `.data/player_accounts.json` (via `main.py player add/list`) — no `--steam-id` CLI flag. Extract from demo: `scripts/pov/extract_steamids.py <demo_path>`.
 - **Render folder per POV:** `renders/pov-{demo-stem}_{player}/`. Render resume is filesystem-based — existing `batch-*.mp4` ≥1MB are skipped (`--resume-from-round` deprecated). `--batches N` splits rounds into N CSDM calls (default 1 — renders all rounds in a single CS2/HLAE launch); `--until N` stops after step N.
 - **Structured errors:** failures print one JSON line — `[PIPELINE_ERROR] {"error":true,"step":N,"step_name":"...","code":"..."}`. Grep `[PIPELINE_ERROR]`; common codes: `EXTRACT_MAP_NOT_FOUND`, `RATINGS_NO_TABLES`, `ANALYZE_NO_ROUNDS`, `RENDER_STEAM_NOT_RUNNING`, `CONCAT_FAILED`, `THUMBNAIL_MISSING`, `HF_DOWNLOAD_FAILED`. Upload errors (`UPLOAD_NO_VIDEO_ID`) come from the upload scripts.
-- **Overlay-only (default for ALL POVs):** every pipeline produces one overlay video at `youtube/{run_id}_overlay/` (title suffix `| Input Overlay + Utility Cam`, badge + note in thumbnail/description) and one `upload_meta.json`. `--raw-only` writes `youtube/{run_id}/` with no overlay. Re-running re-does only missing work.
+- **Overlay-only (default for ALL POVs):** every pipeline produces one overlay video at `youtube/{run_id}_overlay/` (util-cam badge + note in thumbnail/description; `W/ INPUT OVERLAY` pill and input tags only with `--keyboard`) and one `upload_meta.json`. `--raw-only` writes `youtube/{run_id}/` with no overlay. Re-running re-does only missing work.
 - **Chaining:** the listener renders one POV at a time and starts the next after upload spawn. `scripts/pov/pipeline_chain.py` is a leftover manual helper, not used in production.
 
 ## Backlog Creation

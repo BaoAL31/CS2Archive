@@ -144,6 +144,13 @@ def main() -> None:
         default="raw",
         help="Variant: 'raw' (default) or 'overlay' (suffix title/desc/tags)",
     )
+    parser.add_argument(
+        "--keyboard",
+        action="store_true",
+        default=False,
+        help="Overlay video includes the keyboard/mouse input overlay "
+             "(default: off — util-cam PiPs only; drops input tags/desc).",
+    )
     parser.add_argument("--crosshair-code", default="",
                         help="POV player's crosshair share code (from csdm analysis)")
     parser.add_argument("--viewmodel-fov", default="", help="Viewmodel FOV as rendered")
@@ -292,20 +299,33 @@ def main() -> None:
     ]))
 
     if args.variant == "overlay":
-        extra_overlay_tags = [
-            "input overlay",
-            "utility cam",
-            "CS2 overlay",
-            "keyboard overlay",
-            "mouse input",
-            "CS2 utility cam",
-            "smoke lineup",
-        ]
-        description = (
-            f"{description}\n\n"
-            "Real-time keyboard & mouse input overlay plus utility trajectory "
-            "clips for smokes, flashes, molotovs, and other grenades."
-        )
+        if bool(getattr(args, "keyboard", False)):
+            extra_overlay_tags = [
+                "input overlay",
+                "utility cam",
+                "CS2 overlay",
+                "keyboard overlay",
+                "mouse input",
+                "CS2 utility cam",
+                "smoke lineup",
+            ]
+            description = (
+                f"{description}\n\n"
+                "Real-time keyboard & mouse input overlay plus utility trajectory "
+                "clips for smokes, flashes, molotovs, and other grenades."
+            )
+        else:
+            extra_overlay_tags = [
+                "utility cam",
+                "CS2 overlay",
+                "CS2 utility cam",
+                "smoke lineup",
+            ]
+            description = (
+                f"{description}\n\n"
+                "Utility trajectory clips for smokes, flashes, molotovs, "
+                "and other grenades."
+            )
         # Overlay label stays in description + tags only; not in the title
         # (it's already shown in the thumbnail).
         tags = tags + extra_overlay_tags

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Overlay keyboard input + utility throw flight clips onto POV video.
+Overlay utility throw flight clips onto POV video (optional keyboard input).
 
-Keyboard overlay:
+Keyboard overlay (--keyboard only):
   - 18 sprite PNGs (9 keys x idle/pressed), 76x76 per cap, rounded rects
   - Release fade (12-frame stepped fade) so 1-frame taps visible
   - Self-extracts button states via demoparser2 with full DEMOPARSER_TICK_FIELDS
@@ -83,12 +83,21 @@ from overlay.overlay_utilcams import (
     _ensure_cs2util_data,
     _load_player_throws,
     _build_round_frame_ranges,
+    _map_throw_tick_to_frame,
     _rm_empty_dir,
     _util_slug_for_throw,
     _run_batch_util_cams_subprocess,
     _scan_utility_cams_clips,
     _render_throw_flight_clips,
     _count_expected_flight_clips,
+)
+from overlay.lineup_freeze import (
+    apply_freezes_single_pass,
+    classify_throws_straightforward,
+    dedupe_throws_by_lineup,
+    expand_offsets_for_freezes,
+    freeze_specs_for_throws,
+    select_window_throws,
 )
 from overlay.overlay_encode import (
     _overlay_output_valid,
@@ -708,6 +717,162 @@ def _build_pip_overlay(
     return ";".join(parts), tag
 
 
+def _apply_lineup_freezes(
+    *,
+    video_path: Path,
+    offset_path: Path,
+    demo_path: Path,
+    steam_id: str,
+    round_tick_ranges: dict[int, tuple[int, int]],
+    round_frame_ranges: dict[int, tuple[int, int]],
+    fps: float,
+    width: int,
+    height: int,
+) -> bool:
+    """Freeze pre-pass: hold each unique non-straightforward lineup's aim frame.
+
+    Loads the POV player's throws, dedupes to one per lineup, classifies
+    straightforwardness, and inserts holds into ``video_path`` (single ffmpeg
+    pass). Persists expanded offsets + ``freeze_windows`` to ``offset_path``;
+    the caller reloads both after this returns. Returns True when the video
+    was (re)frozen (caller must drop derived artifacts); False is a no-op
+    (nothing to freeze, or resume with identical specs).
+    """
+    if not round_tick_ranges or not round_frame_ranges:
+        return False
+    throws = _load_player_throws(demo_path, steam_id, 0, 0)
+    if throws is None:
+        _ensure_cs2util_data(demo_path)
+        throws = _load_player_throws(demo_path, steam_id, 0, 0)
+        if throws is None:
+            _log("  [freeze] no CS2UtilArchive throw data — skipping freeze pre-pass")
+            return False
+    renderable = [
+        t for t in throws
+        if str(t.get("util_type", "")).lower() != "decoy"
+        and bool(t.get("is_renderable", True))
+    ]
+    if not renderable:
+        return False
+    unique = dedupe_throws_by_lineup(select_window_throws(renderable, round_tick_ranges))
+    if not unique:
+        return False
+    first = unique[0]
+    map_name = str(first.get("map_name") or first.get("map") or "")
+    data_dir = _find_demo_data_dir(demo_path)
+    straightforward = classify_throws_straightforward(
+        unique, data_dir=data_dir, map_name=map_name,
+    )
+    specs = freeze_specs_for_throws(unique, straightforward, data_dir=data_dir)
+
+    def _compute(ranges: dict[int, tuple[int, int]]) -> list[tuple[int, float]]:
+        out: list[tuple[int, float]] = []
+        for spec in specs:
+            frame = _map_throw_tick_to_frame(
+                int(spec["anchor_tick"]), round_tick_ranges, ranges,
+            )
+            if frame is None:
+                _log(f"  [freeze] SKIP {spec['util_type']} t{spec['throw_tick']}: "
+                     f"anchor outside play windows")
+                continue
+            out.append((int(frame), float(spec["hold_seconds"])))
+        return out
+
+    def _recorded() -> list:
+        if not offset_path.is_file():
+            return []
+        try:
+            return json.loads(offset_path.read_text()).get("freeze_windows") or []
+        except Exception:
+            return []
+
+    def _matches(freezes: list[tuple[int, float]], recorded: list) -> bool:
+        want = [[round(f), round(h, 3)] for f, h in sorted(freezes)]
+        have = [[round(float(w.get("frame", -1))), round(float(w.get("hold_seconds", -1)), 3)]
+                for w in recorded]
+        return have == want
+
+    freezes = _compute(round_frame_ranges)
+    if not freezes:
+        return False
+    recorded = _recorded()
+    if _matches(freezes, recorded):
+        _log(f"  [freeze] {len(freezes)} holds already in video (resume) — skipping encode")
+        return False
+    if recorded:
+        # Video already has a DIFFERENT freeze set baked in — restore the
+        # pre-freeze source first, then recompute on the restored timeline
+        # (the in-memory ranges above were built on expanded offsets).
+        combined = video_path.parent.parent / "combined.mp4"
+        combined_sidecar = video_path.parent.parent / "combined.round_offsets.json"
+        if not combined.is_file():
+            _log("[ERROR] freeze specs changed but no combined.mp4 to restore "
+                 "the pre-freeze video from — refusing to double-freeze. "
+                 "Delete .overlay_work/video.mp4* and re-run.")
+            sys.exit(1)
+        _log("  [freeze] specs changed — restoring pre-freeze video from combined.mp4")
+        import shutil
+        shutil.copy2(str(combined), str(video_path))
+        if combined_sidecar.is_file():
+            shutil.copy2(str(combined_sidecar), str(offset_path))
+        _w, _h, _fps, _fc = _probe_video_info(video_path)
+        try:
+            _restored = json.loads(offset_path.read_text())
+            _restored_offsets = {int(k): float(v) for k, v in _restored.get("round_offsets", {}).items()}
+        except Exception:
+            _restored_offsets = {}
+        if not _restored_offsets:
+            _log("[ERROR] restored sidecar has no round_offsets")
+            sys.exit(1)
+        round_frame_ranges = _build_round_frame_ranges(
+            _restored_offsets, round_tick_ranges, fps, _fc,
+        )
+        freezes = _compute(round_frame_ranges)
+        if not freezes:
+            offset_path.write_text(json.dumps(
+                {**_restored, "freeze_windows": []}, indent=2))
+            return False
+
+    apply_freezes_single_pass(video_path, freezes, fps=fps, width=width, height=height)
+
+    # Persist expanded offsets + windows (caller reloads from this file).
+    try:
+        off_data = json.loads(offset_path.read_text()) if offset_path.is_file() else {}
+    except Exception:
+        off_data = {}
+    per_round_durations = {int(k): float(v) for k, v in (off_data.get("per_round_durations") or {}).items()}
+    base_offsets = {int(k): float(v) for k, v in (off_data.get("round_offsets") or {}).items()}
+    if not base_offsets:
+        _log("[ERROR] sidecar lost round_offsets during freeze pre-pass")
+        sys.exit(1)
+    new_offsets, new_durations, windows = expand_offsets_for_freezes(
+        base_offsets, per_round_durations, round_frame_ranges, freezes, fps,
+    )
+    off_data["round_offsets"] = {str(k): v for k, v in new_offsets.items()}
+    off_data["per_round_durations"] = {str(k): v for k, v in new_durations.items()}
+    old_total = float(off_data.get("total_duration_seconds", 0) or 0)
+    off_data["total_duration_seconds"] = old_total + sum(w["hold_seconds"] for w in windows)
+    off_data["freeze_windows"] = [
+        {"frame": w["frame"], "hold_seconds": w["hold_seconds"], "round": w["round"]}
+        for w in windows
+    ]
+    offset_path.write_text(json.dumps(off_data, indent=2))
+    _log(f"  [freeze] sidecar updated: +{sum(w['hold_seconds'] for w in windows):.1f}s "
+         f"across {len(windows)} rounds")
+    # Stale derived artifacts predate the new timeline — drop them so the
+    # batch/single-pass paths re-encode instead of shipping desync.
+    stale = list(video_path.parent.glob(f"{OVERLAY_BATCH_PREFIX}*.mp4"))
+    stale.append(video_path.with_suffix(".overlay.mp4"))
+    dropped = 0
+    for path in stale:
+        if path.is_file():
+            path.unlink(missing_ok=True)
+            dropped += 1
+    if dropped:
+        _log(f"  [freeze] cleared {dropped} stale overlay artifacts")
+    return True
+
+
 def run_overlay(
     video_path: Path,
     demo_path: Path,
@@ -717,8 +882,14 @@ def run_overlay(
     util_cams_root: Path | None = None,
     work_dir: Path | None = None,
     allow_missing_util_cams: bool = False,
+    keyboard: bool = False,
 ) -> None:
-    """Apply keyboard overlay + utility throw flight PiP onto video_path (in place)."""
+    """Apply utility throw flight PiP (plus optional keyboard overlay) onto video_path (in place).
+
+    ``keyboard=False`` (default) skips the demoparser2 input extraction, key
+    sprites, and keyboard filter entirely — output is util-cam PiPs only.
+    Pass ``keyboard=True`` (or ``--keyboard``) for the legacy input overlay.
+    """
     if not video_path.exists():
         _log(f"[ERROR] Video not found: {video_path}")
         sys.exit(1)
@@ -841,6 +1012,43 @@ def run_overlay(
         )
         sys.exit(1)
 
+    # -- Step 0: Freeze pre-pass (non-straightforward lineups) --------------
+    # Holds the lineup aim frame in the MAIN pov video before the throw, so
+    # the order is freeze -> throw -> PiP. Runs on .overlay_work/video.mp4
+    # BEFORE probing-driven math below: the sidecar offsets/durations are
+    # expanded for the inserted holds (in memory + rewritten on disk) so
+    # keyboard extraction, PiP placement, batch boundaries, and the later
+    # voice mix all see the frozen timeline.
+    round_frame_ranges = _build_round_frame_ranges(
+        round_offsets, round_tick_ranges, fps, frame_count,
+    )
+    _apply_lineup_freezes(
+        video_path=video_path,
+        offset_path=offset_path,
+        demo_path=demo_path,
+        steam_id=steam_id,
+        round_tick_ranges=round_tick_ranges,
+        round_frame_ranges=round_frame_ranges,
+        fps=fps,
+        width=width,
+        height=height,
+    )
+    # Re-probe + reload: the pre-pass may have inserted holds.
+    width, height, fps, frame_count = _probe_video_info(video_path)
+    if offset_path.is_file():
+        try:
+            with open(offset_path) as f:
+                _off = json.load(f)
+            round_offsets = {int(k): v for k, v in _off.get("round_offsets", {}).items()}
+            video_total_seconds = float(_off.get("total_duration_seconds", 0))
+            for k, v in (_off.get("per_round_durations") or {}).items():
+                round_video_duration[int(k)] = float(v)
+            round_frame_ranges = _build_round_frame_ranges(
+                round_offsets, round_tick_ranges, fps, frame_count,
+            )
+        except Exception as e:
+            _log(f"[warn] sidecar reload after freeze pre-pass failed: {e}")
+
     # Determine round_start_tick (needed for legacy single-round mode)
     round_start_tick = 0
     if round_num is not None:
@@ -875,15 +1083,18 @@ def run_overlay(
         round_start_tick, _ = round_tick_ranges[first_round]
         _log(f"First round {first_round} start tick: {round_start_tick}")
 
-    # -- Step 1: Keyboard states (background thread) -----------------------------
+    # -- Step 1: Keyboard states (background thread, --keyboard only) --------
     # demoparser2 extraction is pure CPU on the .dem; the flight-clip render
     # below is a CS2 subprocess. Run them overlapped: submit the extract now,
     # join it only where its result is first needed (keyboard filter build,
     # after the flight render). Same inputs -> same per_sig as the old serial
     # order; no output change. Daemon thread: early return/exit never hangs.
+    # Default (keyboard=False): skip extraction entirely — util-cam PiPs only.
     t1 = time.time()
-    _log(f"Extracting keyboard states via demoparser2 (DEMOPARSER_TICK_FIELDS, background)...")
     _kb_box: dict[str, Any] = {}
+    _kb_thread = None
+    if keyboard:
+        _log(f"Extracting keyboard states via demoparser2 (DEMOPARSER_TICK_FIELDS, background)...")
 
     def _kb_target() -> None:
         try:
@@ -896,8 +1107,10 @@ def run_overlay(
         except BaseException as e:  # re-raised at join
             _kb_box["error"] = e
 
-    _kb_thread = threading.Thread(target=_kb_target, name="kb-extract", daemon=True)
-    _kb_thread.start()
+    _kb_thread = None
+    if keyboard:
+        _kb_thread = threading.Thread(target=_kb_target, name="kb-extract", daemon=True)
+        _kb_thread.start()
 
     # -- Step 2: Generate keyboard sprite PNGs -----------------------------------
     if work_dir is not None:
@@ -912,11 +1125,15 @@ def run_overlay(
         # cleanup can relocate it even if an exception fires before line below.
         output_path = video_path.with_suffix(".overlay.mp4")
         t4 = time.time()
-        t2 = time.time()
-        _log(f"Generating key cap sprites...")
-        assets = generate_key_assets(work_dir / "sprites", video_height=height)
-        png_inputs = overlay_png_input_paths(assets)
-        _log(f"{len(png_inputs)} PNGs ({time.time()-t2:.1f}s)")
+        if keyboard:
+            t2 = time.time()
+            _log(f"Generating key cap sprites...")
+            assets = generate_key_assets(work_dir / "sprites", video_height=height)
+            png_inputs = overlay_png_input_paths(assets)
+            _log(f"{len(png_inputs)} PNGs ({time.time()-t2:.1f}s)")
+        else:
+            assets = None
+            png_inputs = []
 
         # Keyboard filter graph is built AFTER the flight render (join below),
         # so the demoparser extract overlaps the CS2 subprocess. Placeholder
@@ -996,32 +1213,39 @@ def run_overlay(
                      f"({missing} missing). A POV overlay missing util-cam PiPs is "
                      f"broken output, not an edge case. Fix the utility-cam render "
                      f"first (re-run render_util_cams.py --render-only), or pass "
-                     f"--allow-missing-util-cams to force a keyboard-only overlay.")
+                     f"--allow-missing-util-cams to force an overlay without PiPs.")
                 sys.exit(1)
 
         # Join the background keyboard extract (re-raises thread errors here).
         # The CS2 flight render above ran concurrently with the extract.
-        _kb_thread.join()
-        if "error" in _kb_box:
-            raise _kb_box["error"]
-        per_sig = _kb_box.get("per_sig")
-        if not per_sig or all(len(v) == 0 for v in per_sig.values()):
-            _log("[WARN] No keyboard states extracted — rendering utility-only overlay")
+        # Skipped entirely without --keyboard (util-cam PiPs only).
+        if _kb_thread is not None:
+            _kb_thread.join()
+            if "error" in _kb_box:
+                raise _kb_box["error"]
+            per_sig = _kb_box.get("per_sig")
+            if not per_sig or all(len(v) == 0 for v in per_sig.values()):
+                _log("[WARN] No keyboard states extracted — rendering utility-only overlay")
+                per_sig = {s: [] for s in _OVERLAY_SIGNALS}
+            _log(f"Keyboard: {len(next(iter(per_sig.values())))} frames x {len(per_sig)} signals "
+                 f"({time.time()-t1:.1f}s wall, overlapped with flight render)")
+        else:
             per_sig = {s: [] for s in _OVERLAY_SIGNALS}
-        _log(f"Keyboard: {len(next(iter(per_sig.values())))} frames x {len(per_sig)} signals "
-             f"({time.time()-t1:.1f}s wall, overlapped with flight render)")
 
-        keyboard_fc, keyboard_out_label = build_png_overlay_filter(
-            per_sig,
-            assets=assets,
-            placement="bottom-center",
-            video_width=width,
-            video_height=height,
-            pressed_release_fade_frames=0,
-            pressed_release_fade_steps=0,
-            video_label="[0:v]",
-            png_input_offset=1,
-        )
+        if keyboard:
+            keyboard_fc, keyboard_out_label = build_png_overlay_filter(
+                per_sig,
+                assets=assets,
+                placement="bottom-center",
+                video_width=width,
+                video_height=height,
+                pressed_release_fade_frames=0,
+                pressed_release_fade_steps=0,
+                video_label="[0:v]",
+                png_input_offset=1,
+            )
+        else:
+            keyboard_fc, keyboard_out_label = "", "[0:v]"
         if not keyboard_fc:
             keyboard_fc = ""
             keyboard_out_label = "[0:v]"
@@ -1053,24 +1277,28 @@ def run_overlay(
 
                     _log(f"  [batch] {batch_name} frames {batch_start_frame}-{batch_end_frame}")
 
-                    # Slice per_sig to this batch's frame range.
-                    batch_per_sig = {
-                        sig: per_sig[sig][batch_start_frame:batch_end_frame]
-                        for sig in per_sig
-                    }
-
                     # Rebuild keyboard filter (smaller graph per batch).
-                    batch_kb_fc, batch_kb_label = build_png_overlay_filter(
-                        batch_per_sig,
-                        assets=assets,
-                        placement="bottom-center",
-                        video_width=width,
-                        video_height=height,
-                        pressed_release_fade_frames=0,
-                        pressed_release_fade_steps=0,
-                        video_label="[0:v]",
-                        png_input_offset=1,
-                    )
+                    # Skipped without --keyboard (all-empty per_sig would
+                    # build a degenerate graph — and there are no sprites).
+                    if keyboard:
+                        # Slice per_sig to this batch's frame range.
+                        batch_per_sig = {
+                            sig: per_sig[sig][batch_start_frame:batch_end_frame]
+                            for sig in per_sig
+                        }
+                        batch_kb_fc, batch_kb_label = build_png_overlay_filter(
+                            batch_per_sig,
+                            assets=assets,
+                            placement="bottom-center",
+                            video_width=width,
+                            video_height=height,
+                            pressed_release_fade_frames=0,
+                            pressed_release_fade_steps=0,
+                            video_label="[0:v]",
+                            png_input_offset=1,
+                        )
+                    else:
+                        batch_kb_fc, batch_kb_label = "", "[0:v]"
                     if not batch_kb_fc:
                         batch_kb_fc = ""
                         batch_kb_label = "[0:v]"
@@ -1269,7 +1497,7 @@ def run_overlay(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Overlay keyboard + utility throw flight PiP on POV video."
+        description="Overlay utility throw flight PiP on POV video (+ optional keyboard input)."
     )
     parser.add_argument("--video", required=True, help="Path to video.mp4 (modified in place)")
     parser.add_argument("--demo", required=True, help="Path to .dem file")
@@ -1286,9 +1514,12 @@ def main() -> None:
     parser.add_argument("--work-dir", type=Path, default=None,
                         help="Working directory for temp files (default: tempdir)")
     parser.add_argument("--allow-missing-util-cams", action="store_true",
-                        help="Force a keyboard-only overlay even when some util-cam "
-                             "flight clips are missing (default: hard-fail so broken "
-                             "output is never shipped silently).")
+                         help="Force an overlay without PiPs even when some util-cam "
+                              "flight clips are missing (default: hard-fail so broken "
+                              "output is never shipped silently).")
+    parser.add_argument("--keyboard", action="store_true", default=False,
+                         help="Also overlay real-time keyboard/mouse input sprites "
+                              "(default: off — util-cam PiPs only).")
     args = parser.parse_args()
 
     # Ensure CS2UtilArchive has extracted+analyzed this demo (throws.parquet).
@@ -1297,7 +1528,8 @@ def main() -> None:
 
     run_overlay(Path(args.video), Path(args.demo), args.steam_id, args.round, args.batches,
                 util_cams_root=args.util_cams_root, work_dir=args.work_dir,
-                allow_missing_util_cams=args.allow_missing_util_cams)
+                allow_missing_util_cams=args.allow_missing_util_cams,
+                keyboard=args.keyboard)
 
 
 if __name__ == "__main__":

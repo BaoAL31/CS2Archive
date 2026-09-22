@@ -74,13 +74,13 @@ HTTP errors (500/502/503/504) up to 20×; the subprocess-level retry in
 - **`--skip-failed-rounds`** — **[DANGER] NEVER set by default.** Skip round batches that fail during rendering instead of aborting the entire pipeline. Only use when a specific demo file is corrupted/incompatible (like the `100-thieves-vs-spirit-m3-dust2.dem` from BLAST Bounty 2026 Season 2 — that demo fails at round 1 with "Game error" for every player). Silently drops failed rounds, producing an incomplete POV video. Enabled per-invocation via CLI flag or the backlog entry's `pipeline_cmd` when the demo is known-broken. See backlog `skip_failed_rounds: true` entries for the canonical example.
 - **`--raw-only`** — produce `youtube/{run_id}/` with no overlay. Default is overlay-only at `youtube/{run_id}_overlay/`. State key: `skip_overlay`.
 - **`--overlay-only`** — deprecated no-op; overlay-only is already the default.
-- **`--voice-shade`** — (optional, requires FACEIT demo voice) overlay a per-player voice-activity shade on the POV team's scoreboard avatars. Each box is dimmed by default and the shade fades OUT over `--voice-shade-fade` (default 0.3s) when that teammate talks, then fades back in. Uses the demo's per-player Opus voice (decoded packet-aligned via libopus) aligned via `combined.round_offsets.json`, mapped to boxes by POV team slot order (see `scripts/overlay/avatar_boxes.py`). **The shade is applied at NATIVE resolution inside the SCALE step** (`concat_rounds.py --voice-shade-demo/steam-id/fade/side`), composited *before* the `scale=2560:1440` filter so the shade stretches together with the video and stays glued to the avatars. It is **not** applied in the overlay step — the overlay step only handles keyboard + util-cam PiP. The comms **audio** mix still runs in step 4 (`mix_team_voice.py`).
+- **`--voice-shade`** — (optional, requires FACEIT demo voice) overlay a per-player voice-activity shade on the POV team's scoreboard avatars. Each box is dimmed by default and the shade fades OUT over `--voice-shade-fade` (default 0.3s) when that teammate talks, then fades back in. Uses the demo's per-player Opus voice (decoded packet-aligned via libopus) aligned via `combined.round_offsets.json`, mapped to boxes by POV team slot order (see `scripts/overlay/avatar_boxes.py`). **The shade is applied at NATIVE resolution inside the SCALE step** (`concat_rounds.py --voice-shade-demo/steam-id/fade/side`), composited *before* the `scale=2560:1440` filter so the shade stretches together with the video and stays glued to the avatars. It is **not** applied in the overlay step — the overlay step only handles util-cam PiPs + lineup freeze frames (plus optional keyboard sprites with `--keyboard`). The comms **audio** mix still runs in step 4 (`mix_team_voice.py`).
   - **Talk segments come from RAW packet activity** (`group_voice_rows` + `tick_to_time`), not decoded-PCM RMS — packet presence tracks the actual mic state, so the indicator stays lit for the full duration of each speech burst instead of turning off early on a soft word.
   - **No native copy kept:** the scale step overwrites `combined.mp4` in place. Shade stable, re-bake path removed — shade changes need a full re-run.
 
 ### Overlay-only (default)
 
-The pipeline produces **one** upload from a backlog entry: the keyboard + util-cam overlay at `youtube/{run_id}_overlay/` (title suffix `| Input Overlay + Utility Cam`, overlay badge on the thumbnail). `--raw-only` writes `youtube/{run_id}/` instead and skips step 4.
+The pipeline produces **one** upload from a backlog entry: the util-cam overlay at `youtube/{run_id}_overlay/` (util-cam badge on the thumbnail; `W/ INPUT OVERLAY` pill + input tags/desc only with `--keyboard`). `--raw-only` writes `youtube/{run_id}/` instead and skips step 4.
 
 **Data flow:**
 1. Step 3 (concat): writes `combined.mp4` in the render dir. Raw-only copies it to `youtube/{run_id}/`. Overlay-only does **not** copy combined into the youtube dir (step 4 writes the overlay there).
@@ -152,8 +152,8 @@ After completing the pipeline for a POV (default overlay-only):
 youtube/
 └── {run_id}_overlay/
     ├── thumbnail.png       (1280×720 PNG, with overlay badge)
-    ├── video.mp4           (keyboard + util-cam POV)
-    └── upload_meta.json    (title suffix "| Input Overlay + Utility Cam")
+    ├── video.mp4           (util-cam POV; + keyboard sprites with --keyboard)
+    └── upload_meta.json    (no title suffix; overlay note in description/tags)
 ```
 
 `--raw-only` writes `youtube/{run_id}/` instead (no overlay).

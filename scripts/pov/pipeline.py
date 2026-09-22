@@ -11,7 +11,7 @@ Usage:
   1 = analyze    csdm analyze the demo
   2 = render     Render all rounds as POV clips
   3 = concat     Concatenate rounds; raw-only copies combined to youtube/
-  4 = overlay    Keyboard + util cam (default product; skipped with --raw-only)
+  4 = overlay    Util-cam PiPs + lineup freezes (default product; skipped with --raw-only)
   5 = outro      Generate 5s silent outro, concat onto video.mp4
   6 = thumbnail  Generate 1280x720 thumbnail + write upload_meta.json
   7 = cleanup    Remove renders folder + pipeline state
@@ -1252,7 +1252,7 @@ class Pipeline:
     # ── Step 4: Overlay ───────────────────────────────────────────────────
 
     def step_overlay(self) -> None:
-        """Apply keyboard + util flight overlay. Skipped in --raw-only mode."""
+        """Apply util-cam PiP overlay (+ optional keyboard). Skipped in --raw-only mode."""
         # Skip in raw-only mode
         if self.skip_overlay:
             print("  [skip] Raw-only mode: overlay step disabled")
@@ -1362,6 +1362,7 @@ class Pipeline:
                 getattr(self.args, "overlay_batches", 10),
                 util_cams_root=self.render_dir / "utility_cams",
                 work_dir=work_dir,
+                keyboard=bool(getattr(self.args, "keyboard", False)),
             )
         except SystemExit as exc:
             code = exc.code if isinstance(exc.code, int) else 1
@@ -1597,11 +1598,12 @@ class Pipeline:
     def _generate_thumbnail(self, youtube_dir: Path, variant: str, step_num: int = 6) -> None:
         """Generate a 1280x720 thumbnail in ``youtube_dir`` and write the
         corresponding upload_meta.json. ``variant`` is 'raw' (default) or
-        'overlay' (adds W/ INPUT OVERLAY and + UTIL CAMS badges in bottom-right).
+        'overlay' (adds the W/ UTIL CAMS badge, plus W/ INPUT OVERLAY with
+        --keyboard).
 
         For ``variant='overlay'``, the background is a frame from the finished
-        overlay ``video.mp4`` (keyboard + util-cam already baked in) at the
-        densest POV killfeed tick, mapped via the concat sidecar. No CS2.
+        overlay ``video.mp4`` (util-cam PiPs + lineup freezes already baked in)
+        at the densest POV killfeed tick, mapped via the concat sidecar. No CS2.
         """
         _minimize_cs2()
 
@@ -1628,6 +1630,8 @@ class Pipeline:
                 cmd += ["--video", str(pov_vid)]
             if self.steam_id:
                 cmd += ["--steam-id", self.steam_id]
+            if bool(getattr(self.args, "keyboard", False)):
+                cmd += ["--keyboard"]
             kd = self._faceit_kd()
             if kd is not None:
                 kills, deaths = kd
@@ -1674,6 +1678,8 @@ class Pipeline:
         ]
         if bg_override is not None:
             cmd += ["--background", str(bg_override)]
+        if bool(getattr(self.args, "keyboard", False)):
+            cmd += ["--keyboard"]
         if self.steam_id:
             cmd += ["--steam-id", self.steam_id]
         if self.tournament:
@@ -1790,6 +1796,9 @@ class Pipeline:
                 titlize_args += [flag, str(val)]
         if self.tournament and not self.is_faceit:
             titlize_args += ["--tournament", self.tournament]
+        if not self.is_faceit and variant == "overlay" \
+                and bool(getattr(self.args, "keyboard", False)):
+            titlize_args += ["--keyboard"]
 
         r = self._run_py(titlize_args, capture_output=True, text=True, timeout=15)
 
@@ -1901,6 +1910,13 @@ def main() -> None:
         help="Rounds per overlay batch (default: 10). Splits overlay ffmpeg "
              "composite into per-batch segments for ~2-3x speedup and crash "
              "resume. Set 0 for single-pass (original behavior).",
+    )
+    parser.add_argument(
+        "--keyboard",
+        action="store_true",
+        default=False,
+        help="Also overlay real-time keyboard/mouse input sprites in step 4 "
+             "(default: off — util-cam PiPs + lineup freeze frames only).",
     )
     parser.add_argument(
         "--enable-voice-comms",

@@ -61,11 +61,13 @@ def _draw_pill(
     return y1
 
 
-def _draw_overlay_badge(img: Image.Image) -> None:
+def _draw_overlay_badge(img: Image.Image, keyboard: bool = True) -> None:
     """Draw stacked pills in top-left corner for the overlay variant.
 
-    The primary pill reads ``W/ INPUT OVERLAY`` (always-on keyboard state)
-    and a secondary ``+ UTIL CAMS`` pill is stacked below.
+    With the keyboard input overlay on (legacy), the primary pill reads
+    ``W/ INPUT OVERLAY`` (always-on keyboard state) and a secondary
+    ``+ UTIL CAMS`` pill is stacked below. With keyboard off (default),
+    a single ``W/ UTIL CAMS`` pill is drawn instead.
     """
     from PIL import ImageDraw, ImageFont
 
@@ -81,6 +83,18 @@ def _draw_overlay_badge(img: Image.Image) -> None:
     except Exception:
         font_main = ImageFont.load_default()
         font_sub = font_main
+
+    if not keyboard:
+        # Util-cams only: single pill.
+        _draw_pill(
+            draw,
+            "W/ UTIL CAMS",
+            font_main,
+            left=margin,
+            top=margin,
+        )
+        img.paste(overlay, (0, 0), overlay)
+        return
 
     # Standard: two stacked pills.
     bbox1 = draw.textbbox((0, 0), "W/ INPUT OVERLAY", font=font_main)
@@ -179,6 +193,7 @@ def generate(
     tournament: str = "",
     stage: str = "",
     variant: str = "raw",
+    keyboard: bool = False,
     tournament_logo: Path | None = None,
 ) -> Image.Image:
     bg = load_background(bg_path)
@@ -226,6 +241,6 @@ def generate(
         cursor += h
 
     if variant == "overlay":
-        _draw_overlay_badge(bg)
+        _draw_overlay_badge(bg, keyboard=keyboard)
 
     return bg

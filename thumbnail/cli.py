@@ -92,7 +92,15 @@ def main() -> None:
         "--variant",
         choices=["raw", "overlay"],
         default="raw",
-        help="Variant: 'raw' (default) or 'overlay' (adds W/ INPUT OVERLAY and + UTIL CAMS badges)",
+        help="Variant: 'raw' (default) or 'overlay' (adds W/ UTIL CAMS badge, "
+             "plus W/ INPUT OVERLAY with --keyboard)",
+    )
+    parser.add_argument(
+        "--keyboard",
+        action="store_true",
+        default=False,
+        help="Overlay video includes the keyboard input overlay (adds the "
+             "W/ INPUT OVERLAY badge pill; default: util-cams badge only).",
     )
     parser.add_argument("--output", "-o", help="Output path (defaults to youtube/...)")
     args = parser.parse_args()
@@ -159,6 +167,7 @@ def main() -> None:
         tournament=args.tournament or "",
         stage=stage,
         variant=args.variant,
+        keyboard=args.keyboard,
         tournament_logo=Path(args.tournament_logo) if args.tournament_logo else None,
     )
     img = img.convert("RGB")

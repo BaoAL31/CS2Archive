@@ -48,3 +48,30 @@ def test_overlay_badge_paints_top_left(tmp_path: Path):
     # Badge is top-left; a raw grey background would stay near (30,30,30).
     px = img.getpixel((40, 40))
     assert px != (30, 30, 30)
+
+
+def _gen(tmp_path: Path, **kw):
+    bg, avatar = _blank_bg(tmp_path)
+    return generate(
+        bg_path=bg,
+        avatar_path=avatar,
+        player_name="ropz",
+        kd="20-10",
+        rating="1.20",
+        map_name="Nuke",
+        match_detail="FaZe vs Vitality",
+        variant="overlay",
+        **kw,
+    )
+
+
+def test_overlay_badge_keyboard_variants_differ(tmp_path: Path):
+    kb = _gen(tmp_path, keyboard=True)
+    no_kb = _gen(tmp_path, keyboard=False)
+    assert list(kb.getdata()) != list(no_kb.getdata())
+
+
+def test_overlay_badge_keyboard_off_paints_top_left(tmp_path: Path):
+    img = _gen(tmp_path, keyboard=False)
+    px = img.getpixel((40, 40))
+    assert px != (30, 30, 30)

@@ -8,6 +8,13 @@ The live product is **one overlay variant** at `youtube/{run_id}_overlay/`.
 
 `--dual-upload` flag on `scripts/pov/pipeline.py` makes one backlog entry produce **two** independent YouTube uploads:
 
+> NOTE (2026-09-22): dual-upload was later replaced by overlay-only default,
+> the `| Input Overlay + Utility Cam` title suffix was dropped from
+> `generate_title.py` (overlay label lives in description + tags only), and
+> the keyboard input overlay is now OFF by default (`--keyboard` opts in;
+> badge reads `W/ UTIL CAMS` unless `--keyboard`). The table + diffs below
+> describe the original implementation, not current behavior.
+
 | Variant | YouTube dir | Title | Thumbnail | Description | Tags |
 |---|---|---|---|---|---|
 | Raw | `youtube/{run_id}/` | standard | standard | standard | standard |

@@ -416,9 +416,15 @@ def _count_expected_flight_clips(
     throws: list[dict[str, Any]],
     round_tick_ranges: dict[int, tuple[int, int]] | None,
 ) -> int:
-    """Throws that must have a PiP: renderable, non-decoy, inside recorded video."""
+    """Throws that must have a PiP: renderable, non-decoy, inside recorded video.
+
+    Deduped by lineup first (same release-cell grouping as the render path)
+    so a repeated lineup counts once — the validator must match what the
+    compositor actually places.
+    """
+    from overlay.lineup_freeze import dedupe_throws_by_lineup, select_window_throws
     n = 0
-    for t in throws:
+    for t in dedupe_throws_by_lineup(select_window_throws(throws, round_tick_ranges)):
         if str(t.get("util_type", "")).lower() == "decoy":
             continue
         if round_tick_ranges and _play_window_for_throw(
@@ -497,6 +503,13 @@ def _render_throw_flight_clips(
             sys.exit(1)
     if not throws:
         return []
+
+    # PiP shows each unique lineup once: repeat throws from the same release
+    # cell collapse to their earliest instance (same grouping the expected-
+    # clip validator applies, so the counts stay honest). Window-filter
+    # first so a cut (freeze/death) instance never shadows a watchable repeat.
+    from overlay.lineup_freeze import dedupe_throws_by_lineup, select_window_throws
+    throws = dedupe_throws_by_lineup(select_window_throws(throws, round_tick_ranges))
 
     # Load trajectories once (per-throw chase-cam injection needs them).
     # Bug A fix: without trajectories + throw_pose + run_csdm inject thread,

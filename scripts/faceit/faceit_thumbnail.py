@@ -1,7 +1,7 @@
 """FACEIT POV thumbnail via style-01 (html_examples.html #proof).
 
 Kill-frame background + HLTV cutout + big K-D. Overlay badge is
-INPUTS + UTIL CAMS. Same-team Recognised Pros (not opponents) get a side portrait when
+UTIL CAMS (INPUTS + UTIL CAMS with --keyboard). Same-team Recognised Pros (not opponents) get a side portrait when
 their avatar is cached. ELO is not drawn — K/D is the proof line.
 
 Usage:
@@ -166,6 +166,9 @@ def main() -> None:
     ap.add_argument("--sidecar", default=None,
                     help="round_offsets JSON (defaults to <video-stem>.round_offsets.json)")
     ap.add_argument("--variant", choices=["raw", "overlay"], default="raw")
+    ap.add_argument("--keyboard", action="store_true", default=False,
+                    help="Overlay video includes the keyboard input overlay "
+                         "(badge reads INPUTS + UTIL CAMS; default: UTIL CAMS).")
     ap.add_argument("--output", required=True, help="youtube dir to write thumbnail.jpg")
     args = ap.parse_args()
 
@@ -194,7 +197,10 @@ def main() -> None:
         temps.append(right)
     score = (args.kd or "0-0").replace("/", "-")
     sub = style01_sub(costar_nicks)
-    badge = BADGE_DEFAULT if args.variant == "overlay" else ""
+    if args.variant == "overlay":
+        badge = BADGE_DEFAULT if args.keyboard else "UTIL CAMS"
+    else:
+        badge = ""
 
     out = out_dir / "thumbnail.jpg"
     try:
