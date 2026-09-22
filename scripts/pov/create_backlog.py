@@ -96,10 +96,10 @@ def _resolve_steam_id(nickname: str, demo_steamids: dict[str, str] | None = None
     return ""
 
 
-def _existing_avatar_path(nickname: str) -> str:
+def _existing_avatar_path(nickname: str, steam_id: str = "") -> str:
     """Cached avatar lookup — shared implementation in _backlog_common."""
     from _backlog_common import find_avatar
-    return find_avatar(nickname)
+    return find_avatar(nickname, steam_id=steam_id)
 
 
 def _ensure_player_account(nickname: str, steam_id: str) -> None:
@@ -110,6 +110,8 @@ def _ensure_player_account(nickname: str, steam_id: str) -> None:
     records = _load_accounts()
     for r in records:
         if r["nickname"].lower() == nickname.lower():
+            return
+        if str(r.get("steam_id") or "").strip() == steam_id.strip():
             return
 
     now = _dt.datetime.now().isoformat()
@@ -176,7 +178,7 @@ async def create_backlog_entry(
     demo_rel = str(demo_for_map.relative_to(PROJECT_ROOT)).replace("\\", "/")
 
     if not avatar_rel:
-        avatar_rel = _existing_avatar_path(player_clean)
+        avatar_rel = _existing_avatar_path(player_clean, steam_id)
 
     missing: list[str] = []
     if not steam_id:

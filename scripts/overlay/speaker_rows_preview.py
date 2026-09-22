@@ -88,8 +88,16 @@ def _demo_names(demo: Path) -> dict[str, str]:
     return out
 
 
-def _find_avatar(nick: str) -> Path | None:
-    """Cached avatar PNG/JPG for a nick, mirroring _backlog_common.find_avatar."""
+def _find_avatar(nick: str, steam_id: str = "") -> Path | None:
+    """Cached avatar PNG/JPG for a player — steam_id first, nick fallback."""
+    if steam_id:
+        try:
+            from faceit_names import avatar_path_for_steam
+            hit = avatar_path_for_steam(steam_id, nick)
+            if hit is not None:
+                return hit
+        except Exception:
+            pass
     base = PROJECT_ROOT / "demos" / "avatars"
     cands = [nick.strip().lower()]
     try:
@@ -292,7 +300,7 @@ def main() -> None:
         name = names.get(sid, sid)
         segs = segments[sid]
         total_s += sum((t1 - t0) for t0, t1 in segs)
-        av = _find_avatar(name)
+        av = _find_avatar(name, sid)
         row = _render_row(name, av, s)
         alpha = _alpha_track(segs, n_frames, fps, fade_frames)
         print(f"  [voice] {name:14s} ({sid}) {len(segs)} seg(s), "

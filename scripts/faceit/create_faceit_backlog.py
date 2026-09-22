@@ -122,12 +122,18 @@ def _resolve_steam_id(demo_path: Path, nick: str, *, steam_id: str = "",
         print(f"  [WARN] --faceit-id {faceit_id.strip()} not a Recognised Pro")
         return ""
     # account-first: any Recognised-Pro account whose steam id is in the
-    # demo and whose nickname matches (covers renames via stored steam).
+    # demo and whose nickname OR faceit_nickname matches (covers renames
+    # via stored steam + FACEIT-nick CLI input like donk666 for donk).
     for acct in players:
-        if str(acct.get("nickname") or "").strip().lower() == nick.lower():
-            sid = str(acct.get("steam_id") or "").strip()
-            if sid in demo_steam_ids:
-                return sid
+        names = {
+            str(acct.get("nickname") or "").strip().lower(),
+            str(acct.get("faceit_nickname") or "").strip().lower(),
+        }
+        if nick.lower() not in names:
+            continue
+        sid = str(acct.get("steam_id") or "").strip()
+        if sid in demo_steam_ids:
+            return sid
     # legacy: raw in-game name match
     try:
         import demoparser2 as dp

@@ -66,6 +66,15 @@ def canonical_nick(demo_nick: str) -> str:
     return _CANON.get(demo_nick.lower(), demo_nick)
 
 
+def canonical_nick_for_steam(steam_id: str, fallback_nick: str = "") -> str:
+    """Canonical nickname by stable steam_id; nick lookup only as fallback."""
+    _load()
+    sid = str(steam_id or "").strip()
+    if sid and sid in _STEAM_IDS:
+        return _STEAM_IDS[sid]
+    return canonical_nick(fallback_nick) if fallback_nick else ""
+
+
 def known_pro_faceit_ids() -> dict[str, str]:
     """FACEIT player_id -> canonical nickname for all known pros."""
     _load()
@@ -92,9 +101,25 @@ def avatar_path(demo_nick: str) -> Path | None:
     """Path to the player's avatar PNG, or None if not cached.
 
     Avatars live under demos/avatars/{nick}/{source}/{nick}.png where source is
-    one of faceit/hltv.
+    one of faceit/hltv. Prefer avatar_path_for_steam when the steam_id is
+    known — nick matching is rename-fragile.
     """
-    nick = canonical_nick(demo_nick)
+    return _avatar_for_nick(canonical_nick(demo_nick))
+
+
+def avatar_path_for_steam(steam_id: str, fallback_nick: str = "") -> Path | None:
+    """Avatar by stable steam_id; nick lookup only as fallback."""
+    nick = canonical_nick_for_steam(steam_id, fallback_nick)
+    if nick:
+        hit = _avatar_for_nick(nick)
+        if hit is not None:
+            return hit
+    if fallback_nick:
+        return _avatar_for_nick(canonical_nick(fallback_nick))
+    return None
+
+
+def _avatar_for_nick(nick: str) -> Path | None:
     base = AVATAR_DIR / nick
     if not base.is_dir():
         return None

@@ -79,15 +79,24 @@ def find_account(*, player: str = "", steam_id: str = "") -> dict:
     return {}
 
 
-def find_avatar(nickname: str) -> str:
+def find_avatar(nickname: str, steam_id: str = "") -> str:
     """Project-relative path to the player's cached avatar, or "".
 
     Layout: demos/avatars/{nick}/{source}/{nick}.{png,jpg,jpeg} where source
-    is hltv|faceit. Tries the raw (lowercased) nick and then the canonical
-    nickname from player_accounts.json.
+    is hltv|faceit. Matches stable steam_id first; nick matching (raw +
+    canonical) is fallback only.
     """
     base = PROJECT_ROOT / "demos" / "avatars"
     candidates = [nickname.strip().lower()]
+    sid = str(steam_id or "").strip()
+    if sid:
+        try:
+            acct = load_accounts_by_steam().get(sid) or {}
+            canon = str(acct.get("nickname") or "").strip().lower()
+            if canon and canon not in candidates:
+                candidates.insert(0, canon)
+        except Exception:
+            pass
     try:
         from faceit_names import canonical_nick
         canon = canonical_nick(nickname)

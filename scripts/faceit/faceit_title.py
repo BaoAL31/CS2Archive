@@ -117,15 +117,6 @@ def _demo_players(demo_path: Path) -> list[dict]:
     return out
 
 
-def _notable_nicks() -> set[str]:
-    """Lowercase nick set for all Recognised Pros (player_accounts.json)."""
-    try:
-        from faceit_names import known_pros
-        return known_pros()
-    except Exception:
-        return set()
-
-
 def _opponent_pros(players: list[dict], pov_steam_id: str, pov_name: str) -> list[str]:
     """Canonical nicks (uppercased) of Recognised Pros on the opponent team.
 
@@ -135,7 +126,7 @@ def _opponent_pros(players: list[dict], pov_steam_id: str, pov_name: str) -> lis
     uppercased for the "vs DONK & MAGIXX" title, or [] when none.
     """
     try:
-        from faceit_names import canonical_nick, known_pro_steam_ids
+        from faceit_names import known_pro_steam_ids
     except Exception:
         return []
     # Find the POV player's team.
@@ -159,7 +150,7 @@ def _opponent_pros(players: list[dict], pov_steam_id: str, pov_name: str) -> lis
             continue
         nick = pros.get(p["steamid"])
         if nick:
-            out.append(canonical_nick(nick).upper())
+            out.append(nick.upper())
     return out
 
 
@@ -279,19 +270,21 @@ def main() -> None:
     map_name = args.map or _map_from_demo(demo)
 
     # Canonicalize the POV player name (proper casing: NiKo, TeSeS, ...)
-    from faceit_names import canonical_nick
-    player = canonical_nick(args.player)
+    # by stable steam_id; nick lookup only as fallback.
+    from faceit_names import canonical_nick_for_steam, known_pro_steam_ids
+    player = canonical_nick_for_steam(args.steam_id, args.player)
 
     notable = []
-    pro_set = _notable_nicks()
+    pros_by_steam = known_pro_steam_ids()
+    pov_nick = args.player.strip().lower()
     for p in players:
-        nick = p["name"]
-        if nick.lower() == args.player.strip().lower():
-            continue
         if p["steamid"] == args.steam_id:
             continue
-        if nick.lower() in pro_set:
-            notable.append(canonical_nick(nick))
+        if str(p.get("name", "")).strip().lower() == pov_nick:
+            continue
+        canon = pros_by_steam.get(p["steamid"])
+        if canon and canon != player:
+            notable.append(canon)
 
     video = {}
     for key in ("viewmodel_fov", "viewmodel_offset_x", "viewmodel_offset_y",

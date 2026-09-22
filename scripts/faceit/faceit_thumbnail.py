@@ -61,7 +61,7 @@ def lobby_costars(
     pov_nick: str,
 ) -> list[tuple[str, Path]]:
     """Same-team Recognised Pros with cached avatars (max one, for the duo layout)."""
-    from faceit_names import avatar_path, canonical_nick, known_pro_steam_ids
+    from faceit_names import avatar_path_for_steam, canonical_nick, known_pro_steam_ids
 
     if not steam_id:
         return []
@@ -90,7 +90,7 @@ def lobby_costars(
         key = nick.lower()
         if key in seen:
             continue
-        av = avatar_path(nick)
+        av = avatar_path_for_steam(p["steamid"], nick)
         if av is None:
             continue
         seen.add(key)
@@ -172,12 +172,12 @@ def main() -> None:
     ap.add_argument("--output", required=True, help="youtube dir to write thumbnail.jpg")
     args = ap.parse_args()
 
-    from faceit_names import avatar_path, canonical_nick
+    from faceit_names import avatar_path_for_steam, canonical_nick_for_steam
 
     from thumbnail.generator import prepare_thumb_avatar
 
-    player = canonical_nick(args.player)
-    av_src = avatar_path(args.player)
+    player = canonical_nick_for_steam(args.steam_id, args.player)
+    av_src = avatar_path_for_steam(args.steam_id, args.player)
     if av_src is None:
         sys.exit(f"[ERR] No avatar for {player} — style-01 needs a cutout PNG")
 

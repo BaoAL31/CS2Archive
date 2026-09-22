@@ -942,6 +942,15 @@ def render_shorts(
         avatar_path = None
         if avatar:
             nick = short.get("pov_nick", "")
+            sid = str(short.get("pov_steam_id", "") or "")
+            if sid:
+                # Canonical nick by stable steam_id; the short's pov_nick
+                # may be a FACEIT alias that never matches the avatar folder.
+                try:
+                    from faceit_names import canonical_nick_for_steam
+                    nick = canonical_nick_for_steam(sid, nick) or nick
+                except Exception:
+                    pass
             avatar_path = _resolve_avatar_path(nick) if nick else None
             if avatar_path:
                 _dbg("avatar", f"{out_name}: avatar {avatar_path.name}")

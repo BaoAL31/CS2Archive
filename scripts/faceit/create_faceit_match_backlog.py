@@ -40,7 +40,7 @@ from _pathsetup import ensure  # noqa: E402
 ensure()
 
 from csdm_json import csdm_json  # noqa: E402
-from faceit_names import avatar_path  # noqa: E402
+from faceit_names import avatar_path_for_steam  # noqa: E402
 from create_faceit_backlog import _match_elo  # noqa: E402
 from _backlog_common import (  # noqa: E402
     load_accounts_by_steam,
@@ -132,7 +132,7 @@ def _write_card(pro: dict, *, demo: Path, map_name: str, match_slug: str,
     backlog_dir.mkdir(parents=True, exist_ok=True)
     backlog_file = backlog_dir / f"{slug}.json"
 
-    av_path = avatar_path(pro["canonical_nick"])
+    av_path = avatar_path_for_steam(pro["steam_id"], pro["canonical_nick"])
     demo_rel = rel_to_project(demo)
 
     meta = {
@@ -159,6 +159,21 @@ def _write_card(pro: dict, *, demo: Path, map_name: str, match_slug: str,
         "avatar_path": str(av_path.relative_to(PROJECT_ROOT)).replace("\\", "/") if av_path else "",
         **({} if not elo_fields else elo_fields),
     }
+    # Stamp the account's stored video/capture settings so the pipeline
+    # renders at the player's real res/aspect (same alias-miss class as the
+    # individual flow: FACEIT nicks never match prosettings).
+    try:
+        _acct = _load_accounts().get(pro["steam_id"], {})
+        for _k in (
+            "resolution", "aspect_ratio", "scaling_mode",
+            "capture_width", "capture_height", "video_settings_source",
+            "viewmodel_fov", "viewmodel_offset_x", "viewmodel_offset_y",
+            "viewmodel_offset_z", "viewmodel_presetpos", "hud_scaling",
+        ):
+            if _acct.get(_k) not in (None, ""):
+                meta[_k] = _acct[_k]
+    except Exception:
+        pass
     write_card(meta, backlog_file)
     return backlog_file
 
@@ -251,7 +266,8 @@ def run(demo: Path, *, map_override: str = "", tournament: str = "",
     by_prio = Counter(priority_from_rating(p["rating"]) for p in pros)
     print(f"[OK] Created {len(written)} backlog card(s) under backlog/faceit/"
           + " ".join(f"{k}={v}" for k, v in sorted(by_prio.items())))
-    missing_avatars = [pro["canonical_nick"] for pro in pros if not avatar_path(pro["canonical_nick"])]
+    missing_avatars = [pro["canonical_nick"] for pro in pros
+                       if not avatar_path_for_steam(pro["steam_id"], pro["canonical_nick"])]
     if missing_avatars:
         print(f"  [HINT] No cached avatar for: {', '.join(missing_avatars)}")
         print(f"         Fetch with: python scripts/faceit/faceit_avatar.py <nick>")
