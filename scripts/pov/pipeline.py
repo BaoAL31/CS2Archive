@@ -401,8 +401,24 @@ class Pipeline:
         if self.avatar_path:
             self.state["data"]["avatar_path"] = str(self.avatar_path)
 
+    def _account_record(self) -> dict:
+        """Recognised-Pro account for this backlog card, if any.
+
+        Matches stable steam_id first, then nickname / faceit_nickname
+        (case-insensitive) — FACEIT cards carry the FACEIT nick (donk666)
+        while the account + prosettings live under the HLTV nick (donk).
+        """
+        try:
+            from _backlog_common import find_account
+            return find_account(
+                player=self.meta.get("player", ""),
+                steam_id=self.meta.get("steam_id", ""),
+            )
+        except Exception:
+            return {}
+
     def _ensure_video_settings(self) -> None:
-        """Fill capture dims + viewmodel from prosettings when backlog lacks them."""
+        """Fill capture dims + viewmodel from the Recognised-Pro account, else prosettings."""
         need_capture = not (
             int(self.meta.get("capture_width") or 0) >= 800
             and int(self.meta.get("capture_height") or 0) >= 600
@@ -410,9 +426,39 @@ class Pipeline:
         need_vm = self.meta.get("viewmodel_fov") is None
         if not need_capture and not need_vm:
             return
+        # 1) Account record first: stored capture fields are authoritative and
+        #    cover FACEIT-nick cards (donk666) that never match prosettings
+        #    (listed as donk) — without this the render silently falls back
+        #    to 1920x1080 16:9 Native.
+        acct = self._account_record()
+        if acct:
+            if need_capture and int(acct.get("capture_width") or 0) >= 800 \
+                    and int(acct.get("capture_height") or 0) >= 600:
+                for k in (
+                    "resolution", "aspect_ratio", "scaling_mode",
+                    "capture_width", "capture_height", "video_settings_source",
+                ):
+                    if acct.get(k) not in (None, ""):
+                        self.meta[k] = acct[k]
+                need_capture = False
+                print(f"  [video] {self.meta['capture_width']}x{self.meta['capture_height']} "
+                      f"{self.meta.get('aspect_ratio', '')} {self.meta.get('scaling_mode', '')} "
+                      f"(source=player_accounts:{acct.get('nickname', '?')})")
+            if need_vm:
+                for k in (
+                    "viewmodel_fov", "viewmodel_offset_x", "viewmodel_offset_y",
+                    "viewmodel_offset_z", "viewmodel_presetpos",
+                ):
+                    if self.meta.get(k) is None and acct.get(k) is not None:
+                        self.meta[k] = acct[k]
+                if self.meta.get("viewmodel_fov") is not None:
+                    need_vm = False
+        if not need_capture and not need_vm:
+            return
         try:
             from scrapers.prosettings import backlog_video_fields
-            fields = backlog_video_fields(self.meta.get("player", ""))
+            lookup = str(acct.get("nickname") or "") if acct else ""
+            fields = backlog_video_fields(lookup or self.meta.get("player", ""))
             if need_capture:
                 for k in (
                     "resolution", "aspect_ratio", "scaling_mode",

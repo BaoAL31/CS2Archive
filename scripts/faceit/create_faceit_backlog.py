@@ -301,6 +301,19 @@ def create_faceit_backlog(*, demo_path, player="", map="", steam_id="",
     # Canonical display name comes from the account record (stable steam
     # key), never from the CLI nick or demo header — rename-proof.
     player = str(acct.get("nickname") or "").strip() or player
+    meta["player"] = player
+    # Stamp the account's stored video/capture settings onto the card so the
+    # pipeline renders at the player's real res/aspect. FACEIT nicks
+    # (donk666) never match prosettings (listed as donk) — without this the
+    # render silently falls back to 1920x1080 16:9 Native.
+    for k in (
+        "resolution", "aspect_ratio", "scaling_mode",
+        "capture_width", "capture_height", "video_settings_source",
+        "viewmodel_fov", "viewmodel_offset_x", "viewmodel_offset_y",
+        "viewmodel_offset_z", "viewmodel_presetpos", "hud_scaling",
+    ):
+        if acct.get(k) not in (None, ""):
+            meta[k] = acct[k]
     faceit_id = faceit_id.strip() or str(acct.get("faceit_id") or "").strip()
     if faceit_id == "-1":
         faceit_id = ""

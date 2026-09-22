@@ -59,6 +59,26 @@ def load_accounts_by_steam() -> dict[str, dict]:
     return out
 
 
+def find_account(*, player: str = "", steam_id: str = "") -> dict:
+    """Recognised-Pro account by stable steam_id first, then nick.
+
+    Nick matches ``nickname`` or ``faceit_nickname`` (case-insensitive) —
+    FACEIT cards carry the FACEIT nick (donk666) while the account +
+    prosettings live under the HLTV nick (donk). Returns {} on miss.
+    """
+    by_steam = load_accounts_by_steam()
+    sid = str(steam_id or "").strip()
+    if sid and sid in by_steam:
+        return by_steam[sid]
+    want = str(player or "").strip().lower()
+    if want:
+        for acct in by_steam.values():
+            for key in ("nickname", "faceit_nickname"):
+                if str(acct.get(key) or "").strip().lower() == want:
+                    return acct
+    return {}
+
+
 def find_avatar(nickname: str) -> str:
     """Project-relative path to the player's cached avatar, or "".
 
