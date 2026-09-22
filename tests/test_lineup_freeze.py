@@ -19,6 +19,7 @@ from overlay.lineup_freeze import (  # noqa: E402
     expand_offsets_for_freezes,
     classify_throws_straightforward,
     select_window_throws,
+    split_straightforward,
 )
 
 
@@ -101,6 +102,16 @@ def test_classify_fails_safe_without_cs2util(tmp_path):
     throws = [_throw("a", 1000), _throw("b", 2000)]
     out = classify_throws_straightforward(throws, data_dir=tmp_path, map_name="de_nuke")
     assert out == {"a": True, "b": True}
+
+
+def test_split_straightforward_keeps_all_without_data(tmp_path):
+    throws = [_throw("a", 1000), _throw("b", 2000)]
+    keep, drop = split_straightforward(throws, data_dir=None)
+    assert [t["throw_id"] for t in keep] == ["a", "b"]
+    assert drop == []
+    keep, drop = split_straightforward(throws, data_dir=tmp_path)
+    assert [t["throw_id"] for t in keep] == ["a", "b"]
+    assert drop == []
 
 
 def test_expand_offsets_shifts_later_rounds():

@@ -415,16 +415,29 @@ def _play_window_for_throw(
 def _count_expected_flight_clips(
     throws: list[dict[str, Any]],
     round_tick_ranges: dict[int, tuple[int, int]] | None,
+    data_dir: Path | None = None,
+    demo_path: Path | None = None,
 ) -> int:
-    """Throws that must have a PiP: renderable, non-decoy, inside recorded video.
+    """Throws that must have a PiP: lineup throws inside recorded video.
 
     Deduped by lineup first (same release-cell grouping as the render path)
-    so a repeated lineup counts once — the validator must match what the
+    so a repeated lineup counts once, then restricted to non-straightforward
+    throws (same render filter) — the validator must match what the
     compositor actually places.
     """
-    from overlay.lineup_freeze import dedupe_throws_by_lineup, select_window_throws
+    from overlay.lineup_freeze import (
+        dedupe_throws_by_lineup,
+        select_window_throws,
+        split_straightforward,
+    )
+    if data_dir is None and demo_path is not None:
+        data_dir = _find_demo_data_dir(Path(demo_path))
+    throws, _ = split_straightforward(
+        dedupe_throws_by_lineup(select_window_throws(throws, round_tick_ranges)),
+        data_dir=data_dir,
+    )
     n = 0
-    for t in dedupe_throws_by_lineup(select_window_throws(throws, round_tick_ranges)):
+    for t in throws:
         if str(t.get("util_type", "")).lower() == "decoy":
             continue
         if round_tick_ranges and _play_window_for_throw(
@@ -515,6 +528,13 @@ def _render_throw_flight_clips(
     # Bug A fix: without trajectories + throw_pose + run_csdm inject thread,
     # csdm free-cams a random POV instead of chasing the grenade.
     data_dir = _find_demo_data_dir(demo_path)
+    # Only non-straightforward lineups get rendered/PiP'd/frozen.
+    # Straightforward tosses are skipped entirely (fail-safe keeps all when
+    # classification cannot run).
+    from overlay.lineup_freeze import split_straightforward
+    throws, _straight_dropped = split_straightforward(throws, data_dir=data_dir)
+    if not throws:
+        return []
     traj_by_throw: dict[str, Any] = {}
     if data_dir is not None:
         traj_path = data_dir / "trajectories.parquet"

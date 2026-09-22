@@ -327,6 +327,7 @@ def freeze_specs_for_throws(
         throw_tick = int(t["throw_tick"])
         anchor = throw_tick - lead
         hold = base_hold
+        typed = None
         g = overlay_by_id.get(tid)
         if g is not None and len(g) and classify is not None and freeze_anchor_tick is not None:
             try:
@@ -334,15 +335,57 @@ def freeze_specs_for_throws(
                 anchor = int(freeze_anchor_tick(g, throw_tick, typed.motion))
                 hold = float(typed.freeze_seconds)
             except Exception:
-                pass
+                typed = None
         specs.append({
             "throw_id": tid,
             "util_type": str(t.get("util_type", "unknown")),
             "throw_tick": throw_tick,
             "anchor_tick": max(0, anchor),
             "hold_seconds": hold,
+            "typed": typed,
         })
     return specs
+
+
+def compose_freeze_recipe_pngs(
+    specs: list[dict[str, Any]],
+    out_dir: Path,
+    *,
+    video_width: int,
+    video_height: int,
+) -> dict[str, Path]:
+    """Compose CS2UtilArchive-style input recipe strips per throw_id.
+
+    Uses the motion/click ThrowType already resolved for the freeze anchor
+    (WASD holds, jump, crouch-release, mouse). Missing types or imports ->
+    no PNG (freeze still applies, without the strip). Returns
+    {throw_id: png_path}.
+    """
+    out: dict[str, Path] = {}
+    try:
+        prefer_cs2util_scripts()
+        from scripts.render.overlay_assets import compose_freeze_recipe_png
+        from scripts.throw_type import freeze_recipe
+    except Exception as e:
+        _log(f"  [freeze] recipe strips unavailable ({e})")
+        return out
+    for spec in specs:
+        typed = spec.get("typed")
+        if typed is None:
+            continue
+        try:
+            slug = "".join(c if (c.isalnum() or c in "-_") else "_" for c in str(spec["throw_id"]))
+            png = Path(out_dir) / f"_freeze_recipe_{slug}.png"
+            compose_freeze_recipe_png(
+                freeze_recipe(typed), png,
+                video_height=video_height, video_width=video_width,
+            )
+            out[str(spec["throw_id"])] = png
+        except Exception as e:
+            _log(f"  [freeze] recipe strip skipped for t{spec.get('throw_tick')} ({e})")
+    if out:
+        _log(f"  [freeze] {len(out)} recipe strips composed")
+    return out
 
 
 # -- Single-pass freeze application -----------------------------------------
@@ -409,14 +452,22 @@ def apply_freezes_single_pass(
     vw, vh = int(width), int(height)
 
     # Clamp into range; ascending (duplicates kept -> adjacent holds).
+    # Items may be (frame, hold) pairs or (frame, hold, recipe_png|None)
+    # triples; a parallel recipes list (same order as freezes) is folded in
+    # BEFORE sorting so alignment survives.
     indexed: list[tuple[int, float, Path | None]] = []
     recs = list(recipes) if recipes else []
-    for i, (idx, hold_s) in enumerate(sorted(freezes, key=lambda p: p[0])):
+    triples: list[tuple[Any, Any, Any]] = []
+    for i, item in enumerate(freezes):
+        if len(item) == 3:
+            triples.append((item[0], item[1], item[2]))
+        else:
+            triples.append((item[0], item[1], recs[i] if i < len(recs) else None))
+    for idx, hold_s, r in sorted(triples, key=lambda p: p[0]):
         idx = max(0, int(idx))
         if frames is not None:
             idx = min(idx, max(0, frames - 1))
         if hold_s > 0:
-            r = recs[i] if i < len(recs) else None
             indexed.append((idx, float(hold_s), r if isinstance(r, Path) and r.is_file() else None))
     if not indexed:
         return
@@ -424,7 +475,7 @@ def apply_freezes_single_pass(
     parts: list[str] = []
     v_segs: list[str] = []
     a_segs: list[str] = []
-    recipe_inputs: list[Path] = []
+    recipe_inputs: list[tuple[Path, float]] = []
     prev = 0
     total_hold_s = 0.0
     for n, (idx, hold_s, recipe) in enumerate(indexed):
@@ -450,11 +501,11 @@ def apply_freezes_single_pass(
         )
         if zoom > 1.0:
             hold_src += f",scale={vw * zoom:.4f}:{vh * zoom:.4f},crop={vw}:{vh}"
-        hold_src += f",loop=loop={loop_n}:size=1:start=0,setpts=N/({fps_i}*TB)[fzv{n}o]"
+        hold_src += f",loop=loop={loop_n}:size=1:start=0,setpts=N/FRAME_RATE/TB[fzv{n}o]"
         hold_label = f"fzv{n}o"
         if recipe is not None:
             r_idx = len(recipe_inputs) + 1  # input 0 is the video
-            recipe_inputs.append(recipe)
+            recipe_inputs.append((recipe, hold_s))
             hold_label = f"fzv{n}r"
             parts.append(hold_src)
             parts.append(
@@ -500,8 +551,10 @@ def apply_freezes_single_pass(
     # Mezzanine (re-encoded again by the batch overlay below): CQ 8 / 200M
     # cap, same mezzanine profile as render/concat — never the final CQ 15.
     cmd = ["ffmpeg", "-y", "-i", str(video_path)]
-    for rp in recipe_inputs:
-        cmd += ["-loop", "1", "-i", str(rp)]
+    for rp, hold_s in recipe_inputs:
+        # Finite loop: -t caps the still image at the hold length. An
+        # unbounded -loop 1 still hangs the graph (overlay never sees EOF).
+        cmd += ["-loop", "1", "-t", f"{hold_s:.6f}", "-i", str(rp)]
     cmd += [
         "-filter_complex", fc,
         *maps,
@@ -513,6 +566,17 @@ def apply_freezes_single_pass(
     ]
     if audio:
         cmd += ["-c:a", "aac", "-b:a", "256k"]
+    # Bound the output duration exactly: -loop 1 recipe inputs are infinite
+    # streams, and without a bound the encode never terminates. Total is
+    # exact (content frames + hold frames at fps_i); the audio track runs
+    # ~44ms long from AAC priming, so video is always the shortest stream.
+    if frames is not None:
+        total_frames = frames + sum(
+            max(2, int(round(h * fps_i))) for _, h, _ in indexed
+        )
+        cmd += ["-t", f"{total_frames / fps_i:.6f}"]
+    elif recipe_inputs:
+        cmd += ["-shortest"]
     cmd += ["-movflags", "+faststart", "-f", "mp4", str(out)]
     _log(f"  [freeze] {len(indexed)} holds, single pass "
          f"({sum(h for _, h, _ in indexed):.1f}s inserted)")
@@ -538,6 +602,41 @@ def apply_freezes_single_pass(
         except Exception as e:
             _log(f"  [warn] freeze frame check skipped: {e}")
     _os.replace(out, video_path)
+
+
+def split_straightforward(
+    throws: list[dict[str, Any]],
+    *,
+    data_dir: Path | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Partition throws into (lineups, straightforward).
+
+    Lineups (non-straightforward) are the ONLY throws that get rendered,
+    PiP'd, and frozen. Straightforward tosses are dropped entirely.
+    Fail-safe: when classification cannot actually run (no trajectories,
+    no volume grid), NOTHING is dropped — a PiP with a straightforward
+    throw beats a missing-PiP validation failure.
+    """
+    if not throws:
+        return [], []
+    first = throws[0]
+    map_name = str(first.get("map_name") or first.get("map") or "")
+    trajs = Path(data_dir) / "trajectories.parquet" if data_dir is not None else None
+    if trajs is None or not trajs.is_file() or not map_name \
+            or _cs2util("volumes") is None or _volume_grid(map_name) is None:
+        _log("  [lineup] straightforward filter unavailable "
+             "(no trajectories/grid) — keeping all throws")
+        return list(throws), []
+    straight = classify_throws_straightforward(
+        throws, data_dir=data_dir, map_name=map_name,
+    )
+    keep = [t for t in throws if not straight.get(str(t.get("throw_id", "")), True)]
+    drop = [t for t in throws if straight.get(str(t.get("throw_id", "")), True)]
+    if drop:
+        _log(f"  [lineup] {len(drop)} straightforward throw(s) excluded "
+             f"(no render/PiP/freeze): "
+             + ", ".join(f"{t.get('util_type')} t{t.get('throw_tick')}" for t in drop[:8]))
+    return keep, drop
 
 
 # -- Sidecar expansion --------------------------------------------------------

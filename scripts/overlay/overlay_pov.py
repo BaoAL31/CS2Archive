@@ -94,6 +94,7 @@ from overlay.overlay_utilcams import (
 from overlay.lineup_freeze import (
     apply_freezes_single_pass,
     classify_throws_straightforward,
+    compose_freeze_recipe_pngs,
     dedupe_throws_by_lineup,
     expand_offsets_for_freezes,
     freeze_specs_for_throws,
@@ -765,8 +766,8 @@ def _apply_lineup_freezes(
     )
     specs = freeze_specs_for_throws(unique, straightforward, data_dir=data_dir)
 
-    def _compute(ranges: dict[int, tuple[int, int]]) -> list[tuple[int, float]]:
-        out: list[tuple[int, float]] = []
+    def _compute(ranges: dict[int, tuple[int, int]]) -> list[tuple[int, float, str]]:
+        out: list[tuple[int, float, str]] = []
         for spec in specs:
             frame = _map_throw_tick_to_frame(
                 int(spec["anchor_tick"]), round_tick_ranges, ranges,
@@ -775,7 +776,7 @@ def _apply_lineup_freezes(
                 _log(f"  [freeze] SKIP {spec['util_type']} t{spec['throw_tick']}: "
                      f"anchor outside play windows")
                 continue
-            out.append((int(frame), float(spec["hold_seconds"])))
+            out.append((int(frame), float(spec["hold_seconds"]), str(spec["throw_id"])))
         return out
 
     def _recorded() -> list:
@@ -786,8 +787,8 @@ def _apply_lineup_freezes(
         except Exception:
             return []
 
-    def _matches(freezes: list[tuple[int, float]], recorded: list) -> bool:
-        want = [[round(f), round(h, 3)] for f, h in sorted(freezes)]
+    def _matches(freezes: list[tuple], recorded: list) -> bool:
+        want = [[round(f), round(h, 3)] for f, h, *_ in sorted(freezes)]
         have = [[round(float(w.get("frame", -1))), round(float(w.get("hold_seconds", -1)), 3)]
                 for w in recorded]
         return have == want
@@ -833,7 +834,12 @@ def _apply_lineup_freezes(
                 {**_restored, "freeze_windows": []}, indent=2))
             return False
 
-    apply_freezes_single_pass(video_path, freezes, fps=fps, width=width, height=height)
+    # Input recipe strips (CS2UtilArchive-style) baked onto each hold.
+    recipe_by_id = compose_freeze_recipe_pngs(
+        specs, video_path.parent, video_width=width, video_height=height,
+    )
+    triples = [(f, h, recipe_by_id.get(tid)) for f, h, tid in freezes]
+    apply_freezes_single_pass(video_path, triples, fps=fps, width=width, height=height)
 
     # Persist expanded offsets + windows (caller reloads from this file).
     try:
@@ -846,7 +852,8 @@ def _apply_lineup_freezes(
         _log("[ERROR] sidecar lost round_offsets during freeze pre-pass")
         sys.exit(1)
     new_offsets, new_durations, windows = expand_offsets_for_freezes(
-        base_offsets, per_round_durations, round_frame_ranges, freezes, fps,
+        base_offsets, per_round_durations, round_frame_ranges,
+        [(f, h) for f, h, _ in freezes], fps,
     )
     off_data["round_offsets"] = {str(k): v for k, v in new_offsets.items()}
     off_data["per_round_durations"] = {str(k): v for k, v in new_durations.items()}
@@ -1201,7 +1208,7 @@ def run_overlay(
         # throws are not in the POV footage — counting either as "missing"
         # false-fails after a successful util-cam render.
         n_expected = _count_expected_flight_clips(
-            n_expected_raw, round_tick_ranges or None)
+            n_expected_raw, round_tick_ranges or None, demo_path=demo_path)
         if n_clips < n_expected:
             missing = n_expected - n_clips
             if allow_missing_util_cams:
