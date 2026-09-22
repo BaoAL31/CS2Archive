@@ -299,16 +299,52 @@ def restore(csgo: Path) -> None:
     journal.unlink()
 
 
+def _live_render_processes() -> bool:
+    """True when any render binary is alive (a mount may belong to it)."""
+    try:
+        import sys as _sys
+        from pathlib import Path as _P
+        _sys.path.insert(0, str(_P(__file__).resolve().parents[1]))
+        from hook_aware import RENDER_PROCESS_NAMES, _process_running
+        return any(_process_running(n) for n in RENDER_PROCESS_NAMES)
+    except Exception:
+        # Indeterminate — fail safe (treat as live, refuse to steal).
+        return True
+
+
 @contextmanager
 def mounted_hud(csgo: Path, menu: Path, session: Path):
-    """Mount for one CSDM invocation (including retries), restore on any exit."""
+    """Mount for one CSDM invocation (including retries), restore on any exit.
+
+    Self-healing: a previous attempt killed between mount and restore strands
+    the journal/mount (every abort/crash lands here — the normal path never
+    restores). When no live render process exists, that mount is stale by
+    definition, so restore it and continue instead of hard-failing. A live
+    renderer (concurrent run, or our own outer attempt) still fails fast.
+    """
     csgo = csgo.resolve()
     gameinfo = csgo / "gameinfo.gi"
     original = gameinfo.read_bytes()
-    mounted = _mounted_gameinfo(original)
+    try:
+        mounted = _mounted_gameinfo(original)
+    except RuntimeError as e:
+        if "already active" not in str(e):
+            raise
+        if _live_render_processes():
+            raise RuntimeError(
+                "A Swift mount is already active with a live renderer; "
+                "refusing to steal it"
+            ) from None
+        print("  [swift] stranded mount found (no live renderer) — restoring, then mounting")
+        restore(csgo)
+        original = gameinfo.read_bytes()
+        mounted = _mounted_gameinfo(original)
     journal = csgo / JOURNAL
     if journal.exists() or (csgo / MOUNT).exists():
-        raise RuntimeError("Swift render session already active; use --restore after its CS2 session exits")
+        if _live_render_processes():
+            raise RuntimeError("Swift render session already active; use --restore after its CS2 session exits")
+        print("  [swift] stranded session files found (no live renderer) — restoring, then mounting")
+        restore(csgo)
     state = {"original": base64.b64encode(original).decode(), "mounted_sha256": _sha(mounted)}
     try:
         with journal.open("x", encoding="utf-8") as handle:
