@@ -1244,6 +1244,15 @@ class Pipeline:
         shutil.copy2(str(overlay), str(target))
         print(f"  [OK] Copied overlay video.mp4 "
               f"({target.stat().st_size / 1e9:.1f} GB)")
+        # The overlay timeline includes freeze holds — the work dir's sidecar
+        # is the expanded one. The render-dir original (unexpanded) must NOT
+        # win: downstream tick mapping (thumbnail kill frame) would drift.
+        work_sidecar = overlay.parent / "video.round_offsets.json"
+        if work_sidecar.is_file():
+            shutil.copy2(str(work_sidecar), str(self.youtube_dir / "video.round_offsets.json"))
+            print(f"  [OK] Copied expanded video.round_offsets.json "
+                  f"(freeze windows included)")
+            return
         self._copy_round_offsets(self.youtube_dir)
 
     def step_concat(self) -> None:
