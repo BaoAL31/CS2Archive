@@ -379,87 +379,130 @@ def apply_freezes_single_pass(
     fps: float,
     width: int,
     height: int,
+    recipes: list[Path | None] | None = None,
+    zoom: float | None = None,
 ) -> None:
     """Insert holds at (frame, hold_seconds) into video_path, ONE ffmpeg pass.
 
-    Chained trim/loop/concat per freeze, last-frame-first so earlier indices
-    stay valid (same ordering rule as CS2UtilArchive's finalize.py). Hold
-    video is the CS2Util-style 1.5x crosshair crop; hold audio is silence.
-    Atomic: encodes to ``.part`` then os.replace (breaks the pipeline's
-    combined.mp4 hardlink safely — the source inode is never written).
+    Single-concat architecture: every segment (content runs + holds) is
+    trimmed DIRECTLY from ``[0:v]`` in original-frame coordinates and joined
+    by ONE trailing concat. Nothing consumes an intermediate, so chained
+    concat/trim starvation (which silently dropped all but one hold) cannot
+    happen. Ascending frame order; duplicate frames emit adjacent holds.
+
+    Hold video is the CS2Util-style crosshair crop (default 1.5x); hold
+    audio is silence. ``recipes[i]`` (optional) is a recipe-strip PNG baked
+    onto hold ``i`` only (bottom-centre, CS2UtilArchive placement).
+    Atomic: encodes to a PID-tagged ``.part`` then os.replace (breaks the
+    pipeline's combined.mp4 hardlink safely — the source inode is never
+    written; the PID tag keeps concurrent runs from sharing the part file).
     """
     import os as _os
     if not freezes:
         return
-    got = _cs2util("freeze_consts")
-    zoom = float(got[0]) if got else 1.5
+    if zoom is None:
+        got = _cs2util("freeze_consts")
+        zoom = float(got[0]) if got else 1.5
     frames = _ffprobe_frames(video_path)
     audio = _has_audio(video_path)
     fps_i = max(1, int(round(fps)))
     vw, vh = int(width), int(height)
 
-    # Clamp into range; drop anything that would leave an empty tail AND an
-    # empty head (degenerate). Tail-empty (idx = last frame) concats n=2.
-    valid: list[tuple[int, float]] = []
-    for idx, hold_s in sorted(freezes, key=lambda p: p[0], reverse=True):
+    # Clamp into range; ascending (duplicates kept -> adjacent holds).
+    indexed: list[tuple[int, float, Path | None]] = []
+    recs = list(recipes) if recipes else []
+    for i, (idx, hold_s) in enumerate(sorted(freezes, key=lambda p: p[0])):
         idx = max(0, int(idx))
         if frames is not None:
             idx = min(idx, max(0, frames - 1))
         if hold_s > 0:
-            valid.append((idx, float(hold_s)))
-    if not valid:
+            r = recs[i] if i < len(recs) else None
+            indexed.append((idx, float(hold_s), r if isinstance(r, Path) and r.is_file() else None))
+    if not indexed:
         return
 
     parts: list[str] = []
-    v_cur = "[0:v]"
-    a_cur = "[0:a]" if audio else ""
-    for n, (idx, hold_s) in enumerate(valid):
-        hold_frames = max(1, int(round(hold_s * fps_i)))
-        loop_n = max(0, hold_frames - 1)
-        head_dur = (idx + 1) / float(fps_i)
-        vt, ht, tl, hd, ho, td = (f"fz{n}{k}" for k in ("v", "hd", "tl", "hd_a", "ho_a", "td_a"))
-        v_in = v_cur
+    v_segs: list[str] = []
+    a_segs: list[str] = []
+    recipe_inputs: list[Path] = []
+    prev = 0
+    total_hold_s = 0.0
+    for n, (idx, hold_s, recipe) in enumerate(indexed):
+        # Looped copies of the anchor frame. The hold REPLACES 1 content
+        # frame with H looped copies, so net inserted = H - 1. For the
+        # sidecar's hold_seconds to be exact, H - 1 must equal
+        # round(hold_s * fps): loop count = round(hold_s * fps).
+        hold_frames = max(2, int(round(hold_s * fps_i)) + 1)
+        loop_n = hold_frames - 1
+        # Content run before this hold (skipped when a previous hold ends
+        # exactly here — e.g. duplicate freeze frames).
+        if prev < idx:
+            parts.append(f"[0:v]trim=start_frame={prev}:end_frame={idx},setpts=PTS-STARTPTS[fzv{n}h]")
+            v_segs.append(f"[fzv{n}h]")
+            if audio:
+                parts.append(
+                    f"[0:a]atrim=start={prev / fps_i:.6f}:end={idx / fps_i:.6f},"
+                    f"asetpts=PTS-STARTPTS[fza{n}h]"
+                )
+                a_segs.append(f"[fza{n}h]")
         hold_src = (
-            f"{v_in}trim=start_frame={idx}:end_frame={idx + 1},setpts=PTS-STARTPTS"
+            f"[0:v]trim=start_frame={idx}:end_frame={idx + 1},setpts=PTS-STARTPTS"
         )
         if zoom > 1.0:
             hold_src += f",scale={vw * zoom:.4f}:{vh * zoom:.4f},crop={vw}:{vh}"
-        hold_src += f",loop=loop={loop_n}:size=1:start=0,setpts=N/({fps_i}*TB)[{ht}]"
-        tail_empty = frames is not None and idx + 1 >= frames
-        parts.append(f"{v_in}trim=end_frame={idx + 1},setpts=PTS-STARTPTS[{hd}]")
-        parts.append(hold_src)
-        if tail_empty:
-            parts.append(f"[{hd}][{ht}]concat=n=2:v=1:a=0[{vt}]")
+        hold_src += f",loop=loop={loop_n}:size=1:start=0,setpts=N/({fps_i}*TB)[fzv{n}o]"
+        hold_label = f"fzv{n}o"
+        if recipe is not None:
+            r_idx = len(recipe_inputs) + 1  # input 0 is the video
+            recipe_inputs.append(recipe)
+            hold_label = f"fzv{n}r"
+            parts.append(hold_src)
+            parts.append(
+                f"[fzv{n}o][{r_idx}:v]overlay=(W-w)/2:H-h-80[{hold_label}]"
+            )
         else:
-            parts.append(f"{v_in}trim=start_frame={idx + 1},setpts=PTS-STARTPTS[{tl}]")
-            parts.append(f"[{hd}][{ht}][{tl}]concat=n=3:v=1:a=0[{vt}]")
-        v_cur = f"[{vt}]"
+            parts.append(hold_src)
+        v_segs.append(f"[{hold_label}]")
         if audio:
-            a_in = a_cur
-            parts.append(f"{a_in}atrim=end={head_dur:.6f},asetpts=PTS-STARTPTS[{hd}]")
             parts.append(
                 f"anullsrc=channel_layout=stereo:sample_rate=48000,"
-                f"atrim=end={hold_s:.6f},asetpts=PTS-STARTPTS[{ho}]"
+                f"atrim=end={hold_s:.6f},asetpts=PTS-STARTPTS[fza{n}o]"
             )
-            if tail_empty:
-                parts.append(f"[{hd}][{ho}]concat=n=2:v=0:a=1[{td}]")
-            else:
-                parts.append(f"{a_in}atrim=start={head_dur:.6f},asetpts=PTS-STARTPTS[{td}_t]")
-                parts.append(f"[{hd}][{ho}][{td}_t]concat=n=3:v=0:a=1[{td}]")
-            a_cur = f"[{td}]"
-    fc = ";".join(parts)
-
-    out = video_path.with_name(video_path.name + ".freeze.part")
-    out.unlink(missing_ok=True)
-    maps = ["-map", v_cur]
+            a_segs.append(f"[fza{n}o]")
+        total_hold_s += hold_s
+        prev = idx + 1
+    # Trailing content (skipped only when provably empty).
+    if frames is None or prev < frames:
+        parts.append(f"[0:v]trim=start_frame={prev},setpts=PTS-STARTPTS[fzvtail]")
+        v_segs.append("[fzvtail]")
+        if audio:
+            parts.append(
+                f"[0:a]atrim=start={prev / fps_i:.6f},asetpts=PTS-STARTPTS[fzatail]"
+            )
+            a_segs.append("[fzatail]")
+    parts.append(f"{''.join(v_segs)}concat=n={len(v_segs)}:v=1:a=0[fzv]")
     if audio:
-        maps += ["-map", a_cur]
+        parts.append(f"{''.join(a_segs)}concat=n={len(a_segs)}:v=0:a=1[fza]")
+    fc = ";".join(parts)
+    # Persist the graph next to the output for post-mortem debugging.
+    try:
+        video_path.with_name(video_path.name + ".freeze_fc.txt").write_text(fc, encoding="utf-8")
+    except Exception:
+        pass
+
+    out = video_path.with_name(f"{video_path.name}.freeze.{_os.getpid()}.part")
+    out.unlink(missing_ok=True)
+    maps = ["-map", "[fzv]"]
+    if audio:
+        maps += ["-map", "[fza]"]
     else:
         maps += ["-an"]
     # Mezzanine (re-encoded again by the batch overlay below): CQ 8 / 200M
     # cap, same mezzanine profile as render/concat — never the final CQ 15.
-    cmd = [
-        "ffmpeg", "-y", "-i", str(video_path),
+    cmd = ["ffmpeg", "-y", "-i", str(video_path)]
+    for rp in recipe_inputs:
+        cmd += ["-loop", "1", "-i", str(rp)]
+    cmd += [
         "-filter_complex", fc,
         *maps,
         "-c:v", "h264_nvenc", "-preset", "p7", "-b:v", "0", "-cq", "8",
@@ -471,14 +514,29 @@ def apply_freezes_single_pass(
     if audio:
         cmd += ["-c:a", "aac", "-b:a", "256k"]
     cmd += ["-movflags", "+faststart", "-f", "mp4", str(out)]
-    _log(f"  [freeze] {len(valid)} holds, single pass "
-         f"({sum(h for _, h in valid):.1f}s inserted)")
+    _log(f"  [freeze] {len(indexed)} holds, single pass "
+         f"({sum(h for _, h, _ in indexed):.1f}s inserted)")
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=21600)
     if r.returncode != 0 or not out.is_file():
         _log(f"[ERROR] freeze pre-pass failed: rc={r.returncode}")
         _log(f"  stderr: {(r.stderr or '')[-400:]}")
         out.unlink(missing_ok=True)
         sys.exit(1)
+    # Structural check: output frames must equal input frames + hold frames.
+    # The chained-concat design silently dropped holds here before; never again.
+    if frames is not None:
+        try:
+            got = _ffprobe_frames(out)
+            want = frames + sum(int(round(h * fps_i)) for _, h, _ in indexed)
+            if got is not None and abs(got - want) > 1:
+                _log(f"[ERROR] freeze frame check: got {got} frames, "
+                     f"want {want} (in {frames} + holds) — refusing output")
+                out.unlink(missing_ok=True)
+                sys.exit(1)
+        except SystemExit:
+            raise
+        except Exception as e:
+            _log(f"  [warn] freeze frame check skipped: {e}")
     _os.replace(out, video_path)
 
 
