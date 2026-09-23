@@ -1554,7 +1554,131 @@ class Pipeline:
         except OSError as e:
             print(f"  [WARN] intermediate cleanup failed (non-fatal): {e}")
 
+    def _prepend_intro(self, youtube_dir: Path, step_num: int = 5) -> None:
+        """Prepend the match intro card + buy-phase lead-in to video.mp4.
+
+        Runs inside step 5 (before the outro append) so step numbering is
+        untouched. FACEIT cards only — the intro card generator needs a
+        FACEIT match. Raw-only skips (raw stays raw).
+
+        The prepend shifts every downstream timestamp, so the youtube
+        sidecar offsets shift by the segment duration (and ``intro_seconds``
+        records it for resume).
+        """
+        if self.skip_overlay:
+            print("  [skip] raw-only: no intro")
+            return
+        if not self.is_faceit:
+            print("  [skip] intro card needs a FACEIT match (HLTV TODO)")
+            return
+        video = youtube_dir / "video.mp4"
+        if not video.exists():
+            fail(step_num, "INTRO_VIDEO_MISSING", f"video.mp4 not found in {youtube_dir}")
+        sidecar = youtube_dir / "video.round_offsets.json"
+        if sidecar.is_file():
+            try:
+                if float(json.loads(sidecar.read_text()).get("intro_seconds", 0) or 0) > 0:
+                    print("  [skip] intro already prepended (sidecar intro_seconds set)")
+                    return
+            except Exception:
+                pass
+        if not self.demo_path or not self.demo_path.exists():
+            fail(step_num, "INTRO_NO_DEMO", f"demo required for intro: {self.demo_path}")
+        if not self.steam_id:
+            fail(step_num, "INTRO_NO_STEAM_ID", "no steam_id for intro")
+
+        intro_dir = PROJECT_ROOT / "renders" / f"intro-{self.run_id}"
+        intro_png = intro_dir / "intro.png"
+        if not intro_png.is_file():
+            r = self._run_py([
+                "scripts/faceit/create_match_intro.py",
+                "--backlog", str(self.args.backlog),
+                "--output", str(intro_dir),
+            ], timeout=900)
+            if r.returncode != 0:
+                fail(step_num, "INTRO_CARD_FAILED",
+                     f"create_match_intro.py exited {r.returncode}")
+            if not intro_png.is_file():
+                cands = sorted(intro_dir.rglob("intro.png"))
+                if cands:
+                    intro_png = cands[0]
+            if not intro_png.is_file():
+                fail(step_num, "INTRO_CARD_MISSING",
+                     f"no intro.png under {intro_dir}")
+
+        render_sidecar = self.render_dir / "combined.round_offsets.json"
+        if not render_sidecar.is_file():
+            fail(step_num, "INTRO_NO_SIDECAR",
+                 f"combined sidecar missing: {render_sidecar}")
+        intro_out = youtube_dir / "video.intro.mp4"
+        r = self._run_py([
+            "scripts/faceit/intro_prepend.py",
+            "--demo", str(self.demo_path),
+            "--steam-id", self.steam_id,
+            "--video", str(video),
+            "--intro", str(intro_png),
+            "--round-offsets", str(render_sidecar),
+            "--output", str(intro_out),
+            "--render-dir", str(intro_dir / "footage"),
+        ], timeout=7200)
+        if r.returncode != 0:
+            fail(step_num, "INTRO_FAILED", f"intro_prepend.py exited {r.returncode}")
+        if not intro_out.is_file() or intro_out.stat().st_size < 1_000_000:
+            fail(step_num, "INTRO_NO_OUTPUT", f"intro segment missing: {intro_out}")
+        intro_out.replace(video)
+        print(f"  [OK] Intro prepended in {youtube_dir.name}/")
+
+        # Shift the youtube sidecar past the intro segment.
+        dur = self._probe_duration(video)
+        seg_dur = self._probe_duration(intro_dir / "footage" / "intro_segment.mp4") \
+            if (intro_dir / "footage" / "intro_segment.mp4").is_file() else 0.0
+        if seg_dur <= 0:
+            seg_dur = dur
+        if sidecar.is_file():
+            try:
+                data = json.loads(sidecar.read_text(encoding="utf-8"))
+            except Exception as e:
+                fail(step_num, "INTRO_SIDECAR_UNREADABLE", f"{sidecar.name}: {e}")
+            data["round_offsets"] = {k: float(v) + seg_dur for k, v in data.get("round_offsets", {}).items()}
+            data["total_duration_seconds"] = float(data.get("total_duration_seconds", 0) or 0) + seg_dur
+            data["intro_seconds"] = seg_dur
+            if isinstance(data.get("freeze_windows"), list):
+                fps = self._probe_fps(video)
+                for w in data["freeze_windows"]:
+                    try:
+                        w["frame"] = float(w.get("frame", 0)) + seg_dur * fps
+                    except Exception:
+                        pass
+            sidecar.write_text(json.dumps(data, indent=2))
+            print(f"  [OK] sidecar shifted +{seg_dur:.2f}s (intro)")
+
+    @staticmethod
+    def _probe_duration(video: Path) -> float:
+        try:
+            r = subprocess.run(
+                [settings.ffprobe_exe, "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", str(video)],
+                capture_output=True, text=True, timeout=60,
+            )
+            return float(r.stdout.strip()) if r.returncode == 0 else 0.0
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _probe_fps(video: Path) -> float:
+        try:
+            r = subprocess.run(
+                [settings.ffprobe_exe, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", str(video)],
+                capture_output=True, text=True, timeout=60,
+            )
+            num, _, den = r.stdout.strip().partition("/")
+            return float(num) / float(den or 1)
+        except Exception:
+            return 60.0
+
     def step_outro(self) -> None:
+        self._prepend_intro(self.youtube_dir, step_num=5)
         self._append_outro(self.youtube_dir, step_num=5)
 
     # ── Step 6: Thumbnail ────────────────────────────────────────────────
