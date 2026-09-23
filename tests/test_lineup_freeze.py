@@ -23,13 +23,14 @@ from overlay.lineup_freeze import (  # noqa: E402
 )
 
 
-@pytest.fixture(autouse=True)
-def _no_cs2util(monkeypatch):
+def _without_cs2util(monkeypatch: pytest.MonkeyPatch):
     import overlay.lineup_freeze as lf
     monkeypatch.setattr(lf, "_cs2util", lambda name: None)
 
 
 def _throw(tid, tick, util="smoke", x=0.0, y=0.0, z=0.0, **kw):
+    # Default landing is spread by tick so fixtures only collapse when a
+    # test sets land_* explicitly (landing match == same lineup).
     row = {
         "throw_id": tid,
         "throw_tick": tick,
@@ -37,6 +38,9 @@ def _throw(tid, tick, util="smoke", x=0.0, y=0.0, z=0.0, **kw):
         "release_x": x,
         "release_y": y,
         "release_z": z,
+        "land_x": 5000.0 + tick,
+        "land_y": 5000.0,
+        "land_z": 0.0,
         "is_renderable": True,
         "flight_ticks": 100,
     }
@@ -84,6 +88,37 @@ def test_dedupe_sorts_by_throw_tick():
     assert [t["throw_id"] for t in dedupe_throws_by_lineup(throws)] == ["a", "b"]
 
 
+def test_dedupe_collapses_same_landing_far_release():
+    # Real case (donk Mirage con smokes): same landing, releases 270u apart.
+    throws = [
+        _throw("first", 11129, x=-721, y=-1341, z=-93,
+               land_x=29, land_y=-2324, land_z=-38),
+        _throw("repeat", 17072, x=-991, y=-1379, z=-91,
+               land_x=22, land_y=-2314, land_z=-38),
+    ]
+    assert [t["throw_id"] for t in dedupe_throws_by_lineup(throws)] == ["first"]
+
+
+def test_dedupe_collapses_boundary_straddle_releases():
+    # Releases 5u apart but straddling a 96u grid boundary collapse by
+    # distance (grid cells would split them).
+    throws = [
+        _throw("a", 30987, x=-678, y=-1156, z=-103,
+               land_x=-637, land_y=-732, land_z=-266),
+        _throw("b", 67360, x=-682, y=-1151, z=-107,
+               land_x=-635, land_y=-745, land_z=-265),
+    ]
+    assert [t["throw_id"] for t in dedupe_throws_by_lineup(throws)] == ["a"]
+
+
+def test_dedupe_keeps_different_type_same_spot():
+    throws = [
+        _throw("smoke", 1000, x=0, y=0, z=0, land_x=100, land_y=100, land_z=0),
+        _throw("flash", 2000, util="flash", x=0, y=0, z=0, land_x=100, land_y=100, land_z=0),
+    ]
+    assert [t["throw_id"] for t in dedupe_throws_by_lineup(throws)] == ["smoke", "flash"]
+
+
 def test_select_window_throws_prefers_watchable_repeat():
     from overlay.overlay_utilcams import _play_window_for_throw  # noqa
     ranges = {1: (10000, 20000)}
@@ -98,7 +133,8 @@ def test_select_window_throws_prefers_watchable_repeat():
     assert _play_window_for_throw(100, ranges) is None
 
 
-def test_classify_fails_safe_without_cs2util(tmp_path):
+def test_classify_fails_safe_without_cs2util(tmp_path, monkeypatch):
+    _without_cs2util(monkeypatch)
     throws = [_throw("a", 1000), _throw("b", 2000)]
     out = classify_throws_straightforward(throws, data_dir=tmp_path, map_name="de_nuke")
     assert out == {"a": True, "b": True}

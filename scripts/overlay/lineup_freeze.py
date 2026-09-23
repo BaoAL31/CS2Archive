@@ -92,85 +92,85 @@ def _cs2util(name: str):
 
 
 def lineup_tolerance_for(util_type: str) -> float:
-    """Release-spot clustering tolerance for a util type (CS2UtilArchive's table)."""
+    """Release/landing clustering tolerance from CS2UtilArchive's table.
+
+    Single source of truth is
+    ``scripts/select_top_utils.py::RELEASE_SPOT_TOLERANCE_BY_UTIL_TYPE``
+    (smoke/fire 96u, flash/he 128u). Hard-fails when that table is
+    unreachable — a silent local fallback would quietly re-tune dedupe.
+    """
     got = _cs2util("release_tolerance")
-    if got is not None:
-        release_spot_tolerance_for, _table = got
-        try:
-            return float(release_spot_tolerance_for(util_type, DEFAULT_SPOT_TOLERANCE))
-        except Exception:
-            pass
-    return DEFAULT_SPOT_TOLERANCE
+    if got is None:
+        _log("[ERROR] CS2UtilArchive release-spot tolerance table unavailable "
+             "(scripts/select_top_utils.py) — refusing to guess dedupe tolerance")
+        sys.exit(1)
+    release_spot_tolerance_for, _table = got
+    try:
+        return float(release_spot_tolerance_for(util_type, 96.0))
+    except Exception as e:
+        _log(f"[ERROR] tolerance lookup failed for {util_type!r}: {e}")
+        sys.exit(1)
 
 
-def _grid_cluster_ids(positions: list[tuple[float, float, float]], tolerance: float) -> list[int]:
-    """Cell-cluster release positions (CS2UtilArchive's cluster_throws_grid, pure fallback)."""
-    cluster = _cs2util("cluster_throws_grid")
-    if cluster is not None:
-        try:
-            import numpy as np
-            return [int(i) for i in cluster(np.asarray(positions, dtype=float), float(tolerance))]
-        except Exception:
-            pass
-    step = tolerance if tolerance > 0 else 1.0
-    cell_of: dict[tuple[int, int, int], int] = {}
-    ids: list[int] = []
-    for x, y, z in positions:
-        cell = (math.floor(x / step), math.floor(y / step), math.floor(z / step))
-        if cell not in cell_of:
-            cell_of[cell] = len(cell_of)
-        ids.append(cell_of[cell])
-    return ids
+def _xyz(t: dict[str, Any], prefix: str) -> tuple[float, float, float] | None:
+    try:
+        return (float(t[f"{prefix}_x"]), float(t[f"{prefix}_y"]), float(t[f"{prefix}_z"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _dist(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2) ** 0.5
 
 
 def dedupe_throws_by_lineup(throws: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep the earliest throw per (util_type, release-cell) lineup.
+    """Keep the earliest throw per lineup; repeats collapse to it.
 
-    Throws missing release coordinates pass through untouched (never
-    dropped — dedupe must not destroy PiPs it can't place). Output is
-    sorted by throw_tick. Idempotent.
+    Same lineup = same util type with a matching release OR landing
+    position (euclidean distance within the per-type tolerance). Landing
+    match is what catches real repeats: the same smoke thrown from
+    release spots 100u+ apart still lands in the same place, and grid
+    cells split releases mere units apart at cell boundaries — so this
+    uses distance, not cells, greedy earliest-keeps (no transitive
+    mega-clusters). Throws missing both coordinates pass through untouched
+    (never drop what we cannot place). Output sorted by throw_tick.
+    Idempotent.
     """
-    by_type: dict[str, list[int]] = {}
-    for i, t in enumerate(throws):
+    ordered = sorted(throws, key=lambda t: int(t.get("throw_tick", 0)))
+    kept: list[dict[str, Any]] = []
+    dropped = 0
+    for t in ordered:
         if str(t.get("util_type", "")).lower() == "decoy":
+            kept.append(t)
             continue
-        try:
-            float(t["release_x"]), float(t["release_y"]), float(t["release_z"])
-        except (KeyError, TypeError, ValueError):
+        rel = _xyz(t, "release")
+        land = _xyz(t, "land")
+        if rel is None and land is None:
+            kept.append(t)
             continue
-        by_type.setdefault(str(t.get("util_type", "unknown")).lower(), []).append(i)
-
-    drop: set[int] = set()
-    for util_type, idxs in by_type.items():
-        if len(idxs) < 2:
-            continue
-        tol = lineup_tolerance_for(util_type)
-        pos = [
-            (float(throws[i]["release_x"]), float(throws[i]["release_y"]), float(throws[i]["release_z"]))
-            for i in idxs
-        ]
-        for cell, group in _cells(_grid_cluster_ids(pos, tol)).items():
-            if len(group) < 2:
+        tol = lineup_tolerance_for(str(t.get("util_type", "unknown")).lower())
+        shadowed_by = None
+        for k in kept:
+            if str(k.get("util_type", "")).lower() != str(t.get("util_type", "")).lower():
                 continue
-            members = sorted((idxs[g] for g in group), key=lambda i: int(throws[i].get("throw_tick", 0)))
-            first = members[0]
-            for dup in members[1:]:
-                drop.add(dup)
-            _log(f"  [lineup] {util_type} cell {cell}: "
-                 f"{len(members)} throws -> keep t{throws[first].get('throw_tick')} "
-                 f"(drop {[throws[d].get('throw_tick') for d in members[1:]]})")
-    if drop:
-        _log(f"  [lineup] deduped {len(drop)} repeat-lineup throws "
-             f"({len(throws)} -> {len(throws) - len(drop)} PiPs)")
-    kept = [t for i, t in enumerate(throws) if i not in drop]
-    return sorted(kept, key=lambda t: int(t.get("throw_tick", 0)))
-
-
-def _cells(ids: list[int]) -> dict[int, list[int]]:
-    out: dict[int, list[int]] = {}
-    for pos, cid in enumerate(ids):
-        out.setdefault(cid, []).append(pos)
-    return out
+            k_rel = _xyz(k, "release")
+            k_land = _xyz(k, "land")
+            if rel is not None and k_rel is not None and _dist(rel, k_rel) <= tol:
+                shadowed_by = k
+                break
+            if land is not None and k_land is not None and _dist(land, k_land) <= tol:
+                shadowed_by = k
+                break
+        if shadowed_by is not None:
+            dropped += 1
+            _log(f"  [lineup] {t.get('util_type')} t{t.get('throw_tick')} repeats "
+                 f"t{shadowed_by.get('throw_tick')} — PiP once")
+            continue
+        kept.append(t)
+    if dropped:
+        _log(f"  [lineup] deduped {dropped} repeat-lineup throws "
+             f"({len(throws)} -> {len(kept)} PiPs)")
+    return kept
 
 
 def select_window_throws(

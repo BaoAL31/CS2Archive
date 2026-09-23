@@ -299,17 +299,20 @@ def restore(csgo: Path) -> None:
     journal.unlink()
 
 
-def _live_render_processes() -> bool:
-    """True when any render binary is alive (a mount may belong to it)."""
+def _live_render_processes() -> list[str]:
+    """Live render processes as NAME:pid strings (empty when none)."""
     try:
         import sys as _sys
         from pathlib import Path as _P
         _sys.path.insert(0, str(_P(__file__).resolve().parents[1]))
-        from hook_aware import RENDER_PROCESS_NAMES, _process_running
-        return any(_process_running(n) for n in RENDER_PROCESS_NAMES)
+        from hook_aware import RENDER_PROCESS_NAMES, _image_pids
+        out: list[str] = []
+        for name in RENDER_PROCESS_NAMES:
+            for pid in sorted(_image_pids(name)):
+                out.append(f"{name}:{pid}")
+        return out
     except Exception:
-        # Indeterminate — fail safe (treat as live, refuse to steal).
-        return True
+        return ["<indeterminate>"]
 
 
 @contextmanager
