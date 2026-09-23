@@ -890,12 +890,18 @@ def run_overlay(
     work_dir: Path | None = None,
     allow_missing_util_cams: bool = False,
     keyboard: bool = False,
+    freeze: bool = False,
 ) -> None:
     """Apply utility throw flight PiP (plus optional keyboard overlay) onto video_path (in place).
 
     ``keyboard=False`` (default) skips the demoparser2 input extraction, key
     sprites, and keyboard filter entirely — output is util-cam PiPs only.
     Pass ``keyboard=True`` (or ``--keyboard``) for the legacy input overlay.
+
+    ``freeze=False`` (default) skips the lineup freeze-frame pre-pass
+    entirely — no holds inserted, sidecar untouched. Pass ``freeze=True``
+    (or ``--freeze``) to hold each unique non-straightforward lineup's aim
+    frame in the main POV before the throw (freeze -> throw -> PiP).
     """
     if not video_path.exists():
         _log(f"[ERROR] Video not found: {video_path}")
@@ -1019,42 +1025,48 @@ def run_overlay(
         )
         sys.exit(1)
 
-    # -- Step 0: Freeze pre-pass (non-straightforward lineups) --------------
+    # -- Step 0: Freeze pre-pass (non-straightforward lineups, --freeze only)
     # Holds the lineup aim frame in the MAIN pov video before the throw, so
     # the order is freeze -> throw -> PiP. Runs on .overlay_work/video.mp4
     # BEFORE probing-driven math below: the sidecar offsets/durations are
     # expanded for the inserted holds (in memory + rewritten on disk) so
     # keyboard extraction, PiP placement, batch boundaries, and the later
-    # voice mix all see the frozen timeline.
-    round_frame_ranges = _build_round_frame_ranges(
-        round_offsets, round_tick_ranges, fps, frame_count,
-    )
-    _apply_lineup_freezes(
-        video_path=video_path,
-        offset_path=offset_path,
-        demo_path=demo_path,
-        steam_id=steam_id,
-        round_tick_ranges=round_tick_ranges,
-        round_frame_ranges=round_frame_ranges,
-        fps=fps,
-        width=width,
-        height=height,
-    )
-    # Re-probe + reload: the pre-pass may have inserted holds.
-    width, height, fps, frame_count = _probe_video_info(video_path)
-    if offset_path.is_file():
-        try:
-            with open(offset_path) as f:
-                _off = json.load(f)
-            round_offsets = {int(k): v for k, v in _off.get("round_offsets", {}).items()}
-            video_total_seconds = float(_off.get("total_duration_seconds", 0))
-            for k, v in (_off.get("per_round_durations") or {}).items():
-                round_video_duration[int(k)] = float(v)
-            round_frame_ranges = _build_round_frame_ranges(
-                round_offsets, round_tick_ranges, fps, frame_count,
-            )
-        except Exception as e:
-            _log(f"[warn] sidecar reload after freeze pre-pass failed: {e}")
+    # voice mix all see the frozen timeline. OFF by default (sidecar stays
+    # pristine); enable with --freeze.
+    if freeze:
+        round_frame_ranges = _build_round_frame_ranges(
+            round_offsets, round_tick_ranges, fps, frame_count,
+        )
+        _apply_lineup_freezes(
+            video_path=video_path,
+            offset_path=offset_path,
+            demo_path=demo_path,
+            steam_id=steam_id,
+            round_tick_ranges=round_tick_ranges,
+            round_frame_ranges=round_frame_ranges,
+            fps=fps,
+            width=width,
+            height=height,
+        )
+        # Re-probe + reload: the pre-pass may have inserted holds.
+        width, height, fps, frame_count = _probe_video_info(video_path)
+        if offset_path.is_file():
+            try:
+                with open(offset_path) as f:
+                    _off = json.load(f)
+                round_offsets = {int(k): v for k, v in _off.get("round_offsets", {}).items()}
+                video_total_seconds = float(_off.get("total_duration_seconds", 0))
+                for k, v in (_off.get("per_round_durations") or {}).items():
+                    round_video_duration[int(k)] = float(v)
+                round_frame_ranges = _build_round_frame_ranges(
+                    round_offsets, round_tick_ranges, fps, frame_count,
+                )
+            except Exception as e:
+                _log(f"[warn] sidecar reload after freeze pre-pass failed: {e}")
+    else:
+        round_frame_ranges = _build_round_frame_ranges(
+            round_offsets, round_tick_ranges, fps, frame_count,
+        )
 
     # Determine round_start_tick (needed for legacy single-round mode)
     round_start_tick = 0
@@ -1527,6 +1539,9 @@ def main() -> None:
     parser.add_argument("--keyboard", action="store_true", default=False,
                          help="Also overlay real-time keyboard/mouse input sprites "
                               "(default: off — util-cam PiPs only).")
+    parser.add_argument("--freeze", action="store_true", default=False,
+                         help="Freeze each unique non-straightforward lineup's aim "
+                              "frame in the main POV before the throw (default: off).")
     args = parser.parse_args()
 
     # Ensure CS2UtilArchive has extracted+analyzed this demo (throws.parquet).
@@ -1536,7 +1551,7 @@ def main() -> None:
     run_overlay(Path(args.video), Path(args.demo), args.steam_id, args.round, args.batches,
                 util_cams_root=args.util_cams_root, work_dir=args.work_dir,
                 allow_missing_util_cams=args.allow_missing_util_cams,
-                keyboard=args.keyboard)
+                keyboard=args.keyboard, freeze=args.freeze)
 
 
 if __name__ == "__main__":

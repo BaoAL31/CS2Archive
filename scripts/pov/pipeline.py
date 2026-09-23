@@ -1418,6 +1418,7 @@ class Pipeline:
                 util_cams_root=self.render_dir / "utility_cams",
                 work_dir=work_dir,
                 keyboard=bool(getattr(self.args, "keyboard", False)),
+                freeze=bool(getattr(self.args, "freeze", False)),
             )
         except SystemExit as exc:
             code = exc.code if isinstance(exc.code, int) else 1
@@ -1971,7 +1972,15 @@ def main() -> None:
         action="store_true",
         default=False,
         help="Also overlay real-time keyboard/mouse input sprites in step 4 "
-             "(default: off — util-cam PiPs + lineup freeze frames only).",
+             "(default: off — util-cam PiPs only).",
+    )
+    parser.add_argument(
+        "--freeze",
+        action="store_true",
+        default=False,
+        help="Freeze each unique non-straightforward lineup's aim frame in "
+             "the main POV before the throw in step 4 (default: off — "
+             "sidecar stays pristine).",
     )
     parser.add_argument(
         "--enable-voice-comms",
