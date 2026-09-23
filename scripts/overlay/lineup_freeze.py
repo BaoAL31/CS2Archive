@@ -124,51 +124,28 @@ def _dist(a: tuple[float, float, float], b: tuple[float, float, float]) -> float
 
 
 def dedupe_throws_by_lineup(throws: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep the earliest throw per lineup; repeats collapse to it.
+    """Keep the earliest throw per util type; repeats never PiP again.
 
-    Same lineup = same util type with a matching release OR landing
-    position (euclidean distance within the per-type tolerance). Landing
-    match is what catches real repeats: the same smoke thrown from
-    release spots 100u+ apart still lands in the same place, and grid
-    cells split releases mere units apart at cell boundaries — so this
-    uses distance, not cells, greedy earliest-keeps (no transitive
-    mega-clusters). Throws missing both coordinates pass through untouched
-    (never drop what we cannot place). Output sorted by throw_tick.
-    Idempotent.
+    One smoke PiP per video, one flash, one HE, one fire — spots do not
+    matter. Output sorted by throw_tick. Idempotent.
     """
     ordered = sorted(throws, key=lambda t: int(t.get("throw_tick", 0)))
+    seen: set[str] = set()
     kept: list[dict[str, Any]] = []
     dropped = 0
     for t in ordered:
-        if str(t.get("util_type", "")).lower() == "decoy":
+        ut = str(t.get("util_type", "unknown")).lower()
+        if ut == "decoy":
             kept.append(t)
             continue
-        rel = _xyz(t, "release")
-        land = _xyz(t, "land")
-        if rel is None and land is None:
-            kept.append(t)
-            continue
-        tol = lineup_tolerance_for(str(t.get("util_type", "unknown")).lower())
-        shadowed_by = None
-        for k in kept:
-            if str(k.get("util_type", "")).lower() != str(t.get("util_type", "")).lower():
-                continue
-            k_rel = _xyz(k, "release")
-            k_land = _xyz(k, "land")
-            if rel is not None and k_rel is not None and _dist(rel, k_rel) <= tol:
-                shadowed_by = k
-                break
-            if land is not None and k_land is not None and _dist(land, k_land) <= tol:
-                shadowed_by = k
-                break
-        if shadowed_by is not None:
+        if ut in seen:
             dropped += 1
-            _log(f"  [lineup] {t.get('util_type')} t{t.get('throw_tick')} repeats "
-                 f"t{shadowed_by.get('throw_tick')} — PiP once")
+            _log(f"  [lineup] {ut} t{t.get('throw_tick')} already PiP'd — skipping repeat")
             continue
+        seen.add(ut)
         kept.append(t)
     if dropped:
-        _log(f"  [lineup] deduped {dropped} repeat-lineup throws "
+        _log(f"  [lineup] deduped {dropped} repeat-util throws "
              f"({len(throws)} -> {len(kept)} PiPs)")
     return kept
 

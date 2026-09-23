@@ -51,12 +51,12 @@ def _throw(tid, tick, util="smoke", x=0.0, y=0.0, z=0.0, **kw):
 def test_dedupe_keeps_earliest_per_release_cell():
     throws = [
         _throw("a", 1000, x=10, y=20, z=30),
-        _throw("b", 2000, x=15, y=25, z=32),  # same 96u cell as a
-        _throw("c", 3000, x=5000, y=20, z=30),  # far cell
+        _throw("b", 2000, x=15, y=25, z=32),  # same cell as a
+        _throw("c", 3000, x=5000, y=20, z=30),  # far cell, same util -> still dropped
         _throw("d", 4000, util="flash", x=10, y=20, z=30),  # other type: separate
     ]
     kept = dedupe_throws_by_lineup(throws)
-    assert [t["throw_id"] for t in kept] == ["a", "c", "d"]
+    assert [t["throw_id"] for t in kept] == ["a", "d"]
 
 
 def test_dedupe_idempotent():
@@ -73,19 +73,30 @@ def test_dedupe_idempotent():
 def test_dedupe_keeps_throws_without_release_coords():
     throws = [
         _throw("a", 1000, x=10, y=20, z=30),
-        {"throw_id": "mystery", "throw_tick": 1500, "util_type": "smoke",
+        {"throw_id": "mystery", "throw_tick": 1500, "util_type": "flash",
          "is_renderable": True, "flight_ticks": 50},
     ]
     kept = dedupe_throws_by_lineup(throws)
     assert [t["throw_id"] for t in kept] == ["a", "mystery"]
 
 
-def test_dedupe_sorts_by_throw_tick():
+def test_dedupe_same_util_no_coords_still_dedupes():
     throws = [
-        _throw("b", 2000, x=5000, y=0, z=0),
-        _throw("a", 1000, x=10, y=0, z=0),
+        _throw("a", 1000, x=10, y=20, z=30),
+        {"throw_id": "mystery", "throw_tick": 1500, "util_type": "smoke",
+         "is_renderable": True, "flight_ticks": 50},
     ]
-    assert [t["throw_id"] for t in dedupe_throws_by_lineup(throws)] == ["a", "b"]
+    kept = dedupe_throws_by_lineup(throws)
+    assert [t["throw_id"] for t in kept] == ["a"]
+
+
+def test_dedupe_keeps_earliest_regardless_of_input_order():
+    throws = [
+        _throw("late", 2000, x=5000, y=0, z=0),
+        _throw("early", 1000, x=10, y=0, z=0),
+        _throw("flash", 1500, util="flash", x=0, y=0, z=0),
+    ]
+    assert [t["throw_id"] for t in dedupe_throws_by_lineup(throws)] == ["early", "flash"]
 
 
 def test_dedupe_collapses_same_landing_far_release():
