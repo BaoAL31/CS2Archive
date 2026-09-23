@@ -329,8 +329,8 @@ def main() -> None:
     ap.add_argument("--steam-id", required=True, help="POV player steam64 id")
     ap.add_argument("--offsets", required=True, help="combined.round_offsets.json")
     ap.add_argument("--out", required=True, help="output mp4")
-    ap.add_argument("--voice-volume", type=float, default=3.5,
-                    help="gain applied to the voice track (default 3.5; the game "
+    ap.add_argument("--voice-volume", type=float, default=4.5,
+                    help="gain applied to the voice track (default 4.5; the game "
                          "bus auto-ducks to 0.9/volume peak, so this lifts voice "
                          "and drops game together)")
     ap.add_argument("--voice-rms-target", type=float, default=0.08,
