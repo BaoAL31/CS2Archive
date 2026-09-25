@@ -21,8 +21,8 @@ from overlay._common import (
     _log,
     _probe_clip_duration_seconds,
     PIP_MAX_SIMULTANEOUS,
-    cameras_for_util_type,
     clip_is_done,
+    pip_cameras_for_util_type,
     pip_render_dimensions,
     prefer_cs2util_scripts,
 )
@@ -384,8 +384,11 @@ def _scan_utility_cams_clips(video_path: Path) -> dict[str, Path]:
                 m for m in matching
                 if m.name.startswith("flight") and "detonate" not in m.name
             ]
-            pick = combined[0] if combined else (
-                flight[0] if flight else (matching[0] if matching else None)
+            # Prefer the clean flight-only standalone: the combined
+            # flight+detonate deliverable carries CS2UtilArchive's burned
+            # keyboard/mouse input overlay, which must not appear in a PiP.
+            pick = flight[0] if flight else (
+                combined[0] if combined else (matching[0] if matching else None)
             )
             if pick is not None and clip_is_done(pick):
                 pre_rendered[tid] = pick
@@ -484,6 +487,7 @@ def _render_throw_flight_clips(
     round_tick_ranges: dict[int, tuple[int, int]] | None = None,
     total_duration_seconds: float = 0.0,
     util_cams_root: Path | None = None,
+    freeze_plan: dict[str, Any] | None = None,
 ) -> list[PipClip]:
     """Render CSDM flight clips for each player throw.
 
@@ -571,11 +575,16 @@ def _render_throw_flight_clips(
         resolved.mkdir(parents=True, exist_ok=True)
         util_cams_root = resolved
 
-    # Build per-round frame ranges from round_offsets
+    # Build per-round frame ranges from round_offsets. The offsets are the
+    # PRISTINE ones when a freeze pass ran, so the range must also use the
+    # pristine total frame count (frozen count minus inserted hold frames).
+    pristine_frame_count = frame_count - (
+        int(freeze_plan.get("total_frames", 0)) if freeze_plan else 0
+    )
     round_frame_ranges = {}
     if round_offsets and round_tick_ranges:
         round_frame_ranges = _build_round_frame_ranges(
-            round_offsets, round_tick_ranges, fps, frame_count,
+            round_offsets, round_tick_ranges, fps, pristine_frame_count,
         )
         _log(f"  [flight] {len(round_frame_ranges)} round frame ranges")
 
@@ -603,7 +612,7 @@ def _render_throw_flight_clips(
         # needs_render (and never error on their missing clip downstream).
         if util_type == "decoy" or not bool(throw.get("is_renderable", True)):
             continue
-        cam = cameras_for_util_type(util_type)
+        cam = pip_cameras_for_util_type(util_type)
         expected = render_dir_check / f"{clip_name_for_cameras(cam, tid)}.mp4"
         clips_ok = clip_is_done(expected)
         if tid in pre_rendered or clips_ok:
@@ -683,12 +692,20 @@ def _render_throw_flight_clips(
         else:
             start_frame = int(throw_tick * fps / TICKRATE)
 
+        # Map the pristine frame past any freeze holds whose anchor it follows
+        # (the video is frozen; the sidecar/ranges above are pristine).
+        if freeze_plan:
+            from overlay.lineup_freeze import expand_frame
+            if round_end_frame is not None:
+                round_end_frame = expand_frame(round_end_frame, freeze_plan)
+            start_frame = expand_frame(int(start_frame), freeze_plan)
+
         start_frame = max(0, int(start_frame))
 
         throw_id = str(throw.get("throw_id", ""))
         _, uid_slug, _ = _util_slug_for_throw(throw, demo_path)
         render_dir = util_cams_root / "unnamed" / uid_slug
-        cam = cameras_for_util_type(util_type)
+        cam = pip_cameras_for_util_type(util_type)
         clip_path = render_dir / f"{clip_name_for_cameras(cam, throw_id)}.mp4"
         if not clip_is_done(clip_path) and throw_id in pre_rendered:
             alt = pre_rendered[throw_id]

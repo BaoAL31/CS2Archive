@@ -103,6 +103,8 @@ logs/
 *.log
 .upload_*.sh
 token_youtube_readonly.json
+token_youtube_analytics.json
+token_*_analytics*.json
 
 # Rust build output (button_extract)
 tools/**/target/

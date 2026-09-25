@@ -7,9 +7,10 @@ Flow:
      mode. This is the freeze-time/buy-phase moment right before round 1, so it
      is a seamless lead-in to the existing video (its tick 0 == this clip's last
      tick).
-  2. Composite the transparent intro card (``--intro intro.png``) over the clip
-     with a quick fade-in pop, a hold, then a fade-out pop, so the footage is
-     clean again before the cut.
+    2. Slide the transparent left/right intro layers (``intro_left.png`` /
+       ``intro_right.png``) in from the frame edges with an ease-in-out pop,
+       hold, then slide them back out, so the footage is clean before the cut.
+
   3. Prepend the composed clip to ``--video``. Both are encoded with the same
      NVENC CQ 15 / 60M profile (the overlay final-export profile) so the concat
      is a stream copy — no re-encode of the main video, its audio is preserved.
@@ -212,35 +213,70 @@ def render_footage(demo: Path, steam_id: str, render_dir: Path,
     return produced
 
 
+def build_intro_filter(
+    final_res: tuple[int, int, float],
+    seconds_before: float,
+    pop_in: float,
+    pop_out: float,
+    left_rect: list[int],
+    right_rect: list[int],
+) -> str:
+    w, h, fps = final_res
+    duration = max(0.1, float(seconds_before))
+    pin = max(0.05, float(pop_in))
+    pout = max(0.05, float(pop_out))
+    out_start = min(max(duration - pout, pin), duration)
+    x0l = -(left_rect[0] + left_rect[2])
+    x0r = w - right_rect[0]
+
+    def ease(var: str) -> str:
+        p = f"min(max({var},0),1)"
+        return f"(pow({p},2)*(3-2*{p}))"
+
+    ein = ease(f"t/{pin}")
+    eout = ease(f"(t-{out_start})/{pout}")
+    xl = f"if(lt(t,{pin}),{x0l}*(1-({ein})),if(lt(t,{out_start}),0,{x0l}*({eout})))"
+    xr = f"if(lt(t,{pin}),{x0r}*(1-({ein})),if(lt(t,{out_start}),0,{x0r}*({eout})))"
+    return (
+        f"[0:v]scale={w}:{h}:flags=spline,setsar=1,fps={round(fps)}[base];"
+        f"[1:v]format=rgba[left];"
+        f"[2:v]format=rgba[right];"
+        f"[base][left]overlay=x='{xl}':y=0:format=auto:eof_action=pass[mid];"
+        f"[mid][right]overlay=x='{xr}':y=0:format=auto:eof_action=pass:shortest=1,"
+        f"format=nv12[v]"
+    )
+
+
 def compose_intro(footage: Path, intro: Path, out: Path,
                   native_res: tuple[int, int, float],
                   final_res: tuple[int, int, float],
                   seconds_before: float,
-                  pop_in: float = 0.7, pop_out: float = 1.0) -> Path:
+                  pop_in: float = 0.5, pop_out: float = 0.5) -> Path:
     if out.is_file() and out.stat().st_size >= 1_048_576:
         print(f"  [skip] composed segment exists: {out.name}")
         return out
 
-    w, h, fps = final_res       # final video size (e.g. 2560x1440)
-    # Fade the card in over pop_in seconds, hold, fade out so the last ~pop_out
-    # seconds are clean footage before the hard cut to the main video.
-    fade_out_start = max(0.0, seconds_before - pop_out)
+    left_path = intro.with_name("intro_left.png")
+    right_path = intro.with_name("intro_right.png")
+    details_path = intro.with_name("intro_details.json")
+    missing = [p for p in (left_path, right_path, details_path) if not p.is_file()]
+    if missing:
+        raise SystemExit(
+            "[ERROR] intro slide layers not found: "
+            + ", ".join(str(p) for p in missing)
+        )
+    details = json.loads(details_path.read_text(encoding="utf-8"))
+    w, h, fps = final_res
     tmp = out.with_name(out.name + ".part")
-    # Upscale the footage to the final video res FIRST, then overlay the
-    # full-resolution (2560x1440) card on top so it stays crisp — NOT downscaled
-    # to native then re-upscaled (that's what made it look low-res).
-    fc = (
-        f"[0:v]scale={w}:{h}:flags=spline,setsar=1,fps={round(fps)}[base];"
-        f"[1:v]format=rgba,"
-        f"fade=t=in:st=0:d={pop_in}:alpha=1,"
-        f"fade=t=out:st={fade_out_start}:d={pop_out}:alpha=1[ov];"
-        f"[base][ov]overlay=0:0:format=auto:eof_action=pass,"
-        f"format=nv12[v]"
+    fc = build_intro_filter(
+        final_res, seconds_before, pop_in, pop_out,
+        details["left_rect"], details["right_rect"],
     )
     cmd = [
         FFMPEG, "-y",
         "-i", str(footage),
-        "-loop", "1", "-i", str(intro),
+        "-loop", "1", "-i", str(left_path),
+        "-loop", "1", "-i", str(right_path),
         "-filter_complex", fc,
         "-map", "[v]", "-map", "0:a?",
         "-c:v", "h264_nvenc", "-preset", "p7", "-b:v", "0", "-cq", "15",
@@ -257,7 +293,7 @@ def compose_intro(footage: Path, intro: Path, out: Path,
     print(f"  [compose] intro pop over {footage.name} ...")
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
     if r.returncode != 0 or not tmp.is_file():
-        print((r.stderr or "")[-1500:])
+        print((r.stderr or "")[-5000:])
         tmp.unlink(missing_ok=True)
         raise SystemExit(f"[ERROR] compose failed (rc={r.returncode})")
     tmp.replace(out)
@@ -285,8 +321,9 @@ def prepend(segment: Path, video: Path, output: Path) -> Path:
         print(f"  [prepend] {segment.name} + {video.name} ...")
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=14400)
         if r.returncode != 0 or not tmp.is_file():
-            print((r.stderr or "")[-1500:])
+            print((r.stderr or "")[-5000:])
             tmp.unlink(missing_ok=True)
+
             raise SystemExit(f"[ERROR] concat failed (rc={r.returncode})")
         tmp.replace(output)
     print(f"  [OK] output: {output}")
@@ -313,10 +350,10 @@ def main() -> None:
                          "Defaults to the player's capture_width from player_accounts.json.")
     ap.add_argument("--native-height", type=int, default=None,
                     help="Native capture height of the POV render (e.g. 960).")
-    ap.add_argument("--pop-in", type=float, default=0.7,
-                    help="Card fade-in duration (s)")
-    ap.add_argument("--pop-out", type=float, default=1.0,
-                    help="Card fade-out duration (s)")
+    ap.add_argument("--pop-in", type=float, default=0.5,
+                    help="Pane slide-in duration (s)")
+    ap.add_argument("--pop-out", type=float, default=0.5,
+                    help="Pane slide-out duration (s)")
     args = ap.parse_args()
 
     demo = Path(args.demo)

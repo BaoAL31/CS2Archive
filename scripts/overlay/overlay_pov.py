@@ -53,11 +53,17 @@ from overlay._common import (
     PIP_MARGIN,
     PIP_GAP,
     PIP_MAX_SIMULTANEOUS,
+    PIP_SHADOW_OFFSET,
+    PIP_SHADOW_BLUR,
+    PIP_SHADOW_OPACITY,
+    PIP_SLIDE_SECONDS,
     _pip_body,
     _pip_inner,
     pip_render_dimensions,
+    pip_shadow_pad,
     prefer_cs2util_scripts,
 )
+from imgutil import drop_shadow, rounded_layer
 prefer_cs2util_scripts()
 
 from scripts.render.overlay_assets import (
@@ -94,9 +100,12 @@ from overlay.overlay_utilcams import (
 from overlay.lineup_freeze import (
     apply_freezes_single_pass,
     classify_throws_straightforward,
+    collapse_frame,
     compose_freeze_recipe_pngs,
     dedupe_throws_by_lineup,
+    expand_frame,
     expand_offsets_for_freezes,
+    freeze_frame_plan,
     freeze_specs_for_throws,
     select_window_throws,
 )
@@ -119,7 +128,7 @@ def _make_rounded_corner_mask(path: Path, size: int, radius: int) -> None:
     """Write a grayscale rounded-rect mask (white 255 interior, black 0 corners).
 
     Used with ``alphamerge`` to punch the four outer corners out of a PiP
-    body (including its white outline) so the main video shows through.
+    body so the main video shows through.
     ffmpeg's ``alphamerge`` maps the SECOND input's luma to the alpha
     channel, so the mask must be a black-and-white image (0 = transparent,
     255 = opaque) — an RGBA mask would contribute its white luma everywhere.
@@ -142,6 +151,28 @@ def _make_rounded_corner_mask(path: Path, size: int, radius: int) -> None:
     for cx, cy in ((r, r), (size - r, r), (r, size - r), (size - r, size - r)):
         d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=255)
     img.save(path)
+
+
+def _make_pip_shadow(path: Path, size: int, radius: int) -> int:
+    """Write the bottom-right drop-shadow sprite for a PiP body.
+
+    Solid rounded rect through imgutil.rounded_layer, then drop_shadow for
+    the offset/blur/opacity. Returns the sprite pad so callers can position
+    the sprite at (x - pad, y - pad) to land the shadow at (x + dx, y + dy).
+    """
+    from PIL import Image
+
+    solid = Image.new("RGBA", (size, size), (255, 255, 255, 255))
+    pane = rounded_layer(solid, radius)
+    shadow, pad = drop_shadow(
+        pane,
+        offset=PIP_SHADOW_OFFSET,
+        blur=PIP_SHADOW_BLUR,
+        spread=0,
+        opacity=PIP_SHADOW_OPACITY,
+    )
+    shadow.save(path)
+    return pad
 
 
 # Reference size for 1440p (test helpers); render path uses _pip_body(height).
@@ -423,6 +454,7 @@ def _extract_keyboard_states(
     round_offsets: dict[int, float] | None = None,
     round_tick_ranges: dict[int, tuple[int, int]] | None = None,
     round_video_duration: dict[int, float] | None = None,
+    freeze_plan: dict[str, Any] | None = None,
 ) -> dict[str, list[int]]:
     """Extract full keyboard states using demoparser2 with per-column booleans.
 
@@ -432,6 +464,11 @@ def _extract_keyboard_states(
     When round_offsets and round_tick_ranges are provided, maps each video
     frame to the correct round and demo tick using the sidecar data from
     concat_rounds.py. This handles concatenated multi-round videos correctly.
+
+    ``freeze_plan`` (from :func:`overlay.lineup_freeze.freeze_frame_plan`)
+    collapses each FROZEN video frame back to the pristine timeline first, so
+    the sidecar inputs must be the PRE-freeze offsets/durations. Without it a
+    frame after a hold reads the wrong tick and the keys lag.
 
     Returns per_signal frame lists (0/1 per frame).
     """
@@ -523,7 +560,10 @@ def _extract_keyboard_states(
                     round_end_sec[rn] = frame_count / fps
 
         for f_idx in range(frame_count):
-            sec = f_idx / fps
+            # Frozen frame -> pristine frame before reading the pristine
+            # sidecar, so a hold does not shift every later key state.
+            orig_idx = collapse_frame(f_idx, freeze_plan) if freeze_plan else f_idx
+            sec = orig_idx / fps
             # Find round containing this frame second
             pos = bisect_right([round_offsets[r] for r in sorted_rounds], sec)
             if pos == 0:
@@ -577,7 +617,7 @@ def _build_pip_chain(
     start_label: str = "[0:v]",
     pip_input_offset: int = 1,
     inner_mask_idx: int | None = None,
-    outer_mask_idx: int | None = None,
+    shadow_idx: int | None = None,
 ) -> tuple[list[str], str, list[PipClip]]:
     """Sort clips, assign stack rows, build PiP filter parts.
 
@@ -589,11 +629,11 @@ def _build_pip_chain(
     clip. When sprite PNGs occupy inputs 1-18, pass ``1 + len(png_inputs)``
     so clips are referenced as ``[19:v]``, ``[20:v]``, etc.
 
-    ``inner_mask_idx`` / ``outer_mask_idx`` are the ffmpeg input indices of
-    the rounded-corner mask PNGs (looped) used by ``alphamerge`` when
-    PIP_CORNER_RADIUS > 0: the inner mask rounds the CONTENT corners before
-    the outline is drawn, the outer mask rounds the outline corners. Pass
-    ``None`` to keep square corners.
+    ``inner_mask_idx`` is the ffmpeg input index of the rounded-corner mask
+    PNG (looped) used by ``alphamerge`` when PIP_CORNER_RADIUS > 0.
+    ``shadow_idx`` is the input index of the pre-rendered drop-shadow sprite
+    (looped), composited behind the content. Pass ``None`` for either to skip
+    that treatment.
     """
     sorted_clips = sorted(flight_clips, key=lambda c: c.start_frame)
     active: list[PipClip] = []
@@ -610,7 +650,7 @@ def _build_pip_chain(
         fc_part, tag = _build_pip_overlay(
             clip, pip_current, idx, width, height, fps,
             inner_mask_idx=inner_mask_idx,
-            outer_mask_idx=outer_mask_idx,
+            shadow_idx=shadow_idx,
         )
         pip_parts.append(fc_part)
         pip_current = f"[{tag}]"
@@ -625,30 +665,30 @@ def _build_pip_overlay(
     height: int,
     fps: float,
     inner_mask_idx: int | None = None,
-    outer_mask_idx: int | None = None,
+    shadow_idx: int | None = None,
 ) -> tuple[str, str]:
     """Build filter string + tag for one PiP overlay at bottom-left.
 
     Scales flight clip (input_idx:v) to PIP size and delays its PTS so the
     clip's first frame aligns with clip.start_frame on the main timeline.
 
-    Corner ordering: round the CONTENT corners FIRST, then draw the white
-    outline around the rounded content, then round the outline's own corners
-    (so the outline hugs the rounded content). This is done with two looped
-    grayscale masks via alphamerge (inner = content size, outer = body size).
+    The content corners are rounded via the looped inner mask (alphamerge).
+    There is no outline; a pre-rendered drop-shadow sprite slides in behind
+    the content. Both slide in from the left with an ease-in-out pop over the
+    first slide frames of the window and slide back out over the last frames.
 
-    The overlay is gated with ``enable='between(n,start,end)'`` so the PiP is
-    only on screen during its window and disappears cleanly afterwards. This
-    is necessary because the looped mask PNGs keep the clip stream from ever
-    EOFing (alphamerge is a framesync filter), so ``eof_action=pass`` alone
-    cannot tear the PiP down; the enable window bounds its visibility instead.
+    The overlays are gated with ``enable='between(n,start,end)'`` so the PiP
+    is only on screen during its window and disappears cleanly afterwards.
+    This is necessary because the looped mask PNGs keep the clip stream from
+    ever EOFing (alphamerge is a framesync filter), so ``eof_action=pass``
+    alone cannot tear the PiP down; the enable window bounds its visibility
+    instead.
     """
     geom = _pip_geometry(clip.pip_index, width, height)
     pip_body = geom["body"]
     pip_inner = geom["inner"]
     x = geom["x"]
     pip_y = geom["y"]
-    ol = geom["outline"]
     tag = f"pip{clip.pip_index}_{input_idx}"
     start_seconds = clip.start_frame / fps
     # Cap clip playback to its PiP window (seconds on the clip's native
@@ -657,6 +697,17 @@ def _build_pip_overlay(
     # and bleed past the round boundary into later rounds within the same
     # overlay batch.
     play_seconds = max(0.0, (clip.end_frame - clip.start_frame) / fps)
+    # Ease-in-out slide, clamped to half the window so short PiPs still work.
+    slide_frames = max(1, int(min(PIP_SLIDE_SECONDS, play_seconds / 2) * fps))
+    slide_from = -(x + pip_body + pip_shadow_pad())
+
+    def _ease(var: str) -> str:
+        p = f"min(max({var},0),1)"
+        return f"(pow({p},2)*(3-2*{p}))"
+
+    ease_in = _ease(f"(n-{clip.start_frame})/{slide_frames}")
+    ease_out = _ease(f"(n-{clip.end_frame - slide_frames})/{slide_frames}")
+    slide = f"({slide_from}*(1-({ease_in})+({ease_out})))"
 
     parts: list[str] = []
 
@@ -674,45 +725,33 @@ def _build_pip_overlay(
     parts.append(f"[{input_idx}:v]" + ",".join(pre) + f"[{scaled_tag}]")
 
     content_tag = scaled_tag
-    # 2) Round the CONTENT corners first (inner mask, radius R).
-    if PIP_CORNER_RADIUS > 0 and inner_mask_idx is not None and outer_mask_idx is not None and ol > 0:
+    # 2) Round the CONTENT corners (inner mask). No outline is drawn; the
+    # drop shadow is a separate sprite composited behind the content below.
+    if PIP_CORNER_RADIUS > 0 and inner_mask_idx is not None:
         rnd = f"pip_rnd_{input_idx}"
         parts.append(f"[{scaled_tag}][{inner_mask_idx}:v]alphamerge[{rnd}]")
-        # Fork the rounded content: one copy becomes the white rounded-rect
-        # background, the other is the content overlaid on top. (Reusing the
-        # same label in both lutrgb and overlay makes ffmpeg's overlay drop the
-        # rounded alpha, so we must `split` explicitly.)
-        r_ol = f"pip_rol_{input_idx}"
-        r_w = f"pip_rw_{input_idx}"
-        parts.append(f"[{rnd}]split[{r_ol}][{r_w}]")
-        wc = f"pip_wc_{input_idx}"
-        parts.append(f"[{r_w}]lutrgb=r=255:g=255:b=255[{wc}]")
-        wp = f"pip_wp_{input_idx}"
-        parts.append(f"[{wc}]pad=w={pip_body}:h={pip_body}:x={ol}:y={ol}:color=white@1[{wp}]")
-        wr = f"pip_wr_{input_idx}"
-        parts.append(f"[{wp}][{outer_mask_idx}:v]alphamerge[{wr}]")
-        comp = f"pip_comp_{input_idx}"
-        parts.append(f"[{wr}][{r_ol}]overlay=x={ol}:y={ol}:eof_action=pass[{comp}]")
-        content_tag = comp
-    else:
-        # Fallback (no rounding): simple rectangular pad outline.
-        if ol > 0:
-            padded_tag = f"pip_pad_{input_idx}"
-            parts.append(
-                f"[{content_tag}]pad=w={pip_body}:h={pip_body}:x={ol}:y={ol}:color=white@1"
-                f"[{padded_tag}]"
-            )
-            content_tag = padded_tag
+        content_tag = rnd
 
     # 5) Delay PTS so the clip's first frame lands on clip.start_frame.
     final_tag = f"pip_final_{input_idx}"
     parts.append(f"[{content_tag}]setpts=PTS-STARTPTS+{start_seconds:.6f}/TB[{final_tag}]")
 
-    # 6) Overlay onto main, gated to the window (and eof_action=pass as a
-    #    belt-and-suspenders so the main video shows through if the clip EOFs).
+    # 6) Shadow sprite behind, content on top — both gated to the window and
+    # sliding in/out from the left (eof_action=pass as a belt-and-suspenders
+    # so the main video shows through if the clip EOFs).
+    enable = f"enable='between(n\\,{clip.start_frame}\\,{clip.end_frame})'"
+    if shadow_idx is not None:
+        pad = pip_shadow_pad()
+        sh_tag = f"pip_sh_{input_idx}"
+        parts.append(
+            f"{current_label}[{shadow_idx}:v]overlay=x='{x - pad}+{slide}':y={pip_y - pad}:"
+            f"{enable}:eof_action=pass"
+            f"[{sh_tag}]"
+        )
+        current_label = f"[{sh_tag}]"
     parts.append(
-        f"{current_label}[{final_tag}]overlay=x={x}:y={pip_y}:"
-        f"enable='between(n\\,{clip.start_frame}\\,{clip.end_frame})':eof_action=pass"
+        f"{current_label}[{final_tag}]overlay=x='{x}+{slide}':y={pip_y}:"
+        f"{enable}:eof_action=pass"
         f"[{tag}]"
     )
     return ";".join(parts), tag
@@ -724,40 +763,67 @@ def _apply_lineup_freezes(
     offset_path: Path,
     demo_path: Path,
     steam_id: str,
+    round_offsets: dict[int, float],
+    per_round_durations: dict[int, float],
     round_tick_ranges: dict[int, tuple[int, int]],
     round_frame_ranges: dict[int, tuple[int, int]],
     fps: float,
     width: int,
     height: int,
-) -> bool:
+) -> dict[str, Any]:
     """Freeze pre-pass: hold each unique non-straightforward lineup's aim frame.
 
     Loads the POV player's throws, dedupes to one per lineup, classifies
     straightforwardness, and inserts holds into ``video_path`` (single ffmpeg
     pass). Persists expanded offsets + ``freeze_windows`` to ``offset_path``;
-    the caller reloads both after this returns. Returns True when the video
-    was (re)frozen (caller must drop derived artifacts); False is a no-op
-    (nothing to freeze, or resume with identical specs).
+    the caller reloads both after this returns.
+
+    Returns a dict describing the PRISTINE (pre-freeze) timeline so the
+    compositor can map ticks/frames exactly instead of letting the expanded
+    sidecar stretch each frozen round:
+
+    ``{applied, freezes, round_offsets, per_round_durations,
+       round_frame_ranges}``
+
+    ``applied`` False is a no-op (nothing to freeze, or a resume guess); the
+    pristine fields are still populated with whatever timeline this call saw.
     """
+    def _result(
+        applied: bool,
+        freezes: list[tuple[int, float, str]],
+        offsets: dict[int, float],
+        durations: dict[int, float],
+        ranges: dict[int, tuple[int, int]],
+    ) -> dict[str, Any]:
+        return {
+            "applied": bool(applied),
+            "freezes": [(int(f), float(h)) for f, h, *_ in (freezes or [])],
+            "round_offsets": {int(k): float(v) for k, v in offsets.items()},
+            "per_round_durations": {int(k): float(v) for k, v in durations.items()},
+            "round_frame_ranges": {
+                int(k): (int(v[0]), int(v[1])) for k, v in ranges.items()
+            },
+        }
+
     if not round_tick_ranges or not round_frame_ranges:
-        return False
+        return _result(False, [], round_offsets, per_round_durations, round_frame_ranges)
     throws = _load_player_throws(demo_path, steam_id, 0, 0)
     if throws is None:
         _ensure_cs2util_data(demo_path)
         throws = _load_player_throws(demo_path, steam_id, 0, 0)
         if throws is None:
             _log("  [freeze] no CS2UtilArchive throw data — skipping freeze pre-pass")
-            return False
+            return _result(False, [], round_offsets, per_round_durations, round_frame_ranges)
     renderable = [
         t for t in throws
         if str(t.get("util_type", "")).lower() != "decoy"
         and bool(t.get("is_renderable", True))
     ]
     if not renderable:
-        return False
+        return _result(False, [], round_offsets, per_round_durations, round_frame_ranges)
     unique = dedupe_throws_by_lineup(select_window_throws(renderable, round_tick_ranges))
     if not unique:
-        return False
+        return _result(False, [], round_offsets, per_round_durations, round_frame_ranges)
     first = unique[0]
     map_name = str(first.get("map_name") or first.get("map") or "")
     data_dir = _find_demo_data_dir(demo_path)
@@ -795,11 +861,11 @@ def _apply_lineup_freezes(
 
     freezes = _compute(round_frame_ranges)
     if not freezes:
-        return False
+        return _result(False, [], round_offsets, per_round_durations, round_frame_ranges)
     recorded = _recorded()
     if _matches(freezes, recorded):
         _log(f"  [freeze] {len(freezes)} holds already in video (resume) — skipping encode")
-        return False
+        return _result(False, freezes, round_offsets, per_round_durations, round_frame_ranges)
     if recorded:
         # Video already has a DIFFERENT freeze set baked in — restore the
         # pre-freeze source first, then recompute on the restored timeline
@@ -820,11 +886,18 @@ def _apply_lineup_freezes(
         try:
             _restored = json.loads(offset_path.read_text())
             _restored_offsets = {int(k): float(v) for k, v in _restored.get("round_offsets", {}).items()}
+            _restored_durations = {
+                int(k): float(v)
+                for k, v in (_restored.get("per_round_durations") or {}).items()
+            }
         except Exception:
             _restored_offsets = {}
+            _restored_durations = {}
         if not _restored_offsets:
             _log("[ERROR] restored sidecar has no round_offsets")
             sys.exit(1)
+        round_offsets = _restored_offsets
+        per_round_durations = _restored_durations
         round_frame_ranges = _build_round_frame_ranges(
             _restored_offsets, round_tick_ranges, fps, _fc,
         )
@@ -832,7 +905,7 @@ def _apply_lineup_freezes(
         if not freezes:
             offset_path.write_text(json.dumps(
                 {**_restored, "freeze_windows": []}, indent=2))
-            return False
+            return _result(False, [], round_offsets, per_round_durations, round_frame_ranges)
 
     # Input recipe strips (CS2UtilArchive-style) baked onto each hold.
     recipe_by_id = compose_freeze_recipe_pngs(
@@ -877,7 +950,7 @@ def _apply_lineup_freezes(
             dropped += 1
     if dropped:
         _log(f"  [freeze] cleared {dropped} stale overlay artifacts")
-    return True
+    return _result(True, freezes, round_offsets, per_round_durations, round_frame_ranges)
 
 
 def run_overlay(
@@ -1028,26 +1101,38 @@ def run_overlay(
     # -- Step 0: Freeze pre-pass (non-straightforward lineups, --freeze only)
     # Holds the lineup aim frame in the MAIN pov video before the throw, so
     # the order is freeze -> throw -> PiP. Runs on .overlay_work/video.mp4
-    # BEFORE probing-driven math below: the sidecar offsets/durations are
-    # expanded for the inserted holds (in memory + rewritten on disk) so
-    # keyboard extraction, PiP placement, batch boundaries, and the later
-    # voice mix all see the frozen timeline. OFF by default (sidecar stays
-    # pristine); enable with --freeze.
+    # and rewrites the sidecar offsets/durations EXPANDED for the inserted
+    # holds. Batch boundaries and the later voice mix need that expanded
+    # timeline; the compositor does NOT — it maps ticks against the PRISTINE
+    # timeline and then pushes the result past the holds (freeze_plan), so a
+    # PiP after a freeze never drifts. OFF by default (sidecar stays pristine).
+    freeze_plan = None
+    pristine_offsets: dict[int, float] = dict(round_offsets)
+    pristine_durations: dict[int, float] = dict(round_video_duration)
     if freeze:
         round_frame_ranges = _build_round_frame_ranges(
             round_offsets, round_tick_ranges, fps, frame_count,
         )
-        _apply_lineup_freezes(
+        freeze_result = _apply_lineup_freezes(
             video_path=video_path,
             offset_path=offset_path,
             demo_path=demo_path,
             steam_id=steam_id,
+            round_offsets=round_offsets,
+            per_round_durations=round_video_duration,
             round_tick_ranges=round_tick_ranges,
             round_frame_ranges=round_frame_ranges,
             fps=fps,
             width=width,
             height=height,
         )
+        pristine_offsets = dict(freeze_result["round_offsets"])
+        pristine_durations = dict(freeze_result["per_round_durations"])
+        if freeze_result.get("freezes"):
+            freeze_plan = freeze_frame_plan(freeze_result["freezes"], fps)
+            _log(f"  [freeze] pristine timeline retained for compositor "
+                 f"({len(freeze_result['freezes'])} holds, "
+                 f"{freeze_plan['total_frames']} frames)")
         # Re-probe + reload: the pre-pass may have inserted holds.
         width, height, fps, frame_count = _probe_video_info(video_path)
         if offset_path.is_file():
@@ -1119,9 +1204,12 @@ def run_overlay(
         try:
             _kb_box["per_sig"] = _extract_keyboard_states(
                 demo_path, steam_id, frame_count, fps,
-                round_offsets=round_offsets or None,
+                # PRISTINE timeline + freeze plan: the extractor walks the
+                # frozen video but reads ticks from the pre-freeze sidecar.
+                round_offsets=pristine_offsets or None,
                 round_tick_ranges=round_tick_ranges or None,
-                round_video_duration=round_video_duration or None,
+                round_video_duration=pristine_durations or None,
+                freeze_plan=freeze_plan,
             )
         except BaseException as e:  # re-raised at join
             _kb_box["error"] = e
@@ -1160,30 +1248,23 @@ def run_overlay(
         keyboard_fc = ""
         keyboard_out_label = "[0:v]"
 
-        # Pre-render rounded-corner masks for the PiP. Two masks are shared by
-        # every PiP in every batch/pass: an INNER one (size = content area) to
-        # round the CONTENT corners first, and an OUTER one (size = full body)
-        # to round the white outline corners around it. Both are looped PNGs
-        # fed to ffmpeg as extra inputs and applied via alphamerge.
+        # Pre-render PiP dressing shared by every PiP in every batch/pass: an
+        # INNER rounded-corner mask (size = content area) applied via
+        # alphamerge, and a drop-shadow sprite composited behind the content.
+        # Both are looped PNGs fed to ffmpeg as extra inputs.
         pip_inner_mask: Path | None = None
-        pip_outer_mask: Path | None = None
+        pip_shadow: Path | None = None
+        body_size = _pip_body(height)
+        inner_size = max(1, body_size - 2 * PIP_OUTLINE_THICKNESS)
         if PIP_CORNER_RADIUS > 0:
-            body_size = _pip_body(height)
-            inner_size = max(1, body_size - 2 * PIP_OUTLINE_THICKNESS)
             pip_inner_mask = work_dir / f"pip_mask_inner_{inner_size}.png"
-            pip_outer_mask = work_dir / f"pip_mask_outer_{body_size}.png"
-            if not pip_outer_mask.exists():
-                # The outline pads the (already-rounded) content by
-                # PIP_OUTLINE_THICKNESS, so its outer boundary has corner radius
-                # PIP_CORNER_RADIUS + PIP_OUTLINE_THICKNESS (concentric). Using
-                # just PIP_CORNER_RADIUS here cuts the outline's corners off.
-                _make_rounded_corner_mask(
-                    pip_outer_mask, body_size,
-                    PIP_CORNER_RADIUS + PIP_OUTLINE_THICKNESS,
-                )
             if not pip_inner_mask.exists():
                 _make_rounded_corner_mask(pip_inner_mask, inner_size, PIP_CORNER_RADIUS)
-            _log(f"  Rounded PiP corners radius={PIP_CORNER_RADIUS}px (content + outline)")
+            _log(f"  Rounded PiP corners radius={PIP_CORNER_RADIUS}px")
+        pip_shadow = work_dir / f"pip_shadow_{body_size}.png"
+        if not pip_shadow.exists():
+            _make_pip_shadow(pip_shadow, body_size, PIP_CORNER_RADIUS)
+            _log(f"  PiP drop shadow offset={PIP_SHADOW_OFFSET} blur={PIP_SHADOW_BLUR}")
 
         # -- Step 3: Render utility throw flight clips ---------------------------
         t3 = time.time()
@@ -1191,10 +1272,13 @@ def run_overlay(
         flight_clips = _render_throw_flight_clips(
             demo_path, steam_id, fps, frame_count, work_dir,
             video_path=video_path,
-            round_offsets=round_offsets or None,
+            # PRISTINE offsets + freeze plan: the clip window is computed on
+            # the pre-freeze timeline, then pushed past the holds.
+            round_offsets=pristine_offsets or None,
             round_tick_ranges=round_tick_ranges or None,
             total_duration_seconds=video_total_seconds,
             util_cams_root=util_cams_root,
+            freeze_plan=freeze_plan,
         )
         n_clips = len(flight_clips) if flight_clips else 0
         _log(f"Flight clips: {n_clips} ({time.time()-t3:.1f}s)")
@@ -1342,16 +1426,19 @@ def run_overlay(
                     sorted_batch_pips: list[PipClip] = []
                     if batch_pips:
                         inner_idx = None
-                        outer_idx = None
-                        if pip_inner_mask is not None and pip_outer_mask is not None:
-                            inner_idx = pip_input_offset + len(batch_pips)
-                            outer_idx = inner_idx + 1
+                        shadow_idx = None
+                        next_idx = pip_input_offset + len(batch_pips)
+                        if pip_inner_mask is not None:
+                            inner_idx = next_idx
+                            next_idx += 1
+                        if pip_shadow is not None:
+                            shadow_idx = next_idx
                         pip_parts, pip_label, sorted_batch_pips = _build_pip_chain(
                             batch_pips, width, height, fps,
                             start_label=batch_kb_label,
                             pip_input_offset=pip_input_offset,
                             inner_mask_idx=inner_idx,
-                            outer_mask_idx=outer_idx,
+                            shadow_idx=shadow_idx,
                         )
                         pip_fc = ";".join(pip_parts)
 
@@ -1392,10 +1479,12 @@ def run_overlay(
                     fc_script.write_text(combined_fc, encoding="utf-8")
                     extra = list(png_inputs) + [c.clip_path for c in sorted_batch_pips]
                     loops = None
-                    if pip_inner_mask is not None and pip_outer_mask is not None:
+                    if pip_inner_mask is not None:
                         extra.append(pip_inner_mask)
-                        extra.append(pip_outer_mask)
-                        loops = {str(pip_inner_mask), str(pip_outer_mask)}
+                        loops = {str(pip_inner_mask)}
+                    if pip_shadow is not None:
+                        extra.append(pip_shadow)
+                        loops = (loops or set()) | {str(pip_shadow)}
                     _ffmpeg_encode(
                         str(video_path), extra,
                         ["-filter_complex_script", str(fc_script.resolve())],
@@ -1442,21 +1531,26 @@ def run_overlay(
                            keyboard_out_label, str(kb_temp))
             _log(f"  ({time.time()-t4:.1f}s)")
 
-            has_mask = pip_inner_mask is not None and pip_outer_mask is not None
+            pass2_next = 1 + len(flight_clips)
+            pass2_inner = pass2_next if pip_inner_mask is not None else None
+            pass2_next += 1 if pip_inner_mask is not None else 0
+            pass2_shadow = pass2_next if pip_shadow is not None else None
             pip_parts, pip_current, sorted_clips = _build_pip_chain(
                 flight_clips, width, height, fps,
-                inner_mask_idx=(1 + len(flight_clips) if has_mask else None),
-                outer_mask_idx=(2 + len(flight_clips) if has_mask else None))
+                inner_mask_idx=pass2_inner,
+                shadow_idx=pass2_shadow)
             pip_fc = ";".join(pip_parts)
             fc_script2 = work_dir / "pip_fc.txt"
             fc_script2.write_text(pip_fc, encoding="utf-8")
             _log(f"Pass 2: PiP composite (1 vid + {len(flight_clips)} flight clips)...")
             pass2_inputs: list[Path] = [c.clip_path for c in sorted_clips]
             pass2_loops = None
-            if has_mask:
+            if pip_inner_mask is not None:
                 pass2_inputs.append(pip_inner_mask)
-                pass2_inputs.append(pip_outer_mask)
-                pass2_loops = {str(pip_inner_mask), str(pip_outer_mask)}
+                pass2_loops = {str(pip_inner_mask)}
+            if pip_shadow is not None:
+                pass2_inputs.append(pip_shadow)
+                pass2_loops = (pass2_loops or set()) | {str(pip_shadow)}
             _ffmpeg_encode(str(kb_temp), pass2_inputs,
                            ["-filter_complex_script", str(fc_script2.resolve())],
                            pip_current, str(output_path),
@@ -1475,21 +1569,26 @@ def run_overlay(
 
         elif flight_clips:
             # PiP only
-            has_mask = pip_inner_mask is not None and pip_outer_mask is not None
+            only_next = 1 + len(flight_clips)
+            only_inner = only_next if pip_inner_mask is not None else None
+            only_next += 1 if pip_inner_mask is not None else 0
+            only_shadow = only_next if pip_shadow is not None else None
             pip_parts, pip_current, sorted_clips = _build_pip_chain(
                 flight_clips, width, height, fps,
-                inner_mask_idx=(1 + len(flight_clips) if has_mask else None),
-                outer_mask_idx=(2 + len(flight_clips) if has_mask else None))
+                inner_mask_idx=only_inner,
+                shadow_idx=only_shadow)
             pip_fc = ";".join(pip_parts)
             fc_script = work_dir / "pip_fc.txt"
             fc_script.write_text(pip_fc, encoding="utf-8")
             _log(f"PiP composite (1 vid + {len(flight_clips)} flight clips)...")
             pip_only_inputs: list[Path] = [c.clip_path for c in sorted_clips]
             pip_only_loops = None
-            if has_mask:
+            if pip_inner_mask is not None:
                 pip_only_inputs.append(pip_inner_mask)
-                pip_only_inputs.append(pip_outer_mask)
-                pip_only_loops = {str(pip_inner_mask), str(pip_outer_mask)}
+                pip_only_loops = {str(pip_inner_mask)}
+            if pip_shadow is not None:
+                pip_only_inputs.append(pip_shadow)
+                pip_only_loops = (pip_only_loops or set()) | {str(pip_shadow)}
             _ffmpeg_encode(str(video_path), pip_only_inputs,
                            ["-filter_complex_script", str(fc_script.resolve())],
                            pip_current, str(output_path),

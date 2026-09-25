@@ -457,12 +457,51 @@ def _render_trimmed_windows(
     _rename_sequence_files(output_dir, global_rounds, tick_overrides=overrides)
 
 
+_DEMO_NAMES_CACHE: dict[str, dict[str, str]] = {}
+
+
+def _demo_player_names(demo_path: str) -> dict[str, str]:
+    """{steamid: demo-recorded name} via demoparser2 (no game needed).
+
+    Swift speaker rows must never depend on the client's runtime name
+    resolution (which can return live/mangled strings); the demo file is
+    the deterministic source of truth. Cached per path: player info is
+    global to the demo, so one parse covers split parts too.
+    """
+    key = str(Path(demo_path).resolve())
+    if key not in _DEMO_NAMES_CACHE:
+        out: dict[str, str] = {}
+        try:
+            import demoparser2 as dp
+            info = dp.DemoParser(key).parse_player_info()
+            for _, row in info.iterrows():
+                sid = str(row.get("steamid", "")).strip()
+                nm = str(row.get("name", "")).strip()
+                if sid and nm:
+                    out[sid] = nm
+        except Exception as e:
+            print(f"  [WARN] demo name lookup failed: {e}")
+        _DEMO_NAMES_CACHE[key] = out
+    return _DEMO_NAMES_CACHE[key]
+
+
+def _merge_voice_names(rename_map: dict[str, str] | None,
+                       demo_names: dict[str, str]) -> dict[str, str]:
+    """Canonical pro names win; everyone else keeps the demo-recorded name."""
+    merged = {sid: nm for sid, nm in demo_names.items() if nm}
+    for sid, name in (rename_map or {}).items():
+        if name:
+            merged[str(sid)] = name
+    return merged
+
+
 def _voice_hud_session(demo_path: str, output_dir: Path, steam_id: str, args):
     style = getattr(args, "voice_indicators", "off")
     if style not in ("swift", "legacy"):
         return nullcontext()
     from overlay.swift_demoui import prepare, mounted_hud
-    names = json.loads(args.rename) if getattr(args, "rename", "") else {}
+    rename = json.loads(args.rename) if getattr(args, "rename", "") else {}
+    names = _merge_voice_names(rename, _demo_player_names(demo_path))
     menu, session = prepare(Path(demo_path), steam_id, output_dir, names, native=(style == "swift"))
     return mounted_hud(GAME_CFG.parent, menu, session)
 
@@ -721,23 +760,13 @@ def _run_csdm_hook_aware(cmd: list[str], label: str, expected: Path | None,
 
 
 def _get_player_crosshair(steam_id: str, demo_parts: list[str]) -> list[str]:
+    """Demo share-code fallback across split demo parts (shared lookup)."""
+    from crosshair_resolve import demo_crosshair_cvars
+
     for p in demo_parts:
-        with tempfile.TemporaryDirectory() as tmp:
-            cmd = [CSDM, "json", p, "--output-folder", tmp]
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-            if r.returncode != 0:
-                continue
-            jf = list(Path(tmp).glob("*.json"))
-            if not jf:
-                continue
-            data = json.loads(jf[0].read_text(encoding="utf-8"))
-            for pl in data.get("players", []):
-                if pl.get("steamId") == steam_id:
-                    code = pl.get("crosshairShareCode")
-                    if code:
-                        from crosshair_code import decode_crosshair, crosshair_to_convars
-                        cvars = crosshair_to_convars(decode_crosshair(code))
-                        return cvars
+        cvars = demo_crosshair_cvars(steam_id, p, csdm_cmd=CSDM)
+        if cvars:
+            return cvars
     return []
 
 
@@ -840,9 +869,11 @@ def _write_render_autoexec(cvars: list[str], rename_map: dict[str, str] | None =
     # in the CS2 console under HLAE, so mirv_* commands are available. byXuid
     # is stable per-player across demos (unlike byUserId, which differs each
     # demo). Only covers "some parts of the HUD" — chat is not replaced.
+    from overlay.swift_demoui import _strip_markup
     for steamid, name in (rename_map or {}).items():
         xuid = f"x{steamid}" if not str(steamid).startswith("x") else str(steamid)
-        lines.append(f'mirv_replace_name byXuid add {xuid} "{name}"')
+        safe_name = _strip_markup(name).replace('"', '')
+        lines.append(f'mirv_replace_name byXuid add {xuid} "{safe_name}"')
 
     # Spec lock (mirv_script_spec_lock_name): re-issues spec_player for the
     # POV player EVERY frame, so the camera stays on their deathcam after
@@ -1043,7 +1074,15 @@ def main() -> None:
     from overlay.swift_demoui import validate_render_profile
     validate_render_profile(output_dir, args.voice_indicators, args.steam_id)
 
-    cvars = _get_player_crosshair(args.steam_id, parts)
+    from scrapers.prosettings import resolve_crosshair
+    player_nick = (getattr(args, "player", "") or "").strip()
+    cvars, xhair_info = resolve_crosshair(
+        player_nick, lambda: _get_player_crosshair(args.steam_id, parts))
+    try:
+        (output_dir / "crosshair_used.json").write_text(
+            json.dumps(xhair_info, indent=2), encoding="utf-8")
+    except OSError as e:
+        print(f"  [WARN] could not write crosshair_used.json: {e}")
     vm_cvars = _viewmodel_cvars_from_args(args)
     if vm_cvars:
         print(f"  Viewmodel: {' | '.join(vm_cvars)}")

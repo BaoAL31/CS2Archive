@@ -148,25 +148,27 @@ def load_edit_timeline(path: Path) -> dict:
     return data
 
 
-def _get_player_crosshair_cvars(steam_id: str, demo_path: Path) -> list[str]:
-    """Extract crosshair share code from demo and decode to cvars."""
-    cvars = []
-    with tempfile.TemporaryDirectory() as tmp:
-        cmd = [CSDM, "json", str(demo_path.resolve()), "--output-folder", tmp]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if r.returncode != 0:
-            return cvars
-        jf = list(Path(tmp).glob("*.json"))
-        if not jf:
-            return cvars
-        data = json.loads(jf[0].read_text(encoding="utf-8"))
-        for pl in data.get("players", []):
-            if pl.get("steamId") == steam_id:
-                code = pl.get("crosshairShareCode")
-                if code:
-                    from crosshair_code import decode_crosshair, crosshair_to_convars
-                    cvars = crosshair_to_convars(decode_crosshair(code))
-                break
+def _nickname_for_steam_id(steam_id: str) -> str:
+    """Canonical nickname from the Recognised-Pro registry, "" when unknown."""
+    try:
+        accounts = json.loads((_PROJECT_ROOT / ".data" / "player_accounts.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    players = accounts if isinstance(accounts, list) else accounts.get("players", [])
+    for a in players:
+        if str(a.get("steam_id") or "") == str(steam_id) and a.get("nickname"):
+            return str(a["nickname"])
+    return ""
+
+
+def _get_player_crosshair_cvars(
+    steam_id: str, demo_path: Path, nickname: str = "",
+) -> list[str]:
+    """Shared crosshair system: prosettings-first, demo share code fallback."""
+    from crosshair_resolve import resolve_crosshair_cvars
+
+    nick = nickname or _nickname_for_steam_id(steam_id)
+    cvars, _info = resolve_crosshair_cvars(nick, steam_id, demo_path, csdm_cmd=CSDM)
     return cvars
 
 

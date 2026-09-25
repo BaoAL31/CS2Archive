@@ -293,25 +293,14 @@ def _resolve_player_resolution(steam_id: str) -> tuple[int, int, str]:
     return (_DEFAULT_SRC_WIDTH, _DEFAULT_SRC_HEIGHT, "Native")
 
 
-def _get_player_crosshair_cvars(steam_id: str, demo_path: Path) -> list[str]:
-    cvars = []
-    import tempfile
-    with tempfile.TemporaryDirectory() as tmp:
-        cmd = [CSDM, "json", str(demo_path.resolve()), "--output-folder", tmp]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if r.returncode != 0:
-            return cvars
-        jf = list(Path(tmp).glob("*.json"))
-        if not jf:
-            return cvars
-        data = json.loads(jf[0].read_text(encoding="utf-8"))
-        for pl in data.get("players", []):
-            if pl.get("steamId") == steam_id:
-                code = pl.get("crosshairShareCode")
-                if code:
-                    from crosshair_code import decode_crosshair, crosshair_to_convars
-                    cvars = crosshair_to_convars(decode_crosshair(code))
-                break
+def _get_player_crosshair_cvars(
+    steam_id: str, demo_path: Path, nickname: str = "",
+) -> list[str]:
+    """Shared crosshair system: prosettings-first, demo share code fallback."""
+    from crosshair_resolve import resolve_crosshair_cvars
+
+    cvars, _info = resolve_crosshair_cvars(
+        nickname, steam_id, demo_path, csdm_cmd=CSDM)
     return cvars
 
 
@@ -325,9 +314,10 @@ def _build_csdm_config(
     use_cpu: bool = False,
 ) -> dict:
     pov_sids = {s["pov_steam_id"] for s in shorts} | {s["pov_switch_to"] for s in shorts if "pov_switch_to" in s}
+    nicks = {s["pov_steam_id"]: (s.get("pov_nick") or "") for s in shorts}
     crosshair_cache = {}
     for sid in pov_sids:
-        cvars = _get_player_crosshair_cvars(sid, demo_path)
+        cvars = _get_player_crosshair_cvars(sid, demo_path, nicks.get(sid, ""))
         if cvars:
             crosshair_cache[sid] = cvars
             _dbg("xhair", f"crosshair for {sid}: {len(cvars)} cvars")

@@ -47,6 +47,22 @@ def test_smoke_cameras_are_combined_flight_detonate():
     assert ruc._cameras_for_type("he") == "flight"
 
 
+def test_pip_render_disables_input_overlay_burn():
+    """PiP renders must not burn CS2UtilArchive's keyboard/mouse overlay.
+
+    For single-camera he/flash jobs the deliverable path IS the standalone
+    flight_*.mp4 the PiP reads, so a burn would leak keycaps into the PiP.
+    """
+    import inspect
+    from overlay._common import prefer_cs2util_scripts
+    prefer_cs2util_scripts()
+    from scripts.render.csdm_session import BatchRenderOptions
+    assert BatchRenderOptions(data_dir="x").burn_input_overlay is True
+    assert BatchRenderOptions(data_dir="x", burn_input_overlay=False).burn_input_overlay is False
+    src = inspect.getsource(ruc._render_util_cams)
+    assert "burn_input_overlay=False" in src
+
+
 def test_util_id_uses_map_from_row(throws_df):
     uid = ruc._util_id_for_row(throws_df.iloc[0].to_dict())
     assert uid.startswith("de_inferno:smoke:T:")
@@ -89,6 +105,31 @@ def test_scan_reads_throw_poses_combined_clip(tmp_path: Path):
     clip.write_bytes(b"x" * 1_000_001)
     result = op._scan_utility_cams_clips(video)
     assert result[tid] == clip.resolve()
+
+
+def test_scan_prefers_flight_only_over_combined_with_input_overlay(tmp_path: Path):
+    """PiP must read the clean flight standalone, never the burned-in one.
+
+    The combined flight+detonate deliverable has CS2UtilArchive's keyboard/
+    mouse input overlay burned onto the clip; the flight-only standalone does
+    not. When both exist the scan must pick the clean one.
+    """
+    youtube_dir = tmp_path / "youtube" / "test_run"
+    video = youtube_dir / "video.mp4"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"fake video")
+    util_dir = youtube_dir / "utility_cams" / "unnamed" / "smoke"
+    util_dir.mkdir(parents=True)
+    tid = "x:e1:s0"
+    (util_dir / "_throw_poses.json").write_text(json.dumps({
+        "_cameras": "flight,detonate",
+        "_throws": {tid: {"pos": [0, 0, 0]}},
+    }), encoding="utf-8")
+    combined = util_dir / f"{ruc.clip_name_for_cameras('flight,detonate', tid)}.mp4"
+    flight = util_dir / f"{ruc.clip_name_for_cameras('flight', tid)}.mp4"
+    combined.write_bytes(b"x" * 1_000_001)
+    flight.write_bytes(b"x" * 1_000_001)
+    assert op._scan_utility_cams_clips(video)[tid] == flight.resolve()
 
 
 def test_scan_empty_without_poses(tmp_path: Path):

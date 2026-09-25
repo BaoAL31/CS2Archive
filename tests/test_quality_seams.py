@@ -15,7 +15,11 @@ ensure()
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts" / "upload"))
 from _backlog_common import pipeline_cmd, write_card
 from variant import resolve_skip_overlay, youtube_dir_name
-from overlay._common import cameras_for_util_type, clip_is_done
+from overlay._common import (
+    cameras_for_util_type,
+    clip_is_done,
+    pip_cameras_for_util_type,
+)
 from scoring import demand_as_raw_star, market_demand_bonus, star_bonus
 from upload_youtube import youtube_upload_completed
 
@@ -46,6 +50,13 @@ def test_smoke_cameras_are_combined():
     assert cameras_for_util_type("molotov") == "flight,detonate"
     assert cameras_for_util_type("he") == "flight"
     assert cameras_for_util_type("flash") == "flight"
+
+
+def test_pip_cameras_are_flight_only():
+    # The flight+detonate deliverable has the keyboard/mouse input overlay
+    # burned in; the PiP must read the clean flight standalone instead.
+    for util in ("smoke", "molotov", "fire", "he", "flash"):
+        assert pip_cameras_for_util_type(util) == "flight"
 
 
 def test_clip_is_done_uses_one_meg_floor(tmp_path: Path):

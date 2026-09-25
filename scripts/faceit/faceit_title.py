@@ -45,10 +45,10 @@ MAP_DISPLAY = {
     "de_vertigo": "Vertigo", "de_dust2": "Dust2", "de_train": "Train",
 }
 
-# CS2 cl_crosshairstyle display names (share-code style 0-5).
+# CS2 cl_crosshairstyle display names (share-code style == cvar value).
 _CROSSHAIR_STYLES = {
-    0: "Default", 1: "Default", 2: "Classic", 3: "Classic Static",
-    4: "Classic Dynamic", 5: "Classic Dynamic Legacy",
+    0: "Default", 1: "Default Static", 2: "Classic", 3: "Classic Dynamic",
+    4: "Classic Static", 5: "Legacy",
 }
 # Share-code preset colors 0-3; 4+ are custom RGB (see crosshair_code.py).
 _COLOR_NAMES = {0: "green", 1: "red", 2: "blue", 3: "yellow"}
@@ -194,6 +194,7 @@ def build_title(player: str, map_name: str, notable: list[str],
 def build_description(player: str, notable: list[str], elo: int | None,
                       opp_elo: int | None, *,
                       match_id: str = "", crosshair_code: str = "",
+                      crosshair_label: str = "",
                       video: dict | None = None) -> str:
     lines: list[str] = []
     if elo is not None and opp_elo is not None:
@@ -206,7 +207,9 @@ def build_description(player: str, notable: list[str], elo: int | None,
         lines.append(f"Match: https://www.faceit.com/en/cs2/room/{match_id}")
 
     settings: list[str] = []
-    if crosshair_code:
+    if crosshair_label:
+        settings.append(f"Crosshair: {crosshair_label}")
+    elif crosshair_code:
         summary = _crosshair_summary(crosshair_code)
         settings.append(f"Crosshair: {crosshair_code}"
                         + (f" ({summary})" if summary else ""))
@@ -248,6 +251,7 @@ def main() -> None:
     ap.add_argument("--voice-comms", action="store_true", help="Append ' + VOICE COMMS' to the title")
     ap.add_argument("--match-id", default="", help="FACEIT match id → room link in description")
     ap.add_argument("--crosshair-code", default="", help="POV player's crosshair share code (from csdm analysis)")
+    ap.add_argument("--crosshair-label", default="", help="Verbatim crosshair description (prosettings source; wins over --crosshair-code)")
     ap.add_argument("--viewmodel-fov", default="", help="Viewmodel FOV as rendered")
     ap.add_argument("--viewmodel-offset-x", default="", help="Viewmodel offset X as rendered")
     ap.add_argument("--viewmodel-offset-y", default="", help="Viewmodel offset Y as rendered")
@@ -307,6 +311,7 @@ def main() -> None:
     description = build_description(
         player, notable, args.elo, args.opp_elo,
         match_id=args.match_id.strip(), crosshair_code=args.crosshair_code.strip(),
+        crosshair_label=args.crosshair_label.strip(),
         video=video,
     )
     tags = ["FACEIT", "CS2", "POV", map_name, player] + notable

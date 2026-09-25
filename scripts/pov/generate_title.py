@@ -153,6 +153,8 @@ def main() -> None:
     )
     parser.add_argument("--crosshair-code", default="",
                         help="POV player's crosshair share code (from csdm analysis)")
+    parser.add_argument("--crosshair-label", default="",
+                        help="Verbatim crosshair description (prosettings source; wins over --crosshair-code)")
     parser.add_argument("--viewmodel-fov", default="", help="Viewmodel FOV as rendered")
     parser.add_argument("--viewmodel-offset-x", default="", help="Viewmodel offset X as rendered")
     parser.add_argument("--viewmodel-offset-y", default="", help="Viewmodel offset Y as rendered")
@@ -246,7 +248,9 @@ def main() -> None:
     # Settings (as rendered) — crosshair + viewmodel + resolution, mirrors the
     # FACEIT path so HLTV POVs advertise the player's actual settings too.
     settings: list[str] = []
-    if args.crosshair_code:
+    if args.crosshair_label.strip():
+        settings.append(f"Crosshair: {args.crosshair_label.strip()}")
+    elif args.crosshair_code:
         summary = _crosshair_summary(args.crosshair_code)
         settings.append(f"Crosshair: {args.crosshair_code}"
                         + (f" ({summary})" if summary else ""))

@@ -38,11 +38,15 @@ TICKRATE = 64.0
 
 # --- Util PiP geometry (shared with overlay_pov + render_util_cams) --------
 # Kept here so pip render sizing and overlay layout stay in sync.
-PIP_OUTLINE_THICKNESS = 2       # Pixels. White border around each PiP (0 disables outline).
+PIP_OUTLINE_THICKNESS = 0       # Pixels. White border removed; PiPs carry a drop shadow instead.
 PIP_CORNER_RADIUS = 16          # Pixels. Rounded corner radius. 0 = square corners.
-PIP_MARGIN = 12                 # Pixels. Outline-to-outline gap from video edge.
-PIP_GAP = 12                    # Pixels. Outline-to-outline gap between stacked PiPs.
+PIP_MARGIN = 12                 # Pixels. Content-to-content gap from video edge.
+PIP_GAP = 12                    # Pixels. Content-to-content gap between stacked PiPs.
 PIP_MAX_SIMULTANEOUS = 3
+PIP_SHADOW_OFFSET = (6, 6)      # Pixels. Bottom-right drop-shadow offset (matches intro panes).
+PIP_SHADOW_BLUR = 12            # Pixels. Shadow softness.
+PIP_SHADOW_OPACITY = 0.28       # Shadow strength.
+PIP_SLIDE_SECONDS = 0.3         # Ease-in-out slide duration at each end of a PiP window.
 
 # Util-cam clip is "done" at 1 MB — same floor as CSDM sequence resume.
 MIN_CLIP_BYTES = 1_000_000
@@ -52,6 +56,17 @@ SMOKE_CAMERAS = ("smoke", "fire", "molotov", "incendiary")
 def cameras_for_util_type(util_type: str) -> str:
     """Canonical CS2Util camera set: combined flight+detonate for smokes."""
     return "flight,detonate" if str(util_type).lower() in SMOKE_CAMERAS else "flight"
+
+
+def pip_cameras_for_util_type(util_type: str) -> str:
+    """Camera tokens for the overlay PiP source clip — flight ONLY.
+
+    The smoke ``flight,detonate`` deliverable has CS2UtilArchive's keyboard/
+    mouse input overlay burned in (``finalize`` burns every lineup segment).
+    The PiP is a small corner inset and must not carry keycaps, so it reads
+    the clean ``flight_<throw>.mp4`` standalone the same render also writes.
+    """
+    return "flight"
 
 
 # Below the byte floor but above this, ask ffprobe — short flash/HE flights
@@ -114,6 +129,11 @@ def _pip_body(video_height: int, max_simultaneous: int | None = None) -> int:
 def _pip_inner(video_height: int, max_simultaneous: int | None = None) -> int:
     """Content area inside the outline."""
     return _pip_body(video_height, max_simultaneous) - 2 * PIP_OUTLINE_THICKNESS
+
+
+def pip_shadow_pad() -> int:
+    """Padding around the shadow sprite. Must match imgutil.drop_shadow's pad."""
+    return PIP_SHADOW_BLUR + max(abs(PIP_SHADOW_OFFSET[0]), abs(PIP_SHADOW_OFFSET[1])) + 2
 
 
 def pip_render_dimensions(

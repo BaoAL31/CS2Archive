@@ -323,12 +323,8 @@ def _flag_img(path: Path | None, size: tuple[int, int] = (34, 24)) -> Image.Imag
     if key not in _FLAG_CACHE:
         try:
             im = Image.open(path).convert("RGBA").resize(size, Image.LANCZOS)
-            mask = Image.new("L", size, 0)
-            ImageDraw.Draw(mask).rounded_rectangle(
-                [0, 0, size[0] - 1, size[1] - 1], radius=4, fill=255)
-            out = Image.new("RGBA", size, (0, 0, 0, 0))
-            out.paste(im, (0, 0), mask)
-            _FLAG_CACHE[key] = out
+            from imgutil import rounded_layer
+            _FLAG_CACHE[key] = rounded_layer(im, 4)
         except Exception:
             _FLAG_CACHE[key] = None
     return _FLAG_CACHE[key]

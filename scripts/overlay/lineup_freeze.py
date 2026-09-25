@@ -31,6 +31,7 @@ import json
 import math
 import subprocess
 import sys
+from bisect import bisect_right
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,24 @@ ANCHOR_LEAD_TICKS = 12
 DEFAULT_FREEZE_SECONDS = 1.5
 # Fallback release-spot tolerance for util types CS2UtilArchive doesn't list.
 DEFAULT_SPOT_TOLERANCE = 96.0
+
+# High-arc tosses that stay in the thrower's own air volume for a long run are
+# open lobs, not lineups: the sightline is blocked by geometry FAR along the
+# path, so any stand/aim roughly works. CS2UtilArchive's ``classify_throw``
+# marks ANY throw with ``rise >= RISE_MIN`` as non-straightforward, which
+# over-includes these (e.g. a long intuitive HE at 45s). A genuine loft over a
+# nearby wall leaves the thrower's volume almost immediately (tiny exit_dist).
+# Tunable: raise to accept more lobs as intuitively straightforward.
+LOFT_EXIT_MAX = 250.0
+
+
+def is_intuitive_lob(*, los_open: bool, exit_dist: float) -> bool:
+    """True when a blocked sightline is a long open lob, not a nearby loft.
+
+    Only ever turns a non-straightforward verdict into straightforward (never
+    the reverse), so it can only reduce freeze/PiP count.
+    """
+    return (not bool(los_open)) and float(exit_dist) >= LOFT_EXIT_MAX
 
 _GRID_CACHE: dict[str, Any] = {}
 
@@ -251,6 +270,14 @@ def classify_throws_straightforward(
                 los_open=bool(los_open), same_volume=(ev == lv),
                 exit_dist=float(ex), total_range=float(rng), rise=float(rise),
             ))
+            if not straight and is_intuitive_lob(
+                los_open=bool(los_open), exit_dist=float(ex)
+            ):
+                # Long open lob: blocked sightline is far along the path, so
+                # the toss is intuitive and needs no lineup freeze/PiP.
+                straight = True
+                _log(f"  [freeze] {t.get('util_type')} t{t.get('throw_tick')} "
+                     f"open lob (exit={ex:.0f} rng={rng:.0f}) — straightforward")
             out[tid] = straight
             if not straight:
                 _log(f"  [freeze] lineup {t.get('util_type')} t{t.get('throw_tick')} "
@@ -663,3 +690,101 @@ def expand_offsets_for_freezes(
         shift += add
     _ = fps  # frame ranges are rebuilt downstream from the new offsets
     return new_offsets, new_durations, windows
+
+
+# -- Freeze-aware tick<->frame conversion ------------------------------------
+#
+# The freeze pre-pass inserts holds into the main POV BEFORE the overlay
+# compositor runs, so the sidecar offsets/durations expand and the naive
+# within-round linear tick->frame map stretches the whole round by the
+# inserted seconds. A throw after a hold then lands too early/late (observed
+# as "the pip after a freeze drifts").
+#
+# These helpers keep the compositor on the PRISTINE timeline: map the demo
+# tick to its pre-freeze frame, then push it past the holds whose anchor it
+# follows. The inverse (collapse) lets the keyboard extractor walk the FROZEN
+# video while still reading the pristine sidecar.
+
+
+def freeze_frame_plan(freezes: list[Any], fps: float) -> dict[str, Any]:
+    """Ordered hold plan for tick<->frame conversion. Pure function.
+
+    ``freezes`` items are ``(original_anchor_frame, hold_seconds)`` pairs or
+    window dicts with ``frame`` / ``hold_seconds``. Held frames replace one
+    content frame, so the net insertion per hold is ``max(1, round(hold_seconds*fps))``
+    (matching ``apply_freezes_single_pass``).
+
+    Returns ``anchors`` (original frames, ascending), ``hold_frames``,
+    ``prefix`` (``prefix[i] == sum(hold_frames[:i])``), ``exp_anchors``
+    (anchor position in the expanded timeline) and ``total_frames``.
+    """
+    pairs: list[tuple[int, int]] = []
+    for item in freezes:
+        if isinstance(item, dict):
+            frame = int(item.get("frame", 0))
+            hold = float(item.get("hold_seconds", 0.0))
+        else:
+            frame, hold = int(item[0]), float(item[1])
+        # apply_freezes_single_pass replaces ONE content frame with the hold,
+        # so the net insertion is max(1, round(hold*fps)) frames.
+        hold_frames = max(1, int(round(hold * fps))) if hold > 0 else 0
+        pairs.append((frame, hold_frames))
+    pairs.sort(key=lambda p: p[0])
+    anchors = [p[0] for p in pairs]
+    hold_frames = [p[1] for p in pairs]
+    prefix = [0]
+    for hf in hold_frames:
+        prefix.append(prefix[-1] + hf)
+    exp_anchors = [a + prefix[i] for i, a in enumerate(anchors)]
+    return {
+        "anchors": anchors,
+        "hold_frames": hold_frames,
+        "prefix": prefix,
+        "exp_anchors": exp_anchors,
+        "total_frames": prefix[-1],
+    }
+
+
+def expand_frame(orig_frame: int, plan: dict[str, Any]) -> int:
+    """Pristine frame -> frozen frame (add holds whose anchor it follows)."""
+    k = bisect_right(plan["anchors"], int(orig_frame))
+    return int(orig_frame) + plan["prefix"][k]
+
+
+def collapse_frame(expanded_frame: int, plan: dict[str, Any]) -> int:
+    """Frozen frame -> pristine frame (frames inside a hold clamp to anchor)."""
+    ef = int(expanded_frame)
+    k = bisect_right(plan["exp_anchors"], ef)
+    if k:
+        start = plan["exp_anchors"][k - 1]
+        if ef < start + plan["hold_frames"][k - 1]:
+            return plan["anchors"][k - 1]
+    return ef - plan["prefix"][k]
+
+
+def reconstruct_pristine_timeline(
+    expanded_offsets: dict[int, float],
+    expanded_durations: dict[int, float],
+    windows: list[dict[str, Any]],
+    fps: float,
+) -> tuple[dict[int, float], dict[int, float]]:
+    """Recover pre-freeze offsets/durations from expanded sidecar + windows.
+
+    Mirrors ``expand_offsets_for_freezes``: each round's duration grows by its
+    holds and every later round's offset shifts by all earlier holds.
+    """
+    by_round: dict[int, float] = {}
+    for w in windows or []:
+        rn = int(w.get("round", 0) or 0)
+        if rn:
+            by_round[rn] = by_round.get(rn, 0.0) + float(w.get("hold_seconds", 0.0))
+    orig_offsets = dict(expanded_offsets)
+    orig_durations = dict(expanded_durations)
+    shift = 0.0
+    for rn in sorted(expanded_offsets.keys()):
+        orig_offsets[rn] = expanded_offsets[rn] - shift
+        add = by_round.get(rn, 0.0)
+        if rn in orig_durations:
+            orig_durations[rn] = expanded_durations[rn] - add
+        shift += add
+    return orig_offsets, orig_durations

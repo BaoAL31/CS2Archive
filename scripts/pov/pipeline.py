@@ -164,11 +164,12 @@ def _faceit_rename_map(demo_path: Path) -> dict:
     except Exception:
         return {}
     pro_names = known_pro_steam_ids()  # steam_id_64 -> canonical pro name
+    from overlay.swift_demoui import _strip_markup
     rename_map = {}
     for sid in steam_ids:
         name = pro_names.get(sid)
         if name:
-            rename_map[sid] = name
+            rename_map[sid] = _strip_markup(name)
     return rename_map
 
 
@@ -995,6 +996,24 @@ class Pipeline:
                 return None
             return json.loads(jf[0].read_text(encoding="utf-8"))
 
+    def _rendered_crosshair_label(self) -> str:
+        """Verbatim crosshair label matching what render_pov actually used.
+
+        render_pov records its winning source in render_dir/crosshair_used.json
+        (prosettings-first, demo fallback). Returns "" when unknown so the
+        caller falls back to the demo share code path.
+        """
+        try:
+            used = json.loads((self.render_dir / "crosshair_used.json").read_text(encoding="utf-8"))
+        except Exception:
+            return ""
+        if used.get("source") == "prosettings" and used.get("settings"):
+            from scrapers.prosettings import crosshair_summary
+            summary = crosshair_summary(used["settings"])
+            if summary:
+                return f"prosettings ({summary})"
+        return ""
+
     def _pov_crosshair_code(self) -> str:
         """POV player's crosshair share code from the persisted csdm analysis.
 
@@ -1554,6 +1573,126 @@ class Pipeline:
         except OSError as e:
             print(f"  [WARN] intermediate cleanup failed (non-fatal): {e}")
 
+    def _prepend_hook(self, youtube_dir: Path, step_num: int = 5) -> None:
+        """Prepend a no-spoiler highlight cold open to video.mp4.
+
+        Runs FIRST in step 5 (before ``_prepend_intro``), so the delivered
+        order is: hook -> intro card + buy phase -> POV -> outro.
+
+        The hook is rendered separately from the POV because the POV footage
+        carries the full HUD (scores/round timer = spoilers). Hook segments are
+        rendered with ``cl_draw_only_deathnotices 1`` (killfeed only, the Shorts
+        format) and re-encoded with the overlay final-export profile, so the
+        prepend is a plain stream copy.
+
+        A demo with no qualifying moment is a normal skip (not an error) — the
+        video simply ships without a hook. Raw-only skips (raw stays raw).
+        """
+        if getattr(self.args, "no_hook", False):
+            print("  [skip] --no-hook: no hook cold open")
+            return
+        if self.skip_overlay:
+            print("  [skip] raw-only: no hook")
+            return
+
+        video = youtube_dir / "video.mp4"
+        if not video.exists():
+            fail(step_num, "HOOK_VIDEO_MISSING", f"video.mp4 not found in {youtube_dir}")
+        sidecar = youtube_dir / "video.round_offsets.json"
+        if sidecar.is_file():
+            try:
+                if float(json.loads(sidecar.read_text()).get("hook_seconds", 0) or 0) > 0:
+                    print("  [skip] hook already prepended (sidecar hook_seconds set)")
+                    return
+            except Exception:
+                pass
+        if not self.demo_path or not self.demo_path.exists():
+            fail(step_num, "HOOK_NO_DEMO", f"demo required for hook: {self.demo_path}")
+        if not self.steam_id:
+            fail(step_num, "HOOK_NO_STEAM_ID", "no steam_id for hook")
+
+        hook_dir = PROJECT_ROOT / "renders" / f"hook-{self.demo_path.stem}_{self.steam_id}"
+        timeline = hook_dir / "hook_timeline.json"
+        max_seconds = float(getattr(self.args, "hook_max_seconds", 30.0))
+
+        # 1. Select moments (detection runs only when there is no cached timeline;
+        #    delete hook_timeline.json to re-tune the tier threshold).
+        if not timeline.is_file():
+            args = [
+                "scripts/pov/build_hook_timeline.py", str(self.demo_path),
+                "--player", self.steam_id,
+                "--max-moments", str(int(getattr(self.args, "hook_max_moments", 3))),
+                "--max-seconds", str(max_seconds),
+            ]
+            if getattr(self.args, "hook_tiers", None):
+                args += ["--tiers", str(self.args.hook_tiers)]
+            r = self._run_py(args, timeout=3600)
+            if r.returncode != 0:
+                fail(step_num, "HOOK_TIMELINE_FAILED",
+                     f"build_hook_timeline.py exited {r.returncode}")
+            if not timeline.is_file():
+                print("  [skip] no qualifying hook moment for this POV")
+                return
+
+        # 2. Render the planned windows (CSDM, killfeed-only HUD).
+        r = self._run_py([
+            "scripts/pov/render_hook.py", str(timeline),
+            "--max-seconds", str(max_seconds),
+            "--hook-timeout", str(getattr(self.args, "hook_timeout", 150.0)),
+            "--hook-retries", str(getattr(self.args, "hook_retries", 2)),
+        ], timeout=14400)
+        if r.returncode != 0:
+            fail(step_num, "HOOK_RENDER_FAILED", f"render_hook.py exited {r.returncode}")
+        render_json = hook_dir / "hook_render.json"
+        if not render_json.is_file():
+            fail(step_num, "HOOK_NO_RENDER_JSON", f"missing {render_json}")
+
+        # 3. Crossfade the clips into one hook at the POV's resolution/fps.
+        hook_mp4 = hook_dir / "hook.mp4"
+        r = self._run_py([
+            "scripts/pov/assemble_hook.py", str(render_json),
+            "--pov-video", str(video),
+            "--fade", str(float(getattr(self.args, "hook_fade", 0.25))),
+        ], timeout=7200)
+        if r.returncode != 0:
+            fail(step_num, "HOOK_ASSEMBLE_FAILED", f"assemble_hook.py exited {r.returncode}")
+        if not hook_mp4.is_file() or hook_mp4.stat().st_size < 1_000_000:
+            fail(step_num, "HOOK_NO_OUTPUT", f"hook missing or tiny: {hook_mp4}")
+
+        # 4. Stream-copy prepend (same profile as the overlay final export).
+        try:
+            from faceit.intro_prepend import prepend as _prepend_segment
+        except Exception as e:  # noqa: BLE001
+            fail(step_num, "HOOK_IMPORT_FAILED", f"intro_prepend.prepend: {e}")
+        out = youtube_dir / "video.hook.mp4"
+        _prepend_segment(hook_mp4, video, out)
+        if not out.is_file() or out.stat().st_size < 1_000_000:
+            fail(step_num, "HOOK_PREPEND_FAILED", f"prepend produced nothing: {out}")
+        out.replace(video)
+
+        hook_dur = self._probe_duration(hook_mp4)
+        print(f"  [OK] Hook prepended in {youtube_dir.name}/ ({hook_dur:.2f}s)")
+
+        # 5. Shift every downstream timestamp by the hook duration.
+        if sidecar.is_file():
+            try:
+                data = json.loads(sidecar.read_text(encoding="utf-8"))
+            except Exception as e:
+                fail(step_num, "HOOK_SIDECAR_UNREADABLE", f"{sidecar.name}: {e}")
+            data["round_offsets"] = {k: float(v) + hook_dur
+                                     for k, v in (data.get("round_offsets") or {}).items()}
+            data["total_duration_seconds"] = float(data.get("total_duration_seconds", 0) or 0) + hook_dur
+            data["hook_seconds"] = hook_dur
+            fps = self._probe_fps(video) or 60.0
+            if isinstance(data.get("freeze_windows"), list):
+                for w in data["freeze_windows"]:
+                    try:
+                        w["frame"] = float(w.get("frame", 0)) + hook_dur * fps
+                    except Exception:
+                        pass
+            sidecar.write_text(json.dumps(data, indent=2))
+            print(f"  [OK] sidecar shifted +{hook_dur:.2f}s (hook)")
+
     def _prepend_intro(self, youtube_dir: Path, step_num: int = 5) -> None:
         """Prepend the match intro card + buy-phase lead-in to video.mp4.
 
@@ -1589,15 +1728,30 @@ class Pipeline:
 
         intro_dir = PROJECT_ROOT / "renders" / f"intro-{self.run_id}"
         intro_png = intro_dir / "intro.png"
-        if not intro_png.is_file():
+        # Only trust an intro produced by the Repeek snapshot builder; any
+        # other intro.png (e.g. the removed drawn card) must be rebuilt.
+        intro_ok = False
+        if intro_png.is_file():
+            try:
+                det = json.loads((intro_dir / "intro_details.json").read_text(encoding="utf-8"))
+                intro_ok = (
+                    det.get("builder") == "create_repeek_intro"
+                    and det.get("effect") == "pane_drop_shadow"
+                    and det.get("effect_version") == 5
+                )
+            except Exception:
+                intro_ok = False
+        if not intro_ok:
+            # Intro frame = a snapshot of the real FACEIT/Repeek room page
+            # (scrapers.repeek_snapshot), not a card drawn by us.
             r = self._run_py([
-                "scripts/faceit/create_match_intro.py",
+                "scripts/faceit/create_repeek_intro.py",
                 "--backlog", str(self.args.backlog),
                 "--output", str(intro_dir),
-            ], timeout=900)
+            ], timeout=1800)
             if r.returncode != 0:
                 fail(step_num, "INTRO_CARD_FAILED",
-                     f"create_match_intro.py exited {r.returncode}")
+                     f"create_repeek_intro.py exited {r.returncode}")
             if not intro_png.is_file():
                 cands = sorted(intro_dir.rglob("intro.png"))
                 if cands:
@@ -1678,6 +1832,7 @@ class Pipeline:
             return 60.0
 
     def step_outro(self) -> None:
+        self._prepend_hook(self.youtube_dir, step_num=5)
         self._prepend_intro(self.youtube_dir, step_num=5)
         self._append_outro(self.youtube_dir, step_num=5)
 
@@ -1957,9 +2112,15 @@ class Pipeline:
 
         # Crosshair + viewmodel + video settings are added to BOTH the HLTV and
         # FACEIT title paths (prosettings-driven "Settings (as rendered)").
-        code = self._pov_crosshair_code()
-        if code:
-            titlize_args += ["--crosshair-code", code]
+        # Prefer the crosshair source render_pov actually used (recorded in
+        # crosshair_used.json); fall back to the demo share code.
+        xhair_label = self._rendered_crosshair_label()
+        if xhair_label:
+            titlize_args += ["--crosshair-label", xhair_label]
+        else:
+            code = self._pov_crosshair_code()
+            if code:
+                titlize_args += ["--crosshair-code", code]
         for flag, key in (
             ("--viewmodel-fov", "viewmodel_fov"),
             ("--viewmodel-offset-x", "viewmodel_offset_x"),
@@ -2105,6 +2266,38 @@ def main() -> None:
         help="Freeze each unique non-straightforward lineup's aim frame in "
              "the main POV before the throw in step 4 (default: off — "
              "sidecar stays pristine).",
+    )
+    parser.add_argument(
+        "--no-hook",
+        action="store_true",
+        default=False,
+        help="Skip the hook cold open in step 5 (no highlight prepended to "
+             "the video).",
+    )
+    parser.add_argument(
+        "--hook-tiers",
+        default=None,
+        help="Qualifying hook tiers, best first (default: the builder's list, "
+             "clutch/5k/punch-up/4k/insta_kill/clutch_attempt).",
+    )
+    parser.add_argument(
+        "--hook-max-moments",
+        type=int,
+        default=3,
+        help="Most moments a hook may use (default: 3).",
+    )
+    parser.add_argument(
+        "--hook-max-seconds",
+        type=float,
+        default=30.0,
+        help="Hook footage budget in seconds (default: 30). Weakest moments "
+             "are dropped to fit.",
+    )
+    parser.add_argument(
+        "--hook-fade",
+        type=float,
+        default=0.25,
+        help="Crossfade duration between hook clips (default: 0.25).",
     )
     parser.add_argument(
         "--enable-voice-comms",

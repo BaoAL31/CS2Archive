@@ -40,6 +40,15 @@ def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _strip_markup(text: object) -> str:
+    """Plain-text names for HUD labels: drop anything looking like a tag.
+
+    Speaker-row labels render text literally, so markup arriving from any
+    name source (rename map, demo, live persona) would show up raw.
+    """
+    return re.sub(r"<[^>]*>?", "", str(text or "")).strip()
+
+
 def install() -> None:
     """Download a pinned official release, verify it, retain upstream licenses."""
     cache = PACKAGE.parent.parent
@@ -77,7 +86,7 @@ def patch_runtime(source: str, allowed_steamids: list[str], names: dict[str, str
         raise ValueError("A nonempty POV-team SteamID list is required")
     config = json.dumps({
         "allowed": {str(s): True for s in allowed_steamids},
-        "names": names,
+        "names": {str(sid): _strip_markup(name) for sid, name in (names or {}).items()},
         "native": bool(native),
     }, ensure_ascii=True)
     source = "var CS2ArchiveVoice = " + config + ";\n" + source
@@ -100,10 +109,13 @@ def patch_runtime(source: str, allowed_steamids: list[str], names: dict[str, str
         if (archiveToggle) archiveToggle.visible = false;
 """,
         "if (name) name.text = player.name;":
-            "if (name) name.text = CS2ArchiveVoice.names[String(player.xuid)] || player.name;\n"
+            "if (name) name.text = _CleanPlayerName(CS2ArchiveVoice.names[String(player.xuid)] || player.name);\n"
             "			if (CS2ArchiveVoice.native) _StyleNativeSpeaking(notice, player, name);",
         "	function _RenderSpeakingPlayers(slots) {":
-            """	function _StyleNativeSpeaking(notice, player, name) {
+            """	function _CleanPlayerName(value) {
+		return String(value == null ? "" : value).replace(/<[^>]*>?/g, "").replace(/\\s+/g, " ").trim();
+	}
+	function _StyleNativeSpeaking(notice, player, name) {
 		var overlay = _Panel("SwiftDemoVoiceStatusOverlay");
 		if (overlay) {
 			overlay.style.margin = "0px 0px 168px 10px";

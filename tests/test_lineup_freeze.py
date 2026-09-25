@@ -18,6 +18,11 @@ from overlay.lineup_freeze import (  # noqa: E402
     dedupe_throws_by_lineup,
     expand_offsets_for_freezes,
     classify_throws_straightforward,
+    collapse_frame,
+    expand_frame,
+    freeze_frame_plan,
+    is_intuitive_lob,
+    reconstruct_pristine_timeline,
     select_window_throws,
     split_straightforward,
 )
@@ -161,6 +166,20 @@ def test_split_straightforward_keeps_all_without_data(tmp_path):
     assert drop == []
 
 
+def test_intuitive_lob_requires_blocked_los_and_far_exit():
+    # The reported HE at 45s: blocked sightline, but the trajectory leaves the
+    # thrower's volume 637u away -> long open lob, not a lineup.
+    assert is_intuitive_lob(los_open=False, exit_dist=637.0) is True
+    # Nearby loft over a wall: leaves the volume almost immediately.
+    assert is_intuitive_lob(los_open=False, exit_dist=14.0) is False
+    # Open sightline is already handled by classify_throw.
+    assert is_intuitive_lob(los_open=True, exit_dist=900.0) is False
+    # Boundary is inclusive at LOFT_EXIT_MAX.
+    from overlay.lineup_freeze import LOFT_EXIT_MAX
+    assert is_intuitive_lob(los_open=False, exit_dist=LOFT_EXIT_MAX) is True
+    assert is_intuitive_lob(los_open=False, exit_dist=LOFT_EXIT_MAX - 1.0) is False
+
+
 def test_expand_offsets_shifts_later_rounds():
     offsets = {1: 0.0, 2: 50.0, 3: 100.0}
     durations = {1: 50.0, 2: 50.0, 3: 60.0}
@@ -184,6 +203,85 @@ def test_expand_offsets_no_freezes_passthrough():
     )
     assert (new_off, new_dur, windows) == (offsets, durations, [])
     assert new_off is not offsets  # copies, never mutates caller state
+
+
+def test_freeze_frame_plan_net_insert_matches_seconds():
+    plan = freeze_frame_plan([(100, 1.5), (4000, 2.5)], fps=60.0)
+    assert plan["anchors"] == [100, 4000]
+    assert plan["hold_frames"] == [90, 150]
+    assert plan["prefix"] == [0, 90, 240]
+    assert plan["exp_anchors"] == [100, 4090]
+    assert plan["total_frames"] == 240
+
+
+def test_freeze_frame_plan_accepts_window_dicts_and_sorts():
+    plan = freeze_frame_plan(
+        [{"frame": 4000, "hold_seconds": 2.5}, {"frame": 100, "hold_seconds": 1.5}],
+        fps=60.0,
+    )
+    assert plan["anchors"] == [100, 4000]
+    assert plan["total_frames"] == 240
+
+
+def test_expand_and_collapse_frame_round_trip():
+    plan = freeze_frame_plan([(100, 1.5)], fps=60.0)  # 90 inserted frames
+    # Before the anchor: untouched.
+    assert expand_frame(0, plan) == 0
+    assert expand_frame(99, plan) == 99
+    # At/after the anchor: pushed past the hold.
+    assert expand_frame(100, plan) == 190
+    assert expand_frame(599, plan) == 689
+    # Inside the hold clamps back to the anchor (keys stay held).
+    assert collapse_frame(100, plan) == 100
+    assert collapse_frame(189, plan) == 100
+    # After the hold inverts exactly.
+    assert collapse_frame(190, plan) == 100
+    assert collapse_frame(689, plan) == 599
+    assert collapse_frame(50, plan) == 50
+
+
+def test_expand_and_collapse_multiple_holds():
+    plan = freeze_frame_plan([(100, 1.5), (300, 1.0)], fps=60.0)  # +90, +60
+    assert expand_frame(299, plan) == 389     # only the first hold applies
+    assert expand_frame(300, plan) == 450     # second hold applies at anchor
+    assert collapse_frame(449, plan) == 300   # inside second hold -> anchor
+    assert collapse_frame(450, plan) == 300
+    assert collapse_frame(389, plan) == 299
+
+
+def test_reconstruct_pristine_timeline_inverts_expansion():
+    offsets = {1: 0.0, 2: 50.0, 3: 100.0}
+    durations = {1: 50.0, 2: 50.0, 3: 60.0}
+    frame_ranges = {1: (0, 2999), 2: (3000, 5999), 3: (6000, 9599)}
+    new_off, new_dur, windows = expand_offsets_for_freezes(
+        offsets, durations, frame_ranges, [(100, 1.5), (4000, 2.5)], fps=60.0,
+    )
+    got_off, got_dur = reconstruct_pristine_timeline(new_off, new_dur, windows, fps=60.0)
+    assert got_off == offsets
+    assert got_dur == durations
+
+
+def test_pip_mapping_stays_put_across_a_freeze():
+    """A throw after a freeze must not drift by the inserted hold.
+
+    Reproduces the reported bug: the expanded sidecar stretches the whole
+    round, so the naive linear map places a later PiP tens of frames off.
+    The pristine map + expand_frame keeps it exact.
+    """
+    from overlay.overlay_utilcams import _map_throw_tick_to_frame
+
+    rs, re = 10000, 20000          # 10000 ticks of gameplay
+    pristine = {1: (0, 599)}       # 600 pristine frames
+    expanded = {1: (0, 689)}       # +90 frames from a 1.5s hold at frame 100
+    tick_mid = 16000               # 60% through the round
+    base = _map_throw_tick_to_frame(tick_mid, {1: (rs, re)}, pristine)
+    naive = _map_throw_tick_to_frame(tick_mid, {1: (rs, re)}, expanded)
+    plan = freeze_frame_plan([(100, 1.5)], fps=60.0)
+    exact = expand_frame(base, plan)
+    assert base == 359
+    assert exact == 449            # +90 frames, the real hold
+    assert naive == 413            # naive stretched map drifts ~36 frames
+    assert exact != naive
 
 
 def _ratings_fixture(path: Path) -> Path:

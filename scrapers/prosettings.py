@@ -132,6 +132,212 @@ def scrape_player_viewmodel(
     return out
 
 
+def scrape_player_crosshair(
+    nickname: str,
+    session: requests.Session | None = None,
+) -> dict:
+    """Fetch crosshair fields from a player's prosettings page.
+
+    Reads the Crosshair section's ``data-field="cl_*"`` rows, so the keys
+    are already CS2 convar names (values are raw display strings).
+    Empty dict on failure.
+    """
+    nick = (nickname or "").strip()
+    if not nick:
+        return {}
+    slug = nick.lower().replace(" ", "-")
+    sess = session or requests.Session()
+    try:
+        resp = sess.get(_PLAYER_URL.format(slug=slug), headers=_UA, timeout=60)
+        if resp.status_code != 200:
+            return {}
+        soup = BeautifulSoup(resp.text, "lxml")
+    except Exception:
+        return {}
+    section = None
+    for h in soup.find_all(["h2", "h3", "h4"]):
+        if h.get_text(strip=True).lower() == "crosshair":
+            section = h.find_parent("section") or h.find_next(["table", "dl"])
+            break
+    root = section if section is not None else soup
+    out: dict = {}
+    for tag in root.find_all(["tr", "dt"]):
+        field = tag.get("data-field", "") if tag.name == "tr" else ""
+        if tag.name == "tr":
+            cells = [c.get_text(strip=True) for c in tag.find_all(["th", "td"])]
+            if field and len(cells) >= 2 and cells[1]:
+                out[field] = cells[1]
+        else:
+            dd = tag.find_next_sibling("dd")
+            if dd and dd.get_text(strip=True):
+                out[tag.get_text(strip=True).lower()] = dd.get_text(strip=True)
+    return out
+
+
+_CROSSHAIR_STYLE_CVARS = {
+    "default": 0,
+    "default static": 1,
+    "classic": 2,
+    "classic dynamic": 3,
+    "classic static": 4,
+    "legacy": 5,
+    "hybrid": 5,
+}
+
+_PRESET_COLOR_CVARS = {
+    "green": 0, "red": 1, "blue": 2, "yellow": 3, "cyan": 4, "teal": 4,
+}
+
+
+def _custom_color_preset(settings: dict) -> int | None:
+    """Nearest CS2 color preset for a Custom RGB crosshair.
+
+    Mint (high green, e.g. donk's 0/255/165) reads as green on video, so the
+    green sector is widened to cover it instead of falling through to teal.
+    """
+    try:
+        r = int(float(settings.get("cl_crosshaircolor_r", 0)))
+        g = int(float(settings.get("cl_crosshaircolor_g", 0)))
+        b = int(float(settings.get("cl_crosshaircolor_b", 0)))
+    except (TypeError, ValueError):
+        return None
+    import colorsys
+    h, s, _ = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+    if s < 0.15:
+        return None
+    deg = h * 360.0
+    if deg < 30 or deg >= 330:
+        return 1
+    if deg < 70:
+        return 3
+    if deg <= 170:
+        return 0
+    if deg <= 195:
+        return 4
+    if deg <= 285:
+        return 2
+    return 1
+
+
+def _yes_no(value: str | None) -> int | None:
+    t = (value or "").strip().lower()
+    if t in ("yes", "true", "1", "on"):
+        return 1
+    if t in ("no", "false", "0", "off"):
+        return 0
+    return None
+
+
+def crosshair_convars(settings: dict) -> list[str]:
+    """CS2 convars for crosshair fields present in prosettings *settings*.
+
+    Same 19-line shape as crosshair_code.crosshair_to_convars so both
+    crosshair sources are interchangeable downstream.
+    """
+    if not settings:
+        return []
+    lines: list[str] = []
+    style = _CROSSHAIR_STYLE_CVARS.get((settings.get("cl_crosshairstyle") or "").strip().lower())
+    if style is not None:
+        lines.append(f"cl_crosshairstyle {style}")
+    for key in (
+        "cl_crosshairsize", "cl_crosshairthickness", "cl_crosshairgap",
+        "cl_crosshair_outlinethickness", "cl_crosshairalpha",
+        "cl_fixedcrosshairgap", "cl_crosshair_dynamic_splitdist",
+        "cl_crosshair_dynamic_splitalpha_innermod",
+        "cl_crosshair_dynamic_splitalpha_outermod",
+        "cl_crosshair_dynamic_maxdist_splitratio", "cl_crosshair_sniper_width",
+    ):
+        val = settings.get(key)
+        if val is None or val == "":
+            continue
+        lines.append(f"{key} {val}")
+    for key, cvar in (
+        ("cl_crosshairdot", "cl_crosshairdot"),
+        ("cl_crosshair_drawoutline", "cl_crosshair_drawoutline"),
+        ("cl_crosshair_recoil", "cl_crosshair_recoil"),
+        ("cl_crosshair_t", "cl_crosshair_t"),
+        ("cl_crosshairgap_useweaponvalue", "cl_crosshairgap_useweaponvalue"),
+        ("cl_crosshairusealpha", "cl_crosshairusealpha"),
+    ):
+        bit = _yes_no(settings.get(key))
+        if bit is not None:
+            lines.append(f"{cvar} {bit}")
+    color = (settings.get("cl_crosshaircolor") or "").strip().lower()
+    if color in _PRESET_COLOR_CVARS:
+        lines.append(f"cl_crosshaircolor {_PRESET_COLOR_CVARS[color]}")
+    elif color == "custom":
+        preset = _custom_color_preset(settings)
+        if preset is not None:
+            lines.append(f"cl_crosshaircolor {preset}")
+        for key in ("cl_crosshaircolor_r", "cl_crosshaircolor_g", "cl_crosshaircolor_b"):
+            val = settings.get(key)
+            if val is not None and val != "":
+                lines.append(f"{key} {val}")
+    return lines
+
+
+def crosshair_summary(settings: dict) -> str | None:
+    """Compact one-line crosshair summary from prosettings fields, or None."""
+    if not settings:
+        return None
+    parts = []
+    style = (settings.get("cl_crosshairstyle") or "").strip()
+    if style:
+        parts.append(style)
+    for key, label in (
+        ("cl_crosshairsize", "size"), ("cl_crosshairthickness", "thickness"),
+        ("cl_crosshairgap", "gap"),
+    ):
+        if settings.get(key) not in (None, ""):
+            parts.append(f"{label} {settings[key]}")
+    if _yes_no(settings.get("cl_crosshairdot")) == 1:
+        parts.append("dot")
+    if _yes_no(settings.get("cl_crosshair_drawoutline")) == 1:
+        parts.append("outline")
+    color = (settings.get("cl_crosshaircolor") or "").strip()
+    if color.lower() in _PRESET_COLOR_CVARS:
+        parts.append(color.lower())
+    elif color.lower() == "custom":
+        parts.append("custom rgb(%s,%s,%s)" % (
+            settings.get("cl_crosshaircolor_r", "?"),
+            settings.get("cl_crosshaircolor_g", "?"),
+            settings.get("cl_crosshaircolor_b", "?"),
+        ))
+    return ", ".join(parts) or None
+
+
+def resolve_crosshair_settings(nickname: str) -> dict:
+    """Scraped crosshair fields for a player ({} when unknown/offline)."""
+    try:
+        return scrape_player_crosshair(nickname)
+    except Exception as e:
+        print(f"  [WARN] prosettings crosshair lookup failed: {e}")
+        return {}
+
+
+def resolve_crosshair(
+    nickname: str,
+    fallback: "callable[[], list[str]] | None" = None,
+) -> tuple[list[str], dict]:
+    """Prosettings crosshair first, demo share code fallback.
+
+    Returns (cvars, info) where info is {"source": "prosettings", "settings"}
+    or {"source": "demo"}. Empty cvars + {"source": "none"} when neither hits.
+    """
+    settings = resolve_crosshair_settings(nickname) if (nickname or "").strip() else {}
+    cvars = crosshair_convars(settings)
+    if cvars:
+        print(f"  Crosshair: prosettings ({nickname})")
+        return cvars, {"source": "prosettings", "settings": settings}
+    if fallback is not None:
+        cvars = fallback() or []
+        if cvars:
+            print("  Crosshair: demo share code")
+            return cvars, {"source": "demo"}
+    return [], {"source": "none"}
+
+
 def viewmodel_convars(settings: dict) -> list[str]:
     """CS2 convars for viewmodel and HUD fields present in *settings*."""
     lines: list[str] = []

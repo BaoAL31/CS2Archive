@@ -552,6 +552,10 @@ def _render_util_cams(
         max_victim_povs=0,
         width=rw,
         height=rh,
+        # Overlay PiPs must stay keycap-free: CS2UtilArchive's input-overlay burn
+        # would otherwise land on the standalone flight_*.mp4 that the PiP reads
+        # (single-camera he/flash jobs finalize to that exact file).
+        burn_input_overlay=False,
     )
 
     work_dir = util_cams_root / "_batch_workdir"

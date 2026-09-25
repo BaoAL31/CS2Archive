@@ -5,6 +5,48 @@
 
 The missing-recording failure now has a **causally tested CSDM initialization defect** (see September 21 below). The clean fix is now installed locally for CSDM 3.20.1. The broader historical association with Steam online/offline remains unproven. Older theories and mitigations below are retained as investigation history, not established explanations.
 
+## 2026-09-24: HLAE was too old for CS2 1.41.8.2 (check this FIRST)
+
+**Before touching Steam or the CSDM plugin, read the HLAE error window.** The
+Sep-24 failure looked identical to the Steam-online flake (CSDM prints only
+`Starting Counter-Strike... / Recording in progress... / HLAE error`, exits 0 at
+~6s, no video, nothing in `~/.csdm/logs/csdm.log`) but was unrelated. Growing up
+the CSDM stack shows the same three lines and no detail; the reason is a **GUI
+message box**, not a log line.
+
+Capture it: `.data/hlae_win_probe.py <batch_config.json>` launches a render and
+enumerates the CS2/HLAE window titles + child control text, then cleans up. The
+dialog read:
+
+```
+Error - AfxHookSource2
+Problem in C:\source\advancedfx\AfxHookSource2\addresses.cpp:120
+```
+
+`addresses.cpp` is HLAE's byte-signature scanner; that throw means HLAE's
+pattern table does not match the installed CS2 build (it is version-pinned to a
+CS2 patch). CS2 had updated to **1.41.8.2 (VersionDate Sep 22 2026)** while the
+installed HLAE was **2.192.1 / AfxHookSource2 0.41.1**, whose changelog last
+says *"Adjusted to CS2 update (1.41.6.8)"*.
+
+**Fix:** install the matching HLAE. `advancedfx/advancedfx` releases a new HLAE
+whenever CS2 moves the offsets:
+
+| CS2 build | Required HLAE |
+|---|---|
+| 1.41.8.2 | **HLAE 2.192.3** (AfxHookSource2 0.41.3, 2026-09-23) |
+
+Install steps (no destructive change; keep the old version):
+1. Download `https://github.com/advancedfx/advancedfx/releases/download/v2.192.3/hlae_2_192_3.zip`
+   (sha256 `680b90dd5bed3e5b17de0945cc62e147696817ecdcf5e80b5de3c3cb77a84ab1`).
+2. Extract its **root contents** into `%USERPROFILE%\.csdm\hlae-versions\HLAE-2.192.3\`.
+3. Point `~/.csdm/settings.json` `video.hlae.customExecutableLocation` at
+   `...HLAE-2.192.3\HLAE.exe` (back up settings.json first).
+
+After that the hook works again (verified: a pip render recorded on the 2nd
+harness attempt). Note the harness's `FFMPEG_GRACE` (45s) can still kill a slow
+first attempt; the retry succeeds.
+
 ## Installed fix — 2026-09-21
 
 The clean plugin is retained at `assets/csdm-startup-fix/server.dll` with its

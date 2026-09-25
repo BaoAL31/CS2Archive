@@ -20,9 +20,11 @@ Reads all POV metadata from the backlog file. Runs steps 1-6 in order (analyze �
 
 **Uploading is a separate step.** The pipeline stops at step 6 (thumbnail) and writes `upload_meta.json` (with `youtube_id=null`, `upload_status="pending"`). Run `python scripts/upload/upload_pending.py` afterward. Step 4 (overlay) is the default product. `--raw-only` skips overlay entirely — no overlay work directory or util_cams are created. `--until 3` also stops before overlay.
 
-**Overlay step (step 4) does two things:**
-1. Extracts keyboard states via demoparser2 (full round, not sparse parquet)
-2. Renders utility throw flight clips via CSDM `build_flight_command()` (chase camera) then composites as PiP overlays at bottom-left
+**Overlay step (step 4) does three things (input + freeze are opt-in):**
+
+1. Renders utility throw flight clips via CSDM `build_flight_command()` (chase camera) then composites as PiP overlays at bottom-left. PiPs are **keycap-free**: the render passes `burn_input_overlay=False` so CS2UtilArchive's keyboard/mouse burn never lands on the clip, and the PiP reads the flight-only source (`pip_cameras_for_util_type`). This matters most for single-camera he/flash jobs, whose deliverable path IS the standalone `flight_<throw>.mp4`.
+2. With `--keyboard`, extracts keyboard states via demoparser2 and composites the input sprites (**OFF by default**).
+3. With `--freeze`, inserts lineup freeze holds in the main POV before each non-straightforward throw (**OFF by default**). Non-straightforward = CS2UtilArchive `classify_throw` plus a CS2Archive tightened-open-lob gate: a blocked sightline whose trajectory stays in the thrower's own air volume for ≥250u (`LOFT_EXIT_MAX`) is intuitive, not a lineup. The pre-pass rewrites the sidecar offsets/durations *expanded* for the holds (batch boundaries + the voice mix need that), but the compositor maps demo ticks against the **pristine** timeline and then pushes each frame past the holds (`freeze_frame_plan` / `expand_frame`). Re-mapping on the expanded sidecar stretched each frozen round and made the PiP after a hold drift.
 
 Throw clips are rendered in sequence via CSDM/HLAE — this takes ~1-2 minutes per throw. For a full match with 20+ throws, budget 30-60 minutes.
 
@@ -31,6 +33,34 @@ restyled). `--voice-indicators legacy` keeps Swift's original dark-bar chrome.
 `--voice-indicators shade` is the older scoreboard-avatar effect, including
 resuming old footage. Swift (native or legacy) must be captured in step 2; see
 [setup and recovery](swift-demoui.md).
+
+**Hook cold open (inside step 5, first — before the intro card):** every POV
+gets a no-spoiler highlight prepended: the POV player's best moments
+(`scripts/pov/build_hook_timeline.py` → `render_hook.py` → `assemble_hook.py`),
+rendered with `cl_draw_only_deathnotices 1` (killfeed only, the Shorts HUD) so
+no score/round/timer leaks.
+
+- Order delivered: hook → card + buy phase → POV → outro. Each prepend shifts
+  every downstream timestamp in `video.round_offsets.json` (`hook_seconds`,
+  then `intro_seconds`).
+- A demo with no qualifying moment is a normal skip — the video ships without a
+  hook. `--no-hook` disables the step entirely.
+- Tier threshold and coverage numbers: see the Hook section in `AGENTS.md`.
+
+**FACEIT match intro (inside step 5, before the outro):** the intro frame is
+composed from the **Repeek left/right stat panes**, not a card drawn by us.
+`scripts/faceit/create_repeek_intro.py` reuses or captures
+`renders/stat-strips/<match_id>/repeek_left.png` + `repeek_right.png` via the
+existing `scrapers.repeek_snapshot` capture (`run_standalone`, headed Chrome on
+`.sessions/faceit`), renders each pane as a **rounded pop-up card** (inset
+`PANE_MARGIN` from every edge, `PANE_RADIUS` anti-aliased corners via
+`scripts/imgutil.rounded_layer`) with a **transparent middle** (the buy-phase
+footage shows through) →
+`renders/intro-<run_id>/intro.png` (2560x1440 RGBA), consumed unchanged by
+`intro_prepend.py`. `_prepend_intro` only reuses an `intro.png` whose
+`intro_details.json` has `"builder": "create_repeek_intro"` — anything else is
+rebuilt. (The old drawn card was removed.) Capture needs the Repeek extension +
+a logged-in FACEIT session; it is the new failure mode for `INTRO_CARD_FAILED`.
 
 ### Structured Errors (agent-parseable)
 
