@@ -77,7 +77,10 @@ def test_demo_lookup_decodes_share_code(tmp_path: Path):
         cvars = demo_crosshair_cvars("123", tmp_path / "x.dem", csdm_cmd="csdm")
 
     assert "cl_crosshairstyle 4" in cvars
-    assert "cl_crosshaircolor 4" in cvars
+    assert "cl_crosshaircolor 5" in cvars
+    assert "cl_crosshaircolor_r 255" in cvars
+    assert "cl_crosshaircolor_g 255" in cvars
+    assert "cl_crosshaircolor_b 255" in cvars
 
 
 def test_demo_lookup_miss_returns_empty(tmp_path: Path):

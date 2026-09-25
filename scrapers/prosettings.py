@@ -185,38 +185,9 @@ _CROSSHAIR_STYLE_CVARS = {
 }
 
 _PRESET_COLOR_CVARS = {
-    "green": 0, "red": 1, "blue": 2, "yellow": 3, "cyan": 4, "teal": 4,
+    "red": 0, "green": 1, "yellow": 2, "blue": 3, "cyan": 4, "teal": 4,
+    "ltblue": 4, "lightblue": 4,
 }
-
-
-def _custom_color_preset(settings: dict) -> int | None:
-    """Nearest CS2 color preset for a Custom RGB crosshair.
-
-    Mint (high green, e.g. donk's 0/255/165) reads as green on video, so the
-    green sector is widened to cover it instead of falling through to teal.
-    """
-    try:
-        r = int(float(settings.get("cl_crosshaircolor_r", 0)))
-        g = int(float(settings.get("cl_crosshaircolor_g", 0)))
-        b = int(float(settings.get("cl_crosshaircolor_b", 0)))
-    except (TypeError, ValueError):
-        return None
-    import colorsys
-    h, s, _ = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
-    if s < 0.15:
-        return None
-    deg = h * 360.0
-    if deg < 30 or deg >= 330:
-        return 1
-    if deg < 70:
-        return 3
-    if deg <= 170:
-        return 0
-    if deg <= 195:
-        return 4
-    if deg <= 285:
-        return 2
-    return 1
 
 
 def _yes_no(value: str | None) -> int | None:
@@ -267,9 +238,7 @@ def crosshair_convars(settings: dict) -> list[str]:
     if color in _PRESET_COLOR_CVARS:
         lines.append(f"cl_crosshaircolor {_PRESET_COLOR_CVARS[color]}")
     elif color == "custom":
-        preset = _custom_color_preset(settings)
-        if preset is not None:
-            lines.append(f"cl_crosshaircolor {preset}")
+        lines.append("cl_crosshaircolor 5")
         for key in ("cl_crosshaircolor_r", "cl_crosshaircolor_g", "cl_crosshaircolor_b"):
             val = settings.get(key)
             if val is not None and val != "":
@@ -307,13 +276,23 @@ def crosshair_summary(settings: dict) -> str | None:
     return ", ".join(parts) or None
 
 
-def resolve_crosshair_settings(nickname: str) -> dict:
-    """Scraped crosshair fields for a player ({} when unknown/offline)."""
-    try:
-        return scrape_player_crosshair(nickname)
-    except Exception as e:
-        print(f"  [WARN] prosettings crosshair lookup failed: {e}")
-        return {}
+def resolve_crosshair_settings(nickname: str, *, retries: int = 3) -> dict:
+    """Scraped crosshair fields for a player ({} when unknown/offline).
+
+    Retries transient network flakes: a single failed fetch must not silently
+    downgrade a render to the demo fallback crosshair.
+    """
+    import time
+
+    for attempt in range(max(1, retries)):
+        try:
+            settings = scrape_player_crosshair(nickname)
+            if settings:
+                return settings
+        except Exception as e:
+            print(f"  [WARN] prosettings crosshair lookup failed (attempt {attempt + 1}): {e}")
+        time.sleep(5)
+    return {}
 
 
 def resolve_crosshair(

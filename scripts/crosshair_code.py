@@ -41,11 +41,11 @@ def decode_crosshair(code: str) -> dict:
     }
 
 def crosshair_to_convars(ch: dict) -> list[str]:
-    # CS2 cl_crosshaircolor: 0=green, 1=red, 2=blue, 3=yellow, 4=teal/cyan.
-    # cl_crosshaircolor_r/g/b cvars are IGNORED by CS2 (custom RGB not available via cfg).
-    # Share code colors 0-3 map directly to CS2 presets. Colors 4+ all clamp to 4 (teal).
-    cs2_color = ch["color"] if ch["color"] in {0, 1, 2, 3} else 4
-    return [
+    # CS2 cl_crosshaircolor: 0=red, 1=green, 2=yellow, 3=blue, 4=ltblue,
+    # 5=custom (reads cl_crosshaircolor_r/g/b). Share-code color nibble uses
+    # the same numbering; RGB bytes are only meaningful for custom (5+).
+    color = ch["color"] if ch["color"] in {0, 1, 2, 3, 4} else 5
+    lines = [
         f"cl_crosshairstyle {ch['style']}",
         f"cl_crosshairsize {ch['length']}",
         f"cl_crosshairthickness {ch['thickness']}",
@@ -53,7 +53,13 @@ def crosshair_to_convars(ch: dict) -> list[str]:
         f"cl_crosshair_drawoutline {1 if ch['outlineEnabled'] else 0}",
         f"cl_crosshair_outlinethickness {ch['outline']}",
         f"cl_crosshairdot {1 if ch['centerDotEnabled'] else 0}",
-        f"cl_crosshaircolor {cs2_color}",
+        f"cl_crosshaircolor {color}"]
+    if color == 5:
+        lines += [
+            f"cl_crosshaircolor_r {ch['red']}",
+            f"cl_crosshaircolor_g {ch['green']}",
+            f"cl_crosshaircolor_b {ch['blue']}"]
+    return lines + [
         f"cl_crosshairalpha {ch['alpha']}",
         f"cl_crosshairusealpha {1 if ch['alphaEnabled'] else 0}",
         f"cl_crosshair_recoil {1 if ch['followRecoil'] else 0}",

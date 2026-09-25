@@ -1,6 +1,7 @@
 """Prosettings crosshair: scrape data-field rows, map to cvars, prefer over demo."""
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -67,30 +68,28 @@ def test_convars_match_donk_prosettings():
     assert "cl_crosshairthickness 1.5" in cvars
     assert "cl_crosshairgap -4" in cvars
     assert "cl_crosshair_drawoutline 0" in cvars
-    assert "cl_crosshaircolor 0" in cvars
+    assert "cl_crosshaircolor 5" in cvars
+    assert "cl_crosshaircolor_r 0" in cvars
     assert "cl_crosshaircolor_g 255" in cvars
+    assert "cl_crosshaircolor_b 165" in cvars
     assert "cl_crosshairusealpha 1" in cvars
     assert "cl_crosshair_recoil 0" in cvars
     assert len(cvars) == len(set(cvars))
 
 
-def test_custom_colors_map_to_nearest_preset():
-    assert "cl_crosshaircolor 4" in crosshair_convars({
+def test_custom_colors_use_exact_rgb():
+    cvars = crosshair_convars({
         "cl_crosshaircolor": "Custom", "cl_crosshaircolor_r": "0",
         "cl_crosshaircolor_g": "255", "cl_crosshaircolor_b": "255"})
-    assert "cl_crosshaircolor 2" in crosshair_convars({
-        "cl_crosshaircolor": "Custom", "cl_crosshaircolor_r": "0",
-        "cl_crosshaircolor_g": "0", "cl_crosshaircolor_b": "255"})
-    assert "cl_crosshaircolor 3" in crosshair_convars({
-        "cl_crosshaircolor": "Custom", "cl_crosshaircolor_r": "255",
-        "cl_crosshaircolor_g": "255", "cl_crosshaircolor_b": "0"})
-    assert "cl_crosshaircolor 1" in crosshair_convars({
-        "cl_crosshaircolor": "Custom", "cl_crosshaircolor_r": "255",
-        "cl_crosshaircolor_g": "0", "cl_crosshaircolor_b": "0"})
+    assert "cl_crosshaircolor 5" in cvars
+    assert "cl_crosshaircolor_g 255" in cvars
+    assert "cl_crosshaircolor_b 255" in cvars
+    assert not [c for c in cvars if re.match(r"cl_crosshaircolor [0-4]$", c)]
 
 
 def test_named_colors_and_unknown_style():
-    assert "cl_crosshaircolor 0" in crosshair_convars({"cl_crosshaircolor": "Green"})
+    assert "cl_crosshaircolor 1" in crosshair_convars({"cl_crosshaircolor": "Green"})
+    assert "cl_crosshaircolor 4" in crosshair_convars({"cl_crosshaircolor": "Cyan"})
     cvars = crosshair_convars({"cl_crosshairstyle": "Something New", "cl_crosshairsize": "2"})
     assert "cl_crosshairsize 2" in cvars
     assert not [c for c in cvars if c.startswith("cl_crosshairstyle")]
@@ -102,6 +101,27 @@ def test_summary_names_style_size_color():
 
     assert crosshair_summary(out) == "Classic Static, size 1, thickness 1.5, gap -4, custom rgb(0,255,165)"
     assert crosshair_summary({}) is None
+
+
+def test_resolve_retries_transient_scrape_failures(monkeypatch):
+    import time
+
+    import scrapers.prosettings as ps
+
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    calls = []
+
+    def flaky(nick, session=None):
+        calls.append(nick)
+        if len(calls) < 3:
+            raise ConnectionError("flaky")
+        return {"cl_crosshairsize": "2"}
+
+    monkeypatch.setattr(ps, "scrape_player_crosshair", flaky)
+    out = ps.resolve_crosshair_settings("donk")
+
+    assert out == {"cl_crosshairsize": "2"}
+    assert calls == ["donk"] * 3
 
 
 def test_resolve_prefers_prosettings_then_demo(monkeypatch):

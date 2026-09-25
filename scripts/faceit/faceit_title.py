@@ -50,8 +50,8 @@ _CROSSHAIR_STYLES = {
     0: "Default", 1: "Default Static", 2: "Classic", 3: "Classic Dynamic",
     4: "Classic Static", 5: "Legacy",
 }
-# Share-code preset colors 0-3; 4+ are custom RGB (see crosshair_code.py).
-_COLOR_NAMES = {0: "green", 1: "red", 2: "blue", 3: "yellow"}
+# CS2 color presets; 5+ carry custom RGB (see crosshair_code.py).
+_COLOR_NAMES = {0: "red", 1: "green", 2: "yellow", 3: "blue", 4: "cyan"}
 
 
 def _crosshair_summary(code: str) -> str | None:
@@ -71,11 +71,11 @@ def _crosshair_summary(code: str) -> str | None:
         parts.append("dot")
     if ch.get("outlineEnabled"):
         parts.append(f"outline {ch['outline']:g}")
-    color = ch.get("color")
-    if color in _COLOR_NAMES:
-        parts.append(_COLOR_NAMES[color])
-    else:
-        parts.append(f"rgb({ch.get('red', 0)},{ch.get('green', 0)},{ch.get('blue', 0)})")
+    red, green, blue = ch.get("red", 0), ch.get("green", 0), ch.get("blue", 0)
+    if (red, green, blue) != (0, 0, 0):
+        parts.append(f"rgb({red},{green},{blue})")
+    elif ch.get("color") in _COLOR_NAMES:
+        parts.append(_COLOR_NAMES[ch["color"]])
     return ", ".join(parts)
 
 
