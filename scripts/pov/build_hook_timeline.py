@@ -75,6 +75,43 @@ TIER_LABELS = {
 
 DEFAULT_TIERS = ",".join(TIER_ORDER)
 
+# Round 1 sits ~30s into the finished video, so replaying it as a cold open adds
+# nothing the viewer is not about to see anyway. Round 0 is the knife/warmup
+# round. Hooks therefore start at round 2 by default (``--min-round``).
+MIN_ROUND_DEFAULT = 2
+
+
+def round_allowed(round_no, min_round: int = MIN_ROUND_DEFAULT) -> bool:
+    """False for the knife round, round 1, and anything unresolvable."""
+    try:
+        return int(round_no) >= int(min_round)
+    except (TypeError, ValueError):
+        return False
+
+
+def timeline_matches(payload: dict, *, tiers: list[str] | None = None,
+                     min_round: int | None = None,
+                     max_moments: int | None = None,
+                     max_seconds: float | None = None) -> bool:
+    """True when a cached hook_timeline.json was built with the same filters.
+
+    The pipeline reuses a cached timeline instead of re-running detection, so a
+    stale cache would silently ignore a changed tier/threshold/round filter.
+    Callers must rebuild when this returns False.
+    """
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        return False  # pre-params cache: rebuild once
+    if tiers is not None and list(params.get("tiers") or []) != list(tiers):
+        return False
+    if min_round is not None and int(params.get("min_round", 1)) != int(min_round):
+        return False
+    if max_moments is not None and int(params.get("max_moments", 0)) != int(max_moments):
+        return False
+    if max_seconds is not None and float(params.get("max_seconds", 0)) != float(max_seconds):
+        return False
+    return True
+
 
 def _kills(short: dict) -> int:
     return len(short.get("kill_ticks") or [])
@@ -279,6 +316,7 @@ def build_hook_timeline(
     tiers: str = DEFAULT_TIERS,
     max_moments: int = 3,
     max_seconds: float = 30.0,
+    min_round: int = MIN_ROUND_DEFAULT,
     tickrate: int = 64,
 ) -> dict:
     """Rank a demo's hook-worthy moments and pick up to ``max_moments``.
@@ -322,6 +360,13 @@ def build_hook_timeline(
             m["pov_nick"] = m.get("pov_nick") or (player or "Unknown")
         candidates.extend(insta)
 
+    # Round filter: a hook must not replay the opening round (see round_allowed).
+    before = len(candidates)
+    candidates = [c for c in candidates if round_allowed(c.get("round"), min_round)]
+    dropped_early = before - len(candidates)
+    if dropped_early:
+        print(f"  [round] dropped {dropped_early} moment(s) from rounds < {min_round}")
+
     # Best first, then kills desc.
     candidates.sort(key=_sort_key)
 
@@ -354,13 +399,18 @@ def build_hook_timeline(
         "map": timeline.get("map", "Unknown"),
         "tickrate": int(timeline.get("tickrate") or tickrate),
         "player": {"steam_id": player_sid, "nick": player_nick},
-        "tiers": enabled,
-        "max_moments": max_moments,
-        "max_seconds": max_seconds,
+        "params": {
+            "tiers": enabled,
+            "min_round": int(min_round),
+            "max_moments": int(max_moments),
+            "max_seconds": float(max_seconds),
+        },
         "picked": picked,
         "candidates": candidates,
         "reason": ("; ".join(m["rank_reason"] for m in reversed(picked))
-                   if picked else "no qualifying moment"),
+                   if picked else
+                   (f"no qualifying moment above round {min_round - 1}" if dropped_early
+                    else "no qualifying moment")),
     }
 
 
@@ -381,6 +431,10 @@ def main() -> int:
                     help="Keep at most this many moments (default: 3)")
     ap.add_argument("--max-seconds", type=float, default=30.0,
                     help="Total uncut footage budget in seconds (default: 30)")
+    ap.add_argument("--min-round", type=int, default=MIN_ROUND_DEFAULT,
+                    help=f"Earliest round a hook may use (default: {MIN_ROUND_DEFAULT} — "
+                         f"round 1 is ~30s into the video, so replaying it "
+                         f"as a cold open is wasted; 0/1 are always useless)")
     ap.add_argument("--include-all-players", action="store_true",
                     help="Accept moments from any player (default: Recognised Pros only; "
                          "ignored when --player is given)")
@@ -400,6 +454,7 @@ def main() -> int:
         tiers=args.tiers,
         max_moments=args.max_moments,
         max_seconds=args.max_seconds,
+        min_round=args.min_round,
     )
 
     if not timeline["picked"]:

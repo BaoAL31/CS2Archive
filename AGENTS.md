@@ -78,7 +78,9 @@ python scripts/pov/assemble_hook.py renders/hook-<stem>_<player>/hook_render.jso
 - `hook_plan.py` plans **kill-anchored windows before rendering** (2s setup, 1.2s pre-kill, 1.5s post-kill, 2.5s payoff capped at 4s, adjacent windows merged) so each CSDM sequence is already a tight clip — no re-trim at assembly, no silent-segment risk.
 - Renders under `autoexec_render.cfg` (this run's pro crosshair/viewmodel **+ HLAE spec-lock**), matching the POV footage. The spec-lock is what keeps the camera on the POV player after death — `clutch_attempt` moments usually end with them dead.
 - Assembly is **one ffmpeg pass**: xfade + acrossfade chain, scaled to the POV video's exact W×H/fps, NVENC CQ15 / 60M (the overlay final-export profile) → the prepend into `video.mp4` stays a plain `-c copy` stream copy.
-- `--no-hook` disables it; `--hook-tiers`, `--hook-max-moments` (3), `--hook-max-seconds` (30), `--hook-fade` (0.25) tune it. Delete `hook_timeline.json` to re-tune the tier threshold (the builder only runs when the timeline is missing).
+- `--no-hook` disables it; `--hook-tiers`, `--hook-max-moments` (3), `--hook-max-seconds` (30), `--hook-fade` (0.25), `--hook-min-round` (2) tune it. Delete `hook_timeline.json` to re-tune the tier threshold.
+- **`--hook-min-round` (default 2):** round 1 sits ~30s into the finished video, so replaying it as a cold open is wasted (and round 0 is the knife round). A POV whose only hook-worthy moment is round 1 therefore ships with **no hook** — correct, not a failure.
+- **Cached-timeline staleness:** the builder only re-runs when `hook_timeline.json` is missing, so the timeline records its `params` (tiers / min_round / max_moments / max_seconds) and the pipeline revalidates them — a changed filter **rebuilds** instead of silently reusing stale selections (`timeline_matches()`; pre-`params` caches rebuild once).
 
 ## Match Intro (16:9 Highlight Intro)
 

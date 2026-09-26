@@ -12,7 +12,10 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from pov.build_hook_timeline import (  # noqa: E402
     DEFAULT_TIERS,
+    MIN_ROUND_DEFAULT,
     TIER_ORDER,
+    round_allowed,
+    timeline_matches,
     tier_of,
 )
 from pov.hook_plan import plan_hook  # noqa: E402
@@ -149,6 +152,60 @@ def test_budget_drops_weakest_moment_first_and_keeps_one():
     plan = plan_hook([weak, strong], TICKRATE, max_seconds=1.0)
     assert len(plan) == 1, "must shed moments to fit the budget"
     assert plan[0]["label"] == "1v3 CLUTCH", "the strong moment must survive"
+
+
+# ── round filter ─────────────────────────────────────────────────────────
+
+def test_round_1_is_excluded_by_default():
+    # Round 1 sits ~30s into the finished video: a cold-open replay of it is
+    # wasted, and round 0 is the knife/warmup round.
+    assert MIN_ROUND_DEFAULT == 2
+    assert round_allowed(0) is False
+    assert round_allowed(1) is False
+    assert round_allowed(2) is True
+    assert round_allowed(15) is True
+
+
+def test_round_filter_rejects_unresolvable_rounds():
+    assert round_allowed(None) is False
+    assert round_allowed("") is False
+    assert round_allowed("nope") is False
+
+
+def test_round_filter_is_configurable():
+    assert round_allowed(1, min_round=1) is True
+    assert round_allowed(1, min_round=5) is False
+    assert round_allowed(5, min_round="5") is True
+
+
+# ── stale-cache guard ────────────────────────────────────────────────────
+
+def _params(tiers=None, min_round=2, max_moments=3, max_seconds=30.0):
+    return {"params": {"tiers": tiers or list(TIER_ORDER), "min_round": min_round,
+                       "max_moments": max_moments, "max_seconds": max_seconds}}
+
+
+def test_cache_matches_when_filters_agree():
+    assert timeline_matches(_params(), tiers=list(TIER_ORDER), min_round=2,
+                            max_moments=3, max_seconds=30.0) is True
+
+
+def test_cache_is_stale_when_the_round_filter_changed():
+    # The bug this guards: a cached timeline built before --min-round existed
+    # would keep serving round-1 moments.
+    assert timeline_matches(_params(min_round=1), min_round=2) is False
+
+
+def test_cache_is_stale_on_any_filter_change():
+    cached = _params()
+    assert timeline_matches(cached, tiers=list(TIER_ORDER)[:-1]) is False
+    assert timeline_matches(cached, max_moments=5) is False
+    assert timeline_matches(cached, max_seconds=12.0) is False
+
+
+def test_cache_without_params_is_treated_as_stale():
+    assert timeline_matches({"picked": []}, min_round=2) is False
+    assert timeline_matches({"params": "nonsense"}, min_round=2) is False
 
 
 # ── crossfade math ───────────────────────────────────────────────────────
