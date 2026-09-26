@@ -34,6 +34,7 @@ whenever CS2 moves the offsets:
 
 | CS2 build | Required HLAE |
 |---|---|
+| 1.41.8.3 | **HLAE 2.192.4** (AfxHookSource2 0.41.4, 2026-09-24) |
 | 1.41.8.2 | **HLAE 2.192.3** (AfxHookSource2 0.41.3, 2026-09-23) |
 
 Install steps (no destructive change; keep the old version):

@@ -19,7 +19,7 @@ import crosshair_resolve  # noqa: E402
 def test_unknown_nick_skips_prosettings():
     calls = []
 
-    def fake_resolve(nick, fallback=None):
+    def fake_resolve(nick, fallback=None, **kwargs):
         calls.append(nick)
         return (fallback(), {"source": "demo"}) if fallback else ([], {"source": "none"})
 
@@ -77,10 +77,11 @@ def test_demo_lookup_decodes_share_code(tmp_path: Path):
         cvars = demo_crosshair_cvars("123", tmp_path / "x.dem", csdm_cmd="csdm")
 
     assert "cl_crosshairstyle 4" in cvars
-    assert "cl_crosshaircolor 5" in cvars
+    assert "cl_crosshair_length" in " ".join(cvars)
     assert "cl_crosshaircolor_r 255" in cvars
     assert "cl_crosshaircolor_g 255" in cvars
     assert "cl_crosshaircolor_b 255" in cvars
+    assert "cl_crosshaircolor_a" in " ".join(cvars)
 
 
 def test_demo_lookup_miss_returns_empty(tmp_path: Path):
@@ -135,10 +136,10 @@ def test_hook_build_config_uses_shared_system(tmp_path: Path):
         "windows": [{"start_tick": 100, "end_tick": 200}],
     }]
     with patch("crosshair_resolve.resolve_crosshair_cvars",
-               return_value=(["cl_crosshairsize 1"], {"source": "prosettings"})) as resolve:
+               return_value=(["cl_crosshair_length 3"], {"source": "prosettings"})) as resolve:
         cfg = build_config(plan, demo, tmp_path, 1280, 960, 60)
 
     assert resolve.call_args[0][:3] == ("donk", "123", demo)
     seq = cfg["sequences"][0]
-    assert "cl_crosshairsize 1" in seq["cfg"]
+    assert "cl_crosshair_length 3" in seq["cfg"]
     assert 'mirv_replace_name byXuid add x123 "donk"' in seq["cfg"]

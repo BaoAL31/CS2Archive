@@ -13,7 +13,13 @@ from pathlib import Path
 from scrapers.prosettings import resolve_crosshair
 
 
-def demo_crosshair_cvars(steam_id: str, demo_path: Path | str, *, csdm_cmd: str) -> list[str]:
+def demo_crosshair_cvars(
+    steam_id: str,
+    demo_path: Path | str,
+    *,
+    csdm_cmd: str,
+    screen_height: int = 1440,
+) -> list[str]:
     """Decode one demo's embedded share code for *steam_id* into cvars."""
     cvars: list[str] = []
     with tempfile.TemporaryDirectory() as tmp:
@@ -32,7 +38,8 @@ def demo_crosshair_cvars(steam_id: str, demo_path: Path | str, *, csdm_cmd: str)
                 code = pl.get("crosshairShareCode")
                 if code:
                     from crosshair_code import decode_crosshair, crosshair_to_convars
-                    cvars = crosshair_to_convars(decode_crosshair(code))
+                    cvars = crosshair_to_convars(
+                        decode_crosshair(code), screen_height=screen_height)
                 break
     return cvars
 
@@ -43,6 +50,7 @@ def resolve_crosshair_cvars(
     demo_path: Path | str,
     *,
     csdm_cmd: str,
+    screen_height: int = 1440,
 ) -> tuple[list[str], dict]:
     """Prosettings crosshair for *nickname*, demo share code fallback.
 
@@ -53,4 +61,8 @@ def resolve_crosshair_cvars(
     if not nick or nick.lower() == "unknown":
         nick = ""
     return resolve_crosshair(
-        nick, lambda: demo_crosshair_cvars(steam_id, demo_path, csdm_cmd=csdm_cmd))
+        nick,
+        lambda: demo_crosshair_cvars(
+            steam_id, demo_path, csdm_cmd=csdm_cmd, screen_height=screen_height),
+        screen_height=screen_height,
+    )

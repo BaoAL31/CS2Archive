@@ -180,6 +180,7 @@ _CROSSHAIR_STYLE_CVARS = {
     "classic": 2,
     "classic dynamic": 3,
     "classic static": 4,
+    "static cross": 4,
     "legacy": 5,
     "hybrid": 5,
 }
@@ -199,50 +200,118 @@ def _yes_no(value: str | None) -> int | None:
     return None
 
 
-def crosshair_convars(settings: dict) -> list[str]:
-    """CS2 convars for crosshair fields present in prosettings *settings*.
+def crosshair_convars(settings: dict, *, screen_height: int = 1440) -> list[str]:
+    """CS2 1.41.8+ convars for crosshair fields in prosettings *settings*.
 
-    Same 19-line shape as crosshair_code.crosshair_to_convars so both
-    crosshair sources are interchangeable downstream.
+    Pre–Rush Hour Length/Thickness/Gap (incl. negative gap) are converted to
+    pixel ``cl_crosshair_length`` / ``_thickness`` / ``_gap`` for the capture
+    resolution. Same shape as ``crosshair_code.crosshair_to_convars``.
     """
     if not settings:
         return []
+    # Prefer the share-code path when we have enough fields to build a dict;
+    # otherwise emit renamed/converted lines piecemeal.
+    try:
+        from crosshair_code import (
+            PRESET_RGB,
+            STYLE_OLD_TO_NEW,
+            looks_like_old_scale,
+            old_scale_to_pixels,
+        )
+    except ImportError:
+        import sys
+        sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+        from crosshair_code import (
+            PRESET_RGB,
+            STYLE_OLD_TO_NEW,
+            looks_like_old_scale,
+            old_scale_to_pixels,
+        )
+
     lines: list[str] = []
     style = _CROSSHAIR_STYLE_CVARS.get((settings.get("cl_crosshairstyle") or "").strip().lower())
     if style is not None:
-        lines.append(f"cl_crosshairstyle {style}")
-    for key in (
-        "cl_crosshairsize", "cl_crosshairthickness", "cl_crosshairgap",
-        "cl_crosshair_outlinethickness", "cl_crosshairalpha",
-        "cl_fixedcrosshairgap", "cl_crosshair_dynamic_splitdist",
-        "cl_crosshair_dynamic_splitalpha_innermod",
-        "cl_crosshair_dynamic_splitalpha_outermod",
-        "cl_crosshair_dynamic_maxdist_splitratio", "cl_crosshair_sniper_width",
-    ):
-        val = settings.get(key)
-        if val is None or val == "":
-            continue
-        lines.append(f"{key} {val}")
+        lines.append(f"cl_crosshairstyle {STYLE_OLD_TO_NEW.get(style, style)}")
+
+    length_s = settings.get("cl_crosshairsize")
+    thick_s = settings.get("cl_crosshairthickness")
+    gap_s = settings.get("cl_crosshairgap")
+    # Also accept already-migrated field names from newer prosettings pages.
+    if length_s in (None, ""):
+        length_s = settings.get("cl_crosshair_length")
+    if thick_s in (None, ""):
+        thick_s = settings.get("cl_crosshair_thickness")
+    if gap_s in (None, ""):
+        gap_s = settings.get("cl_crosshair_gap")
+    if length_s not in (None, "") and thick_s not in (None, "") and gap_s not in (None, ""):
+        length_f, thick_f, gap_f = float(length_s), float(thick_s), float(gap_s)
+        if looks_like_old_scale(length_f, thick_f, gap_f):
+            length_i, thick_i, gap_i = old_scale_to_pixels(
+                length_f, thick_f, gap_f, screen_height=screen_height,
+            )
+        else:
+            length_i = max(0, min(255, int(round(length_f))))
+            thick_i = max(0, min(31, int(round(thick_f))))
+            gap_i = max(0, min(128, int(round(gap_f))))
+        lines += [
+            f"cl_crosshair_length {length_i}",
+            f"cl_crosshair_thickness {thick_i}",
+            f"cl_crosshair_gap {gap_i}",
+        ]
+    else:
+        for old_key, new_key, lo, hi in (
+            ("cl_crosshairsize", "cl_crosshair_length", 0, 255),
+            ("cl_crosshairthickness", "cl_crosshair_thickness", 0, 31),
+            ("cl_crosshairgap", "cl_crosshair_gap", 0, 128),
+        ):
+            val = settings.get(old_key)
+            if val in (None, ""):
+                val = settings.get(new_key)
+            if val in (None, ""):
+                continue
+            # Single-field: rename only (can't convert gap without thickness).
+            lines.append(f"{new_key} {max(lo, min(hi, int(round(float(val)))))}")
+
     for key, cvar in (
         ("cl_crosshairdot", "cl_crosshairdot"),
         ("cl_crosshair_drawoutline", "cl_crosshair_drawoutline"),
         ("cl_crosshair_recoil", "cl_crosshair_recoil"),
         ("cl_crosshair_t", "cl_crosshair_t"),
-        ("cl_crosshairgap_useweaponvalue", "cl_crosshairgap_useweaponvalue"),
-        ("cl_crosshairusealpha", "cl_crosshairusealpha"),
     ):
         bit = _yes_no(settings.get(key))
         if bit is not None:
             lines.append(f"{cvar} {bit}")
+
+    for key in (
+        "cl_crosshair_dynamic_splitdist",
+        "cl_crosshair_dynamic_splitalpha_innermod",
+        "cl_crosshair_dynamic_splitalpha_outermod",
+        "cl_crosshair_dynamic_maxdist_splitratio",
+        "cl_crosshair_sniper_width",
+    ):
+        val = settings.get(key)
+        if val is not None and val != "":
+            lines.append(f"{key} {val}")
+
     color = (settings.get("cl_crosshaircolor") or "").strip().lower()
     if color in _PRESET_COLOR_CVARS:
-        lines.append(f"cl_crosshaircolor {_PRESET_COLOR_CVARS[color]}")
+        r, g, b = PRESET_RGB[_PRESET_COLOR_CVARS[color]]
+        lines += [
+            f"cl_crosshaircolor_r {r}",
+            f"cl_crosshaircolor_g {g}",
+            f"cl_crosshaircolor_b {b}",
+        ]
     elif color == "custom":
-        lines.append("cl_crosshaircolor 5")
         for key in ("cl_crosshaircolor_r", "cl_crosshaircolor_g", "cl_crosshaircolor_b"):
             val = settings.get(key)
             if val is not None and val != "":
                 lines.append(f"{key} {val}")
+    alpha = settings.get("cl_crosshairalpha") or settings.get("cl_crosshaircolor_a")
+    use_alpha = _yes_no(settings.get("cl_crosshairusealpha"))
+    if alpha not in (None, "") and use_alpha != 0:
+        lines.append(f"cl_crosshaircolor_a {alpha}")
+    elif use_alpha == 0:
+        lines.append("cl_crosshaircolor_a 255")
     return lines
 
 
@@ -298,6 +367,8 @@ def resolve_crosshair_settings(nickname: str, *, retries: int = 3) -> dict:
 def resolve_crosshair(
     nickname: str,
     fallback: "callable[[], list[str]] | None" = None,
+    *,
+    screen_height: int = 1440,
 ) -> tuple[list[str], dict]:
     """Prosettings crosshair first, demo share code fallback.
 
@@ -305,7 +376,7 @@ def resolve_crosshair(
     or {"source": "demo"}. Empty cvars + {"source": "none"} when neither hits.
     """
     settings = resolve_crosshair_settings(nickname) if (nickname or "").strip() else {}
-    cvars = crosshair_convars(settings)
+    cvars = crosshair_convars(settings, screen_height=screen_height)
     if cvars:
         print(f"  Crosshair: prosettings ({nickname})")
         return cvars, {"source": "prosettings", "settings": settings}

@@ -61,19 +61,19 @@ def test_scrape_reads_data_field_rows():
 
 def test_convars_match_donk_prosettings():
     out = scrape_player_crosshair("donk", session=_Sess())
-    cvars = crosshair_convars(out)
+    cvars = crosshair_convars(out, screen_height=1440)
 
     assert "cl_crosshairstyle 4" in cvars
-    assert "cl_crosshairsize 1" in cvars
-    assert "cl_crosshairthickness 1.5" in cvars
-    assert "cl_crosshairgap -4" in cvars
+    assert "cl_crosshair_length 3" in cvars
+    assert "cl_crosshair_thickness 5" in cvars
+    assert "cl_crosshair_gap 3" in cvars
     assert "cl_crosshair_drawoutline 0" in cvars
-    assert "cl_crosshaircolor 5" in cvars
     assert "cl_crosshaircolor_r 0" in cvars
     assert "cl_crosshaircolor_g 255" in cvars
     assert "cl_crosshaircolor_b 165" in cvars
-    assert "cl_crosshairusealpha 1" in cvars
+    assert "cl_crosshaircolor_a 255" in cvars
     assert "cl_crosshair_recoil 0" in cvars
+    assert not any(c.startswith("cl_crosshairsize ") for c in cvars)
     assert len(cvars) == len(set(cvars))
 
 
@@ -81,17 +81,18 @@ def test_custom_colors_use_exact_rgb():
     cvars = crosshair_convars({
         "cl_crosshaircolor": "Custom", "cl_crosshaircolor_r": "0",
         "cl_crosshaircolor_g": "255", "cl_crosshaircolor_b": "255"})
-    assert "cl_crosshaircolor 5" in cvars
     assert "cl_crosshaircolor_g 255" in cvars
     assert "cl_crosshaircolor_b 255" in cvars
-    assert not [c for c in cvars if re.match(r"cl_crosshaircolor [0-4]$", c)]
+    assert not [c for c in cvars if re.match(r"cl_crosshaircolor [0-5]$", c)]
 
 
 def test_named_colors_and_unknown_style():
-    assert "cl_crosshaircolor 1" in crosshair_convars({"cl_crosshaircolor": "Green"})
-    assert "cl_crosshaircolor 4" in crosshair_convars({"cl_crosshaircolor": "Cyan"})
+    green = crosshair_convars({"cl_crosshaircolor": "Green"})
+    assert "cl_crosshaircolor_g 250" in green
+    cyan = crosshair_convars({"cl_crosshaircolor": "Cyan"})
+    assert "cl_crosshaircolor_b 250" in cyan
     cvars = crosshair_convars({"cl_crosshairstyle": "Something New", "cl_crosshairsize": "2"})
-    assert "cl_crosshairsize 2" in cvars
+    assert "cl_crosshair_length 2" in cvars
     assert not [c for c in cvars if c.startswith("cl_crosshairstyle")]
     assert crosshair_convars({}) == []
 
@@ -130,7 +131,7 @@ def test_resolve_prefers_prosettings_then_demo(monkeypatch):
     monkeypatch.setattr(ps, "scrape_player_crosshair", lambda nick, session=None: {"cl_crosshairsize": "2"})
     called = []
     cvars, info = ps.resolve_crosshair("donk", lambda: called.append(1) or ["demo"])
-    assert cvars == ["cl_crosshairsize 2"]
+    assert cvars == ["cl_crosshair_length 2"]
     assert info["source"] == "prosettings"
     assert called == []
 

@@ -705,7 +705,9 @@ class Pipeline:
                   f"youtube video not ready yet — keeping render intermediates.")
 
     def _run_py(self, args: list[str], **kwargs):
-        env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+        # Unbuffered child output: if a render worker is ever hard-killed,
+        # its log lines still land on disk instead of dying in the buffer.
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
         kwargs.setdefault("env", env)
         if kwargs.get("text") and "encoding" not in kwargs:
             kwargs["encoding"] = "utf-8"
@@ -840,17 +842,24 @@ class Pipeline:
             render_args += ["--voice-indicators", self._voice_indicator_style()]
         if skip_failed:
             render_args += ["--skip-failed-rounds"]
+        # Always HLAE-capture at the export resolution (default 2560x1440).
+        # Player capture_width/height (e.g. 1280x960) is metadata for titles
+        # only — feeding it to HLAE then upscaling in concat stretches the
+        # crosshair (Length 1 at 960p → ~1.5–2× longer arms at 1440p).
         cap_w = int(self.meta.get("capture_width") or 0)
         cap_h = int(self.meta.get("capture_height") or 0)
+        hlae_w = export_w if export_w >= 800 else 2560
+        hlae_h = export_h if export_h >= 600 else 1440
+        render_args += ["--width", str(hlae_w), "--height", str(hlae_h)]
         if export_w >= 800 and export_h >= 600:
-            render_args += ["--width", str(export_w), "--height", str(export_h)]
-            print(f"  [capture] {export_w}x{export_h} (CLI --width/--height)")
+            print(f"  [capture] {hlae_w}x{hlae_h} (CLI --width/--height)")
         elif cap_w >= 800 and cap_h >= 600:
-            render_args += ["--width", str(cap_w), "--height", str(cap_h)]
-            print(f"  [capture] {cap_w}x{cap_h} "
-                  f"({self.meta.get('aspect_ratio', '?')} "
-                  f"{self.meta.get('scaling_mode', '')}) "
-                  f"from {self.meta.get('video_settings_source', 'backlog')}")
+            print(f"  [capture] {hlae_w}x{hlae_h} HLAE "
+                  f"(player native {cap_w}x{cap_h} "
+                  f"{self.meta.get('aspect_ratio', '')} "
+                  f"{self.meta.get('scaling_mode', '')} — title only)")
+        else:
+            print(f"  [capture] {hlae_w}x{hlae_h} (export default)")
         player = (self.meta.get("player") or "").strip()
         if player:
             render_args += ["--player", player]
@@ -859,7 +868,8 @@ class Pipeline:
         # canonical pro name (players often change their FACEIT name to avoid
         # recognition, so we display the official pro name instead). Uses the same
         # canonical nickname logic as the title/thumbnail.
-        if self.is_faceit and self.demo_path and self.demo_path.exists():
+        if (self.is_faceit and self.demo_path and self.demo_path.exists()
+                and not self.meta.get("skip_rename")):
             rename_map = _faceit_rename_map(self.demo_path)
             if rename_map:
                 render_args += ["--rename", json.dumps(rename_map)]
@@ -1614,6 +1624,30 @@ class Pipeline:
         hook_dir = PROJECT_ROOT / "renders" / f"hook-{self.demo_path.stem}_{self.steam_id}"
         timeline = hook_dir / "hook_timeline.json"
         max_seconds = float(getattr(self.args, "hook_max_seconds", 30.0))
+        max_moments = int(getattr(self.args, "hook_max_moments", 3))
+        min_round = int(getattr(self.args, "hook_min_round", 2))
+
+        # A cached timeline is reused to avoid re-running detection. Validate it
+        # against the CURRENT filters first — otherwise a changed tier/threshold/
+        # round filter would be silently ignored by a stale cache.
+        if timeline.is_file():
+            try:
+                from pov.build_hook_timeline import DEFAULT_TIERS, timeline_matches
+                cached = json.loads(timeline.read_text(encoding="utf-8"))
+                want_tiers = ([t.strip() for t in str(self.args.hook_tiers).split(",") if t.strip()]
+                              if getattr(self.args, "hook_tiers", None)
+                              else [t for t in DEFAULT_TIERS.split(",") if t.strip()])
+                if not timeline_matches(cached, tiers=want_tiers, min_round=min_round,
+                                        max_moments=max_moments,
+                                        max_seconds=max_seconds):
+                    print("  [stale] hook_timeline.json built with different filters "
+                          "— rebuilding")
+                    timeline.unlink()
+                    for stale in (hook_dir / "hook_render.json", hook_dir / "hook.mp4"):
+                        stale.unlink(missing_ok=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"  [warn] could not validate cached hook timeline ({e}) — rebuilding")
+                timeline.unlink(missing_ok=True)
 
         # 1. Select moments (detection runs only when there is no cached timeline;
         #    delete hook_timeline.json to re-tune the tier threshold).
@@ -1621,8 +1655,9 @@ class Pipeline:
             args = [
                 "scripts/pov/build_hook_timeline.py", str(self.demo_path),
                 "--player", self.steam_id,
-                "--max-moments", str(int(getattr(self.args, "hook_max_moments", 3))),
+                "--max-moments", str(max_moments),
                 "--max-seconds", str(max_seconds),
+                "--min-round", str(min_round),
             ]
             if getattr(self.args, "hook_tiers", None):
                 args += ["--tiers", str(self.args.hook_tiers)]
@@ -2292,6 +2327,13 @@ def main() -> None:
         default=30.0,
         help="Hook footage budget in seconds (default: 30). Weakest moments "
              "are dropped to fit.",
+    )
+    parser.add_argument(
+        "--hook-min-round",
+        type=int,
+        default=2,
+        help="Earliest round a hook may use (default: 2). Round 1 sits ~30s into "
+             "the finished video, so replaying it as a cold open is wasted.",
     )
     parser.add_argument(
         "--hook-fade",

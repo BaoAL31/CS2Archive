@@ -399,6 +399,39 @@ def _cfg_without_comments() -> str:
     return "\n".join(lines) + "\n"
 
 
+def _sequence_cfg(player_cvars: list[str] | None = None) -> str:
+    """POV base cfg + inlined player crosshair/viewmodel (last wins).
+
+    CSDM runs the sequence ``cfg`` string as console commands. Nested
+    ``exec render_crosshair`` is unreliable there — hooks already inline
+    cvars for that reason. Player cvars must be literal lines at the end.
+    """
+    base = _cfg_without_comments()
+    skip = (
+        "cl_crosshairstyle ", "cl_crosshaircolor ", "cl_crosshairsize ",
+        "cl_crosshairthickness ", "cl_crosshairgap ", "cl_crosshairdot ",
+        "cl_crosshair_drawoutline ", "cl_crosshair_outlinethickness ",
+        "cl_crosshair_length ", "cl_crosshair_thickness ", "cl_crosshair_gap ",
+        "cl_crosshaircolor_r ", "cl_crosshaircolor_g ", "cl_crosshaircolor_b ",
+        "cl_crosshaircolor_a ", "cl_crosshairalpha ", "cl_crosshairusealpha ",
+        "cl_crosshair_recoil ", "cl_crosshair_t ",
+        "cl_crosshairgap_useweaponvalue ", "cl_fixedcrosshairgap ",
+        "cl_crosshair_sniper_width ", "cl_crosshair_dynamic_",
+        "exec render_crosshair",
+        "viewmodel_fov ", "viewmodel_offset_", "viewmodel_presetpos ",
+        "hud_scaling ",
+    )
+    lines = [
+        ln for ln in base.splitlines()
+        if ln and not any(ln.startswith(p) for p in skip)
+    ]
+    for cv in player_cvars or []:
+        cv = (cv or "").strip()
+        if cv:
+            lines.append(cv)
+    return "\n".join(lines) + "\n"
+
+
 def _pov_ffmpeg_settings() -> dict:
     return {
         "constantRateFactor": 10,
@@ -427,7 +460,7 @@ def _render_trimmed_windows(
     args,
 ) -> None:
     """Record trimmed round tick windows via CSDM --config-file (not --event rounds)."""
-    cfg_text = _cfg_without_comments()
+    cfg_text = _sequence_cfg(getattr(args, "player_cvars", None))
     sequences = []
     global_rounds = []
     overrides: dict[int, tuple[int, int]] = {}
@@ -510,6 +543,8 @@ def _render_event_rounds_cli(demo_part: str, output_dir: Path, steam_id: str,
                              missing_local: list[int], missing_global: list[int],
                              args) -> None:
     """One CLI --event rounds attempt. Raises SystemExit via run_csdm on failure."""
+    seq_cfg = output_dir / "pov_sequence.cfg"
+    seq_cfg.write_text(_sequence_cfg(getattr(args, "player_cvars", None)), encoding="utf-8")
     cmd = [
         CSDM, "video", str(Path(demo_part).resolve()),
         "--steamids", steam_id,
@@ -519,7 +554,7 @@ def _render_event_rounds_cli(demo_part: str, output_dir: Path, steam_id: str,
         "--framerate", str(args.framerate),
         "--width", str(args.width),
         "--height", str(args.height),
-        "--cfg", str(abs_cfg_path()),
+        "--cfg", str(seq_cfg.resolve()),
     ] + BASE_FLAGS
     # csdm writes per-round sequence files; caller renames them below.
     with _voice_hud_session(demo_part, output_dir, steam_id, args):
@@ -759,12 +794,15 @@ def _run_csdm_hook_aware(cmd: list[str], label: str, expected: Path | None,
     return newest
 
 
-def _get_player_crosshair(steam_id: str, demo_parts: list[str]) -> list[str]:
+def _get_player_crosshair(
+    steam_id: str, demo_parts: list[str], *, screen_height: int = 1440,
+) -> list[str]:
     """Demo share-code fallback across split demo parts (shared lookup)."""
     from crosshair_resolve import demo_crosshair_cvars
 
     for p in demo_parts:
-        cvars = demo_crosshair_cvars(steam_id, p, csdm_cmd=CSDM)
+        cvars = demo_crosshair_cvars(
+            steam_id, p, csdm_cmd=CSDM, screen_height=screen_height)
         if cvars:
             return cvars
     return []
@@ -1075,9 +1113,19 @@ def main() -> None:
     validate_render_profile(output_dir, args.voice_indicators, args.steam_id)
 
     from scrapers.prosettings import resolve_crosshair
+    from crosshair_code import effective_crosshair_height
     player_nick = (getattr(args, "player", "") or "").strip()
+    xhair_h = effective_crosshair_height(args.height)
+    if xhair_h != args.height:
+        print(f"  [crosshair] pixel convert at {xhair_h}p "
+              f"(HLAE capped by desktop; requested {args.height})")
     cvars, xhair_info = resolve_crosshair(
-        player_nick, lambda: _get_player_crosshair(args.steam_id, parts))
+        player_nick,
+        lambda: _get_player_crosshair(
+            args.steam_id, parts, screen_height=xhair_h),
+        screen_height=xhair_h,
+    )
+    xhair_info = {**xhair_info, "screen_height": xhair_h}
     try:
         (output_dir / "crosshair_used.json").write_text(
             json.dumps(xhair_info, indent=2), encoding="utf-8")
@@ -1111,12 +1159,23 @@ def main() -> None:
         print("  [WARN] could not resolve in-demo nickname — no spec lock")
     _write_spec_lock_cfg(demo_name)
 
+    # Stashed for sequence cfg inlining (trimmed + --event rounds paths).
+    args.player_cvars = list(cvars)
+
     if cvars or rename_map or demo_name:
         print(f"  Player crosshair/viewmodel ({len(cvars)} cvars)"
               + (f", {len(rename_map)} name override(s)" if rename_map else ""))
         _write_render_autoexec(cvars, rename_map, demo_name)
         _swap_autoexec(AUTOEXEC_RENDER)
         print(f"  Swapped {AUTOEXEC_RENDER.name} -> {AUTOEXEC_MAIN.name}")
+        if any(
+            c.startswith(p) for c in cvars
+            for p in ("cl_crosshairsize ", "cl_crosshair_length ",
+                      "cl_crosshairthickness ", "cl_crosshair_thickness ")
+        ):
+            print(f"  [crosshair] inlined into sequence cfg: "
+                  + ", ".join(c for c in cvars if c.startswith("cl_crosshair")
+                              or c.startswith("cl_fixedcrosshair")))
     else:
         print("  [WARN] No crosshair/viewmodel, no --rename, no spec target — keeping current autoexec.cfg")
 
