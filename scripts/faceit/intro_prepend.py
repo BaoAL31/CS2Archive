@@ -48,8 +48,6 @@ from config import settings  # noqa: E402
 
 FFMPEG = settings.ffmpeg_exe
 CSDM = settings.csdm_cmd
-CFG = Path(__file__).resolve().parents[2] / "assets" / "cs2_pov.cfg"
-
 # The POV render swaps the game's active autoexec.cfg to a render-specific one
 # (autoexec_render.cfg) holding the POV player's crosshair/viewmodel/voice + name
 # overrides, so the recorded footage matches the POV exactly. The intro footage
@@ -150,22 +148,51 @@ def _native_resolution(steam_id: str,
 
 def render_footage(demo: Path, steam_id: str, render_dir: Path,
                    start_tick: int, seconds_before: float,
-                   res: tuple[int, int, float]) -> Path:
+                   res: tuple[int, int, float],
+                   player: str = "",
+                   rename_map: dict | None = None,
+                   voice_style: str = "swift") -> Path:
+    from types import SimpleNamespace
+    from crosshair_code import effective_crosshair_height
+    from crosshair_resolve import resolve_crosshair_cvars
+    from render_pov import (
+        CSDM, _sequence_cfg, _viewmodel_cvars_from_args, _voice_hud_session,
+        _write_render_autoexec, rename_cfg_lines,
+    )
+
     clip = render_dir / "intro_footage.mp4"
-    if clip.is_file() and clip.stat().st_size >= 1_048_576:
+    w, h, fps = res
+    xhair_h = effective_crosshair_height(h)
+    cvars, info = resolve_crosshair_cvars(
+        player, steam_id, demo, csdm_cmd=CSDM, screen_height=xhair_h,
+    )
+    cvars = list(cvars) + _viewmodel_cvars_from_args(SimpleNamespace(player=player))
+    print(f"  [crosshair] {info.get('source')} @ {xhair_h}p ({len(cvars)} cvars)")
+    rename_lines = rename_cfg_lines(rename_map)
+    if rename_lines:
+        print(f"  [rename] {len(rename_lines)} name override(s)")
+    cfg_text = _sequence_cfg(cvars) + "\n".join(rename_lines) + "\n"
+    cfg_path = render_dir / "intro_sequence.cfg"
+    stamp = render_dir / "intro_footage.stamp"
+    cfg_path.write_text(cfg_text, encoding="utf-8")
+    fresh = stamp.is_file() and stamp.read_text(encoding="utf-8") == cfg_text
+    if clip.is_file() and clip.stat().st_size >= 1_048_576 and fresh:
         print(f"  [skip] footage exists: {clip.name}")
         return clip
+    if clip.is_file():
+        print(f"  [intro] dropping stale {clip.name} (crosshair cfg changed)")
+        clip.unlink()
+        (render_dir / "intro_segment.mp4").unlink(missing_ok=True)
 
-    w, h, fps = res
     start = max(0, int(start_tick - seconds_before * TICKRATE))
     render_dir.mkdir(parents=True, exist_ok=True)
-    # Mirror the POV render: use the render autoexec (b1t's crosshair/viewmodel/
-    # voice + name overrides) so the intro footage matches the POV exactly.
-    # assets/cs2_pov.cfg execs the game autoexec at launch. We render an
-    # explicit tick range (start_tick - seconds_before -> start_tick) using
-    # --focus-player to follow the POV player — NOT --mode player (which forces
-    # --event and renders a whole round, not a bare tick window).
+    # Same autoexec writer and Swift mount as the POV render.
+    _write_render_autoexec(cvars, rename_map, None)
     _swap_autoexec(AUTOEXEC_RENDER)
+    hud_args = SimpleNamespace(
+        rename=json.dumps(rename_map or {}),
+        voice_indicators=voice_style,
+    )
     try:
         cmd = [
             CSDM, "video", str(demo.resolve()),
@@ -182,7 +209,7 @@ def render_footage(demo: Path, steam_id: str, render_dir: Path,
             "--framerate", str(int(fps)),
             "--width", str(w),
             "--height", str(h),
-            "--cfg", str(CFG.resolve()),
+            "--cfg", str(cfg_path.resolve()),
             "--recording-system", "HLAE",
             "--close-game-after-recording",
             "--ffmpeg-executable-path", FFMPEG,
@@ -198,10 +225,11 @@ def render_footage(demo: Path, steam_id: str, render_dir: Path,
         # POV/util-cam renderers so a flaky hook retries instead of silently
         # producing garbage.
         from hook_aware import run_csdm_hook_aware
-        produced = run_csdm_hook_aware(
-            cmd, "intro-footage", render_dir,
-            hook_timeout=120.0, hook_retries=2,
-        )
+        with _voice_hud_session(str(demo), render_dir, steam_id, hud_args):
+            produced = run_csdm_hook_aware(
+                cmd, "intro-footage", render_dir,
+                hook_timeout=120.0, hook_retries=2,
+            )
     except Exception as e:
         _restore_autoexec()
         raise SystemExit(f"[ERROR] intro footage render failed: {e}")
@@ -209,6 +237,7 @@ def render_footage(demo: Path, steam_id: str, render_dir: Path,
         _restore_autoexec()
     if produced is None or produced.stat().st_size < 1_048_576:
         raise SystemExit("[ERROR] CSDM render failed to hook / no footage produced")
+    stamp.write_text(cfg_text, encoding="utf-8")
     print(f"  [OK] footage: {produced} ({produced.stat().st_size/1e6:.0f} MB)")
     return produced
 
@@ -354,6 +383,13 @@ def main() -> None:
                     help="Pane slide-in duration (s)")
     ap.add_argument("--pop-out", type=float, default=0.5,
                     help="Pane slide-out duration (s)")
+    ap.add_argument("--player", default="",
+                    help="POV nickname for the shared prosettings crosshair lookup")
+    ap.add_argument("--rename", default="",
+                    help="Same SteamID64->name JSON the POV render passes to mirv_replace_name")
+    ap.add_argument("--voice-indicators", default="swift",
+                    choices=("off", "swift", "shade"),
+                    help="Match the POV render's speaker HUD (off/shade mount nothing)")
     args = ap.parse_args()
 
     demo = Path(args.demo)
@@ -382,8 +418,11 @@ def main() -> None:
     print(f"  Round-1 start tick: {start_tick}")
     print(f"  native render {native_w}x{native_h} -> final {final_res[0]}x{final_res[1]}@{final_res[2]}")
 
+    rename_map = json.loads(args.rename) if args.rename else {}
     clip = render_footage(demo, args.steam_id, render_dir, start_tick,
-                          args.seconds_before, (native_w, native_h, final_res[2]))
+                          args.seconds_before, (native_w, native_h, final_res[2]),
+                          player=args.player, rename_map=rename_map,
+                          voice_style=args.voice_indicators)
     segment = compose_intro(clip, intro, render_dir / "intro_segment.mp4",
                             (native_w, native_h, final_res[2]), final_res,
                             args.seconds_before,

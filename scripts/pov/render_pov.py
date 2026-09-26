@@ -530,12 +530,12 @@ def _merge_voice_names(rename_map: dict[str, str] | None,
 
 def _voice_hud_session(demo_path: str, output_dir: Path, steam_id: str, args):
     style = getattr(args, "voice_indicators", "off")
-    if style not in ("swift", "legacy"):
+    if style != "swift":
         return nullcontext()
     from overlay.swift_demoui import prepare, mounted_hud
     rename = json.loads(args.rename) if getattr(args, "rename", "") else {}
     names = _merge_voice_names(rename, _demo_player_names(demo_path))
-    menu, session = prepare(Path(demo_path), steam_id, output_dir, names, native=(style == "swift"))
+    menu, session = prepare(Path(demo_path), steam_id, output_dir, names, native=True)
     return mounted_hud(GAME_CFG.parent, menu, session)
 
 
@@ -794,20 +794,6 @@ def _run_csdm_hook_aware(cmd: list[str], label: str, expected: Path | None,
     return newest
 
 
-def _get_player_crosshair(
-    steam_id: str, demo_parts: list[str], *, screen_height: int = 1440,
-) -> list[str]:
-    """Demo share-code fallback across split demo parts (shared lookup)."""
-    from crosshair_resolve import demo_crosshair_cvars
-
-    for p in demo_parts:
-        cvars = demo_crosshair_cvars(
-            steam_id, p, csdm_cmd=CSDM, screen_height=screen_height)
-        if cvars:
-            return cvars
-    return []
-
-
 SPEC_LOCK_SNIPPET = "mirv_script_spec_lock_name.js"
 
 
@@ -885,6 +871,21 @@ def _demo_player_name(steam_id: str, demo_parts: list[str]) -> str | None:
     return None
 
 
+def rename_cfg_lines(rename_map: dict[str, str] | None) -> list[str]:
+    """HLAE HUD name overrides. Same lines for POV and intro.
+
+    byXuid is stable per player (unlike byUserId). Chat is not replaced.
+    """
+    from overlay.swift_demoui import _strip_markup
+    lines = []
+    for steamid, name in (rename_map or {}).items():
+        xuid = f"x{steamid}" if not str(steamid).startswith("x") else str(steamid)
+        safe_name = _strip_markup(name).replace('"', '')
+        if safe_name:
+            lines.append(f'mirv_replace_name byXuid add {xuid} "{safe_name}"')
+    return lines
+
+
 def _write_render_autoexec(cvars: list[str], rename_map: dict[str, str] | None = None,
                            player_name: str | None = None) -> None:
     # cl_chatfilters 63: hide ALL chat — cl_chatfilters is unreliable for
@@ -901,17 +902,10 @@ def _write_render_autoexec(cvars: list[str], rename_map: dict[str, str] | None =
              "tv_listen_voice_indices -1",
              "tv_listen_voice_indices_h -1",
              "tv_relaytextchat 2",
-             "spec_autodirector 0"] + cvars
-
-    # HLAE name override (mirv_replace_name, HLAE 2.184+). This cfg is exec'd
-    # in the CS2 console under HLAE, so mirv_* commands are available. byXuid
-    # is stable per-player across demos (unlike byUserId, which differs each
-    # demo). Only covers "some parts of the HUD" — chat is not replaced.
-    from overlay.swift_demoui import _strip_markup
-    for steamid, name in (rename_map or {}).items():
-        xuid = f"x{steamid}" if not str(steamid).startswith("x") else str(steamid)
-        safe_name = _strip_markup(name).replace('"', '')
-        lines.append(f'mirv_replace_name byXuid add {xuid} "{safe_name}"')
+             "spec_autodirector 0",
+             "cl_hide_avatar_images 0",
+             "cl_teamcounter_playercount_instead_of_avatars false"] + cvars
+    lines.extend(rename_cfg_lines(rename_map))
 
     # Spec lock (mirv_script_spec_lock_name): re-issues spec_player for the
     # POV player EVERY frame, so the camera stays on their deathcam after
@@ -1011,9 +1005,9 @@ def main() -> None:
                              "(default: 2). 0 disables hook detection entirely.")
     parser.add_argument("--rounds", type=str, default="",
                     help="Comma-separated list of specific rounds to render, e.g. '1,3,5' or '2-4,7'. If omitted, all rounds are rendered.")
-    parser.add_argument("--voice-indicators", choices=("swift", "legacy", "off"), default="off",
-                        help="Mount Swift DemoUI Pro speaker HUD during capture. "
-                             "swift is the native in-game rows; legacy keeps Swift's dark-bar chrome.")
+    parser.add_argument("--voice-indicators", choices=("swift", "off"), default="off",
+                        help="Mount Swift DemoUI Pro speaker HUD during capture "
+                             "(native in-game rows).")
 
     parser.add_argument("--no-minimize-cs2", action="store_true",
                         help="Disable auto-minimize CS2 when it launches (default: enabled)")
@@ -1092,6 +1086,8 @@ def main() -> None:
             f"  [OK] versions demo={vers.get('demo')} cs2={vers.get('cs2')} "
             f"hlae={vers.get('hlae')} csdm={vers.get('csdm')}"
         )
+        if vers.get("hlae_path"):
+            print(f"  [OK] HLAE path: {vers['hlae_path']}")
     except RenderVersionError as e:
         payload = json.dumps({
             "error": True,
@@ -1112,18 +1108,16 @@ def main() -> None:
     from overlay.swift_demoui import validate_render_profile
     validate_render_profile(output_dir, args.voice_indicators, args.steam_id)
 
-    from scrapers.prosettings import resolve_crosshair
     from crosshair_code import effective_crosshair_height
+    from crosshair_resolve import resolve_crosshair_cvars
     player_nick = (getattr(args, "player", "") or "").strip()
     xhair_h = effective_crosshair_height(args.height)
     if xhair_h != args.height:
         print(f"  [crosshair] pixel convert at {xhair_h}p "
               f"(HLAE capped by desktop; requested {args.height})")
-    cvars, xhair_info = resolve_crosshair(
-        player_nick,
-        lambda: _get_player_crosshair(
-            args.steam_id, parts, screen_height=xhair_h),
-        screen_height=xhair_h,
+    cvars, xhair_info = resolve_crosshair_cvars(
+        player_nick, args.steam_id, parts[0],
+        csdm_cmd=CSDM, screen_height=xhair_h, demo_paths=parts,
     )
     xhair_info = {**xhair_info, "screen_height": xhair_h}
     try:

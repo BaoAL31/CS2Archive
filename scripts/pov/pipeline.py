@@ -353,6 +353,7 @@ class Pipeline:
             self.demo_path and "demos/faceit" in str(self.demo_path).replace("\\", "/")
         )
         self._voice_cache: bool | None = None
+        self._rename_map: dict | None = None
 
         ratings_path_str = self.meta.get("ratings_path", "")
         self.ratings_json = Path(ratings_path_str) if ratings_path_str else PROJECT_ROOT / "demos" / "analysis" / ""
@@ -611,13 +612,24 @@ class Pipeline:
     def _voice_indicator_style(self) -> str:
         return getattr(self.args, "voice_indicators", "swift")
 
+    def _cached_rename_map(self) -> dict:
+        """FACEIT pro rename map, parsed once per process.
+
+        Step 2 (render) and step 5 (intro) both need it; sharing one parse
+        saves a full demoparser2 player-info pass and guarantees the intro's
+        HUD names match the POV's. Safe to memoize: resume spawns a new
+        process, and demo_path is fixed for the run.
+        """
+        if self._rename_map is None:
+            self._rename_map = _faceit_rename_map(self.demo_path)
+        return self._rename_map
+
     def _check_voice_capture(self, step: int) -> None:
-        if self._voice_enabled() and self._voice_indicator_style() in ("swift", "legacy"):
+        if self._voice_enabled() and self._voice_indicator_style() == "swift":
             from overlay.swift_demoui import require_swift_capture
             try:
                 require_swift_capture(
                     self.render_dir, self.steam_id,
-                    native=self._voice_indicator_style() == "swift",
                 )
             except (ValueError, RuntimeError) as exc:
                 fail(step, "VOICE_INDICATOR_CAPTURE_REQUIRED", str(exc))
@@ -805,6 +817,8 @@ class Pipeline:
                 f"  [OK] versions demo={vers.get('demo')} cs2={vers.get('cs2')} "
                 f"hlae={vers.get('hlae')} csdm={vers.get('csdm')}"
             )
+            if vers.get("hlae_path"):
+                print(f"  [OK] HLAE path: {vers['hlae_path']}")
         except RenderVersionError as e:
             fail(2, e.code, e.message)
 
@@ -838,26 +852,29 @@ class Pipeline:
             "--hook-timeout", str(getattr(self.args, "hook_timeout", 150.0)),
             "--hook-retries", str(getattr(self.args, "hook_retries", 2)),
         ]
-        if self._voice_enabled() and self._voice_indicator_style() in ("swift", "legacy"):
+        if self._voice_enabled() and self._voice_indicator_style() == "swift":
             render_args += ["--voice-indicators", self._voice_indicator_style()]
         if skip_failed:
             render_args += ["--skip-failed-rounds"]
-        # Always HLAE-capture at the export resolution (default 2560x1440).
-        # Player capture_width/height (e.g. 1280x960) is metadata for titles
-        # only — feeding it to HLAE then upscaling in concat stretches the
-        # crosshair (Length 1 at 960p → ~1.5–2× longer arms at 1440p).
+        # HLAE captures at the player's prosettings resolution (4:3 1280x960
+        # for stretched players). Concat stretches that to the 16:9 export
+        # (default 2560x1440). CLI --width/--height overrides the capture.
         cap_w = int(self.meta.get("capture_width") or 0)
         cap_h = int(self.meta.get("capture_height") or 0)
-        hlae_w = export_w if export_w >= 800 else 2560
-        hlae_h = export_h if export_h >= 600 else 1440
+        if export_w >= 800 and export_h >= 600:
+            hlae_w, hlae_h = export_w, export_h
+        elif cap_w >= 800 and cap_h >= 600:
+            hlae_w, hlae_h = cap_w, cap_h
+        else:
+            hlae_w, hlae_h = 2560, 1440
         render_args += ["--width", str(hlae_w), "--height", str(hlae_h)]
         if export_w >= 800 and export_h >= 600:
             print(f"  [capture] {hlae_w}x{hlae_h} (CLI --width/--height)")
         elif cap_w >= 800 and cap_h >= 600:
-            print(f"  [capture] {hlae_w}x{hlae_h} HLAE "
-                  f"(player native {cap_w}x{cap_h} "
+            print(f"  [capture] {hlae_w}x{hlae_h} "
                   f"{self.meta.get('aspect_ratio', '')} "
-                  f"{self.meta.get('scaling_mode', '')} — title only)")
+                  f"{self.meta.get('scaling_mode', '')} "
+                  f"(concat stretches to export)")
         else:
             print(f"  [capture] {hlae_w}x{hlae_h} (export default)")
         player = (self.meta.get("player") or "").strip()
@@ -870,7 +887,7 @@ class Pipeline:
         # canonical nickname logic as the title/thumbnail.
         if (self.is_faceit and self.demo_path and self.demo_path.exists()
                 and not self.meta.get("skip_rename")):
-            rename_map = _faceit_rename_map(self.demo_path)
+            rename_map = self._cached_rename_map()
             if rename_map:
                 render_args += ["--rename", json.dumps(rename_map)]
         for flag, key in (
@@ -1300,7 +1317,7 @@ class Pipeline:
             concat_args += ["--scaling-mode", scaling]
         if skip_failed or load_voided_rounds(self.render_dir):
             concat_args += ["--allow-gaps"]
-        # Swift indicators are already in the captured frames. Only the legacy
+        # Swift indicators are already in the captured frames. Only the shade
         # style adds scoreboard shading during the native-resolution scale pass.
         # FACEIT demos carry packet-aligned team voice; they enable voice by
         # default only when the demo has enough real team voice (see
@@ -1342,7 +1359,7 @@ class Pipeline:
             print("  [skip] Raw-only mode: overlay step disabled")
             return
 
-        # Audio is mixed here; Swift's HUD was captured in step 2, or legacy
+        # Audio is mixed here; Swift's HUD was captured in step 2, or shade
         # shading was added in step 3. Both use the existing voice eligibility.
         enable_voice = self._voice_enabled()
         self._check_voice_capture(4)
@@ -1800,7 +1817,7 @@ class Pipeline:
             fail(step_num, "INTRO_NO_SIDECAR",
                  f"combined sidecar missing: {render_sidecar}")
         intro_out = youtube_dir / "video.intro.mp4"
-        r = self._run_py([
+        r_args = [
             "scripts/faceit/intro_prepend.py",
             "--demo", str(self.demo_path),
             "--steam-id", self.steam_id,
@@ -1809,7 +1826,21 @@ class Pipeline:
             "--round-offsets", str(render_sidecar),
             "--output", str(intro_out),
             "--render-dir", str(intro_dir / "footage"),
-        ], timeout=7200)
+            "--player", (self.meta.get("player") or "").strip(),
+        ]
+        # Match the intro footage's speaker HUD to the POV render: swift
+        # only when voice actually rendered it, else mount nothing ("off").
+        # _voice_indicator_style() returns the default "swift" even when voice
+        # is disabled, so gate on _voice_enabled() here.
+        if self._voice_enabled() and self._voice_indicator_style() == "swift":
+            r_args += ["--voice-indicators", self._voice_indicator_style()]
+        else:
+            r_args += ["--voice-indicators", "off"]
+        if self.is_faceit and not self.meta.get("skip_rename"):
+            rename_map = self._cached_rename_map()
+            if rename_map:
+                r_args += ["--rename", json.dumps(rename_map)]
+        r = self._run_py(r_args, timeout=7200)
         if r.returncode != 0:
             fail(step_num, "INTRO_FAILED", f"intro_prepend.py exited {r.returncode}")
         if not intro_out.is_file() or intro_out.stat().st_size < 1_000_000:
@@ -2346,13 +2377,12 @@ def main() -> None:
         action="store_true",
         default=False,
         help="Enable POV-team voice comms and speaker indicators. Native in-game "
-             "rows are the default HUD; --voice-indicators legacy keeps Swift's "
-             "dark-bar chrome; shade is the old scoreboard-avatar effect.",
+             "rows are the HUD; shade is the old scoreboard-avatar effect.",
     )
     parser.add_argument(
-        "--voice-indicators", choices=("swift", "legacy", "shade"), default="swift",
+        "--voice-indicators", choices=("swift", "shade"), default="swift",
         help="Speaker display when voice comms are enabled (default: swift, native HUD). "
-             "legacy keeps Swift's original dark-bar chrome. shade is the old scoreboard effect.",
+             "shade is the old scoreboard effect.",
     )
     parser.add_argument(
         "--voice-shade",

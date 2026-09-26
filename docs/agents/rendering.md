@@ -13,7 +13,7 @@ Uses `--recording-system HLAE` — csdm drives HLAE `mirv_streams` to encode dir
 
 **Critical:** `--output` must be an **absolute** path. Relative paths (e.g. `renders/...`) resolve from the CS2 install directory and cause `AFXERROR: Failed writing image for screen recording` → csdm **Raw files not found**. `render_pov.py` and the pipeline always pass `Path.resolve()` output dirs.
 
-HLAE **2.190.1+** required (`C:\Program Files (x86)\HLAE\HLAE.exe`). Disable RTSS/MSI OSD and Steam/Xbox overlays if capture fails. After CS2 updates, if HLAE breaks again, test one round with absolute output before full pipeline runs.
+HLAE must match the running CS2 build: `render_version_check.py` hard-fails before launch (`RENDER_HLAE_CS2_MISMATCH` / `RENDER_CS2_UNPINNED`). It reads the binary CSDM actually launches — `~/.csdm/settings.json` `video.hlae.customExecutableLocation`, falling back to `C:\Program Files (x86)\HLAE\HLAE.exe`. Pins, install steps and the `CS2_MIN_HLAE` table: `docs/bugs/hlae-steam-online-hook.md`. Disable RTSS/MSI OSD and Steam/Xbox overlays if capture fails. After CS2 updates, if HLAE breaks again, test one round with absolute output before full pipeline runs.
 
 **Steam-online hook flake (long-running):** HLAE sometimes injects (`AfxHookSource2` in `cs2.exe`) but never starts ffmpeg — vanilla `+playdemo` / `Raw files not found`. Mitigations and what is *not* proven live in `docs/bugs/hlae-steam-online-hook.md`. Code: `scripts/hook_aware.py`. Do not toggle Steam offline from an agent.
 
@@ -21,7 +21,7 @@ HLAE **2.190.1+** required (`C:\Program Files (x86)\HLAE\HLAE.exe`). Disable RTS
 
 Render at **2560×1440** even for 1080p-targeted uploads. YouTube allocates VP9 codec (higher bitrate) to 1440p+ uploads, while 1080p gets H.264. Video looks sharper even when watched at 1080p because YouTube uses better encoding.
 
-All scripts default to 2560×1440; per-round render and concat upscale use **h264_nvenc CQ 15** (match quality end-to-end).
+Capture follows the POV's prosettings resolution (4:3 1280×960 for stretched players); `concat_rounds.py` stretches it to the 2560×1440 upload target. Per-round render and concat upscale use **h264_nvenc CQ 15** (match quality end-to-end).
 
 ## Scoreboard Avatar-Box Calibration
 
@@ -89,7 +89,7 @@ rounds pass. Blind spots (need nameplate OCR): director cuts to a teammate
 clutch, third-person chase with visible viewmodel. Opt out with
 `render_pov.py --no-verify`.
 
-All scripts pass `--cfg assets/cs2_pov.cfg` which configures HUD and restores keybinds via `exec autoexec`. The crosshair comes from CS2's `autoexec.cfg` in the game's `csgo/cfg/` directory — `render_pov.py` swaps `autoexec_render.cfg` (pro's crosshair, extracted from demo) and `autoexec_personal.cfg` (your crosshair) before/after rendering.
+Render scripts pass a generated per-render `--cfg` (`render_pov.py` writes `pov_sequence.cfg` per batch; the intro writes `intro_sequence.cfg`) which configures HUD and restores keybinds via `exec autoexec`. The crosshair comes from CS2's `autoexec.cfg` in the game's `csgo/cfg/` directory — `render_pov.py` swaps `autoexec_render.cfg` (pro's crosshair, extracted from demo) and `autoexec_personal.cfg` (your crosshair) before/after rendering.
 
 ## Split demos (p1, p2)
 

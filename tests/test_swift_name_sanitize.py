@@ -117,3 +117,19 @@ def test_faceit_rename_map_sanitizes_names(tmp_path: Path, monkeypatch):
     demo.write_bytes(b"0")
 
     assert pipeline._faceit_rename_map(demo) == {"76561199646115626": "blyka"}
+
+
+def test_cached_rename_map_parses_once(tmp_path: Path, monkeypatch):
+    import types
+
+    import pipeline
+
+    calls = []
+    monkeypatch.setattr(
+        pipeline, "_faceit_rename_map", lambda p: calls.append(p) or {"1": "x"}
+    )
+    stub = types.SimpleNamespace(_rename_map=None, demo_path=tmp_path / "match.dem")
+    cached = pipeline.Pipeline._cached_rename_map.__get__(stub)
+    assert cached() == {"1": "x"}
+    assert cached() == {"1": "x"}
+    assert len(calls) == 1

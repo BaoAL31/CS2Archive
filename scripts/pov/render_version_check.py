@@ -1,20 +1,37 @@
-"""Pre-render version gate: demo ↔ CS2 patch + HLAE/CSDM floors.
+"""Pre-render version gate: demo ↔ CS2 patch + HLAE↔CS2 pin + CSDM floors.
 
 Local filesystem only — no network. Typical cost is tens of milliseconds
 (steam.inf + two PE version resources + demoparser header).
+
+HLAE is version-pinned to CS2 builds (AfxHookSource2 byte signatures). A CS2
+update without a matching HLAE fails at hook time with a GUI dialog, not a
+useful log line — so this gate hard-fails before launch when:
+  - CS2 is newer than the highest pin in ``CS2_MIN_HLAE`` (table not updated), or
+  - the HLAE CSDM actually launches is older than the pin for this CS2.
 """
 
 from __future__ import annotations
 
 import ctypes
+import json
 import re
 from ctypes import wintypes
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Bump these when a CS2 update requires newer tooling (after you install it).
+# Absolute floor when CS2 is older than every pin below.
 MIN_HLAE = (2, 192, 0)
 MIN_CSDM = (3, 20, 0)
+
+# CS2 patch (inclusive lower bound) → minimum HLAE. Highest matching bound wins.
+# Bump BOTH the new row AND the docs/bugs/hlae-steam-online-hook.md table when
+# installing a new HLAE for a CS2 update. A CS2 newer than the top row hard-fails
+# with RENDER_CS2_UNPINNED so a game update never silently burns HLAE retries.
+CS2_MIN_HLAE: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...] = (
+    ((1, 41, 8, 5), (2, 192, 5)),  # HLAE 2.192.5 / AfxHookSource2 0.41.5
+    ((1, 41, 8, 3), (2, 192, 4)),  # HLAE 2.192.4 / AfxHookSource2 0.41.4
+    ((1, 41, 8, 2), (2, 192, 3)),  # HLAE 2.192.3 / AfxHookSource2 0.41.3
+)
 
 # Demo patches HLAE will not record on current CS2 (AfxHook loads, no ffmpeg /
 # "Raw files not found"). Confirmed vs CS2 1.41.8.1: 1.41.3.8 and 1.41.4.1
@@ -28,6 +45,7 @@ MIN_RENDERABLE_DEMO_PATCH = (1, 41, 6, 4)
 
 HLAE_EXE = Path(r"C:\Program Files (x86)\HLAE\HLAE.exe")
 CSDM_EXE = Path(r"C:\Users\jembo\AppData\Local\Programs\cs-demo-manager\cs-demo-manager.exe")
+CSDM_SETTINGS = Path.home() / ".csdm" / "settings.json"
 CS2_STEAM_INF = Path(
     r"D:\Steam\steamapps\common\Counter-Strike Global Offensive\game\csgo\steam.inf"
 )
@@ -157,17 +175,60 @@ def version_at_least(have: tuple[int, ...], need: tuple[int, ...]) -> bool:
     return tuple(have[: len(need)]) >= need
 
 
+def hlae_bounds_for_cs2(cs2_patch: str) -> tuple[tuple[int, ...], tuple[int, ...] | None] | None:
+    """(min HLAE inclusive, max HLAE exclusive) for *cs2_patch*.
+
+    None means CS2 is newer than every pin (table stale → RENDER_CS2_UNPINNED).
+    Max is the HLAE built for the next newer CS2 pin: that build's signatures
+    are missing on the older game (e.g. ReplayName on 2.192.5 vs CS2 1.41.8.3).
+    """
+    cs2 = patch_tuple(cs2_patch)
+    rows = sorted(CS2_MIN_HLAE, key=lambda row: row[0])
+    highest_bound = rows[-1][0]
+    if cs2 > highest_bound:
+        return None
+    required = MIN_HLAE
+    ceiling: tuple[int, ...] | None = rows[0][1]
+    for i, (bound, hlae) in enumerate(rows):
+        if cs2 >= bound:
+            required = hlae
+            ceiling = rows[i + 1][1] if i + 1 < len(rows) else None
+    return required, ceiling
+
+
+def resolve_hlae_exe(
+    *,
+    csdm_settings: Path = CSDM_SETTINGS,
+    fallback: Path = HLAE_EXE,
+) -> Path:
+    """HLAE binary CSDM will actually launch (custom path when enabled)."""
+    try:
+        data = json.loads(csdm_settings.read_text(encoding="utf-8"))
+        hlae = ((data.get("video") or {}).get("hlae") or {})
+        if hlae.get("customLocationEnabled"):
+            loc = (hlae.get("customExecutableLocation") or "").strip()
+            if loc:
+                return Path(loc)
+    except (OSError, json.JSONDecodeError, TypeError, AttributeError):
+        pass
+    return fallback
+
+
 def check_render_versions(
     demo_path: Path | str | None = None,
     *,
     steam_inf: Path = CS2_STEAM_INF,
-    hlae_exe: Path = HLAE_EXE,
+    hlae_exe: Path | None = None,
     csdm_exe: Path = CSDM_EXE,
-    min_hlae: tuple[int, ...] = MIN_HLAE,
+    csdm_settings: Path = CSDM_SETTINGS,
+    # Explicit floor that bypasses the CS2 pin table (and its ceiling check).
+    hlae_override: tuple[int, ...] | None = None,
     min_csdm: tuple[int, ...] = MIN_CSDM,
 ) -> VersionCheckResult:
     """Local-only preflight. Safe to call before every render."""
     result = VersionCheckResult(ok=True)
+    if hlae_exe is None:
+        hlae_exe = resolve_hlae_exe(csdm_settings=csdm_settings, fallback=HLAE_EXE)
 
     # --- CS2 ---
     try:
@@ -213,18 +274,65 @@ def check_render_versions(
             result.ok = False
             result.errors.append(("RENDER_DEMO_VERSION_UNKNOWN", str(e)))
 
-    # --- HLAE ---
+    # --- HLAE (the one CSDM launches) ---
+    required_hlae = hlae_override
+    hlae_ceiling: tuple[int, ...] | None = None
+    if required_hlae is None and cs2 is not None:
+        bounds = hlae_bounds_for_cs2(cs2)
+        if bounds is None:
+            result.ok = False
+            top_cs2 = format_version(max(bound for bound, _ in CS2_MIN_HLAE))
+            top_hlae = format_version(next(
+                h for b, h in CS2_MIN_HLAE if b == max(bound for bound, _ in CS2_MIN_HLAE)
+            ))
+            result.errors.append((
+                "RENDER_CS2_UNPINNED",
+                f"CS2 {cs2} is newer than the HLAE compatibility table "
+                f"(last pin: CS2 {top_cs2} → HLAE {top_hlae}). "
+                f"Install matching HLAE from https://github.com/advancedfx/advancedfx/releases "
+                f"and add a CS2_MIN_HLAE row before rendering.",
+            ))
+            required_hlae = MIN_HLAE
+        else:
+            required_hlae, hlae_ceiling = bounds
+    if required_hlae is None:
+        required_hlae = MIN_HLAE
+
     try:
         if not hlae_exe.is_file():
             raise FileNotFoundError(f"HLAE not found: {hlae_exe}")
         hlae_ver = read_pe_version(hlae_exe)
         result.versions["hlae"] = format_version(hlae_ver)
-        if not version_at_least(hlae_ver, min_hlae):
+        result.versions["hlae_path"] = str(hlae_exe)
+        too_old = not version_at_least(hlae_ver, required_hlae)
+        too_new = (
+            hlae_ceiling is not None
+            and version_at_least(hlae_ver, hlae_ceiling)
+        )
+        if too_old or too_new:
             result.ok = False
+            # CS2-specific code only when the requirement came from the pin table.
+            code = (
+                "RENDER_HLAE_CS2_MISMATCH"
+                if hlae_override is None and cs2 is not None
+                else "RENDER_HLAE_OUTDATED"
+            )
+            if too_new:
+                detail = (
+                    f"HLAE {format_version(hlae_ver)} is newer than CS2 {cs2} "
+                    f"(need < {format_version(hlae_ceiling)}; "
+                    f"a newer hook looks for symbols this build does not have)"
+                )
+            else:
+                detail = (
+                    f"HLAE {format_version(hlae_ver)} < required {format_version(required_hlae)}"
+                    + (f" for CS2 {cs2}" if cs2 else "")
+                )
             result.errors.append((
-                "RENDER_HLAE_OUTDATED",
-                f"HLAE {format_version(hlae_ver)} < required {format_version(min_hlae)}; "
-                f"update from https://github.com/advancedfx/advancedfx/releases",
+                code,
+                f"{detail} (using {hlae_exe}); "
+                f"point ~/.csdm/settings.json video.hlae.customExecutableLocation "
+                f"at the matching HLAE from https://github.com/advancedfx/advancedfx/releases",
             ))
     except Exception as e:
         result.ok = False

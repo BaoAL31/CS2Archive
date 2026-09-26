@@ -90,7 +90,7 @@ def test_swift_profile_can_resume_but_cannot_change_player_or_style(tmp_path):
     (tmp_path / "round-001.mp4").write_bytes(b"new footage")
     validate_render_profile(tmp_path, "swift", "123")
     require_swift_capture(tmp_path, "123")
-    for style, player in (("off", "123"), ("swift", "456"), ("legacy", "123")):
+    for style, player in (("off", "123"), ("swift", "456")):
         with pytest.raises(RuntimeError):
             validate_render_profile(tmp_path, style, player)
 
@@ -149,8 +149,4 @@ def test_renderer_mounts_prepared_hud_with_names_and_restores_on_failure(tmp_pat
     with render_pov._voice_hud_session("demo.dem", tmp_path, "123", args):
         assert gameinfo.read_bytes() == original
     assert len(calls) == 1
-    args.voice_indicators = "legacy"
-    with render_pov._voice_hud_session("demo.dem", tmp_path, "123", args):
-        assert b"cs2archive_swift" in gameinfo.read_bytes()
-    assert calls[-1][-1] is False
     assert gameinfo.read_bytes() == original

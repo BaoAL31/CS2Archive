@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -73,7 +74,7 @@ def test_check_demo_game_mismatch(tmp_path: Path):
             steam_inf=steam_inf,
             hlae_exe=hlae,
             csdm_exe=csdm,
-            min_hlae=(2, 192, 0),
+            hlae_override=(2, 192, 0),
             min_csdm=(3, 20, 0),
         )
     assert not result.ok
@@ -100,7 +101,7 @@ def test_incompatible_old_demo_patch(tmp_path: Path):
             steam_inf=steam_inf,
             hlae_exe=hlae,
             csdm_exe=csdm,
-            min_hlae=(2, 192, 0),
+            hlae_override=(2, 192, 0),
             min_csdm=(3, 20, 0),
         )
     assert not result.ok
@@ -126,7 +127,7 @@ def test_demo_below_min_renderable_is_too_old(tmp_path: Path):
             steam_inf=steam_inf,
             hlae_exe=hlae,
             csdm_exe=csdm,
-            min_hlae=(2, 192, 0),
+            hlae_override=(2, 192, 0),
             min_csdm=(3, 20, 0),
         )
     assert not result.ok
@@ -152,7 +153,7 @@ def test_slightly_older_demo_is_allowed(tmp_path: Path):
             steam_inf=steam_inf,
             hlae_exe=hlae,
             csdm_exe=csdm,
-            min_hlae=(2, 192, 0),
+            hlae_override=(2, 192, 0),
             min_csdm=(3, 20, 0),
         )
     assert result.ok
@@ -178,7 +179,7 @@ def test_check_hlae_outdated(tmp_path: Path):
             steam_inf=steam_inf,
             hlae_exe=hlae,
             csdm_exe=csdm,
-            min_hlae=(2, 192, 0),
+            hlae_override=(2, 192, 0),
             min_csdm=(3, 20, 0),
         )
     assert not result.ok
@@ -204,11 +205,108 @@ def test_assert_ok(tmp_path: Path):
             steam_inf=steam_inf,
             hlae_exe=hlae,
             csdm_exe=csdm,
-            min_hlae=(2, 192, 0),
+            hlae_override=(2, 192, 0),
             min_csdm=(3, 20, 0),
         )
     assert vers["demo"] == "1.41.7.2"
     assert vers["cs2"] == "1.41.7.2"
+
+
+def test_hlae_bounds_for_cs2_table():
+    from render_version_check import hlae_bounds_for_cs2
+
+    assert hlae_bounds_for_cs2("1.41.8.5") == ((2, 192, 5), None)
+    assert hlae_bounds_for_cs2("1.41.8.4") == ((2, 192, 4), (2, 192, 5))
+    assert hlae_bounds_for_cs2("1.41.8.3") == ((2, 192, 4), (2, 192, 5))
+    assert hlae_bounds_for_cs2("1.41.8.2") == ((2, 192, 3), (2, 192, 4))
+    assert hlae_bounds_for_cs2("1.41.7.8") == ((2, 192, 0), (2, 192, 3))
+    assert hlae_bounds_for_cs2("1.41.8.6") is None
+
+
+def test_resolve_hlae_prefers_csdm_custom(tmp_path: Path):
+    from render_version_check import resolve_hlae_exe
+
+    custom = tmp_path / "HLAE-custom" / "HLAE.exe"
+    custom.parent.mkdir()
+    custom.write_bytes(b"x")
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({
+        "video": {"hlae": {
+            "customLocationEnabled": True,
+            "customExecutableLocation": str(custom),
+        }},
+    }), encoding="utf-8")
+    fallback = tmp_path / "ProgramFiles" / "HLAE.exe"
+    fallback.parent.mkdir()
+    fallback.write_bytes(b"y")
+    assert resolve_hlae_exe(csdm_settings=settings, fallback=fallback) == custom
+
+
+def test_cs2_unpinned_hard_fails(tmp_path: Path):
+    steam_inf = tmp_path / "steam.inf"
+    steam_inf.write_text("PatchVersion=1.41.9.0\n", encoding="utf-8")
+    hlae = tmp_path / "HLAE.exe"
+    csdm = tmp_path / "cs-demo-manager.exe"
+    hlae.write_bytes(b"x")
+    csdm.write_bytes(b"x")
+
+    with patch("render_version_check.read_pe_version", return_value=(2, 192, 5, 0)):
+        result = check_render_versions(
+            None,
+            steam_inf=steam_inf,
+            hlae_exe=hlae,
+            csdm_exe=csdm,
+        )
+    assert not result.ok
+    assert any(c == "RENDER_CS2_UNPINNED" for c, _ in result.errors)
+
+
+def test_hlae_cs2_mismatch_hard_fails(tmp_path: Path):
+    steam_inf = tmp_path / "steam.inf"
+    steam_inf.write_text("PatchVersion=1.41.8.5\n", encoding="utf-8")
+    hlae = tmp_path / "HLAE.exe"
+    csdm = tmp_path / "cs-demo-manager.exe"
+    hlae.write_bytes(b"x")
+    csdm.write_bytes(b"x")
+
+    def pe_ver(path: Path):
+        if path == hlae:
+            return (2, 192, 4, 0)  # too old for 1.41.8.5
+        return (3, 20, 0, 0)
+
+    with patch("render_version_check.read_pe_version", side_effect=pe_ver):
+        result = check_render_versions(
+            None,
+            steam_inf=steam_inf,
+            hlae_exe=hlae,
+            csdm_exe=csdm,
+        )
+    assert not result.ok
+    assert any(c == "RENDER_HLAE_CS2_MISMATCH" for c, _ in result.errors)
+
+
+def test_hlae_too_new_for_cs2_hard_fails(tmp_path: Path):
+    steam_inf = tmp_path / "steam.inf"
+    steam_inf.write_text("PatchVersion=1.41.8.3\n", encoding="utf-8")
+    hlae = tmp_path / "HLAE.exe"
+    csdm = tmp_path / "cs-demo-manager.exe"
+    hlae.write_bytes(b"x")
+    csdm.write_bytes(b"x")
+
+    def pe_ver(path: Path):
+        if path == hlae:
+            return (2, 192, 5, 0)  # built for 1.41.8.5
+        return (3, 20, 0, 0)
+
+    with patch("render_version_check.read_pe_version", side_effect=pe_ver):
+        result = check_render_versions(
+            None,
+            steam_inf=steam_inf,
+            hlae_exe=hlae,
+            csdm_exe=csdm,
+        )
+    assert not result.ok
+    assert any(c == "RENDER_HLAE_CS2_MISMATCH" for c, _ in result.errors)
 
 
 def test_assert_raises(tmp_path: Path):
@@ -220,5 +318,6 @@ def test_assert_raises(tmp_path: Path):
             steam_inf=steam_inf,
             hlae_exe=tmp_path / "missing-hlae.exe",
             csdm_exe=tmp_path / "missing-csdm.exe",
+            hlae_override=(2, 192, 0),
         )
     assert ei.value.code in ("RENDER_HLAE_MISSING", "RENDER_VERSION_CHECK")

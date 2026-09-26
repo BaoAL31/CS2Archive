@@ -51,18 +51,25 @@ def resolve_crosshair_cvars(
     *,
     csdm_cmd: str,
     screen_height: int = 1440,
+    demo_paths: list[Path | str] | None = None,
 ) -> tuple[list[str], dict]:
     """Prosettings crosshair for *nickname*, demo share code fallback.
 
     Blank/"unknown" nicknames skip prosettings and go straight to the demo.
-    Returns (cvars, info) where info is {"source": "prosettings"|"demo"|"none"}.
+    ``demo_paths`` covers split demos (p1/p2); the first part with a share
+    code wins. Returns (cvars, info).
     """
     nick = (nickname or "").strip()
     if not nick or nick.lower() == "unknown":
         nick = ""
-    return resolve_crosshair(
-        nick,
-        lambda: demo_crosshair_cvars(
-            steam_id, demo_path, csdm_cmd=csdm_cmd, screen_height=screen_height),
-        screen_height=screen_height,
-    )
+    parts = list(demo_paths) if demo_paths else [demo_path]
+
+    def fallback() -> list[str]:
+        for part in parts:
+            cvars = demo_crosshair_cvars(
+                steam_id, part, csdm_cmd=csdm_cmd, screen_height=screen_height)
+            if cvars:
+                return cvars
+        return []
+
+    return resolve_crosshair(nick, fallback, screen_height=screen_height)

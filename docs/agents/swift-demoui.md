@@ -5,7 +5,7 @@ CSDM/HLAE capture. It uses the actual upstream compiled Panorama layout/styles a
 voice indexer, with a small runtime adaptation for unattended POV recording.
 
 - Lower-left speaker icon, Steam avatar and name rows come from recorded voice packets.
-- Canonical look matches CS2's live voice HUD (no dark bars); Swift's original chrome is `--voice-indicators legacy`.
+- Canonical look matches CS2's live voice HUD (no dark bars).
 - Only the POV team's SteamIDs appear; selection survives halftime and slot changes.
 - Only the POV team's SteamIDs appear; selection survives halftime and slot changes.
 - Canonical names from the render's `--rename` map also apply to speaker labels.
@@ -34,18 +34,15 @@ Unexpected source versions fail explicitly rather than guessing compatible repla
 ## Pipeline use
 
 `pipeline.py` defaults to `--voice-indicators swift` **when voice comms are enabled**.
-That is the native in-game speaker HUD. `--voice-indicators legacy` keeps Swift's
-dark-bar chrome. `--voice-indicators shade` is the old scoreboard-avatar effect.
+That is the native in-game speaker HUD. `--voice-indicators shade` is the old scoreboard-avatar effect.
 The existing FACEIT eligibility threshold still applies; `--enable-voice-comms` forces it.
-Swift (native or legacy) and shade are mutually exclusive in a normal new pipeline render.
+Swift and shade are mutually exclusive in a normal new pipeline render.
 
 For a separate manual render:
 
 ```powershell
 python scripts/pov/render_pov.py <demo.dem> <steam64> --voice-indicators swift --output renders/<new-folder>
 # native HUD (canonical)
-python scripts/pov/render_pov.py <demo.dem> <steam64> --voice-indicators legacy --output renders/<new-folder>
-# Swift's original dark-bar chrome
 ```
 
 The renderer defaults to `off` when called directly; the production pipeline selects Swift.

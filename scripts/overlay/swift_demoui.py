@@ -80,7 +80,6 @@ def patch_runtime(source: str, allowed_steamids: list[str], names: dict[str, str
     """Adapt pinned upstream code, refusing to guess if upstream changes.
 
     ``native=True`` (canonical) restyles speaker rows to the in-game HUD.
-    ``native=False`` keeps Swift's original dark-bar chrome (legacy).
     """
     if not allowed_steamids or any(not str(sid).isdigit() for sid in allowed_steamids):
         raise ValueError("A nonempty POV-team SteamID list is required")
@@ -380,15 +379,14 @@ def mounted_hud(csgo: Path, menu: Path, session: Path):
 
 def validate_render_profile(output: Path, style: str, steam_id: str) -> None:
     """Do not resume old footage as if it contained the new baked-in HUD."""
-    native = style == "swift"
-    enabled = style in ("swift", "legacy")
+    enabled = style == "swift"
     marker = output / HUD_MARKER
-    expected = {"profile": capture_profile(native) if enabled else "off", "steam_id": steam_id}
+    expected = {"profile": capture_profile(True) if enabled else "off", "steam_id": steam_id}
     recorded = json.loads(marker.read_text()) if marker.is_file() else None
     has_video = any(output.glob("round-*.mp4")) or any(output.glob("batch-*.mp4")) or (output / "combined.mp4").exists()
     if has_video and recorded != expected and (enabled or recorded is not None):
         raise RuntimeError("Existing render uses a different voice indicator style. Keep its saved progress; "
-                           "use a new --output folder for Swift or resume the original style.")
+                           "use a new --output folder for Swift.")
     output.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps(expected, indent=2), encoding="utf-8")
 
@@ -409,8 +407,6 @@ def main():
     parser.add_argument("--demo", type=Path)
     parser.add_argument("--steam-id")
     parser.add_argument("--output", type=Path, default=ROOT / "renders/swift-preview")
-    parser.add_argument("--legacy-hud", action="store_true",
-                        help="Keep Swift's original dark-bar speaker chrome instead of the native HUD.")
     args = parser.parse_args()
     if args.install:
         install()
@@ -419,7 +415,7 @@ def main():
         from config import settings
         restore(Path(settings.cs2_cfg_dir).parent)
     elif args.demo and args.steam_id:
-        menu, session = prepare(args.demo, args.steam_id, args.output, native=not args.legacy_hud)
+        menu, session = prepare(args.demo, args.steam_id, args.output)
         print(f"Prepared (game unchanged): {menu}\n{session}")
     else:
         parser.error("Use --install, --restore, or --demo with --steam-id")

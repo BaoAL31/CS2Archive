@@ -34,8 +34,16 @@ whenever CS2 moves the offsets:
 
 | CS2 build | Required HLAE |
 |---|---|
+| 1.41.8.5 | **HLAE 2.192.5** (AfxHookSource2 0.41.5, 2026-09-26) |
 | 1.41.8.3 | **HLAE 2.192.4** (AfxHookSource2 0.41.4, 2026-09-24) |
 | 1.41.8.2 | **HLAE 2.192.3** (AfxHookSource2 0.41.3, 2026-09-23) |
+
+`scripts/pov/render_version_check.py` hard-fails before launch when CS2 is
+newer than this table (`RENDER_CS2_UNPINNED`) or when CSDM's configured HLAE
+is older than the pin (`RENDER_HLAE_CS2_MISMATCH`). It reads HLAE from
+`~/.csdm/settings.json` `video.hlae.customExecutableLocation`, not
+`Program Files`. After installing a new HLAE, add a `CS2_MIN_HLAE` row and
+update this table in the same commit.
 
 Install steps (no destructive change; keep the old version):
 1. Download `https://github.com/advancedfx/advancedfx/releases/download/v2.192.3/hlae_2_192_3.zip`

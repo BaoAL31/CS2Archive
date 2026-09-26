@@ -29,9 +29,8 @@ Reads all POV metadata from the backlog file. Runs steps 1-6 in order (analyze �
 Throw clips are rendered in sequence via CSDM/HLAE — this takes ~1-2 minutes per throw. For a full match with 20+ throws, budget 30-60 minutes.
 
 Voice-enabled captures default to native in-game speaker rows (Swift DemoUI Pro,
-restyled). `--voice-indicators legacy` keeps Swift's original dark-bar chrome.
-`--voice-indicators shade` is the older scoreboard-avatar effect, including
-resuming old footage. Swift (native or legacy) must be captured in step 2; see
+restyled). `--voice-indicators shade` is the older scoreboard-avatar effect, including
+resuming old footage. Swift must be captured in step 2; see
 [setup and recovery](swift-demoui.md).
 
 **Hook cold open (inside step 5, first — before the intro card):** every POV
