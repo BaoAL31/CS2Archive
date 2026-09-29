@@ -10,10 +10,9 @@ from pathlib import Path
 
 from PIL import Image
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import player_accounts
-from models import PlayerAccount
+import cs2archive.player_accounts as player_accounts
+from cs2archive.models import PlayerAccount
 from scrapers import hltv_player_resolver as resolver
 
 

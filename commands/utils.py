@@ -7,7 +7,7 @@ from __future__ import annotations
 from rich.console import Console
 from rich.table import Table
 
-from models import DownloadResult, DownloadStatus, MatchInfo
+from cs2archive.models import DownloadResult, DownloadStatus, MatchInfo
 
 console = Console(force_terminal=True)
 

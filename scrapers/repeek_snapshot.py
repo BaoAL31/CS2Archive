@@ -403,13 +403,64 @@ def _screenshot_clip(page: Any, box: dict, dest: Path, vw: dict, **pad: float) -
         )
 
 
-def strips_dir(match_id: str) -> Path:
-    return STRIPS_ROOT / match_id
+def strips_dir(match_id: str, root: Path | None = None) -> Path:
+    return (root or STRIPS_ROOT) / match_id
+
+
+def _read_json(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def repeek_registered(profile: Path) -> bool:
+    """True when Secure Preferences (or legacy Preferences) has the Repeek entry.
+
+    Chrome 153+ keeps extension registration only in ``Secure Preferences``;
+    ``Preferences`` is empty. The old merge looked at the wrong file.
+    """
+    for name in ("Secure Preferences", "Preferences"):
+        data = _read_json(profile / "Default" / name)
+        if not isinstance(data, dict):
+            continue
+        entry = ((data.get("extensions") or {}).get("settings") or {}).get(REPEEK_ID)
+        if isinstance(entry, dict):
+            return True
+    return False
 
 
 def repeek_installed(profile: Path) -> bool:
     ext = profile / "Default" / "Extensions" / REPEEK_ID
     return ext.is_dir() and any(ext.iterdir())
+
+
+def _merge_repeek_secure_prefs(src_prefs: Path, dst_prefs: Path) -> bool:
+    """Copy the Repeek extensions.settings entry into dst Secure Preferences.
+
+    Also drops ``protection.macs.extensions`` so Chrome re-hashes on next
+    launch instead of rejecting the edited file as tampered (which would
+    uninstall the extension). Must run while Chrome is not using dst.
+    """
+    src = _read_json(src_prefs)
+    if not isinstance(src, dict):
+        return False
+    entry = ((src.get("extensions") or {}).get("settings") or {}).get(REPEEK_ID)
+    if not isinstance(entry, dict):
+        return False
+    dst = _read_json(dst_prefs) or {}
+    ext = dst.setdefault("extensions", {})
+    settings = ext.setdefault("settings", {})
+    settings[REPEEK_ID] = entry
+    try:
+        macs = (dst.get("protection") or {}).get("macs")
+        if isinstance(macs, dict) and "extensions" in macs:
+            del macs["extensions"]
+    except Exception:
+        pass
+    dst_prefs.parent.mkdir(parents=True, exist_ok=True)
+    dst_prefs.write_text(json.dumps(dst, ensure_ascii=False), encoding="utf-8")
+    return True
 
 
 def _merge_repeek_prefs(src_prefs: Path, dst_prefs: Path) -> bool:
@@ -438,10 +489,17 @@ def seed_repeek_into_debug_profile(
 
     Must run while Chrome is not using ``dst_profile``. Returns True if the
     extension files landed.
+
+    Idempotent: when dst already has files + registration, do nothing so a
+    manual Web-Store install is never clobbered. Registration lives in
+    ``Secure Preferences`` on Chrome 153+ (``Preferences`` is empty).
     """
+    if repeek_installed(dst_profile) and repeek_registered(dst_profile):
+        return True
     src_ext = src_profile / "Default" / "Extensions" / REPEEK_ID
     if not src_ext.is_dir():
-        return False
+        # src files missing but dst already has a working install — keep it.
+        return repeek_installed(dst_profile) and repeek_registered(dst_profile)
     dst_ext = dst_profile / "Default" / "Extensions" / REPEEK_ID
     dst_ext.parent.mkdir(parents=True, exist_ok=True)
     if dst_ext.exists():
@@ -453,7 +511,14 @@ def seed_repeek_into_debug_profile(
         dst_les.parent.mkdir(parents=True, exist_ok=True)
         if dst_les.exists():
             shutil.rmtree(dst_les, ignore_errors=True)
-        shutil.copytree(src_les, dst_les)
+        try:
+            shutil.copytree(src_les, dst_les)
+        except OSError:
+            pass
+    _merge_repeek_secure_prefs(
+        src_profile / "Default" / "Secure Preferences",
+        dst_profile / "Default" / "Secure Preferences",
+    )
     _merge_repeek_prefs(
         src_profile / "Default" / "Preferences",
         dst_profile / "Default" / "Preferences",

@@ -1,4 +1,4 @@
-"""Tests for scripts/pov/concat_rounds.py — single-pass concat-demuxer."""
+"""Tests for cs2archive/pov/concat_rounds.py — single-pass concat-demuxer."""
 
 from __future__ import annotations
 
@@ -8,11 +8,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
-from _pathsetup import ensure
-ensure()
 
-import concat_rounds
+import cs2archive.pov.concat_rounds as concat_rounds
 
 FFMPEG = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
 

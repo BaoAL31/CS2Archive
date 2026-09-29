@@ -15,12 +15,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
-from _pathsetup import ensure
-ensure()
 
-import concat_rounds
-from concat_rounds import validate_round_offsets_sidecar
+import cs2archive.pov.concat_rounds as concat_rounds
+from cs2archive.pov.concat_rounds import validate_round_offsets_sidecar
 
 FFMPEG = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
 

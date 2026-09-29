@@ -12,12 +12,11 @@ from pathlib import Path
 import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PROJECT_ROOT / "scripts" / "faceit"))
 
 
 @pytest.fixture()
 def accounts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    import faceit_names as fn
+    import cs2archive.faceit.faceit_names as fn
     acc = tmp_path / "player_accounts.json"
     acc.write_text(json.dumps([
         {"nickname": "donk", "faceit_nickname": "donk666",

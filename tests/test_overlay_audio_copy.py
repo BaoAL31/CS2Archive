@@ -13,11 +13,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
-from _pathsetup import ensure
-ensure()
 
-from overlay.overlay_encode import (
+from cs2archive.overlay.overlay_encode import (
     _concat_overlay_batches,
     _ffmpeg_encode,
     _remux_source_audio,

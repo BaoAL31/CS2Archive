@@ -1,8 +1,8 @@
 """Seams for the dataset-backed POV fitter (LIM pro channel)."""
 from __future__ import annotations
 
-from shorts.fit_clip_weights import spearman
-from shorts.fit_pov_weights import (
+from cs2archive.shorts.fit_clip_weights import spearman
+from cs2archive.shorts.fit_pov_weights import (
     features_from_row,
     new_weights,
     predict_log_views,
@@ -42,7 +42,7 @@ def test_predict_sums_groups():
 
 
 def test_sgd_epoch_learns_and_zero_alpha_freezes():
-    from shorts.fit_pov_weights import GROUPS
+    from cs2archive.shorts.fit_pov_weights import GROUPS
     weights = new_weights()
     alphas = {group: 0.0 for group in GROUPS}
     alphas.update({"map": 0.1, "bias": 0.0, "channel": 0.0})
@@ -56,7 +56,7 @@ def test_spearman_reexport():
 
 
 def test_time_split_is_ordered_and_disjoint():
-    from shorts.fit_pov_weights import time_split
+    from cs2archive.shorts.fit_pov_weights import time_split
     rows = [{"published_at": f"2026-01-{i:02d}", "i": i} for i in range(1, 11)]
     train, val, test = time_split(rows, train_frac=0.8, val_of_tail=0.5)
     assert [r["i"] for r in train] == [1, 2, 3, 4, 5, 6, 7, 8]
@@ -65,7 +65,7 @@ def test_time_split_is_ordered_and_disjoint():
 
 
 def test_row_from_card_matches_dataset_features():
-    from shorts.fit_pov_weights import features_from_row, row_from_card
+    from cs2archive.shorts.fit_pov_weights import features_from_row, row_from_card
     row = _row()
     card = {"player": "Frozen", "map": "Mirage", "rating": 1.2, "kd": 1.5,
             "decider": "no", "won": "yes", "ot": "no", "derby_views": 5000,
@@ -81,8 +81,8 @@ def test_row_from_card_matches_dataset_features():
 
 
 def test_serve_uses_rating_group():
-    from hltv.score_cards import predict_model_log_views
-    from shorts.fit_pov_weights import new_weights
+    from cs2archive.hltv.score_cards import predict_model_log_views
+    from cs2archive.shorts.fit_pov_weights import new_weights
     weights = new_weights()
     weights["bias"] = 1.0
     weights["rating"]["1.2+"] = 0.5
@@ -93,7 +93,7 @@ def test_serve_uses_rating_group():
 
 
 def test_within_match_pairwise():
-    from shorts.fit_pov_weights import evaluate_within_match, new_weights
+    from cs2archive.shorts.fit_pov_weights import evaluate_within_match, new_weights
     weights = new_weights()
     weights["player"]["a"] = 1.0
     a = _row(player="a", target_views=100_000, published_at="2026-06-01T00:00:00")
@@ -105,7 +105,7 @@ def test_within_match_pairwise():
 
 
 def test_label_views_plateaus_at_21_days():
-    from shorts.fit_pov_weights import label_views
+    from cs2archive.shorts.fit_pov_weights import label_views
     mature = _row(target_views=2100, age_days=100)
     young = _row(target_views=700, age_days=7)
     assert label_views(mature) == 2100
@@ -114,7 +114,7 @@ def test_label_views_plateaus_at_21_days():
 
 
 def test_event_tier_blast_open_and_qualifier():
-    from shorts.pro_context import event_tier
+    from cs2archive.shorts.pro_context import event_tier
     assert event_tier("BLAST Open Porto 2026") == "s-tier"
     assert event_tier("IEM Krakow 2026") == "s-tier"
     assert event_tier("IEM Atlanta 2026 Closed Qualifier") == "regular"
@@ -122,7 +122,7 @@ def test_event_tier_blast_open_and_qualifier():
 
 
 def test_parse_navi_vs_3dmax_not_self():
-    from shorts.pro_context import parse_pro_title, same_team
+    from cs2archive.shorts.pro_context import parse_pro_title, same_team
     parsed = parse_pro_title(
         "Aleksib (16-8) NAVI vs 3DMAX (Ancient) ESL Pro League #navi")
     assert parsed["team1"] == "Natus Vincere"
@@ -131,7 +131,7 @@ def test_parse_navi_vs_3dmax_not_self():
 
 
 def test_summarize_rounds_marks_ace_and_map_win():
-    from shorts.demo_pov_features import summarize_rounds
+    from cs2archive.shorts.demo_pov_features import summarize_rounds
     by_round = {1: {"zywoo": 5, "flamez": 1}, 2: {"zywoo": 2, "flamez": 0}}
     winners = {1: "CT", 2: "T"}
     sides = {(1, "zywoo"): "CT", (1, "flamez"): "T",
@@ -143,7 +143,7 @@ def test_summarize_rounds_marks_ace_and_map_win():
 
 
 def test_teams_from_folder_strips_event():
-    from shorts.demo_pov_features import teams_from_folder, map_from_demo_name
+    from cs2archive.shorts.demo_pov_features import teams_from_folder, map_from_demo_name
     assert teams_from_folder("2396950-mouz-vs-vitality-blast-open-porto") == (
         "mouz", "vitality")
     assert teams_from_folder(
@@ -153,14 +153,14 @@ def test_teams_from_folder_strips_event():
 
 
 def test_match_url_from_relative_hltv_href():
-    from shorts.download_pov_demos import match_url_from_stats_html
+    from cs2archive.shorts.download_pov_demos import match_url_from_stats_html
     html = '<a href="/matches/2380123/nrg-vs-falcons-iem-krakow-2026">match</a>'
     assert match_url_from_stats_html(html) == (
         "https://www.hltv.org/matches/2380123/nrg-vs-falcons-iem-krakow-2026")
 
 
 def test_match_url_skips_short_related_match_href():
-    from shorts.download_pov_demos import match_url_from_stats_html
+    from cs2archive.shorts.download_pov_demos import match_url_from_stats_html
     html = (
         '<a href="/matches/122371/nrg-vs-falcons">old</a>'
         '<a href="/matches/2389652/nrg-vs-falcons-iem-krakw-2026">real</a>'

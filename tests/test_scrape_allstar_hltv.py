@@ -5,9 +5,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from shorts.scrape_allstar_hltv import clip_from_allstar, clips_from_playlist_payload, match_stage_from_html
+from cs2archive.shorts.scrape_allstar_hltv import clip_from_allstar, clips_from_playlist_payload, match_stage_from_html
 
 
 SAMPLE_CLIP = {

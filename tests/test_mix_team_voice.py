@@ -3,9 +3,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "faceit"))
 
-from mix_team_voice import _as_steamid, teammate_voice_map
+from cs2archive.faceit.mix_team_voice import _as_steamid, teammate_voice_map
 
 
 def test_as_steamid_normalizes_float_pandas_ids():

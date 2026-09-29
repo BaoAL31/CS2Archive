@@ -9,13 +9,9 @@ import pytest
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "scripts"))
-from _pathsetup import ensure  # noqa: E402
 
-ensure()
 
-from create_repeek_intro import (  # noqa: E402
+from cs2archive.faceit.create_repeek_intro import (  # noqa: E402
     OUT_H,
     OUT_W,
     PANE_MARGIN,
@@ -24,7 +20,7 @@ from create_repeek_intro import (  # noqa: E402
     match_id_from_backlog,
     pane_layers,
 )
-from intro_prepend import build_intro_filter  # noqa: E402
+from cs2archive.faceit.intro_prepend import build_intro_filter  # noqa: E402
 
 
 def _panes(w=400, h=900, lc=(200, 0, 0), rc=(0, 200, 0)):
@@ -93,6 +89,15 @@ def test_intro_filter_slides_panes_with_ease_in_out():
     assert "if(lt(t,4.5),0," in fc
     assert str(-(56 + 700)) in fc
     assert str(2560 - 1804) in fc
+
+
+def test_intro_filter_fade_in_opens_from_black():
+    fc = build_intro_filter(
+        (2560, 1440, 60.0), 5.0, 0.5, 0.5,
+        [56, 56, 700, 1300], [1804, 56, 700, 1300],
+        fade_in=0.5,
+    )
+    assert "fade=t=in:st=0:d=0.5" in fc
 
 
 def test_compose_panes_shadow_falls_bottom_right():

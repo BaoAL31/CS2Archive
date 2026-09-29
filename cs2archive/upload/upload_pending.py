@@ -1,0 +1,352 @@
+"""
+Scan youtube/*/upload_meta.json and upload any that are still pending.
+
+The pipeline (cs2archive/pov/pipeline.py) only produces the finished video,
+thumbnail, and upload_meta.json (with youtube_id=None, upload_status="pending").
+This script does the actual uploading: for every upload_meta.json whose
+upload_status != "completed", it invokes cs2archive/upload/upload_youtube.py --meta <path>,
+which performs the upload, sets the thumbnail, and writes youtube_id +
+upload_status="completed" back into the same meta file.
+
+Because the pipeline writes one independent upload_meta.json per variant
+(raw -> youtube/{run_id}/, overlay -> youtube/{run_id}_overlay/), this script
+naturally handles dual-upload and overlay-only variants with no special flags.
+
+Resume-safe: a completed meta (youtube_id set, upload_status="completed") is
+skipped, so re-running only uploads what's left. upload_youtube.py also stores
+resumable_* fields in the meta file for crash recovery within a single upload.
+
+With --also-bilibili, after YouTube (or when YouTube is already done) this also
+runs the bilibili.tv upload via upload_youtube.py --also-bilibili /
+--bilibili-only. Bilibili status is stored separately in the same meta
+(bilibili_aid / bilibili_upload_status).
+
+Usage:
+    python cs2archive/upload/upload_pending.py                 # upload every pending meta
+    python cs2archive/upload/upload_pending.py --dry-run       # list what would upload
+    python cs2archive/upload/upload_pending.py --limit 1       # upload at most one
+    python cs2archive/upload/upload_pending.py --dir youtube/my-match   # restrict scope
+    python cs2archive/upload/upload_pending.py --also-bilibili # YouTube + bilibili.tv
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+from cs2archive.upload.upload_bilibili import is_bilibili_pending  # noqa: E402
+from cs2archive.upload.youtube_schedule import DEFAULT_PUBLISH_TZ, resolve_auto_publish_schedule  # noqa: E402
+
+PY = sys.executable
+UPLOAD_YOUTUBE = PROJECT_ROOT / "cs2archive" / "upload" / "upload_youtube.py"
+DEFAULT_YOUTUBE_DIR = PROJECT_ROOT / "youtube"
+
+
+def _is_youtube_pending(meta: dict) -> bool:
+    return not (meta.get("upload_status") == "completed" and meta.get("youtube_id"))
+
+
+def _needs_upload(meta: dict, also_bilibili: bool) -> bool:
+    if _is_youtube_pending(meta):
+        return True
+    if also_bilibili and is_bilibili_pending(meta):
+        return True
+    return False
+
+
+def find_pending(youtube_dir: Path, also_bilibili: bool = False) -> list[Path]:
+    """Return paths of upload_meta.json files that still need uploading."""
+    pending: list[Path] = []
+    for meta_path in sorted(youtube_dir.rglob("upload_meta.json")):
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"  [skip] could not parse {meta_path}: {e}")
+            continue
+        if not _needs_upload(meta, also_bilibili):
+            continue
+        video = meta.get("video_path")
+        if not video or not Path(video).exists():
+            print(f"  [skip] missing video for {meta_path.parent.name}: {video}")
+            continue
+        pending.append(meta_path)
+    return pending
+
+
+def _run_id_for_meta_dir(meta_dir: Path) -> str:
+    """youtube/{run_id}[_overlay]/ -> {run_id} (matches .pipeline/{run_id}.json)."""
+    name = meta_dir.name
+    if name.endswith("_overlay"):
+        name = name[: -len("_overlay")]
+    return name
+
+
+def _sibling_metas_pending(run_id: str, youtube_root: Path,
+                           also_bilibili: bool) -> list[str]:
+    """Pending meta dirs (raw + overlay variants) sharing this run_id."""
+    pending: list[str] = []
+    for cand in (youtube_root / run_id, youtube_root / f"{run_id}_overlay"):
+        meta_path = cand / "upload_meta.json"
+        if not meta_path.is_file():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if _needs_upload(meta, also_bilibili):
+            pending.append(cand.name)
+    return pending
+
+
+def maybe_purge_renders(meta_path: Path, also_bilibili: bool,
+                        dry_run: bool = False) -> None:
+    """Delete renders/pov-* once EVERY variant of the run is uploaded.
+
+    Render intermediates are the only repair path (re-overlay, re-scale),
+    so purge only when neither raw nor overlay variant still needs uploading.
+    The render dir comes from .pipeline/{run_id}.json (written by pipeline.py).
+    Shorts survive the purge (separate upload flow) — see paths.purge_pov_dir.
+    """
+    meta_dir = meta_path.parent
+    # youtube_root: parent of the variant dir, unless --dir pointed deeper.
+    youtube_root = meta_dir.parent
+    run_id = _run_id_for_meta_dir(meta_dir)
+    still = _sibling_metas_pending(run_id, youtube_root, also_bilibili)
+    if still:
+        print(f"  [keep-renders] {run_id}: still pending: {', '.join(still)}")
+        return
+    state_path = PROJECT_ROOT / ".pipeline" / f"{run_id}.json"
+    render_dir = None
+    if state_path.is_file():
+        try:
+            render_dir = (json.loads(state_path.read_text(encoding="utf-8"))
+                            .get("data", {}).get("render_dir"))
+        except Exception:
+            render_dir = None
+    if not render_dir:
+        return
+    rd = Path(render_dir)
+    if not rd.is_absolute():
+        rd = PROJECT_ROOT / rd
+    if not rd.exists():
+        return
+    if dry_run:
+        print(f"  [dry-run] would purge renders: {rd.name}")
+        return
+    try:
+        from cs2archive.paths import purge_pov_dir
+        freed_gb = purge_pov_dir(rd)
+        print(f"  [purge-renders] removed {rd.name}/ "
+              f"({freed_gb:.1f} GB) — all variants uploaded (shorts spared)")
+    except OSError as e:
+        print(f"  [WARN] render purge failed (non-fatal): {e}")
+
+
+def upload_one(meta_path: Path, meta: dict, dry_run: bool, also_bilibili: bool) -> bool:
+    """Upload a single pending meta. Returns True on success.
+
+    Success means upload_youtube.py exited 0 AND the expected platform IDs
+    are present in the meta file afterward.
+    """
+    video = Path(meta["video_path"])
+    thumb = meta.get("thumbnail_path")
+    privacy = meta.get("privacy", "private")
+    yt_pending = _is_youtube_pending(meta)
+    bili_pending = also_bilibili and is_bilibili_pending(meta)
+
+    if dry_run:
+        parts = []
+        if yt_pending:
+            parts.append("youtube")
+        if bili_pending:
+            parts.append("bilibili")
+        print(
+            f"  [dry-run] would upload ({'+'.join(parts) or 'nothing'}): {video} "
+            f"(privacy={privacy}, thumbnail={'yes' if thumb else 'no'})"
+        )
+        return False
+
+    if yt_pending:
+        cmd = [
+            PY, str(UPLOAD_YOUTUBE),
+            str(video),
+            "--meta", str(meta_path),
+            "--privacy", privacy,
+        ]
+        if thumb and Path(thumb).exists():
+            cmd += ["--thumbnail", str(thumb)]
+        if also_bilibili:
+            cmd.append("--also-bilibili")
+
+        print(f"  Uploading: {video}")
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+        r = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=env)
+        if r.returncode != 0:
+            print(f"  [FAIL] upload exited {r.returncode}: {video}")
+            return False
+    elif bili_pending:
+        cmd = [
+            PY, str(UPLOAD_YOUTUBE),
+            str(video),
+            "--meta", str(meta_path),
+            "--bilibili-only",
+        ]
+        if thumb and Path(thumb).exists():
+            cmd += ["--thumbnail", str(thumb)]
+        print(f"  Uploading bilibili only: {video}")
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+        r = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=env)
+        if r.returncode != 0:
+            print(f"  [FAIL] bilibili upload exited {r.returncode}: {video}")
+            return False
+    else:
+        return True
+
+    try:
+        updated = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        updated = {}
+
+    ok = True
+    vid = updated.get("youtube_id")
+    if yt_pending or not also_bilibili:
+        if vid:
+            print(f"  [OK] Uploaded: https://youtu.be/{vid}")
+        else:
+            print(f"  [WARN] upload_youtube.py exited 0 but no youtube_id in {meta_path.name}")
+            ok = False
+    if also_bilibili:
+        aid = updated.get("bilibili_aid")
+        if aid and updated.get("bilibili_upload_status") == "completed":
+            print(f"  [OK] Bilibili: aid={aid}")
+        else:
+            print(f"  [WARN] bilibili not completed in {meta_path.name}")
+            ok = False
+    return ok
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Upload every pending youtube/*/upload_meta.json")
+    parser.add_argument(
+        "--dir", default=str(DEFAULT_YOUTUBE_DIR),
+        help=f"Root dir to scan for upload_meta.json (default: {DEFAULT_YOUTUBE_DIR})")
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="List pending uploads without actually uploading")
+    parser.add_argument(
+        "--limit", type=int, default=0,
+        help="Upload at most N pending metas (default: 0 = all)")
+    parser.add_argument(
+        "--also-bilibili", action="store_true",
+        help="Also upload to bilibili.tv (same title/schedule/tags; needs "
+             ".bilibili_storage.json). Resume-safe via bilibili_aid in meta.")
+    parser.add_argument(
+        "--retries", type=int, default=3,
+        help="Retry a failed upload (crash/non-zero exit) up to N times "
+             "(default: 3). upload_youtube.py is resumable, so a relaunch picks "
+             "up where the failed run left off.")
+    parser.add_argument(
+        "--retry-delay", type=float, default=10.0,
+        help="Base delay in seconds before the first retry; delay grows linearly "
+             "per attempt (default: 10).")
+    parser.add_argument(
+        "--purge-renders", dest="purge_renders", action="store_true",
+        default=True,
+        help="Delete renders/pov-* once every variant of the run is uploaded "
+             "(default: on).")
+    parser.add_argument(
+        "--keep-renders", dest="purge_renders", action="store_false",
+        help="Keep render intermediates after upload (repair path).")
+    parser.add_argument(
+        "--check-schedule", action="store_true",
+        help="Show next available YouTube publish slot and exit")
+    args = parser.parse_args()
+
+    if args.check_schedule:
+        from cs2archive.upload.upload_youtube import get_authenticated_service, get_youtube_publish_dates
+        print("Querying YouTube schedule...")
+        youtube = get_authenticated_service()
+        occupied = get_youtube_publish_dates(youtube) or set()
+        privacy, utc, tz, local = resolve_auto_publish_schedule(
+            timezone=DEFAULT_PUBLISH_TZ, occupied_dates=occupied,
+        )
+        print(f"Next free slot:")
+        print(f"  Local:  {local} {tz}")
+        print(f"  UTC:    {utc}")
+        print(f"  Status: {privacy}")
+        if occupied:
+            print(f"  Occupied dates: {len(occupied)}")
+        return
+
+    youtube_dir = Path(args.dir)
+    if not youtube_dir.exists():
+        print(f"[ERROR] directory not found: {youtube_dir}")
+        sys.exit(1)
+
+    pending = find_pending(youtube_dir, also_bilibili=args.also_bilibili)
+    print(f"Found {len(pending)} pending upload(s) under {youtube_dir}")
+    if args.limit > 0:
+        pending = pending[:args.limit]
+
+    if not pending:
+        print("Nothing to upload.")
+        return
+
+    ok = 0
+    failed = 0
+    retried = 0
+    for meta_path in pending:
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"  [skip] could not re-read {meta_path}: {e}")
+            failed += 1
+            continue
+
+        attempts = 1 + args.retries  # first try + N retries
+        uploaded_ok = False
+        for attempt in range(1, attempts + 1):
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                print(f"  [skip] could not re-read {meta_path}: {e}")
+                break
+            if upload_one(meta_path, meta, args.dry_run, args.also_bilibili):
+                uploaded_ok = True
+                break
+            if args.dry_run:
+                break
+            if attempt < attempts:
+                delay = args.retry_delay * attempt
+                print(f"  [retry] {meta_path.parent.name}: try {attempt}/{args.retries} "
+                      f"failed; retrying in {delay:.0f}s...", flush=True)
+                time.sleep(delay)
+                retried += 1
+
+        if uploaded_ok:
+            ok += 1
+            if args.purge_renders and not args.dry_run:
+                try:
+                    maybe_purge_renders(meta_path, args.also_bilibili)
+                except Exception as e:
+                    print(f"  [WARN] post-upload purge failed (non-fatal): {e}")
+        elif not args.dry_run:
+            failed += 1
+
+    print(f"\nDone. uploaded={ok} failed={failed} retried={retried} "
+          f"(dry_run={args.dry_run}, also_bilibili={args.also_bilibili})")
+    if failed and not args.dry_run:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

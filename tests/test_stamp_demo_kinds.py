@@ -6,10 +6,9 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from shorts.stamp_demo_kinds import kinds_by_player_round, kinds_for_clip, stamp_joined_clips
-from shorts.fit_partial_stars import apply_demo_kind_stamps
+from cs2archive.shorts.stamp_demo_kinds import kinds_by_player_round, kinds_for_clip, stamp_joined_clips
+from cs2archive.shorts.fit_partial_stars import apply_demo_kind_stamps
 
 
 def test_kinds_by_player_round_merges_cuts_in_the_same_round():

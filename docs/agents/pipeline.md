@@ -35,27 +35,42 @@ resuming old footage. Swift must be captured in step 2; see
 
 **Hook cold open (inside step 5, first — before the intro card):** every POV
 gets a no-spoiler highlight prepended: the POV player's best moments
-(`scripts/pov/build_hook_timeline.py` → `render_hook.py` → `assemble_hook.py`),
+(`cs2archive/pov/build_hook_timeline.py` → `render_hook.py` → `assemble_hook.py`),
 rendered with `cl_draw_only_deathnotices 1` (killfeed only, the Shorts HUD) so
-no score/round/timer leaks.
+no score/round/timer leaks. The hook renders under its own autoexec with the
+same cfg inputs as the POV (canonical nick → prosettings crosshair/viewmodel,
+rename map, spec-lock); auto-team FACEIT lobbies (no tournament) additionally
+hide scoreboard avatars (`--hide-avatars`, same flag on POV/hook/intro renders)
+since unresolvable Steam avatars show as missing-texture checkers.
 
-- Order delivered: hook → card + buy phase → POV → outro. Each prepend shifts
-  every downstream timestamp in `video.round_offsets.json` (`hook_seconds`,
-  then `intro_seconds`).
+- Order delivered: hook → card + buy phase → POV → outro. Step 5 runs the
+  intro first, then prepends the hook in front, so the intro's buy-phase
+  footage stays adjacent to the POV (seamless lead-in). Each prepend shifts
+  every downstream timestamp in `video.round_offsets.json` (`intro_seconds`,
+  then `hook_seconds`).
+- Moments whose kills land <5s apart **chain** into one continuous clip
+  (union bounds + kills, best tier wins, 15s span cap); wider gaps stay
+  separate jump-cut clips. Every tail ends 0.4s before the POV's next kill.
+  The hook tail fades to black and the intro head fades back in, so hook →
+  intro reads as a dip-to-black across the cut. Prepends stream-copy video
+  but re-encode audio to AAC 48k stereo — segments come from mixed encoders
+  and a `-c copy` audio join leaves everything past the cut undecodable.
 - A demo with no qualifying moment is a normal skip — the video ships without a
+  hook. Same when the planned footage is under `--hook-min-seconds` (10s):
+  a lone insta flash into the intro is disorienting, so short plans ship no
   hook. `--no-hook` disables the step entirely.
 - Tier threshold and coverage numbers: see the Hook section in `AGENTS.md`.
 
 **FACEIT match intro (inside step 5, before the outro):** the intro frame is
 composed from the **Repeek left/right stat panes**, not a card drawn by us.
 `scripts/faceit/create_repeek_intro.py` reuses or captures
-`renders/stat-strips/<match_id>/repeek_left.png` + `repeek_right.png` via the
+`{pov}/stat-strips/<match_id>/repeek_left.png` + `repeek_right.png` via the
 existing `scrapers.repeek_snapshot` capture (`run_standalone`, headed Chrome on
 `.sessions/faceit`), renders each pane as a **rounded pop-up card** (inset
 `PANE_MARGIN` from every edge, `PANE_RADIUS` anti-aliased corners via
 `scripts/imgutil.rounded_layer`) with a **transparent middle** (the buy-phase
 footage shows through) →
-`renders/intro-<run_id>/intro.png` (2560x1440 RGBA), consumed unchanged by
+`{pov}/intro/intro.png` (2560x1440 RGBA), consumed unchanged by
 `intro_prepend.py`. `_prepend_intro` only reuses an `intro.png` whose
 `intro_details.json` has `"builder": "create_repeek_intro"` — anything else is
 rebuilt. (The old drawn card was removed.) Capture needs the Repeek extension +
@@ -103,7 +118,11 @@ HTTP errors (500/502/503/504) up to 20×; the subprocess-level retry in
 - **`--skip-failed-rounds`** — **[DANGER] NEVER set by default.** Skip round batches that fail during rendering instead of aborting the entire pipeline. Only use when a specific demo file is corrupted/incompatible (like the `100-thieves-vs-spirit-m3-dust2.dem` from BLAST Bounty 2026 Season 2 — that demo fails at round 1 with "Game error" for every player). Silently drops failed rounds, producing an incomplete POV video. Enabled per-invocation via CLI flag or the backlog entry's `pipeline_cmd` when the demo is known-broken. See backlog `skip_failed_rounds: true` entries for the canonical example.
 - **`--raw-only`** — produce `youtube/{run_id}/` with no overlay. Default is overlay-only at `youtube/{run_id}_overlay/`. State key: `skip_overlay`.
 - **`--overlay-only`** — deprecated no-op; overlay-only is already the default.
-- **`--voice-shade`** — (optional, requires FACEIT demo voice) overlay a per-player voice-activity shade on the POV team's scoreboard avatars. Each box is dimmed by default and the shade fades OUT over `--voice-shade-fade` (default 0.3s) when that teammate talks, then fades back in. Uses the demo's per-player Opus voice (decoded packet-aligned via libopus) aligned via `combined.round_offsets.json`, mapped to boxes by POV team slot order (see `scripts/overlay/avatar_boxes.py`). **The shade is applied at NATIVE resolution inside the SCALE step** (`concat_rounds.py --voice-shade-demo/steam-id/fade/side`), composited *before* the `scale=2560:1440` filter so the shade stretches together with the video and stays glued to the avatars. It is **not** applied in the overlay step — the overlay step only handles util-cam PiPs + lineup freeze frames (plus optional keyboard sprites with `--keyboard`). The comms **audio** mix still runs in step 4 (`mix_team_voice.py`).
+- **`--voice-shade` / `--voice-shade-fade`** — REMOVED. The legacy shade indicator (dimming the scoreboard to highlight the POV team) is gone; the voice HUD is now the
+  Swift indicators, which are baked into the captured frames in step 2, so concat/scaling
+  needs no voice arguments. The still-useful avatar rectangles live in
+  `cs2archive/overlay/avatar_boxes.py` (measure at native resolution). The comms **audio**
+  mix still runs in step 4 (`mix_team_voice.py`).
   - **Talk segments come from RAW packet activity** (`group_voice_rows` + `tick_to_time`), not decoded-PCM RMS — packet presence tracks the actual mic state, so the indicator stays lit for the full duration of each speech burst instead of turning off early on a soft word.
   - **No native copy kept:** the scale step overwrites `combined.mp4` in place. Shade stable, re-bake path removed — shade changes need a full re-run.
 
@@ -154,7 +173,7 @@ python scripts/pov/pipeline_chain.py --watch falcons-vs-mouz-m2-dust2_kyousuke_D
 
 ## Backlog Creation
 
-`python scripts/pov/create_backlog.py <hltv_url>` — downloads a match and generates prioritized backlog entries for every player/map combo. After cards are written it also extracts Recognised-Pro Shorts timelines (`--no-shorts` skips), then drops low-demand POVs (not in the YouTube demand index, and the match/title does not name NAVI / Spirit / Vitality — Falcons does not count). `upload_pending_shorts.py` writes `upload_status=skipped` on already-rendered clips that fail the same gate. Demos with zero qualifying shorts leave no folder under `renders/shorts/`.
+`python scripts/pov/create_backlog.py <hltv_url>` — downloads a match and generates prioritized backlog entries for every player/map combo. After cards are written it also extracts Recognised-Pro Shorts timelines (`--no-shorts` skips), then drops low-demand POVs (not in the YouTube demand index, and the match/title does not name NAVI / Spirit / Vitality — Falcons does not count). `upload_pending_shorts.py` writes `upload_status=skipped` on already-rendered clips that fail the same gate. Demos with zero qualifying shorts leave no folder under any `renders/pov-*/shorts/`.
 
 **Demos are downloaded automatically.** The script calls into `acquire_match()` then scrapes HLTV Rating 3.0, creating a per-player backlog card ranked by rating. It validates that the `.dem` file for each map exists on disk — if not found, it raises `FileNotFoundError` with the expected path, rather than writing a placeholder.
 

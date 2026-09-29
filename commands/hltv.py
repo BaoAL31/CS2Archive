@@ -16,7 +16,7 @@ from pathlib import Path
 from rich.console import Console
 
 from commands.utils import console, print_match_table, print_result_summary
-from player_accounts import get_account
+from cs2archive.player_accounts import get_account
 
 
 def register_subparser(subparsers: argparse._SubParsersAction) -> None:

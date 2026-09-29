@@ -6,9 +6,8 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from shorts.join_clips_to_demos import (
+from cs2archive.shorts.join_clips_to_demos import (
     build_join,
     demos_for_map,
     index_hltv_demo_dirs,

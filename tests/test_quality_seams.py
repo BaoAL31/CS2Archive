@@ -7,21 +7,17 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-from _pathsetup import ensure
 
-ensure()
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts" / "upload"))
-from _backlog_common import pipeline_cmd, write_card
-from variant import resolve_skip_overlay, youtube_dir_name
-from overlay._common import (
+from cs2archive._backlog_common import pipeline_cmd, write_card
+from cs2archive.pov.variant import resolve_skip_overlay, youtube_dir_name
+from cs2archive.overlay._common import (
     cameras_for_util_type,
     clip_is_done,
     pip_cameras_for_util_type,
 )
-from scoring import demand_as_raw_star, market_demand_bonus, star_bonus
-from upload_youtube import youtube_upload_completed
+from cs2archive.scoring import demand_as_raw_star, market_demand_bonus, star_bonus
+from cs2archive.upload.upload_youtube import youtube_upload_completed
 
 
 def test_default_is_overlay():
@@ -81,7 +77,7 @@ def test_pipeline_cmd_uses_this_interpreter(tmp_path: Path):
     cmd = pipeline_cmd(card)
     assert sys.executable.replace("\\", "/") in cmd.replace("\\", "/")
     assert "--overlay-only" not in cmd
-    assert "scripts/pov/pipeline.py --backlog" in cmd
+    assert "-m cs2archive.pov.pipeline --backlog" in cmd
 
 
 def test_write_card_fills_pipeline_cmd(tmp_path: Path):
@@ -90,7 +86,7 @@ def test_write_card_fills_pipeline_cmd(tmp_path: Path):
     data = json.loads(dest.read_text(encoding="utf-8"))
     cmd = data["pipeline_cmd"].replace("\\", "/")
     assert sys.executable.replace("\\", "/") in cmd
-    assert "pipeline.py" in cmd
+    assert "cs2archive.pov.pipeline" in cmd
 
 
 def test_star_bonus_still_pays_plus_kd_losses():

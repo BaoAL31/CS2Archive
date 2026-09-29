@@ -3,12 +3,9 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
-from _pathsetup import ensure
 
-ensure()
 
-from create_backlog import get_priority  # noqa: E402  (scripts/pov on path)
+from cs2archive.pov.create_backlog import get_priority  # noqa: E402
 
 
 def test_rating_1_5_returns_high():

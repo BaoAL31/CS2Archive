@@ -7,22 +7,18 @@ from pathlib import Path
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "scripts"))
-from _pathsetup import ensure  # noqa: E402
 
-ensure()
 
-from imgutil import drop_shadow, rounded_layer  # noqa: E402
-from overlay._common import (  # noqa: E402
+from cs2archive.imgutil import drop_shadow, rounded_layer  # noqa: E402
+from cs2archive.overlay._common import (  # noqa: E402
     PIP_SHADOW_BLUR,
     PIP_SHADOW_OFFSET,
     PIP_SHADOW_OPACITY,
     _pip_body,
     pip_shadow_pad,
 )
-from overlay.overlay_pov import _build_pip_overlay, _make_pip_shadow  # noqa: E402
-from overlay.overlay_utilcams import PipClip  # noqa: E402
+from cs2archive.overlay.overlay_pov import _build_pip_overlay, _make_pip_shadow  # noqa: E402
+from cs2archive.overlay.overlay_utilcams import PipClip  # noqa: E402
 
 
 def _clip(**overrides):

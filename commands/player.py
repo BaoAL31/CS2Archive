@@ -12,7 +12,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from player_accounts import add_account, get_account, list_accounts, remove_account
+from cs2archive.player_accounts import add_account, get_account, list_accounts, remove_account
 
 console = Console(force_terminal=True)
 

@@ -1,0 +1,380 @@
+"""ffmpeg encode / segment / concat helpers for the overlay pipeline."""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+from cs2archive.overlay._common import _log
+from cs2archive import encode
+
+def _overlay_output_valid(path: Path) -> bool:
+    """Return True if a batch/final overlay file is present and non-empty."""
+    return path.is_file() and path.stat().st_size > 100_000
+
+
+BATCH_STAMP_VERSION = 1  # bump when batch encode params change (forces re-encode)
+
+
+def _batch_stamp(batch_path: Path, spec: dict) -> None:
+    """Record what a batch file was built from (encoder params, boundaries,
+    source identity). Resume trusts the stamp, not just file size — a stale
+    batch from older settings/boundaries silently corrupts GOP and sync."""
+    stamp = {"version": BATCH_STAMP_VERSION, **spec}
+    batch_path.with_suffix(".stamp.json").write_text(
+        json.dumps(stamp, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _batch_stamp_matches(batch_path: Path, spec: dict) -> bool:
+    """True when a cached batch was built from exactly this spec."""
+    stamp_path = batch_path.with_suffix(".stamp.json")
+    if not batch_path.is_file() or batch_path.stat().st_size <= 100_000:
+        return False
+    if not stamp_path.is_file():
+        return False
+    try:
+        want = {"version": BATCH_STAMP_VERSION, **spec}
+        return json.loads(stamp_path.read_text(encoding="utf-8")) == want
+    except Exception:
+        return False
+
+
+def _keyframe_times(output_path: Path) -> list[float]:
+    """Keyframe PTS list, packet-level (demux only, no decode).
+
+    Packet flags are used instead of frame-level best-effort timestamps:
+    the frame series drops keyframes around PTS-disordered regions, which
+    is exactly what the audit must see.
+    """
+    r = subprocess.run(
+        ["ffprobe", "-v", "error",
+         "-select_streams", "v:0",
+         "-show_entries", "packet=pts_time,flags", "-of", "csv",
+         str(output_path)],
+        capture_output=True, text=True, timeout=3600,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"ffprobe rc={r.returncode}: {(r.stderr or '')[-300:]}")
+    times = []
+    for line in (r.stdout or "").splitlines():
+        parts = line.strip().split(",")
+        if len(parts) >= 3 and parts[0] == "packet" and "K" in parts[2]:
+            try:
+                times.append(float(parts[1]))
+            except ValueError:
+                continue
+    return times
+
+
+def _check_gop_times(times: list[float], max_gap_s: float) -> str | None:
+    """Pure GOP verdict: None when clean, else a human-readable failure.
+
+    Fails on PTS regression (non-monotonic keyframe timestamps — the seam
+    wrinkle class: duplicated heads, reordered IDRs) and on gaps above
+    ``max_gap_s``. An empty series fails too (a video with no parsable
+    keyframes is broken, not clean).
+    """
+    if not times:
+        return "no keyframes parsed"
+    bad = [f"{b:.3f}<{a:.3f}" for a, b in zip(times, times[1:]) if b < a - 1e-3]
+    if bad:
+        return f"PTS regression at keyframes: {', '.join(bad[:4])}"
+    worst = max((b - a for a, b in zip(times, times[1:])), default=0.0)
+    if worst > max_gap_s:
+        return f"{worst:.1f}s keyframe gap (max {max_gap_s:g}s)"
+    return None
+
+
+def _audit_gop(output_path: Path, max_gap_s: float = 6.0) -> None:
+    """Fail loudly on GOP defects: PTS regression or huge keyframe gaps.
+
+    The cap sits above the legitimate CSDM source GOP (4.17s, inherited by
+    stream-copied no-overlay batches) and far below real holes (15s+); the
+    monotonicity check catches seam wrinkles no gap threshold can see.
+    Raises ``SystemExit`` like every other encode validation in this module.
+    Probe-infra failure (missing ffprobe, timeout) warns and skips — a
+    strict parse of a successful probe never skips.
+    """
+    try:
+        times = _keyframe_times(output_path)
+    except Exception as e:  # noqa: BLE001
+        _log(f"  [warn] GOP audit skipped (probe failed: {e})")
+        return
+    failure = _check_gop_times(times, max_gap_s)
+    if failure is not None:
+        _log(f"[ERROR] GOP audit failed in {output_path.name}: {failure} — refusing to ship")
+        sys.exit(1)
+    worst = max((b - a for a, b in zip(times, times[1:])), default=0.0)
+    _log(f"  [gop] clean in {output_path.name} "
+         f"({len(times)} IDRs, max gap {worst:.2f}s)")
+
+
+def _compute_batch_boundaries(
+    round_offsets: dict[int, float],
+    fps: float,
+    frame_count: int,
+    batch_size: int,
+) -> list[tuple[int, int, int, float, float]]:
+    """Group sorted rounds into chunks of ``batch_size`` and return
+    ``[(round_start, round_end, batch_start_frame, batch_start_sec, batch_end_sec), ...]``.
+
+    The last batch's end_sec clamps to ``frame_count / fps``. ``batch_end_sec``
+    for intermediate batches is the start_sec of the next batch's first round.
+    """
+    if batch_size < 1 or not round_offsets:
+        return []
+    sorted_rounds = sorted(round_offsets.keys())
+    total_seconds = frame_count / fps
+    boundaries: list[tuple[int, int, int, float, float]] = []
+    for i in range(0, len(sorted_rounds), batch_size):
+        chunk = sorted_rounds[i:i + batch_size]
+        rn_start, rn_end = chunk[0], chunk[-1]
+        start_sec = float(round_offsets[rn_start])
+        if i + batch_size < len(sorted_rounds):
+            end_sec = float(round_offsets[sorted_rounds[i + batch_size]])
+        else:
+            end_sec = total_seconds
+        start_frame = int(start_sec * fps)
+        boundaries.append((rn_start, rn_end, start_frame, start_sec, end_sec))
+    return boundaries
+
+
+
+
+def _ffmpeg_encode(
+    main_input: str,
+    extra_inputs: list[Path],
+    fc_args: list[str],
+    out_label: str,
+    output_path: str,
+    segment: tuple[float, float] | None = None,
+    loop_inputs: set[str] | None = None,
+    raw_inputs: list[tuple[Path, list[str]]] | None = None,
+    include_audio: bool = True,
+) -> None:
+    """Run ffmpeg with h264_nvenc. No CPU fallback (libx forbidden by user).
+
+    When ``segment`` is set, input-side ``-ss`` plus an explicit ``-t``
+    duration is applied to the main video. Using ``-to`` here is subtly
+    wrong: with input-side seeking ffmpeg can retain the original absolute
+    end timestamp, making each independently encoded batch longer than its
+    corresponding video interval. Those extra timestamps accumulate when
+    batches are concatenated and make the remuxed source audio sound late.
+    Keyframe-aligned input seeking is intentional; visible round-boundary
+    jumps are avoided by the round_offsets sidecar using actual per-round
+    frames.
+
+    ``raw_inputs`` is a list of ``(path, input_options)`` for raw video inputs
+    (e.g. 1x1 RGBA alpha controls) that need explicit demuxer flags before
+    ``-i`` (``-f rawvideo -pix_fmt rgba -s 1x1 -r <fps>``). They are appended
+    AFTER ``extra_inputs`` in input order.
+
+    ``include_audio=False`` encodes video-only (``-an``). The batched overlay
+    path uses this: per-batch audio re-encodes drift a few ms per batch
+    (video is frame-quantized, audio sample-precise), so batches carry no
+    audio at all and the source audio is muxed back exactly once at the end
+    by ``_remux_source_audio`` (re-encoded AAC 48k stereo — a copied MP3
+    track breaks downstream ``-c copy`` audio joins). With no batch
+    audio there is no drift to fix — the source track is sample-locked to
+    the video timeline.
+
+    Atomic write: ffmpeg renders to ``{output}.part`` and the file is
+    renamed onto ``output_path`` only after a successful exit. A cancelled /
+    crashed encode therefore leaves a stale ``.part`` (never the final name),
+    so resume checks (``_overlay_output_valid``) cannot mistake a partial
+    file for a complete one.
+    """
+    out_path = Path(output_path)
+    tmp_path = out_path.with_name(out_path.name + ".part")
+    tmp_path.unlink(missing_ok=True)
+
+    # Force square pixels on the final label. Without this, an anamorphic
+    # master (e.g. 2560x1440 with SAR 3:4 from a 4:3 stretch that omitted
+    # setsar=1) makes ffmpeg composite keyboard/PiP sprites with the wrong
+    # sample aspect — overlays look permanently squished in the encode.
+    map_label = out_label
+    fc_out = list(fc_args)
+    if fc_out and fc_out[0] == "-filter_complex" and len(fc_out) >= 2:
+        fc_out[1] = f"{fc_out[1].rstrip().rstrip(';')};{out_label}setsar=1[__sar1]"
+        map_label = "[__sar1]"
+    elif fc_out and fc_out[0] == "-filter_complex_script" and len(fc_out) >= 2:
+        script = Path(fc_out[1])
+        body = script.read_text(encoding="utf-8").rstrip().rstrip(";")
+        script.write_text(
+            f"{body};{out_label}setsar=1[__sar1]\n", encoding="utf-8"
+        )
+        map_label = "[__sar1]"
+
+    cmd = ["ffmpeg", "-y"]
+    if segment is not None:
+        start_sec, end_sec = segment
+        if start_sec > 0:
+            cmd.extend(["-ss", f"{start_sec:.6f}"])
+        duration_sec = max(0.0, end_sec - start_sec)
+        cmd.extend(["-t", f"{duration_sec:.6f}"])
+    cmd.extend(["-i", main_input])
+    loop_set = loop_inputs or set()
+    for inp in extra_inputs:
+        if str(inp) in loop_set:
+            # Loop a still image so it keeps producing frames for the whole
+            # encode (framesync filters like alphamerge would otherwise EOF
+            # after the first frame). Sprite PNGs fed to `overlay` do NOT
+            # need this — overlay's eof_action repeats their last frame.
+            cmd.extend(["-loop", "1"])
+        cmd.extend(["-i", str(inp)])
+    for raw_path, raw_opts in (raw_inputs or []):
+        cmd.extend(raw_opts)
+        cmd.extend(["-i", str(raw_path)])
+    if include_audio:
+        audio_map_args = ["-map", "0:a?"]
+        audio_codec_args = ["-c:a", "aac", "-b:a", "256k",
+                            "-af", "asetpts=PTS-STARTPTS"]
+    else:
+        audio_map_args = ["-an"]
+        audio_codec_args: list[str] = []
+    cmd.extend([
+        *fc_out, "-map", map_label,
+        *audio_map_args, "-shortest",
+        # FINAL EXPORT — uploaded verbatim (YouTube copy + outro append are both
+        # -c copy, so this bitstream is exactly what goes up). Max practical
+        # 1440p quality for overlay content (text/UI/keyboard-cam edges are the
+        # most banding/ringing-prone): CQ 15 with a 60M cap. Well below
+        # YouTube's own re-encode so their lossy pass has clean input, but not
+        # so low that the cap clips on busy motion (a too-low maxrate would just
+        # become capped VBR, silently raising the QP in busy scenes). p7 =
+        # highest-quality nvenc preset. If upload size ever matters more than
+        # edge quality, drop toward CQ 18/35M; if graphics still shimmer, step
+        # to CQ 14/80M.
+        *encode.codec_args(encode.FINAL),
+        "-profile:v", "high", "-pix_fmt", "yuv420p",
+        "-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
+        *audio_codec_args,
+        "-movflags", "+faststart",
+        "-g", "60", "-keyint_min", "60",
+        "-f", "mp4", str(tmp_path),
+    ])
+    _log(f"  [ffmpeg] nvenc preset p7 cq 15 maxrate 60M (final export -> uploaded verbatim)")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=21600)  # 6h
+    if result.returncode != 0 or not tmp_path.is_file():
+        _log(f"[ERROR] nvenc ffmpeg failed: rc={result.returncode}")
+        _log(f"  stderr: {(result.stderr or '')[-400:]}")
+        tmp_path.unlink(missing_ok=True)
+        sys.exit(1)
+    os.replace(tmp_path, out_path)
+
+
+
+
+def _ffmpeg_segment_copy(
+    video_path: Path,
+    start_sec: float,
+    end_sec: float,
+    output_path: Path,
+) -> None:
+    """Stream-copy a video segment when no overlay applies to this batch.
+
+    Fast path (no encode) used when a batch has zero key presses AND zero
+    flight PiP clips — output is byte-identical (codec params) to the
+    other batch-overlay-*.mp4 files so the final concat stream-copy works.
+    """
+    tmp_path = output_path.with_name(output_path.name + ".part")
+    tmp_path.unlink(missing_ok=True)
+    cmd = ["ffmpeg", "-y"]
+    if start_sec > 0:
+        cmd.extend(["-ss", f"{start_sec:.6f}"])
+    cmd.extend(["-to", f"{end_sec:.6f}", "-i", str(video_path), "-c", "copy",
+                "-movflags", "+faststart", "-f", "mp4", str(tmp_path)])
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    if result.returncode != 0 or not tmp_path.is_file():
+        _log(f"[ERROR] ffmpeg segment copy failed: rc={result.returncode}")
+        _log(f"  stderr: {(result.stderr or '')[-400:]}")
+        tmp_path.unlink(missing_ok=True)
+        sys.exit(1)
+    os.replace(tmp_path, output_path)
+
+
+
+
+def _remux_source_audio(overlay_path: Path, source_path: Path) -> None:
+    """Replace the overlay video's audio with the original source audio.
+
+    Batch encodes run video-only (``-an``), so the concatenated overlay has
+    no audio track at all — there is no per-batch drift to fix. The overlay
+    adds no audio, so the source's audio is the correct sync reference. Mux
+    it back, trimmed to the overlay video's duration.
+
+    Audio is re-encoded to the house format (AAC 48kHz stereo), NOT
+    stream-copied: CSDM captures mux MP3 44.1kHz, and a copied MP3 track
+    breaks every downstream ``-c copy`` concat (hook/intro prepends) — the
+    joined file declares one audio config while the packets after the join
+    use another, so nothing past the join decodes (silence after the hook).
+    Video is still stream-copied (no re-encode).
+    """
+    from cs2archive.overlay._common import _log
+    tmp = overlay_path.with_name(overlay_path.name + ".resync.mp4")
+    tmp.unlink(missing_ok=True)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(overlay_path),
+        "-i", str(source_path),
+        "-map", "0:v", "-map", "1:a?",
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2",
+        "-movflags", "+faststart",
+        "-shortest",
+        str(tmp),
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    if r.returncode != 0 or not tmp.is_file():
+        _log(f"[ERROR] audio resync failed: {r.stderr[-500:]}")
+        tmp.unlink(missing_ok=True)
+        sys.exit(1)
+    os.replace(tmp, overlay_path)
+
+
+def _concat_overlay_batches(batch_files: list[Path], output_path: Path) -> None:
+    """Concat batch-overlay-*.mp4 files via ffmpeg stream copy (no re-encode).
+
+    Validates the merged file is non-empty. Raises ``SystemExit`` on ffmpeg
+    failure. Stream copy requires all inputs to share codec params (same
+    _ffmpeg_encode call produces all batches, so this holds). Batches are
+    video-only (``-an`` at encode); ``-an`` here too so a stale pre-change
+    batch with an audio track can never sneak audio into the concat — the
+    source audio is muxed back exactly once by ``_remux_source_audio``.
+    """
+    if not batch_files:
+        _log("[ERROR] no batch files to concat")
+        sys.exit(1)
+    with tempfile.TemporaryDirectory() as tmp:
+        lst = Path(tmp) / "files.txt"
+        with open(lst, "w", encoding="utf-8") as f:
+            for bf in batch_files:
+                f.write(f"file '{bf.resolve()}'\n")
+        tmp_path = output_path.with_name(output_path.name + ".part")
+        tmp_path.unlink(missing_ok=True)
+        cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
+            "-c", "copy", "-an", "-movflags", "+faststart", "-f", "mp4", str(tmp_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        if result.returncode != 0 or not tmp_path.is_file():
+            _log(f"[ERROR] ffmpeg batch concat failed: rc={result.returncode}")
+            _log(f"  stderr: {(result.stderr or '')[-400:]}")
+            tmp_path.unlink(missing_ok=True)
+            sys.exit(1)
+        os.replace(tmp_path, output_path)
+    if not _overlay_output_valid(output_path):
+        _log(f"[ERROR] concat output too small: {output_path}")
+        sys.exit(1)
+    # A mixed-GOP concat (re-encoded + stream-copied batches) can carry
+    # multi-second keyframe gaps and PTS wrinkles that decode in ffmpeg but
+    # smear in seeky players — fail loudly instead of shipping silence.
+    _audit_gop(output_path)
+
+
+# -- CLI -----------------------------------------------------------------
+
+

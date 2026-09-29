@@ -1,4 +1,4 @@
-"""Hook cold open: tier ranking, kill-anchored windows, crossfade offsets.
+"""Hook cold open: tier ranking, kill-anchored windows, jump-cut assembly.
 
 Pure-function tests — no CS2, no demo, no ffmpeg run.
 """
@@ -7,19 +7,25 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "scripts"))
+import pytest
 
-from pov.build_hook_timeline import (  # noqa: E402
+ROOT = Path(__file__).resolve().parent.parent
+
+from cs2archive.pov.build_hook_timeline import (  # noqa: E402
     DEFAULT_TIERS,
     MIN_ROUND_DEFAULT,
     TIER_ORDER,
+    flick_speed_bonus,
+    moment_quality,
+    peek_kill_bonus,
+    punch_up_singles,
     round_allowed,
     timeline_matches,
+    timeline_moment_candidates,
     tier_of,
 )
-from pov.hook_plan import plan_hook  # noqa: E402
-from pov.assemble_hook import crossfade_offsets  # noqa: E402
+from cs2archive.pov.hook_plan import plan_hook  # noqa: E402
+from cs2archive.pov.assemble_hook import build_hook_filter  # noqa: E402
 
 TICKRATE = 64
 
@@ -92,14 +98,14 @@ def test_default_tiers_keep_best_first_order():
 
 def test_insta_kill_candidates_are_skipped_when_tier_disabled():
     # Must not touch the demo (or the collision mesh) at all when disabled.
-    from pov.build_hook_timeline import insta_kill_candidates
+    from cs2archive.pov.build_hook_timeline import insta_kill_candidates
     enabled = [t for t in TIER_ORDER if t != "insta_kill"]
     assert insta_kill_candidates(Path("nope.dem"), "76561198386265483",
                                  "de_mirage", TICKRATE, enabled) == []
 
 
 def test_insta_kill_candidates_need_a_player():
-    from pov.build_hook_timeline import insta_kill_candidates
+    from cs2archive.pov.build_hook_timeline import insta_kill_candidates
     assert insta_kill_candidates(Path("nope.dem"), "", "de_mirage",
                                  TICKRATE, list(TIER_ORDER)) == []
 
@@ -122,7 +128,7 @@ def test_windows_are_kill_anchored_not_whole_round():
 def test_payoff_is_capped_so_post_death_dead_time_is_dropped():
     # clutch_attempt: the POV player dies and the round plays on for seconds.
     # The hold must stay under MAX_PAYOFF rather than run to the round end.
-    from pov.hook_plan import MAX_PAYOFF
+    from cs2archive.pov.hook_plan import MAX_PAYOFF
     moment = {"start_tick": 0, "end_tick": 6400,
               "kill_ticks": [1600, 3200], "round_win_tick": 4000}
     windows = plan_hook([moment], TICKRATE, max_seconds=300)[0]["windows"]
@@ -208,21 +214,765 @@ def test_cache_without_params_is_treated_as_stale():
     assert timeline_matches({"params": "nonsense"}, min_round=2) is False
 
 
-# ── crossfade math ───────────────────────────────────────────────────────
+# ── jump-cut assembly ────────────────────────────────────────────────
 
-def test_crossfade_offsets_account_for_accumulated_fades():
-    assert crossfade_offsets([3.0, 3.0], 0.5) == [2.5]
-    offs = crossfade_offsets([3.0, 3.0, 3.0], 0.5)
-    assert offs == [2.5, 5.0]
-
-
-def test_total_length_shrinks_by_one_fade_per_join():
-    durs = [4.0, 2.0, 5.0]
-    fade = 0.25
-    offs = crossfade_offsets(durs, fade)
-    total = offs[-1] + durs[-1]
-    assert abs(total - (sum(durs) - fade * (len(durs) - 1))) < 1e-9
+def test_moments_join_with_concat_not_xfade():
+    fc = build_hook_filter([0, 2], [0, 2], end_fade=0.5, total=6.0,
+                           width=2560, height=1440, fps=60.0)
+    assert "concat=n=2:v=1:a=1" in fc
+    assert "[v0][a0][v1][a1]concat" in fc
+    assert "xfade" not in fc
+    assert "acrossfade" not in fc
 
 
-def test_single_clip_has_no_offsets():
-    assert crossfade_offsets([2.0], 0.25) == []
+def test_tail_fades_to_black_for_the_intro_dip():
+    fc = build_hook_filter([0], [0], end_fade=0.5, total=4.0,
+                           width=2560, height=1440, fps=60.0)
+    assert "fade=t=out:st=3.500:d=0.5" in fc
+    assert "afade=t=out:st=3.500:d=0.5" in fc
+
+
+def test_zero_end_fade_means_hard_cut_to_black_free():
+    fc = build_hook_filter([0, 1], [0, 1], end_fade=0.0, total=6.0,
+                           width=2560, height=1440, fps=60.0)
+    assert "concat=n=2:v=1:a=1" in fc
+    assert "fade=t=out" not in fc
+    assert "afade=t=out" not in fc
+
+
+def test_audio_filler_input_is_addressable():
+    # Second clip has no audio: its filler lands on input 2.
+    fc = build_hook_filter([0, 1], [0, 2], end_fade=0.5, total=6.0,
+                           width=2560, height=1440, fps=60.0)
+    assert "[2:a]" in fc
+    assert "concat=n=2:v=1:a=1" in fc
+
+
+# ── single-kill window cap (no 2k from an insta moment) ───────────────
+
+def _insta(**kw):
+    base = {"start_tick": 72987, "end_tick": 73275, "kill_ticks": [73147],
+            "round_win_tick": None, "label": "INSTA", "tier": "insta_kill",
+            "pov_steam_id": "x", "round": 14}
+    base.update(kw)
+    return base
+
+
+def test_single_kill_window_ends_before_next_kill():
+    # kyousuke reality: insta HS at 73147, next kill 96 ticks later. The
+    # payoff must not stretch into it or the cold open reads as a 2k.
+    wins = plan_hook([_insta()], TICKRATE,
+                     all_kill_ticks=[69887, 73147, 73243])[0]["windows"]
+    assert wins[0]["end_tick"] < 73243
+    assert wins[0]["end_tick"] >= 73147 + 48  # kill + beat always play
+    assert wins[0]["start_tick"] == 73083  # 1s pre-kill setup
+
+
+def test_far_next_kill_leaves_window_unchanged():
+    plain = plan_hook([_insta()], TICKRATE)[0]["windows"]
+    capped = plan_hook([_insta()], TICKRATE,
+                       all_kill_ticks=[73147, 90000])[0]["windows"]
+    assert capped == plain
+
+
+def test_multikill_window_ignores_the_cap():
+    m = _insta(kill_ticks=[73147, 73243])
+    wins = plan_hook([m], TICKRATE,
+                     all_kill_ticks=[69887, 73147, 73243])[0]["windows"]
+    assert wins[0]["end_tick"] == 73275
+
+
+def test_cap_floor_keeps_the_kill_beat_on_instant_trades():
+    # Next kill 0.3s later: cap would land before the kill itself — the floor
+    # (kill + 0.75s) wins instead of a degenerate window.
+    wins = plan_hook([_insta()], TICKRATE,
+                     all_kill_ticks=[73147, 73166])[0]["windows"]
+    assert wins[0]["end_tick"] >= 73147 + 48
+
+
+# ── minimum hook length (no disorienting 3s flash) ───────────────────
+
+def test_no_kill_list_means_no_cap():
+    assert plan_hook([_insta()], TICKRATE)[0]["windows"] == \
+        plan_hook([_insta()], TICKRATE, all_kill_ticks=None)[0]["windows"]
+
+
+def test_planned_seconds_reports_assembled_footage():
+    from cs2archive.pov.hook_plan import planned_seconds
+    plan = plan_hook([_insta()], TICKRATE,
+                     all_kill_ticks=[69887, 73147, 73243])
+    total = planned_seconds(plan, TICKRATE)
+    assert total == 2.0  # [kill-64, kill+64]: 1s setup + 1s hold
+    assert total < 10.0, "a lone capped insta kill must fall below the floor"
+
+
+def test_two_short_moments_still_fall_below_the_floor():
+    from cs2archive.pov.hook_plan import planned_seconds
+    # Two single kills ~1.5s apart: capped first window (2s) + full second
+    # (2s) stays below the floor — ships no hook.
+    kills = [73147, 73243]
+    moments = [_insta(start_tick=k - 200, end_tick=k + 200, kill_ticks=[k])
+               for k in kills]
+    plan = plan_hook(moments, TICKRATE, all_kill_ticks=kills)
+    assert planned_seconds(plan, TICKRATE) < 10.0
+
+
+def test_clustered_singles_can_clear_the_bar_together():
+    from cs2archive.pov.hook_plan import planned_seconds
+    # Eight single kills ~1.5s apart: 8 x 2s of action across the jump cuts
+    # clears the 15s bar — a real cold open, not a lone flash.
+    kills = [73147 + i * 96 for i in range(8)]
+    moments = [_insta(start_tick=k - 200, end_tick=k + 200, kill_ticks=[k])
+               for k in kills]
+    plan = plan_hook(moments, TICKRATE, all_kill_ticks=kills)
+    assert planned_seconds(plan, TICKRATE) >= 15.0
+
+
+def test_clutch_moment_plans_three_windows():
+    from cs2archive.pov.hook_plan import planned_seconds
+    m = _insta(start_tick=0, end_tick=6400, kill_ticks=[1600, 3200, 4800],
+               round_win_tick=5000)
+    plan = plan_hook([m], TICKRATE)
+    assert planned_seconds(plan, TICKRATE) == 6.0  # 3 x 128 ticks
+
+
+# ── insta pairing (double-insta or flick solo, never lone) ────────────
+
+def _irow(tick, rnd=11, reasons=None, hp=100.0, vic=None, ttk=0.25, head="head"):
+    return {"kill_tick": tick, "round": rnd,
+            "reasons": reasons or ["insta_kill"],
+            "los_open_tick": tick - int(ttk * 64),
+            "attacker_sid": "x", "victim_sid": vic or f"v{tick}",
+            "weapon": "ak47", "hitgroup": head, "victim_hp": hp}
+
+
+def _pair(rows):
+    from cs2archive.pov.build_hook_timeline import pair_insta_rows
+    enabled = list(TIER_ORDER)
+    return pair_insta_rows(rows, "x", enabled, TICKRATE)
+
+
+def test_lone_nonflick_insta_qualifies_as_solo():
+    out = _pair([_irow(61341)])
+    assert len(out) == 1
+    assert out[0]["kill_ticks"] == [61341]
+    assert out[0]["tier"] == "insta_kill"
+    assert not out[0].get("chained")
+    assert out[0]["label"].startswith("INSTA")
+    # ...however clean the victim, and whatever the HP.
+    out = _pair([_irow(61341, hp=16.0)])
+    assert len(out) == 1
+
+
+def test_flick_solo_stays_eligible():
+    out = _pair([_irow(73147, rnd=14, reasons=["flick", "insta_kill"])])
+    assert len(out) == 1
+    assert out[0]["kill_ticks"] == [73147]
+    assert out[0]["label"].startswith("FLICK")
+    assert not out[0].get("chained")
+
+
+def test_clean_pair_within_3s_chains():
+    out = _pair([_irow(61341, hp=100.0), _irow(61460, hp=20.0)])
+    assert len(out) == 1
+    assert out[0]["kill_ticks"] == [61341, 61460]
+    assert out[0].get("chained") is True
+    assert out[0]["label"].startswith("2× INSTA")
+
+
+def test_tagged_pair_fails_the_clean_gate_but_solos_survive():
+    # Both victims damaged: no chained pair — but each lone kill still
+    # ships as a solo moment.
+    out = _pair([_irow(61341, hp=16.0), _irow(61460, hp=20.0)])
+    assert [m["kill_ticks"] for m in out] == [[61341], [61460]]
+    assert all(not m.get("chained") for m in out)
+
+
+def test_pair_splits_beyond_3s_into_solos():
+    out = _pair([_irow(1000, rnd=2), _irow(1400, rnd=2)])
+    assert [m["kill_ticks"] for m in out] == [[1000], [1400]]
+
+
+def test_pair_requires_same_round_and_distinct_victims():
+    # ...to CHAIN. Unchainable kills still qualify alone.
+    out = _pair([_irow(1000, rnd=2), _irow(1100, rnd=3)])
+    assert [m["kill_ticks"] for m in out] == [[1000], [1100]]
+    out = _pair([_irow(1000, vic="same"), _irow(1100, vic="same")])
+    assert [m["kill_ticks"] for m in out] == [[1000], [1100]]
+
+
+def test_missing_hp_blocks_pair_but_not_solos():
+    out = _pair([_irow(61341, hp=None), _irow(61460, hp=None)])
+    assert [m["kill_ticks"] for m in out] == [[61341], [61460]]
+
+
+def test_rule_version_bumps_cache():
+    from cs2archive.pov.build_hook_timeline import INSTA_RULE_VERSION, timeline_matches
+    assert INSTA_RULE_VERSION == 7
+    assert timeline_matches({"params": {"tiers": [], "min_round": 2,
+                                        "max_moments": 3, "max_seconds": 30.0,
+                                        "rule_version": 7}},
+                            tiers=[], min_round=2, max_moments=3,
+                            max_seconds=30.0, rule_version=7) is True
+    assert timeline_matches({"params": {"tiers": [], "min_round": 2,
+                                        "max_moments": 3, "max_seconds": 30.0}},
+                            tiers=[], min_round=2, max_moments=3,
+                            max_seconds=30.0, rule_version=7) is False
+
+
+# ── canonical nick (same crosshair input as the POV) ──────────────────
+
+def test_canonical_nick_resolves_by_steam_id(tmp_path):
+    from cs2archive.crosshair_resolve import canonical_nick
+    acc = tmp_path / "player_accounts.json"
+    acc.write_text(__import__("json").dumps([
+        {"steam_id": "76561199032006224", "nickname": "kyousuke"},
+    ]))
+    assert canonical_nick("76561199032006224", "76561199032006224",
+                          accounts_path=acc) == "kyousuke"
+    assert canonical_nick("000", "rawname", accounts_path=acc) == "rawname"
+
+
+# ── chaining (<5s merges, cut at/above) ────────────────────────────────
+
+def _cand(kill, tier_rank=6, start=None, end=None, **kw):
+    base = {"start_tick": kill - 160, "end_tick": kill + 128,
+            "kill_ticks": [kill], "tier": "insta_kill", "tier_rank": tier_rank,
+            "label": f"INSTA {kill}", "rank_reason": "r", "round": 11,
+            "pov_steam_id": "x", "pov_nick": "x"}
+    if start is not None:
+        base["start_tick"] = start
+    if end is not None:
+        base["end_tick"] = end
+    base.update(kw)
+    return base
+
+
+def test_close_moments_chain_into_one():
+    from cs2archive.pov.build_hook_timeline import pick_moments
+    # kyousuke 7:44 chain: kills 1.9s apart must not jump-cut.
+    picked = pick_moments([_cand(61341), _cand(61460)], TICKRATE, 3)
+    assert len(picked) == 1
+    m = picked[0]
+    assert m.get("chained") is True
+    assert m["kill_ticks"] == [61341, 61460]
+    assert m["start_tick"] == 61341 - 160
+    assert m["end_tick"] == 61460 + 128
+
+
+def test_best_tier_wins_the_chain():
+    from cs2archive.pov.build_hook_timeline import pick_moments
+    weak = _cand(61341, tier_rank=6, label="INSTA")
+    strong = _cand(61460, tier_rank=3, label="4K")
+    picked = pick_moments([weak, strong], TICKRATE, 3)
+    assert len(picked) == 1
+    assert picked[0]["tier_rank"] == 3
+    assert picked[0]["label"] == "4K"
+    assert picked[0]["kill_ticks"] == [61341, 61460]
+
+
+def test_distant_moments_stay_separate_clips():
+    from cs2archive.pov.build_hook_timeline import pick_moments
+    # 6s kill gap: cut, two moments.
+    picked = pick_moments([_cand(61341), _cand(61341 + 384)], TICKRATE, 3)
+    assert len(picked) == 2
+    assert all(not m.get("chained") for m in picked)
+
+
+def test_chain_counts_as_one_toward_max_moments():
+    from cs2archive.pov.build_hook_timeline import pick_moments
+    cands = [_cand(61341), _cand(61460), _cand(70000)]
+    picked = pick_moments(cands, TICKRATE, 2)
+    assert len(picked) == 2
+    assert picked[0]["kill_ticks"] == [61341, 61460]
+
+
+def test_span_cap_refuses_runaway_chains():
+    from cs2archive.pov.build_hook_timeline import pick_moments
+    # Overlapping bounds but a union beyond the 15s span cap: dropped, not merged.
+    wide = _cand(61341, start=61341 - 800, end=61341 + 800)
+    other = _cand(61460, start=61460 - 800, end=61460 + 800)
+    picked = pick_moments([wide, other], TICKRATE, 3)
+    assert len(picked) == 1
+    assert not picked[0].get("chained")
+
+
+def test_chained_moment_plans_one_continuous_window():
+    # Same kills 3s apart: chained -> one window (no cut); unchained -> two.
+    m = _insta(start_tick=61000, end_tick=62000, kill_ticks=[61341, 61533],
+               chained=True)
+    wins = plan_hook([m], TICKRATE)[0]["windows"]
+    assert len(wins) == 1
+    assert wins[0]["start_tick"] <= 61341 - 64
+    assert wins[0]["end_tick"] >= 61533
+    m2 = _insta(start_tick=61000, end_tick=62000, kill_ticks=[61341, 61533])
+    assert len(plan_hook([m2], TICKRATE)[0]["windows"]) == 2
+
+
+def test_multikill_payoff_capped_at_next_kill():
+    # A 4k tail running into the next POV kill reads as a 5k — cap it.
+    m = _insta(start_tick=60000, end_tick=64000,
+               kill_ticks=[61000, 61100, 61200, 61300])
+    wins = plan_hook([m], TICKRATE,
+                     all_kill_ticks=[61000, 61100, 61200, 61300, 61400])[0]["windows"]
+    assert wins[-1]["end_tick"] < 61400
+    assert wins[-1]["end_tick"] >= 61300 + 48
+    # Far next kill: the tail rests on the 1s payoff instead of the cap.
+    wins2 = plan_hook([m], TICKRATE,
+                      all_kill_ticks=[61000, 61100, 61200, 61300, 70000])[0]["windows"]
+    assert wins2[-1]["end_tick"] == 61300 + 64
+
+
+def test_bridge_candidate_joins_chain_despite_full_quota():
+    # max_moments=1: the first candidate takes the only slot, but a later
+    # chainable candidate still merges (merges never consume slots).
+    from cs2archive.pov.build_hook_timeline import pick_moments
+    cands = [_cand(61341), _cand(61460), _cand(61550)]
+    picked = pick_moments(cands, TICKRATE, 1)
+    assert len(picked) == 1
+    assert picked[0]["kill_ticks"] == [61341, 61460, 61550]
+    assert picked[0].get("chained") is True
+
+
+# ── action-timeline tiers (punch-up singles + duel/opener/trade) ───
+
+def test_new_tiers_ship_in_defaults_in_rank_order():
+    for t in ("punch_up_single", "duel", "opener", "trade"):
+        assert t in TIER_ORDER
+        assert t in DEFAULT_TIERS
+    idx = TIER_ORDER.index
+    assert idx("4k") < idx("punch_up_single") < idx("insta_kill")
+    assert idx("insta_kill") < idx("duel") < idx("clutch_attempt")
+    assert idx("clutch_attempt") < idx("opener") < idx("trade")
+
+
+def _prow(tick, rnd=2, reasons=None, ttk=0.12):
+    return {"kill_tick": tick, "round": rnd,
+            "reasons": reasons or ["insta_kill"],
+            "los_open_tick": tick - int(ttk * 64),
+            "attacker_sid": "x", "victim_sid": f"v{tick}",
+            "weapon": "deagle", "hitgroup": "head", "victim_hp": 100.0}
+
+
+def _tkill(tick, rnd=2, aid="x", weapon="deagle", victim_weapon="AK-47",
+           hs=True):
+    return {"tick": tick, "round": rnd, "attacker_steam_id": aid,
+            "victim_steam_id": "v", "weapon": weapon,
+            "victim_weapon": victim_weapon, "headshot": hs}
+
+
+def _penabled():
+    return list(TIER_ORDER)
+
+
+def test_punch_up_single_deagle_vs_rifle_head():
+    out = punch_up_singles([_prow(11582)], [_tkill(11582)], "x",
+                           _penabled(), TICKRATE)
+    assert len(out) == 1
+    m = out[0]
+    assert m["tier"] == "punch_up_single"
+    assert m["kill_ticks"] == [11582]
+    assert m["label"].startswith("DEAGLE PUNCH-UP")
+    assert m["round"] == 2
+    assert m["hs_ticks"] == {11582: 50.0}
+    assert m["hs_bonus"] == 50.0
+
+
+def test_punch_up_single_rejects_non_punch_up():
+    rows = [_prow(11582)]
+    assert punch_up_singles(rows, [_tkill(11582, hs=False)], "x",
+                            _penabled(), TICKRATE) == []
+    assert punch_up_singles(rows, [_tkill(11582, weapon="ak47")], "x",
+                            _penabled(), TICKRATE) == []
+    assert punch_up_singles(rows, [_tkill(11582, victim_weapon="MP9")], "x",
+                            _penabled(), TICKRATE) == []
+    assert punch_up_singles(rows, [_tkill(11582, aid="y")], "x",
+                            _penabled(), TICKRATE) == []
+    assert punch_up_singles(rows, [], "x",
+                            _penabled(), TICKRATE) == []
+
+
+def test_punch_up_single_needs_no_rewind_row():
+    # First contact is scoring input, not eligibility: a Deagle headshot
+    # onto a rifle with no measured LOS (tracked re-kill, missing snaps)
+    # still qualifies — it just carries no TTK.
+    out = punch_up_singles([], [_tkill(112854)], "x", _penabled(), TICKRATE)
+    assert len(out) == 1
+    assert out[0]["kill_ticks"] == [112854]
+    assert out[0]["ttk"] is None
+    assert out[0]["label"] == "DEAGLE PUNCH-UP"
+
+
+def test_punch_up_singles_sort_fastest_first():
+    out = punch_up_singles([_prow(200, ttk=0.2), _prow(100, ttk=0.1)],
+                           [_tkill(200), _tkill(100)], "x",
+                           _penabled(), TICKRATE)
+    assert [m["kill_ticks"] for m in out] == [[100], [200]]
+
+
+def test_punch_up_single_accepts_slow_peek():
+    # 0.44s first contact: over the 0.3s insta cap (no insta stacking) but
+    # inside the 0.5s measured-contact window — still a punch-up single.
+    out = punch_up_singles([_prow(112737, ttk=0.44, reasons=["peek"])],
+                           [_tkill(112737)], "x", _penabled(), TICKRATE)
+    assert len(out) == 1
+    assert out[0]["tier"] == "punch_up_single"
+    assert out[0]["ttk"] == 28 / 64
+
+
+def _amoment(mid, mtype, rnd=2, kills=(11582,), start=11262, end=11710):
+    return {"id": mid, "type": mtype, "round": rnd,
+            "start_tick": start, "end_tick": end,
+            "kill_ticks": list(kills)}
+
+
+def test_moment_candidates_take_duel_opener_trade():
+    moments = [_amoment("r2-opener-1", "opener"),
+               _amoment("r2-trade-4", "trade"),
+               _amoment("r11-duel-2", "duel", rnd=11,
+                        kills=(63864, 65572), start=63000, end=66800,
+                        )]
+    out = timeline_moment_candidates(moments, "x", _penabled())
+    assert [(m["tier"], m["round"]) for m in out] == [
+        ("opener", 2), ("trade", 2), ("duel", 11)]
+    assert out[0]["kill_ticks"] == [11582]
+    assert out[2]["label"] == "DUEL"
+
+
+def test_moment_candidates_skip_bomb_util_and_empty():
+    moments = [_amoment("r20-bomb-1", "bomb_plant", kills=()),
+               _amoment("r3-burst-1", "util_burst", kills=()),
+               _amoment("r5-opener-1", "opener", kills=(29522,))]
+    out = timeline_moment_candidates(moments, "x", _penabled())
+    assert [m["tier"] for m in out] == ["opener"]
+
+
+def test_moment_candidates_respect_enabled_tiers():
+    moments = [_amoment("r2-opener-1", "opener"),
+               _amoment("r2-trade-4", "trade")]
+    enabled = [t for t in TIER_ORDER if t != "trade"]
+    assert [m["tier"] for m in timeline_moment_candidates(
+        moments, "x", enabled)] == ["opener"]
+
+
+# ── headshot bonus (every headshot the same, bodies nothing) ──────
+
+def test_headshot_bonus_flat_across_guns():
+    from cs2archive.weapons import headshot_bonus
+    assert headshot_bonus("m4a1_silencer") == 50.0
+    assert headshot_bonus("M4A4") == 50.0
+    assert headshot_bonus("ak47") == 50.0
+    assert headshot_bonus("AK-47") == 50.0
+    assert headshot_bonus("deagle") == 50.0
+    assert headshot_bonus("awp") == 50.0
+    assert headshot_bonus("hegrenade") == 0.0
+    assert headshot_bonus("knife") == 0.0
+    assert headshot_bonus("") == 0.0
+
+
+def test_insta_solo_carries_hs_bonus():
+    out = _pair([_irow(42274, hp=100.0)])
+    assert out[0]["hs_bonus"] == 50.0  # ak47 head in _irow
+
+
+def test_insta_pair_sums_hs_bonus():
+    out = _pair([_irow(61341, hp=100.0), _irow(61460, hp=20.0)])
+    assert len(out) == 1
+    assert out[0]["hs_bonus"] == 100.0  # 2x ak47 head
+
+
+def test_body_shot_scores_no_hs_bonus():
+    out = _pair([_irow(61341, hp=100.0, head="chest")])
+    assert out[0]["hs_bonus"] == 0.0
+    assert "HEAD" not in out[0]["label"]
+
+
+def test_hs_bonus_never_breaks_tier_order():
+    weak_punch = {"tier": "punch_up_single",
+                  "tier_rank": TIER_ORDER.index("punch_up_single"),
+                  "kill_ticks": [1], "ttk": 0.5,
+                  "clutch_initial_count": "", "start_tick": 1,
+                  "hs_bonus": 0.0}
+    rich_insta = {"tier": "insta_kill",
+                  "tier_rank": TIER_ORDER.index("insta_kill"),
+                  "kill_ticks": [2], "ttk": 0.06,
+                  "clutch_initial_count": "", "start_tick": 2,
+                  "hs_bonus": 75.0}
+    assert moment_quality(weak_punch) > moment_quality(rich_insta)
+
+
+def test_moment_candidates_score_heads_up():
+    kills = [{"tick": 29522, "attacker_steam_id": "x", "weapon": "m4a1_silencer",
+              "headshot": True},
+             {"tick": 39485, "attacker_steam_id": "x", "weapon": "ak47",
+              "headshot": False}]
+    moments = [_amoment("r5-opener-1", "opener", rnd=5, kills=(29522,)),
+               _amoment("r7-opener-2", "opener", rnd=7, kills=(39485,),
+                        start=39165, end=39613)]
+    out = timeline_moment_candidates(moments, "x", _penabled(),
+                                     timeline_kills=kills)
+    assert [m["hs_bonus"] for m in out] == [50.0, 0.0]
+    assert moment_quality(out[0]) > moment_quality(out[1])
+
+
+def test_merged_chain_stacks_hs_bonus():
+    # 2 headshots fused into one segment must outscore either alone.
+    from cs2archive.pov.build_hook_timeline import pick_moments
+    a = _cand(61341, tier_rank=7, label="INSTA A",
+              start=61341 - 160, end=61341 + 128)
+    a["hs_ticks"] = {61341: 50.0}
+    a["hs_bonus"] = 50.0
+    b = _cand(61460, tier_rank=7, label="INSTA B",
+              start=61460 - 160, end=61460 + 128)
+    b["hs_ticks"] = {61460: 50.0}
+    b["hs_bonus"] = 50.0
+    solo = _cand(70000, tier_rank=7, label="INSTA C",
+                 start=70000 - 160, end=70000 + 128)
+    solo["hs_ticks"] = {70000: 50.0}
+    solo["hs_bonus"] = 50.0
+    picked = pick_moments([a, b, solo], TICKRATE, 3)
+    assert len(picked) == 2
+    chain = next(m for m in picked if m.get("chained"))
+    assert chain["kill_ticks"] == [61341, 61460]
+    assert chain["hs_bonus"] == 100.0
+    assert chain["hs_ticks"] == {61341: 50.0, 61460: 50.0}
+    assert moment_quality(chain) > moment_quality(solo)
+
+
+def test_merge_counts_shared_kill_once():
+    # Same headshot referenced by two fused candidates (insta solo +
+    # opener on the same tick) scores once, not twice.
+    from cs2archive.pov.build_hook_timeline import pick_moments
+    a = _cand(61341, tier_rank=6, label="PUNCH",
+              start=61341 - 160, end=61341 + 128)
+    a["hs_ticks"] = {61341: 50.0}
+    a["hs_bonus"] = 50.0
+    b = _cand(61341, tier_rank=7, label="INSTA",
+              start=61341 - 160, end=61341 + 128)
+    b["hs_ticks"] = {61341: 50.0}
+    b["hs_bonus"] = 50.0
+    picked = pick_moments([a, b], TICKRATE, 3)
+    assert len(picked) == 1
+    assert picked[0]["hs_bonus"] == 50.0
+    assert picked[0]["hs_ticks"] == {61341: 50.0}
+
+
+def test_punch_chain_counts_each_head_once():
+    # Three punch-up headshots chained: 150, beating any single-headshot
+    # moment at the same tier.
+    from cs2archive.pov.build_hook_timeline import pick_moments
+    cands = []
+    for i, tick in enumerate([112654, 112737, 112854]):
+        m = _cand(tick, tier_rank=6, label="PUNCH",
+                  start=tick - 160, end=tick + 128)
+        m["hs_ticks"] = {tick: 50.0}
+        m["hs_bonus"] = 50.0
+        cands.append(m)
+    picked = pick_moments(cands, TICKRATE, 3)
+    assert len(picked) == 1
+    assert picked[0]["hs_bonus"] == 150.0
+    assert moment_quality(picked[0]) > moment_quality(cands[0])
+
+
+# ── peek-kill bonus (taper) + flick-speed bonus ───────────────────
+
+def test_peek_bonus_taper():
+    from cs2archive.pov.build_hook_timeline import peek_kill_bonus
+    assert peek_kill_bonus(0.8) == 100.0   # dead-on hold: full credit
+    assert peek_kill_bonus(15.0) == 100.0
+    assert peek_kill_bonus(30.0) == 50.0   # ambiguous lane: half
+    assert peek_kill_bonus(32.2) == pytest.approx(42.7, abs=0.1)
+    assert peek_kill_bonus(40.0) == pytest.approx(16.7, abs=0.1)
+    assert peek_kill_bonus(45.0) == 0.0    # back/side shot: nothing
+    assert peek_kill_bonus(82.3) == 0.0
+    assert peek_kill_bonus(None) == 0.0    # unknown: fail closed
+    assert peek_kill_bonus(999.0) == 0.0   # degenerate-geometry sentinel
+
+
+def test_flick_speed_bonus_clamp():
+    assert flick_speed_bonus(58) == 0.0     # ordinary tracking
+    assert flick_speed_bonus(100) == 0.0    # floor
+    assert flick_speed_bonus(138) == pytest.approx(28.5)
+    assert flick_speed_bonus(204) == pytest.approx(78.0)
+    assert flick_speed_bonus(453) == 150.0  # cap
+    assert flick_speed_bonus(None) == 0.0
+
+
+def test_peek_ak_head_beats_m4_back_shot():
+    # The acceptance target: 135419 (AK peek head, ttk 0.25, hold 0.8)
+    # must outscore 45079 (M4 back shot, ttk 0.19, hold 82.3) even though
+    # the back shot has the faster TTK.
+    peek_ak = _q("insta_kill", ttk=0.25)
+    peek_ak.update({"hs_bonus": 50.0,
+                    "peek_ticks": {1000: 100.0},
+                    "flick_speed": 58.0})
+    back_m4 = _q("insta_kill", ttk=0.19)
+    back_m4.update({"hs_bonus": 50.0,
+                    "peek_ticks": {},
+                    "flick_speed": 27.0})
+    assert moment_quality(peek_ak) > moment_quality(back_m4)
+
+
+def test_full_peek_head_outscores_partial_peek_body_flick():
+    # The 65572 absurdity guard: a 10hp body-shot flick into a 32 deg hold
+    # must not outrank a full-HP AK head peek.
+    flick_body = _q("insta_kill", ttk=0.19)
+    flick_body.update({"hs_bonus": 0.0,
+                       "peek_ticks": {1000: peek_kill_bonus(32.2)},
+                       "flick_speed": 204.0})
+    peek_ak = _q("insta_kill", ttk=0.31)
+    peek_ak.update({"hs_bonus": 50.0,
+                    "peek_ticks": {1000: 100.0},
+                    "flick_speed": 67.0})
+    assert moment_quality(peek_ak) > moment_quality(flick_body)
+
+
+def test_merge_unions_peek_and_maxes_flick():
+    from cs2archive.pov.build_hook_timeline import pick_moments
+    a = _cand(61341, tier_rank=7, label="A",
+              start=61341 - 160, end=61341 + 128)
+    a["hs_ticks"] = {}; a["hs_bonus"] = 0.0
+    a["peek_ticks"] = {61341: 100.0}; a["flick_speed"] = 120.0
+    b = _cand(61460, tier_rank=7, label="B",
+              start=61460 - 160, end=61460 + 128)
+    b["hs_ticks"] = {}; b["hs_bonus"] = 0.0
+    b["peek_ticks"] = {61460: 50.0}; b["flick_speed"] = 260.0
+    picked = pick_moments([a, b], TICKRATE, 3)
+    assert len(picked) == 1
+    assert picked[0]["peek_ticks"] == {61341: 100.0, 61460: 50.0}
+    assert picked[0]["flick_speed"] == 260.0  # max, never summed
+    # Shared-kill fusion counts the peek once, not twice.
+    c = _cand(61341, tier_rank=6, label="C",
+              start=61341 - 160, end=61341 + 128)
+    c["hs_ticks"] = {}; c["hs_bonus"] = 0.0
+    c["peek_ticks"] = {61341: 100.0}; c["flick_speed"] = None
+    picked2 = pick_moments([a, c], TICKRATE, 3)
+    assert len(picked2) == 1
+    assert picked2[0]["peek_ticks"] == {61341: 100.0}
+
+
+# ── quality levels (least impressive first) ────────────────────────
+
+def _q(tier, kills=1, ttk=None, clutch="", start=1000):
+    return {"tier": tier, "tier_rank": TIER_ORDER.index(tier),
+            "kill_ticks": [start + i for i in range(kills)],
+            "ttk": ttk, "clutch_initial_count": clutch,
+            "start_tick": start}
+
+
+def test_quality_tier_dominates_kills_and_ttk():
+    assert moment_quality(_q("4k", kills=4)) > moment_quality(
+        _q("punch_up_single", kills=1, ttk=0.06))
+    assert moment_quality(_q("punch_up_single", kills=1)) > moment_quality(
+        _q("insta_kill", kills=3, ttk=0.06))
+
+
+def test_quality_more_kills_then_faster_ttk():
+    one = _q("punch_up_single", kills=1, ttk=0.12)
+    two = _q("punch_up_single", kills=2, ttk=0.44)
+    assert moment_quality(two) > moment_quality(one)
+    fast = _q("insta_kill", kills=2, ttk=0.1)
+    slow = _q("insta_kill", kills=2, ttk=0.4)
+    assert moment_quality(fast) > moment_quality(slow)
+
+
+def test_quality_bigger_clutch_disadvantage():
+    v5 = _q("clutch_1v5", kills=3, clutch="1v5")
+    v3 = _q("clutch_1v3", kills=3, clutch="1v3")
+    assert moment_quality(v5) > moment_quality(v3)
+
+
+def test_quality_missing_fields_never_crash():
+    assert moment_quality({}) == moment_quality({})
+    assert moment_quality({}) < moment_quality(_q("trade"))
+    assert moment_quality({"tier_rank": 99, "kill_ticks": None,
+                           "ttk": "nonsense"}) == moment_quality({})
+
+
+def test_kyousuke_order_single_builds_to_chain():
+    # r2 lone Deagle (11582) must open; the r19 2-kill chain closes.
+    single = {"tier": "punch_up_single",
+              "tier_rank": TIER_ORDER.index("punch_up_single"),
+              "kill_ticks": [11582], "ttk": 0.125,
+              "clutch_initial_count": "", "start_tick": 11262}
+    chain = {"tier": "punch_up_single",
+             "tier_rank": TIER_ORDER.index("punch_up_single"),
+             "kill_ticks": [112654, 112737], "ttk": 0.4375,
+             "clutch_initial_count": "", "start_tick": 112334}
+    assert moment_quality(chain) > moment_quality(single)
+    ordered = sorted([chain, single],
+                     key=lambda m: (moment_quality(m), m["start_tick"]))
+    assert [m["kill_ticks"] for m in ordered] == [[11582], [112654, 112737]]
+
+
+# ── target fill (minimum segments to reach the bar) ────────────────
+
+def _fchain(kill, quality, start=None, end=None):
+    base = {"start_tick": (kill - 160) if start is None else start,
+            "end_tick": (kill + 128) if end is None else end,
+            "kill_ticks": [kill], "tier": "insta_kill",
+            "tier_rank": TIER_ORDER.index("insta_kill"),
+            "label": f"INSTA {kill}", "rank_reason": "r",
+            "round": 11, "pov_steam_id": "x", "pov_nick": "x",
+            "quality": quality}
+    return base
+
+
+def test_fill_takes_minimum_segments_to_bar():
+    from cs2archive.pov.build_hook_timeline import fill_to_target
+    # Each lone single plans exactly 2.00s uncapped: 8 segments = 16s.
+    chains = [_fchain(1000 + i * 10000, quality=5000 - i) for i in range(9)]
+    picked, total = fill_to_target(chains, tickrate=TICKRATE, min_seconds=15.0)
+    assert len(picked) == 8
+    assert total == 16.0
+    assert [m["quality"] for m in picked] == [5000 - i for i in range(8)]
+
+
+def test_fill_stops_at_first_reaching_bar():
+    from cs2archive.pov.build_hook_timeline import fill_to_target
+    chains = [_fchain(1000, quality=100), _fchain(20000, quality=9000)]
+    picked, total = fill_to_target(chains, tickrate=TICKRATE, min_seconds=2.0)
+    assert [m["kill_ticks"] for m in picked] == [[20000]]
+    assert total == 2.0
+
+
+def test_fill_short_of_bar_ships_nothing():
+    from cs2archive.pov.build_hook_timeline import fill_to_target
+    chains = [_fchain(1000, quality=100)]
+    picked, total = fill_to_target(chains, tickrate=TICKRATE, min_seconds=15.0)
+    assert picked == []
+    assert total == 2.0
+
+
+def test_fill_skips_unplannable_chains():
+    from cs2archive.pov.build_hook_timeline import fill_to_target
+    dead = _fchain(1000, quality=9999)
+    dead["kill_ticks"] = []
+    chains = [dead, _fchain(20000, quality=100), _fchain(30000, quality=50),
+              _fchain(40000, quality=25)]
+    picked, total = fill_to_target(chains, tickrate=TICKRATE, min_seconds=5.0)
+    assert [m["kill_ticks"] for m in picked] == [[20000], [30000], [40000]]
+    assert total == 6.0
+
+
+def test_quota_blocks_new_chains_but_not_merges():
+    from cs2archive.pov.build_hook_timeline import pick_moments
+    far = _cand(70000)
+    cands = [far, _cand(61341), _cand(61460)]
+    picked = pick_moments(cands, TICKRATE, 1)
+    # far takes the slot; the close pair still forms nothing (no free slot
+    # for a NEW chain) — merging only applies to existing chains.
+    assert len(picked) == 1
+    assert picked[0]["kill_ticks"] == [70000]
+
+
+def test_transitive_bridge_merges_two_chains():
+    from cs2archive.pov.build_hook_timeline import pick_moments
+    # p1=[100] and p2=[600] are separate (gap 500); bridge [350] joins p1,
+    # and the grown union then absorbs p2 — one chain, fixpoint.
+    p1 = _cand(100, start_tick=0, end_tick=400)
+    p2 = _cand(600, start_tick=500, end_tick=900)
+    bridge = _cand(350, start_tick=250, end_tick=650)
+    picked = pick_moments([p1, p2, bridge], TICKRATE, 3)
+    assert len(picked) == 1
+    assert picked[0]["kill_ticks"] == [100, 350, 600]

@@ -8,11 +8,8 @@ import tempfile
 import types
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
-from _pathsetup import ensure
-ensure()
 
-import upload_pending
+import cs2archive.upload.upload_pending as upload_pending
 
 
 def _meta(adir: Path, status: str, vid: str | None = "v") -> Path:
@@ -94,7 +91,7 @@ def test_purge_dry_run_keeps() -> None:
 
 
 def _should_purge(end_step: int, no_cleanup: bool) -> bool:
-    from pipeline import Pipeline
+    from cs2archive.pov.pipeline import Pipeline
     fake = types.SimpleNamespace(
         end_step=end_step,
         args=types.SimpleNamespace(no_cleanup=no_cleanup),

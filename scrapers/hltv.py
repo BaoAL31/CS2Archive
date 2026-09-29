@@ -21,8 +21,8 @@ from playwright.async_api import async_playwright, Browser, BrowserContext
 from playwright.sync_api import sync_playwright
 from rich.console import Console
 
-from config import settings
-from models import DemoSource, DownloadResult, DownloadStatus, MatchInfo
+from cs2archive.config import settings
+from cs2archive.models import DemoSource, DownloadResult, DownloadStatus, MatchInfo
 
 console = Console(force_terminal=True)
 

@@ -9,7 +9,7 @@ Player lookup + match history use the free FACEIT Data API v4 key
 (FACEIT_API_KEY). Demo download uses the FACEIT Downloads API
 (FACEIT_DOWNLOADS_TOKEN, Bearer) when configured, falling back to the
 browser scrape (authed Chrome, .sessions/faceit/) if the API is unavailable.
-Log in once with `python scripts/faceit/faceit_login_launcher.py` for the fallback.
+Log in once with `python cs2archive/faceit/faceit_login_launcher.py` for the fallback.
 
 Recognised Pros come from `.data/player_accounts.json` (single identity store).
 """
@@ -80,10 +80,7 @@ def _recognised_pro_nicks() -> list[str]:
     from pathlib import Path
 
     root = Path(__file__).resolve().parent.parent
-    sys.path.insert(0, str(root / "scripts"))
-    from _pathsetup import ensure
-    ensure()
-    from player_accounts import list_accounts
+    from cs2archive.player_accounts import list_accounts
 
     return [a.nickname for a in list_accounts() if a.nickname]
 
@@ -101,7 +98,7 @@ async def _cmd_recent(hours: int, count: int) -> None:
 
     client = FACEITClient()
     try:
-        from faceit_names import (
+        from cs2archive.faceit.faceit_names import (
             known_pro_faceit_ids, known_pro_steam_ids, faceit_nick,
         )
         known_fids = known_pro_faceit_ids()
@@ -181,7 +178,7 @@ async def _cmd_recent(hours: int, count: int) -> None:
 async def _cmd_popular(count: int) -> None:
     """Download recent matches for Recognised Pros (player_accounts.json)."""
     from scrapers.faceit import FACEITClient, download_demo
-    from faceit_names import faceit_nick
+    from cs2archive.faceit.faceit_names import faceit_nick
 
     pros = _recognised_pro_nicks()
     if not pros:

@@ -3,9 +3,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "faceit"))
 
-from daily_notable import fallback_demo_if_history_lagged
+from cs2archive.faceit.daily_notable import fallback_demo_if_history_lagged
 
 
 class _FakeStat:

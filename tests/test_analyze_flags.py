@@ -6,12 +6,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
-from _pathsetup import ensure
-ensure()
 
-from pipeline import flag_round_risks
-from round_windows import (
+from cs2archive.pov.pipeline import flag_round_risks
+from cs2archive.pov.round_windows import (
     CSDM_PLAY_LEAD_TICKS,
     DEFUSE_PRE_TAIL_TICKS,
     SAVE_KEEP_TICKS,

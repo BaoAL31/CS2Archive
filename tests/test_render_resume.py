@@ -7,11 +7,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
-from _pathsetup import ensure
-ensure()
 
-import render_pov
+import cs2archive.pov.render_pov as render_pov
 
 
 def _big(folder: Path, name: str, size: int = 2_000_000) -> Path:

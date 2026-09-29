@@ -7,10 +7,8 @@ from pathlib import Path
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "scripts"))
 
-from imgutil import (  # noqa: E402
+from cs2archive.imgutil import (  # noqa: E402
     drop_shadow,
     rounded_alpha_mask,
     rounded_layer,

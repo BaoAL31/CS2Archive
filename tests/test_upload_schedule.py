@@ -9,9 +9,8 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts" / "upload"))
 
-from youtube_schedule import AUTO_PUBLISH_TIMES, DEFAULT_PUBLISH_TZ, parse_publish_at, resolve_publish_schedule
+from cs2archive.upload.youtube_schedule import AUTO_PUBLISH_TIMES, DEFAULT_PUBLISH_TZ, parse_publish_at, resolve_publish_schedule
 
 
 def test_parse_publish_at_aest_winter() -> None:
@@ -134,7 +133,7 @@ def test_resolve_publish_schedule_auto_skips_consecutive_occupied_slots() -> Non
 
 
 def test_resolve_publish_schedule_forces_private() -> None:
-    from youtube_schedule import resolve_publish_schedule
+    from cs2archive.upload.youtube_schedule import resolve_publish_schedule
 
     privacy, utc, tz, local = resolve_publish_schedule(
         publish_at="2026-06-12 17:00",
@@ -149,7 +148,7 @@ def test_resolve_publish_schedule_forces_private() -> None:
 
 
 def test_ensure_shorts_hashtag() -> None:
-    from upload_youtube_shorts import ensure_shorts_hashtag
+    from cs2archive.upload.upload_youtube_shorts import ensure_shorts_hashtag
 
     title, desc = ensure_shorts_hashtag("ropz Nuke", "POV highlights")
     assert title == "ropz Nuke"

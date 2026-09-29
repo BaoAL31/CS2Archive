@@ -1,3 +1,26 @@
+## Named encode profiles (CR-04)
+
+`cs2archive/encode.py` is the single source for every NVENC rate-control combination. This
+page used to claim "two profiles"; the code actually used **eight**, so they are now named and
+pinned by a golden test (`tests/test_encode_profiles.py`):
+
+| Profile | preset / cq | rate | Used by |
+|---|---|---|---|
+| `CAPTURE` | p7 / cq15 | none | `render_pov` CSDM capture config (mezzanine) |
+| `SCALE` | p5 / cq8 | maxrate 200M (bufsize 400M) | `concat_rounds` 1080p→1440p upscale |
+| `FREEZE` | p7 / cq8 | maxrate 200M | `lineup_freeze` PiP clips |
+| `FINAL` | p7 / cq15 | maxrate 60M (bufsize 120M) | delivered export: `overlay_encode`, prepends, `assemble_reel` |
+| `FINAL_NOCAP` | p7 / cq15 | none | intermediates that get re-encoded later |
+| `EDIT` | p7 / cq14 | none, **with** `-b:v 0` | `render_edit_timeline` segments |
+| `EDIT_BARE` | p7 / cq14 | none, **without** `-b:v 0` | `render_shorts` (both sites) |
+| `BILIBILI` | p4 | maxrate 18M | bilibili.tv ingest spec |
+| `PREVIEW` | p7 | none | dev-only preview renders |
+
+**CR-12 note, so the change is not silent:** `assemble_reel` used to encode the delivered reel
+at CQ13/CQ14 **with no rate cap**. It now uses `FINAL` (CQ15 + 60M/120M cap), matching every
+other delivered artifact. That is a rate-control change to a shipped file, not just a
+quantiser fix.
+
 # Demo Video Rendering
 
 > Reference doc extracted from `AGENTS.md`. Read this when rendering POV videos, debugging HLAE capture failures, or touching CSDM/ffmpeg commands.
@@ -25,10 +48,12 @@ Capture follows the POV's prosettings resolution (4:3 1280×960 for stretched pl
 
 ## Scoreboard Avatar-Box Calibration
 
-`scripts/overlay/voice_shade.py` dims/reveals the POV team's scoreboard
-avatars. Its rectangles live in `scripts/overlay/avatar_boxes.py` and must be
-measured in the player's **native render resolution**, not in the final
-2560×1440 upload: `concat_rounds.py` may stretch a 4:3 or 16:10 render.
+The legacy **voice-shade** indicator (dimming the scoreboard to highlight the POV
+team) has been removed — the voice HUD is now the Swift indicators, baked into the
+captured frames in step 2. What remains relevant: avatar rectangles live in
+`cs2archive/overlay/avatar_boxes.py` and must be measured in the player's **native
+render resolution**, not in the final 2560×1440 upload, because `concat_rounds.py`
+may stretch a 4:3 or 16:10 render.
 
 When a box is offset or clips a neighbouring avatar:
 

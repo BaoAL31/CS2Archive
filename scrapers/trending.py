@@ -17,7 +17,7 @@ import httpx
 from rich.console import Console
 from bs4 import BeautifulSoup
 
-from config import settings
+from cs2archive.config import settings
 
 console = Console(force_terminal=True)
 

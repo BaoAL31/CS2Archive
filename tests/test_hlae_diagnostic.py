@@ -1,4 +1,4 @@
-from scripts.misc.diagnose_hlae_capture import classify_plugin_log
+from cs2archive.misc.diagnose_hlae_capture import classify_plugin_log
 
 
 def test_missing_client_callback_is_not_reported_as_failed_hlae_injection():

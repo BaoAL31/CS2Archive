@@ -3,10 +3,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "faceit"))
 
-import backfill_faceit_ids as bf
+import cs2archive.faceit.backfill_faceit_ids as bf
 
 
 def test_extract_match_ids_from_room_url():

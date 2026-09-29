@@ -3,11 +3,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from datetime import date, datetime, timedelta
 
-from hltv.match_listener import (
+from cs2archive.hltv.match_listener import (
     State,
     Match,
     ScheduledMatch,
@@ -298,7 +297,7 @@ def test_upload_cmd_targets_this_meta_only(tmp_path: Path):
 
 def test_spawn_upload_dry_run_does_not_popen(monkeypatch):
     called = []
-    monkeypatch.setattr("hltv.match_listener.subprocess.Popen", lambda *a, **k: called.append((a, k)))
+    monkeypatch.setattr("cs2archive.hltv.match_listener.subprocess.Popen", lambda *a, **k: called.append((a, k)))
     _spawn_upload_terminal(["python", "upload_youtube.py"], dry_run=True)
     assert called == []
 
@@ -311,8 +310,8 @@ def test_spawn_upload_opens_new_console(monkeypatch):
         captured["kwargs"] = kwargs
         return None
 
-    monkeypatch.setattr("hltv.match_listener.subprocess.Popen", fake_popen)
-    cmd = ["python", "-u", "scripts/upload/upload_youtube.py", "video.mp4"]
+    monkeypatch.setattr("cs2archive.hltv.match_listener.subprocess.Popen", fake_popen)
+    cmd = ["python", "-u", "cs2archive/upload/upload_youtube.py", "video.mp4"]
     _spawn_upload_terminal(cmd, dry_run=False)
     assert captured["cmd"] == cmd
     assert captured["kwargs"].get("creationflags") == subprocess.CREATE_NEW_CONSOLE
@@ -320,7 +319,7 @@ def test_spawn_upload_opens_new_console(monkeypatch):
 
 def test_start_upload_after_pipeline_dry_run_does_not_popen(monkeypatch):
     called = []
-    monkeypatch.setattr("hltv.match_listener.subprocess.Popen", lambda *a, **k: called.append((a, k)))
+    monkeypatch.setattr("cs2archive.hltv.match_listener.subprocess.Popen", lambda *a, **k: called.append((a, k)))
     _start_upload_after_pipeline("backlog/x.json", dry_run=True)
     assert called == []
 
@@ -330,7 +329,7 @@ def test_start_upload_spawns_upload_pending_for_this_meta(monkeypatch, tmp_path:
     video.write_bytes(b"x")
     meta_path = _write_pending_meta(tmp_path / "youtube" / "run_overlay", video)
     monkeypatch.setattr(
-        "hltv.match_listener._pending_upload_metas",
+        "cs2archive.hltv.match_listener._pending_upload_metas",
         lambda card, **k: [meta_path],
     )
     captured = {}
@@ -340,7 +339,7 @@ def test_start_upload_spawns_upload_pending_for_this_meta(monkeypatch, tmp_path:
         captured["kwargs"] = kwargs
         return None
 
-    monkeypatch.setattr("hltv.match_listener.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("cs2archive.hltv.match_listener.subprocess.Popen", fake_popen)
     _start_upload_after_pipeline("backlog/x.json", dry_run=False)
     joined = " ".join(captured["cmd"])
     assert "upload_pending.py" in joined
@@ -489,7 +488,7 @@ def test_faceit_window_stretches_over_render_blocked_gap():
 
 
 def test_prune_keeps_one_faceit_card_per_match(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr("hltv.match_listener.ROOT", tmp_path)
+    monkeypatch.setattr("cs2archive.hltv.match_listener.ROOT", tmp_path)
     cards = []
     for match_id, player, rating in (
         ("m1", "donk", 1.8),
@@ -520,3 +519,135 @@ def test_prune_keeps_one_faceit_card_per_match(tmp_path: Path, monkeypatch):
         for rel in kept
     }
     assert players == {"donk", "ropz", "sh1ro"}
+
+
+def _guard_args(dry_run: bool = False):
+    from types import SimpleNamespace
+    return SimpleNamespace(dry_run=dry_run)
+
+
+def _mk_guard_card(tmp_path: Path, name: str) -> str:
+    path = tmp_path / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}", encoding="utf-8")
+    return name
+
+
+def test_day_guard_reenqueues_unrendered_pick_instead_of_scraping(
+        monkeypatch, tmp_path: Path):
+    """Once today's pick is queued, a scrape must never queue another —
+    re-enqueue the SAME card instead (the n=room batching grew one day to
+    14 while zero uploads completed)."""
+    import asyncio
+
+    import cs2archive.hltv.match_listener as ml
+    monkeypatch.setattr(ml, "ROOT", tmp_path)
+    card = _mk_guard_card(tmp_path, "backlog/faceit/2026-09-29/high/p.json")
+    state = State(tmp_path / "listener.json")
+    daily = _daily(state)
+    daily["faceit_queued"] = [card]
+    enqueued: list[str] = []
+    spawned: list[str] = []
+    monkeypatch.setattr(ml, "_enqueue",
+                        lambda st, cards, idx: enqueued.extend(cards))
+    monkeypatch.setattr(ml, "_start_upload_after_pipeline",
+                        lambda c, dry: spawned.append(c))
+    asyncio.run(ml._maybe_queue_faceit(_guard_args(), state, None))
+    assert enqueued == [card]
+    assert spawned == []
+    assert _daily(state)["faceit_queued"] == [card]
+
+
+def test_day_guard_never_respawns_fresh_upload_spawn(monkeypatch, tmp_path: Path):
+    """A live upload console (spawn <30 min old) must not get a second
+    spawn — upload_pending.py has no single-instance lock, so racing
+    consoles double-upload the same video. A dead one (>=30 min) respawns."""
+    import asyncio
+
+    import cs2archive.hltv.match_listener as ml
+    monkeypatch.setattr(ml, "ROOT", tmp_path)
+    card = _mk_guard_card(tmp_path, "backlog/faceit/2026-09-29/high/p.json")
+    state = State(tmp_path / "listener.json")
+    daily = _daily(state)
+    daily["completed"] = [card]
+    daily["faceit_queued"] = [card]
+    spawns = daily.setdefault("faceit_upload_spawns", {})
+    spawns[card] = {"at": datetime.now().isoformat(), "count": 1}
+    spawned: list[str] = []
+    monkeypatch.setattr(ml, "_start_upload_after_pipeline",
+                        lambda c, dry: spawned.append(c))
+    asyncio.run(ml._maybe_queue_faceit(_guard_args(), state, None))
+    assert spawned == []
+    # the guard writes its ledger copy back to daily — re-read it live
+    _daily(state)["faceit_upload_spawns"][card] = {
+        "at": (datetime.now() - timedelta(minutes=45)).isoformat(),
+        "count": 1,
+    }
+    asyncio.run(ml._maybe_queue_faceit(_guard_args(), state, None))
+    assert spawned == [card]
+    assert _daily(state)["faceit_upload_spawns"][card]["count"] == 2
+
+
+def test_day_guard_respects_upload_spawn_cap(monkeypatch, tmp_path: Path):
+    import asyncio
+
+    import cs2archive.hltv.match_listener as ml
+    monkeypatch.setattr(ml, "ROOT", tmp_path)
+    card = _mk_guard_card(tmp_path, "backlog/faceit/2026-09-29/high/p.json")
+    state = State(tmp_path / "listener.json")
+    daily = _daily(state)
+    daily["completed"] = [card]
+    daily["faceit_queued"] = [card]
+    spawns = daily.setdefault("faceit_upload_spawns", {})
+    spawns[card] = {
+        "at": (datetime.now() - timedelta(minutes=45)).isoformat(),
+        "count": ml.FACEIT_UPLOAD_SPAWN_CAP,
+    }
+    spawned: list[str] = []
+    monkeypatch.setattr(ml, "_start_upload_after_pipeline",
+                        lambda c, dry: spawned.append(c))
+    asyncio.run(ml._maybe_queue_faceit(_guard_args(), state, None))
+    assert spawned == []
+
+
+def test_day_guard_falls_through_when_queued_card_gone(monkeypatch, tmp_path: Path):
+    """A dup-cleaned/purged card must not kill the day: the scrape still
+    runs so a fresh pick can be found."""
+    import asyncio
+
+    import cs2archive.hltv.match_listener as ml
+    monkeypatch.setattr(ml, "ROOT", tmp_path)
+    state = State(tmp_path / "listener.json")
+    daily = _daily(state)
+    daily["faceit_queued"] = ["backlog/faceit/2026-09-29/high/gone.json"]
+    scraped: dict = {}
+
+    async def fake_discover(n=0, *, hours=0, count=25, skip_youtube_demand=True):
+        scraped["n"] = n
+        return ([], [])
+
+    monkeypatch.setattr(ml, "discover_faceit_tracks", fake_discover)
+    asyncio.run(ml._maybe_queue_faceit(_guard_args(), state, None))
+    assert scraped["n"] == 1
+
+
+def test_day_guard_dry_run_reports_guard_not_scrape(monkeypatch, tmp_path: Path):
+    import asyncio
+
+    import cs2archive.hltv.match_listener as ml
+    monkeypatch.setattr(ml, "ROOT", tmp_path)
+    card = _mk_guard_card(tmp_path, "backlog/faceit/2026-09-29/high/p.json")
+    state = State(tmp_path / "listener.json")
+    daily = _daily(state)
+    daily["faceit_queued"] = [card]
+    scraped: dict = {}
+
+    async def fake_discover(n=0, *, hours=0, count=25, skip_youtube_demand=True):
+        scraped["n"] = n
+        return ([], [])
+
+    monkeypatch.setattr(ml, "discover_faceit_tracks", fake_discover)
+    asyncio.run(ml._maybe_queue_faceit(_guard_args(dry_run=True), state, None))
+    assert "n" not in scraped
+    # a dry run must not advance the 15-min FACEIT cooldown
+    assert _daily(state).get("faceit_last_scrape") is None

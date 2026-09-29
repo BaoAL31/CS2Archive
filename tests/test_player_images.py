@@ -10,9 +10,8 @@ from unittest.mock import patch
 
 from PIL import Image
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from models import PlayerAccount
+from cs2archive.models import PlayerAccount
 from scrapers import hltv_player_resolver as resolver
 from scrapers.player_images import (
     _bodyshot_url_matches_player,
@@ -86,7 +85,7 @@ def test_promote_hltv_identity_updates_account() -> None:
         "player_id": "25619",
         "source": "ratings",
     }
-    with patch("player_accounts.update_hltv_player") as update_mock:
+    with patch("cs2archive.player_accounts.update_hltv_player") as update_mock:
         _promote_hltv_identity(account, resolution)
         update_mock.assert_called_once_with(
             "ropz",

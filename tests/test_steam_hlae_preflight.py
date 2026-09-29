@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from hook_aware import (
+from cs2archive.render.hook_aware import (
     block_steam_overlay,
     ensure_csdm_steam_launch,
     ensure_steam_appid,

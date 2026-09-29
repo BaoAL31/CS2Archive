@@ -8,12 +8,10 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "faceit"))
 
-import daily_notable as dn
-import scrape_notable as sn
-import update_player_demand as upd
+import cs2archive.faceit.daily_notable as dn
+import cs2archive.faceit.scrape_notable as sn
+import cs2archive.faceit.update_player_demand as upd
 
 
 @pytest.fixture(autouse=True)
@@ -121,6 +119,15 @@ def test_star_bonus_scales_with_kd():
     assert sn.star_bonus(0, True, kd=2.0) == 0
 
 
+def test_star_bonus_kd_ratio_is_clamped():
+    """One frags line must not dominate the weight (jL 6.5 K/D used to
+    pay a 1.3M chip, 88% of the total); a disaster map still pays half."""
+    assert sn.star_bonus(400_000, True, kd=6.5) == 400_000
+    assert sn.star_bonus(400_000, True, kd=2.5) == 400_000
+    assert sn.star_bonus(400_000, True, kd=0.1) == 100_000
+    assert sn.star_bonus(400_000, True, kd=0.0) == 100_000
+
+
 def test_candidate_weight_keeps_explainable_components(monkeypatch):
     monkeypatch.setattr(sn, "star_bonus_for_pros", lambda pros, ranking: 120_000)
     record = {
@@ -141,7 +148,7 @@ def test_candidate_weight_keeps_explainable_components(monkeypatch):
 
     candidate = sn.make_player_candidates(record, "solo", {})[0]
 
-    assert candidate["score_version"] == 7
+    assert candidate["score_version"] == 8
     assert candidate["raw_star_bonus"] == 120_000
     assert candidate["star_bonus"] == 120_000
     assert candidate["market_demand_bonus"] == 125_000
@@ -289,7 +296,15 @@ def test_select_picks_only_one_pov_per_match():
     ]
 
 
-def test_is_good_faceit_pov_is_demand_only():
+def test_is_good_faceit_pov_is_demand_only(monkeypatch):
+    """Demand-gate passers at the 1.40 floor qualify on any line (losses
+    count); below-floor players with no ranked org stay out. Pinned to a
+    synthetic index so the test is machine-independent."""
+    monkeypatch.setattr(sn, "load_player_demand_index", lambda *a, **k: {
+        "donk": 1.45, "s1mple": 1.50, "nocries": 0.76, "mzinho": 0.62,
+        "blamef": 0.62, "neityu": 0.50,
+    })
+    monkeypatch.setattr(sn._scoring, "load_demand_payload", lambda *a, **k: {})
     donk = {
         "player": "donk", "won": True, "kd": 1.5, "adr": 85.0, "kills": 18,
     }
@@ -332,11 +347,58 @@ def test_is_good_faceit_pov_is_demand_only():
     assert sn.is_good_faceit_pov({**donk, "won": False})
 
 
+def test_demand_star_supported_sample_gate(monkeypatch):
+    """A stale long-window-only thin index (8 videos, 0 recent) must not
+    count for the gate; recent evidence or a deep track record does. No
+    live payload -> the fallback table keeps the old behaviour."""
+    payload = {
+        "index": {"jboen": 1.63, "latto": 1.78, "s1mple": 1.8},
+        "players": {
+            "JBOEN": {"videos": 8, "recent_videos": 0},
+            "latto": {"videos": 12, "recent_videos": 3},
+            "s1mple": {"videos": 262, "recent_videos": 70},
+        },
+    }
+    monkeypatch.setattr(sn._scoring, "load_demand_payload",
+                        lambda *a, **k: payload)
+    assert not sn._scoring.demand_star_supported("jboen")
+    assert sn._scoring.demand_star_supported("latto")
+    assert sn._scoring.demand_star_supported("s1mple")
+    assert not sn._scoring.demand_star_supported("unknown-player")
+
+
+def test_demand_star_supported_without_live_payload():
+    """Missing live file -> the research fallback table (no sample
+    counts) keeps the old behaviour: supported."""
+    from pathlib import Path
+    assert sn._scoring.demand_star_supported(
+        "jboen", path=Path("Z:/definitely/missing.json"))
+
+
+def test_demand_star_needs_sample_evidence_for_gate(monkeypatch):
+    """Replay of the 2026-09-29 shape: JBOEN/mezii/xfl0ud (recent=0,
+    thin 8-video windows) auto-passed the gate on presence alone."""
+    payload = {
+        "index": {"jboen": 1.63, "mezii": 1.59},
+        "players": {
+            "JBOEN": {"videos": 8, "recent_videos": 0},
+            "mezii": {"videos": 8, "recent_videos": 0},
+        },
+    }
+    monkeypatch.setattr(sn, "load_player_demand_index",
+                        lambda *a, **k: payload["index"])
+    monkeypatch.setattr(sn._scoring, "load_demand_payload",
+                        lambda *a, **k: payload)
+    quiet = {"player": "mezii", "won": False, "kd": 1.2, "adr": 80.0, "kills": 18}
+    assert not sn.is_good_faceit_pov(quiet)
+    assert not sn.is_good_faceit_pov({**quiet, "player": "jboen"})
+
+
 def test_org_star_needs_standout_line_for_solo_pov(monkeypatch):
     """Replay of 1-75510475: TeSeS (Falcons, no measurable demand) with a
     25/20 mid line must NOT get a solo render — that lobby belongs to the
     highlight feed. A TeSeS banger still qualifies."""
-    import hltv_ranking
+    import cs2archive.faceit.hltv_ranking as hltv_ranking
     monkeypatch.setattr(sn, "load_player_demand_index", lambda *a, **k: {})
     monkeypatch.setattr(
         hltv_ranking, "_ROSTER_CACHE",
@@ -370,7 +432,7 @@ def test_org_star_floor_is_top_ten_teams(monkeypatch):
 def test_stacked_lobby_with_mid_lines_is_highlight_not_solo(monkeypatch):
     """1-75510475 as scraped: all-mid lines, 4-pro Spirit/Falcons lobby.
     Nobody earns a solo render, but the lobby clears the highlight bar."""
-    import hltv_ranking
+    import cs2archive.faceit.hltv_ranking as hltv_ranking
     monkeypatch.setattr(sn, "load_player_demand_index", lambda *a, **k: {})
     monkeypatch.setattr(
         hltv_ranking, "_ROSTER_CACHE",
@@ -412,7 +474,7 @@ def test_pick_for_day_burns_used_only_for_card_backed_picks(tmp_path, monkeypatc
 def test_tracks_split_one_scrape_into_solo_and_highlight(tmp_path, monkeypatch):
     """One collect call feeds both tracks: donk's POV goes solo, the
     stacked lobby goes to the highlight feed. No lobby-carried solo."""
-    import hltv_ranking
+    import cs2archive.faceit.hltv_ranking as hltv_ranking
     calls = []
 
     async def fake_collect(**kwargs):

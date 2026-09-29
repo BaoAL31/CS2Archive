@@ -2,7 +2,7 @@
 CS2Archive — FACEIT Demo Downloader (browser scrape)
 
 No FACEIT API key required for downloads. Uses a CDP-debuggable Chrome
-(``scripts/misc/launch-debug-chrome.ps1`` → ``~/.chrome-debug``, seeded with
+(``cs2archive/misc/launch-debug-chrome.ps1`` → ``~/.chrome-debug``, seeded with
 cookies from the main logged-in Chrome profile) to open the match room, click
 "Watch Demo", and capture the browser download to disk. Some matches start the
 download directly from "Watch Demo"; others open a Demo 1/Demo 2 dropdown.
@@ -25,12 +25,12 @@ from typing import Any, Callable, Optional
 import httpx
 from rich.console import Console
 
-from config import settings
-from downloader import (
+from cs2archive.config import settings
+from cs2archive.downloader import (
     build_demo_path, extract_demo, file_size_mb,
     is_already_downloaded, record_download,
 )
-from models import DemoSource, DownloadResult, DownloadStatus, MatchInfo
+from cs2archive.models import DemoSource, DownloadResult, DownloadStatus, MatchInfo
 
 console = Console(force_terminal=True)
 
@@ -355,7 +355,7 @@ class FACEITDownloadsClient:
 
     async def download_match(self, match_id: str, out_dir: Path) -> Optional[Path]:
         """Resolve demo_url via Data API, get signed URL, stream to disk."""
-        from downloader import file_size_mb
+        from cs2archive.downloader import file_size_mb
         # 1. fetch match payload for demo_url
         try:
             async with httpx.AsyncClient(
@@ -632,7 +632,7 @@ def _ensure_repeek_roster(match_id: str) -> None:
 def _launch_context():
     """Launch the authenticated Chrome context via CDP debug Chrome.
 
-    Runs ``scripts/misc/launch-debug-chrome.ps1`` which seeds cookies from the
+    Runs ``cs2archive/misc/launch-debug-chrome.ps1`` which seeds cookies from the
     main logged-in Chrome profile (``Profile 2``) into ``~/.chrome-debug`` and
     launches a CDP-debuggable Chrome on port 9221. We then connect over CDP so
     the FACEIT room renders authenticated (Watch Demo button present) using the
@@ -677,8 +677,18 @@ def _kill_debug_chrome() -> None:
     )
 
 
-def _disconnect_cdp(pw, page=None, browser=None) -> None:
-    """Close the room tab and quit debug Chrome when the download/scrape is done."""
+def _disconnect_cdp(pw, page=None, browser=None, keep_chrome: bool = False) -> None:
+    """Close the room tab and quit debug Chrome when the download/scrape is done.
+
+    ``keep_chrome=True`` detaches only: the tab and the browser stay up for the
+    operator (Cloudflare challenge that needs to be solved by hand).
+    """
+    if keep_chrome:
+        try:
+            pw.stop()
+        except Exception:
+            pass
+        return
     if page is not None:
         try:
             page.close()
@@ -750,7 +760,7 @@ def _ensure_cdp_chrome() -> None:
 
     if _port_open(_CDP_PORT):
         return
-    ps1 = Path(__file__).resolve().parent.parent / "scripts" / "misc" / "launch-debug-chrome.ps1"
+    ps1 = Path(__file__).resolve().parent.parent / "cs2archive" / "misc" / "launch-debug-chrome.ps1"
     console.print(f"[cyan]   [CDP] Launching debug Chrome (seed cookies from main profile)...[/cyan]")
     try:
         subprocess.run(
@@ -823,6 +833,56 @@ DOWNLOAD_START_TIMEOUT = 120  # seconds to wait for the download to begin
 # (FACEIT's demo server can be slow to start — allow up to 2 min)
 DOWNLOAD_MAX_RETRIES = 3     # restart attempts if the download doesn't start
 
+
+class CloudflareChallenge(RuntimeError):
+    """A Cloudflare interstitial is blocking the page — a human must solve it.
+
+    Refreshing/re-navigating does not clear a challenge (it makes it worse), and
+    the operator solves it by hand in the debug Chrome — so on this error the
+    browser is deliberately left OPEN and no retry/reload happens.
+    """
+
+
+_CHALLENGE_TEXT = re.compile(
+    r"just a moment|attention required|verify you are human|checking your browser", re.I
+)
+
+
+def _cloudflare_challenge(page) -> bool:
+    """True if the page is a Cloudflare challenge instead of FACEIT.
+
+    A passive turnstile iframe is normal on FACEIT and must NOT count — only a
+    challenge main frame, challenge wording, or a turnstile widget shown in
+    place of the room content does.
+    """
+    try:
+        if "/cdn-cgi/challenge-platform/" in (page.url or ""):
+            return True
+    except Exception:
+        return False
+    try:
+        title = page.title() or ""
+    except Exception:
+        title = ""
+    if _CHALLENGE_TEXT.search(title):
+        return True
+    try:
+        body = page.inner_text("body")[:600]
+    except Exception:
+        return False
+    if _CHALLENGE_TEXT.search(body):
+        return True
+    # A visible turnstile widget *replacing* the room (no room markers) blocks us.
+    room_markers = ("watch demo", "matchroom", "back to matchmaking")
+    if any(m in body.lower() for m in room_markers):
+        return False
+    try:
+        widget = page.locator("iframe[src*='challenges.cloudflare.com']").first
+        box = widget.bounding_box() if widget.count() else None
+        return bool(box and box["width"] > 60 and box["height"] > 40)
+    except Exception:
+        return False
+
 def _find_demo_button(page):
     """Visible 'Watch Demo' control only. Hidden/empty matches are ignored."""
     name = re.compile(r"watch\s*demo", re.I)
@@ -882,9 +942,17 @@ def _human_click(page, x: float, y: float, variance: float = 3.0) -> None:
     _t.sleep(random.uniform(0.05, 0.15))
 
 def _reload(page, room_url: Optional[str]) -> bool:
-    """Re-navigate to the room page; returns False if impossible."""
+    """Re-navigate to the room page; returns False if impossible.
+
+    Refuses to re-navigate while a Cloudflare challenge is showing: refreshing
+    cannot clear it, and the operator finishes it by hand in the debug Chrome.
+    """
     if not room_url:
         return False
+    if _cloudflare_challenge(page):
+        raise CloudflareChallenge(
+            "Cloudflare challenge showing — not reloading; debug Chrome left open"
+        )
     try:
         page.goto(room_url, wait_until="domcontentloaded")
         page.wait_for_timeout(8000)
@@ -1071,6 +1139,10 @@ def _click_demo_and_save(page, out_dir: Path, room_url: Optional[str] = None,
     page_count_before = len(page.context.pages)
 
     for attempt in range(1, DOWNLOAD_MAX_RETRIES + 1):
+        if _cloudflare_challenge(page):
+            raise CloudflareChallenge(
+                "Cloudflare challenge on the room page — stopping (no reload)"
+            )
         try:
             dropdown_state = _open_dropdown(attempt)
             if dropdown_state == "":
@@ -1191,12 +1263,8 @@ def download_demo(match_id: str) -> DownloadResult:
         try:
             _ensure_repeek_roster(match_id)
         except Exception as e:
-            console.print(f"[bold red]   [ERR] {e}[/bold red]")
-            return DownloadResult(
-                match=match_info, status=DownloadStatus.FAILED,
-                demo_path=existing, error=str(e),
-                started_at=started, completed_at=datetime.now(),
-            )
+            # Demo is usable without strips; strips retry next run.
+            console.print(f"[yellow]   [WARN] Repeek failed, demo kept: {e}[/yellow]")
         return DownloadResult(
             match=match_info, status=DownloadStatus.SKIPPED,
             demo_path=existing, file_size_mb=file_size_mb(existing),
@@ -1215,12 +1283,7 @@ def download_demo(match_id: str) -> DownloadResult:
             try:
                 _ensure_repeek_roster(match_id)
             except Exception as e:
-                console.print(f"[bold red]   [ERR] {e}[/bold red]")
-                return DownloadResult(
-                    match=match_info, status=DownloadStatus.FAILED,
-                    demo_path=result.demo_path, error=str(e),
-                    started_at=started, completed_at=datetime.now(),
-                )
+                console.print(f"[yellow]   [WARN] Repeek failed, demo kept: {e}[/yellow]")
             return result
         console.print("[yellow]   [WARN] Downloads API failed; falling back to browser scrape.[/yellow]")
 
@@ -1229,7 +1292,7 @@ def download_demo(match_id: str) -> DownloadResult:
 
 def _finalize_download(match_info, saved, started) -> DownloadResult:
     """Extract the archived demo and organize it into the FACEIT demo dir."""
-    from downloader import build_demo_path, record_download
+    from cs2archive.downloader import build_demo_path, record_download
     console.print("[cyan]   [EXTRACT] Extracting .dem...[/cyan]")
     dem_paths = extract_demo(saved, settings.temp_dir)
     dem_path = dem_paths[0]
@@ -1267,38 +1330,45 @@ def _finalize_download(match_info, saved, started) -> DownloadResult:
 
 def _download_demo_browser(match_id: str, match_info: MatchInfo, started) -> DownloadResult:
     """Fallback: open room (authed) → click demo → extract → organize."""
-    leftover = _finished_match_archive(match_id)
+    _dirs = _watch_dirs_for(settings.temp_dir)
+    leftover = _finished_match_archive(match_id, _dirs)
     if leftover:
         console.print(f"[yellow]   [SKIP] Archive already on disk: {leftover}[/yellow]")
         result = _finalize_download(match_info, leftover, started)
         try:
             _ensure_repeek_roster(match_id)
         except Exception as e:
-            console.print(f"[bold red]   [ERR] {e}[/bold red]")
-            return DownloadResult(
-                match=match_info, status=DownloadStatus.FAILED,
-                demo_path=result.demo_path, error=str(e),
-                started_at=started, completed_at=datetime.now(),
-            )
+            console.print(f"[yellow]   [WARN] Repeek failed, demo kept: {e}[/yellow]")
         return result
-    inflight = _inflight_match_archive(match_id)
+    inflight = _inflight_match_archive(match_id, _dirs)
     if inflight:
         console.print(f"[yellow]   [SKIP] Download already in progress: {inflight.name}[/yellow]")
-        done = _wait_for_match_archive(match_id, timeout=600.0)
+        done = _wait_for_match_archive(match_id, timeout=600.0, dirs=_dirs)
         if done:
             result = _finalize_download(match_info, done, started)
             try:
                 _ensure_repeek_roster(match_id)
             except Exception as e:
-                console.print(f"[bold red]   [ERR] {e}[/bold red]")
-                return DownloadResult(
-                    match=match_info, status=DownloadStatus.FAILED,
-                    demo_path=result.demo_path, error=str(e),
-                    started_at=started, completed_at=datetime.now(),
-                )
+                console.print(f"[yellow]   [WARN] Repeek failed, demo kept: {e}[/yellow]")
             return result
 
     room_url = f"https://www.faceit.com/en/cs2/room/{match_id}"
+    keep_chrome = False
+
+    def _challenge_result(reason: str) -> DownloadResult:
+        """Cloudflare interstitial: stop, keep the browser for the operator."""
+        nonlocal keep_chrome
+        keep_chrome = True
+        console.print(f"[red]   [CF] {reason}[/red]")
+        console.print(
+            "[yellow]   Debug Chrome left OPEN on the challenge page — solve it in that window "
+            "and re-run. No retry/reload is attempted; refreshing does not clear a challenge.[/yellow]"
+        )
+        return DownloadResult(
+            match=match_info, status=DownloadStatus.FAILED,
+            error="FACEIT_CLOUDFLARE_CHALLENGE",
+            started_at=started, completed_at=datetime.now(),
+        )
 
     try:
         pw, browser = _launch_context()
@@ -1323,6 +1393,9 @@ def _download_demo_browser(match_id: str, match_info: MatchInfo, started) -> Dow
                     break
                 page.wait_for_timeout(500)
 
+            if _cloudflare_challenge(page):
+                return _challenge_result("Cloudflare challenge on the room page")
+
             # Auth check: the Watch Demo button only renders when logged in. If
             # the debug Chrome isn't authenticated, give clear guidance instead
             # of silently failing all download attempts.
@@ -1331,7 +1404,7 @@ def _download_demo_browser(match_id: str, match_info: MatchInfo, started) -> Dow
                     "[red]   [AUTH] FACEIT is not logged in — the Watch Demo button is hidden.[/red]"
                 )
                 console.print(
-                    "[yellow]   Fix: run `scripts/misc/launch-debug-chrome.ps1`, log into FACEIT in the "
+                    "[yellow]   Fix: run `cs2archive/misc/launch-debug-chrome.ps1`, log into FACEIT in the "
                     "opened Chrome, then retry.[/yellow]"
                 )
                 return DownloadResult(
@@ -1364,7 +1437,10 @@ def _download_demo_browser(match_id: str, match_info: MatchInfo, started) -> Dow
 
             out_dir = settings.temp_dir
             out_dir.mkdir(parents=True, exist_ok=True)
-            saved = _click_demo_and_save(page, out_dir, room_url=room_url, match_id=match_id)
+            try:
+                saved = _click_demo_and_save(page, out_dir, room_url=room_url, match_id=match_id)
+            except CloudflareChallenge as cf:
+                return _challenge_result(str(cf))
 
             if not saved:
                 console.print("[red]   [ERR] Could not find a demo download button.[red]")
@@ -1375,11 +1451,9 @@ def _download_demo_browser(match_id: str, match_info: MatchInfo, started) -> Dow
                 )
 
             console.print(f"[green]   [OK] Downloaded: {saved.name} ({file_size_mb(saved):.1f} MB)[/green]")
-            # Same tab: Repeek has been loading during the transfer. Do not
-            # close until last-30 cards are snapped.
-            _capture_repeek_roster(page, match_id)
-            hold_browser_until_both(download_ok=True, repeek_ok=True)
-
+            # Finalize FIRST so a Repeek failure never discards a good download.
+            # The 93MB-then-FAILED case was capture-before-extract: the archive
+            # sat in temp unorganized and the backlog reported "demo not located".
             console.print("[cyan]   [EXTRACT] Extracting .dem...[/cyan]")
             dem_paths = extract_demo(saved, settings.temp_dir)
             dem_path = dem_paths[0]
@@ -1397,14 +1471,25 @@ def _download_demo_browser(match_id: str, match_info: MatchInfo, started) -> Dow
                 started_at=started, completed_at=datetime.now(),
             ))
             console.print(f"[bold green]   [DONE] Saved: {dem_path.name} ({file_size_mb(dem_path):.1f} MB)[/bold green]")
+
+            # Same tab: Repeek has been loading during the transfer. Best-effort —
+            # strips retry via _ensure_repeek_roster on the next run.
+            try:
+                _capture_repeek_roster(page, match_id)
+                hold_browser_until_both(download_ok=True, repeek_ok=True)
+            except Exception as e:
+                console.print(f"[yellow]   [WARN] Repeek failed, demo kept: {e}[/yellow]")
+
             return DownloadResult(
                 match=match_info, status=DownloadStatus.COMPLETED,
                 demo_path=dem_path, file_size_mb=file_size_mb(dem_path),
                 started_at=started, completed_at=datetime.now(),
             )
         finally:
-            _disconnect_cdp(pw, page, browser)
+            _disconnect_cdp(pw, page, browser, keep_chrome=keep_chrome)
 
+    except CloudflareChallenge as cf:
+        return _challenge_result(str(cf))
     except Exception as e:
         console.print(f"[bold red]   [ERR] Error: {e}[/bold red]")
         return DownloadResult(

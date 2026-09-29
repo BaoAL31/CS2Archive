@@ -12,8 +12,8 @@ import argparse
 from rich.console import Console
 from rich.table import Table
 
-from config import settings
-from downloader import get_download_history
+from cs2archive.config import settings
+from cs2archive.downloader import get_download_history
 
 console = Console(force_terminal=True)
 

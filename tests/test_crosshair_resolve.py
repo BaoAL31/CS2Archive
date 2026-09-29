@@ -7,13 +7,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "scripts"))
-from _pathsetup import ensure  # noqa: E402
 
-ensure()
 
-import crosshair_resolve  # noqa: E402
+import cs2archive.crosshair_resolve as crosshair_resolve  # noqa: E402
 
 
 def test_unknown_nick_skips_prosettings():
@@ -59,7 +55,7 @@ def test_nick_goes_to_prosettings_first():
 
 
 def test_demo_lookup_decodes_share_code(tmp_path: Path):
-    from crosshair_resolve import demo_crosshair_cvars
+    from cs2archive.crosshair_resolve import demo_crosshair_cvars
 
     payload = {"players": [
         {"steamId": "123", "crosshairShareCode": "CSGO-dGik3-tOynV-MWMqb-KMiLO-K7XXC"},
@@ -85,7 +81,7 @@ def test_demo_lookup_decodes_share_code(tmp_path: Path):
 
 
 def test_demo_lookup_miss_returns_empty(tmp_path: Path):
-    from crosshair_resolve import demo_crosshair_cvars
+    from cs2archive.crosshair_resolve import demo_crosshair_cvars
 
     class _R:
         returncode = 0
@@ -100,9 +96,9 @@ def test_demo_lookup_miss_returns_empty(tmp_path: Path):
 
 
 def test_shorts_wrapper_passes_nick():
-    from shorts.render_shorts import _get_player_crosshair_cvars
+    from cs2archive.shorts.render_shorts import _get_player_crosshair_cvars
 
-    with patch("crosshair_resolve.resolve_crosshair_cvars",
+    with patch("cs2archive.crosshair_resolve.resolve_crosshair_cvars",
                return_value=(["x"], {"source": "demo"})) as resolve:
         out = _get_player_crosshair_cvars("123", Path("x.dem"), "donk")
 
@@ -111,13 +107,13 @@ def test_shorts_wrapper_passes_nick():
 
 
 def test_highlights_wrapper_falls_back_to_registry_nick(tmp_path: Path, monkeypatch):
-    import highlights.render_edit_timeline as ret
+    import cs2archive.highlights.render_edit_timeline as ret
 
     accounts = [{"steam_id": "123", "nickname": "donk"}]
     (tmp_path / ".data").mkdir(exist_ok=True)
     (tmp_path / ".data" / "player_accounts.json").write_text(json.dumps(accounts), encoding="utf-8")
     monkeypatch.setattr(ret, "_PROJECT_ROOT", tmp_path)
-    with patch("crosshair_resolve.resolve_crosshair_cvars",
+    with patch("cs2archive.crosshair_resolve.resolve_crosshair_cvars",
                return_value=(["x"], {"source": "prosettings"})) as resolve:
         out = ret._get_player_crosshair_cvars("123", Path("x.dem"))
 
@@ -126,7 +122,8 @@ def test_highlights_wrapper_falls_back_to_registry_nick(tmp_path: Path, monkeypa
 
 
 def test_hook_build_config_uses_shared_system(tmp_path: Path):
-    from pov.render_hook import build_config
+    from cs2archive.pov import render_hook as rh
+    from cs2archive.pov.render_hook import build_config
 
     demo = tmp_path / "x.dem"
     demo.write_bytes(b"0")
@@ -135,11 +132,29 @@ def test_hook_build_config_uses_shared_system(tmp_path: Path):
         "tier": "4k", "round": 1,
         "windows": [{"start_tick": 100, "end_tick": 200}],
     }]
-    with patch("crosshair_resolve.resolve_crosshair_cvars",
-               return_value=(["cl_crosshair_length 3"], {"source": "prosettings"})) as resolve:
+    with patch("cs2archive.pov.render_hook.resolve_crosshair_cvars",
+               return_value=(["cl_crosshair_length 3"], {"source": "prosettings"})) as resolve, \
+         patch("cs2archive.pov.render_pov._viewmodel_cvars_from_args",
+               return_value=[]):
         cfg = build_config(plan, demo, tmp_path, 1280, 960, 60)
 
     assert resolve.call_args[0][:3] == ("donk", "123", demo)
     seq = cfg["sequences"][0]
     assert "cl_crosshair_length 3" in seq["cfg"]
     assert 'mirv_replace_name byXuid add x123 "donk"' in seq["cfg"]
+
+
+def test_hook_build_config_prefers_explicit_player_cvars(tmp_path: Path):
+    from cs2archive.pov.render_hook import build_config
+
+    demo = tmp_path / "x.dem"
+    demo.write_bytes(b"0")
+    plan = [{
+        "pov_steam_id": "123", "pov_nick": "donk", "label": "4k",
+        "tier": "4k", "round": 1,
+        "windows": [{"start_tick": 100, "end_tick": 200}],
+    }]
+    cfg = build_config(plan, demo, tmp_path, 1280, 960, 60,
+                       player_cvars=["cl_crosshair_length 9"])
+    seq = cfg["sequences"][0]
+    assert "cl_crosshair_length 9" in seq["cfg"]

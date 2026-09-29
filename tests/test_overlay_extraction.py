@@ -23,8 +23,8 @@ for _p in (str(_CS2UTIL / "scripts"), str(_CS2UTIL)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from scripts.input_overlay_decode import overlay_tick_from_row
-from scripts.render.overlay_layout import _OVERLAY_SIGNALS
+from input_overlay_decode import overlay_tick_from_row
+from render.overlay_layout import _OVERLAY_SIGNALS
 
 
 # --- Helpers -------------------------------------------------------
@@ -91,7 +91,7 @@ def test_vs_ground_truth(demo: Path, steam_id: int) -> int:
     print(f"Ground truth: {len(gt)} rows, ticks {tick_lo}..{tick_hi}")
 
     # Re-parse same tick window with full DEMOPARSER_TICK_FIELDS
-    from scripts.input_overlay_decode import DEMOPARSER_TICK_FIELDS
+    from input_overlay_decode import DEMOPARSER_TICK_FIELDS
     raw = extract_per_tick(demo, steam_id, DEMOPARSER_TICK_FIELDS, tick_lo, tick_hi)
     our_states_by_tick = {}
     for _, row in raw.iterrows():

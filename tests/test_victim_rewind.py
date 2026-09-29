@@ -5,15 +5,16 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+import pytest
 
-from overlay.victim_rewind import (
+from cs2archive.overlay.victim_rewind import (
     CLEAN_FIRE_TICKS,
     LOS_LOOKBACK_TICKS,
     LOS_STRIDE,
     TTK_TICKS,
     detect_rewinds,
     eye_z,
+    has_prior_exposure,
     is_clean_shot,
     los_open_tick_from_flags,
     smoke_occludes,
@@ -152,9 +153,60 @@ def test_insta_kill_qualifies_on_ttk():
     assert _within_ttk(KILL, got[0]["los_open_tick"])
     assert set(got[0]) == {
         "round", "kill_tick", "attacker_sid", "victim_sid", "reason",
-        "weapon", "hitgroup", "los_open_tick", "reasons",
+        "weapon", "hitgroup", "los_open_tick", "reasons", "victim_hp",
+        "flick_speed", "victim_hold_deg",
     }
     assert got[0]["reasons"] == ["insta_kill"]
+
+
+def test_slow_peek_is_not_insta_but_stays_visible():
+    """0.5s first contact: over the 0.35s insta cap, inside the 0.5s
+    measured-contact window — surfaces as ``peek`` (hook punch-up proof),
+    never as an insta moment."""
+    ticks = list(range(KILL - LOS_LOOKBACK_TICKS, KILL + 1, LOS_STRIDE))
+    if ticks[-1] != KILL:
+        ticks.append(KILL)
+    open_at = {t: t >= KILL - 32 for t in ticks}
+    open_at[KILL - 36] = False
+    got = detect_rewinds(
+        [_kill()],
+        snaps=_snaps_lookback(),
+        mesh_open_fn=_open_at_fn(open_at),
+    )
+    assert len(got) == 1
+    assert got[0]["reasons"] == ["peek"]
+    assert got[0]["los_open_tick"] == KILL - 32
+
+
+def test_boundary_20_ticks_is_insta():
+    """134957 reality: 20-tick TTK (0.3125s) fits the 0.35s cap."""
+    ticks = list(range(KILL - LOS_LOOKBACK_TICKS, KILL + 1, LOS_STRIDE))
+    if ticks[-1] != KILL:
+        ticks.append(KILL)
+    open_at = {t: t >= KILL - 20 for t in ticks}
+    open_at[KILL - 24] = False
+    got = detect_rewinds(
+        [_kill()],
+        snaps=_snaps_lookback(),
+        mesh_open_fn=_open_at_fn(open_at),
+    )
+    assert [r["reasons"] for r in got] == [["insta_kill"]]
+    assert got[0]["los_open_tick"] == KILL - 20
+
+
+def test_boundary_24_ticks_is_peek():
+    """24-tick TTK (0.375s) clears the cap but stays measured contact."""
+    ticks = list(range(KILL - LOS_LOOKBACK_TICKS, KILL + 1, LOS_STRIDE))
+    if ticks[-1] != KILL:
+        ticks.append(KILL)
+    open_at = {t: t >= KILL - 24 for t in ticks}
+    open_at[KILL - 28] = False
+    got = detect_rewinds(
+        [_kill()],
+        snaps=_snaps_lookback(),
+        mesh_open_fn=_open_at_fn(open_at),
+    )
+    assert [r["reasons"] for r in got] == [["peek"]]
 
 
 def test_insta_kill_m4_body_still_qualifies():
@@ -167,10 +219,22 @@ def test_insta_kill_m4_body_still_qualifies():
     assert got[0]["reason"] == "insta_kill"
 
 
-def test_insta_kill_rejects_low_hp():
+def test_insta_kill_accepts_tagged_victim():
+    # No HP requirement: a fast LOS flick onto a damaged victim still
+    # qualifies (kyousuke 61341/61460 at 16/20 HP).
     got = detect_rewinds(
         [_kill(weapon="m4a1", headshot=False, hitgroup="chest")],
         snaps=_snaps_lookback(health=20.0),
+        mesh_open_fn=_open_at_fn(_peek_open_at()),
+    )
+    assert [r["reasons"] for r in got] == [["insta_kill"]]
+
+
+def test_insta_kill_still_rejects_missing_snaps():
+    # Missing snapshots fail closed (hp None -> reject).
+    got = detect_rewinds(
+        [_kill(weapon="m4a1", headshot=False, hitgroup="chest")],
+        snaps={},
         mesh_open_fn=_open_at_fn(_peek_open_at()),
     )
     assert got == []
@@ -342,10 +406,58 @@ def test_flick_spray_still_qualifies():
 
 
 def test_los_most_recent_peek_not_first():
-    """Early peek would fail TTK; hide; second peek at the kill qualifies."""
+    """los_open_tick_from_flags still reports the most recent run start.
+
+    Whether that run counts as first contact is the insta gate's job
+    (has_prior_exposure) — see the repeek tests below.
+    """
     ticks = [0, 4, 8, 12, 16, 20]
     opens = [False, True, True, False, True, True]
     assert los_open_tick_from_flags(ticks, opens) == 16
+    assert has_prior_exposure(ticks, opens) is True
+
+
+def test_prior_exposure_clean_first_contact_is_false():
+    ticks = [0, 4, 8, 12]
+    opens = [False, False, True, True]
+    assert has_prior_exposure(ticks, opens) is False
+
+
+def test_prior_exposure_single_crack_is_noise():
+    # One stray open sample early in the window must not kill a legit
+    # first-contact insta (mesh edge flicker, not a real sighting).
+    ticks = [0, 4, 8, 12, 16, 20]
+    opens = [False, True, False, False, True, True]
+    assert has_prior_exposure(ticks, opens) is False
+
+
+def test_prior_exposure_needs_no_final_run():
+    ticks = [0, 4, 8, 12]
+    opens = [True, True, True, True]
+    assert has_prior_exposure(ticks, opens) is False
+
+
+def _repeek_open_at():
+    """124655 replay: long open, short hide, repeek kill (prefire, not insta)."""
+    ticks = list(range(KILL - LOS_LOOKBACK_TICKS, KILL + 1, LOS_STRIDE))
+    if ticks[-1] != KILL:
+        ticks.append(KILL)
+    open_at = {t: False for t in ticks}
+    for t in ticks:
+        if KILL - 72 <= t <= KILL - 20:
+            open_at[t] = True  # first sighting (~0.8s)
+        if t >= KILL - 4:
+            open_at[t] = True  # repeek + prefire (TTK 0.06s)
+    return open_at
+
+
+def test_insta_kill_rejects_repeek_prefire():
+    got = detect_rewinds(
+        [_kill()],
+        snaps=_snaps_lookback(),
+        mesh_open_fn=_open_at_fn(_repeek_open_at()),
+    )
+    assert got == []
 
 
 def test_tk_rejected():
@@ -396,3 +508,76 @@ def test_smoke_occludes_midpoint():
     smokes = [{"x": 100.0, "y": 0.0, "z": 64.0, "start": 1, "end": 10}]
     assert smoke_occludes(a, b, 5, smokes)
     assert not smoke_occludes(a, b, 5, [{"x": 100.0, "y": 500.0, "z": 64.0, "start": 1, "end": 10}])
+
+
+# ── flick speed + victim hold angle (hook quality inputs) ──────────
+
+from cs2archive.overlay.victim_rewind import (  # noqa: E402
+    angle_between_deg,
+    flick_speed,
+    victim_hold_deg,
+    view_dir,
+)
+
+
+def test_view_dir_wrap_free():
+    # The ±180 yaw seam must read as ~2 deg, not ~358.
+    a = {"yaw": 179.0, "pitch": 0.0}
+    b = {"yaw": -179.0, "pitch": 0.0}
+    assert angle_between_deg(view_dir(a), view_dir(b)) == pytest.approx(2.0, abs=0.1)
+
+
+def test_flick_speed_measures_sweep():
+    k = {"tick": 2000, "attacker_sid": AID}
+    snaps = {}
+    for t in range(1980, 2001):
+        snaps[(t, AID)] = {"x": 0.0, "y": 0.0, "z": 0.0,
+                           "yaw": 0.0, "pitch": 0.0,
+                           "duck_amount": 0.0, "health": 100.0}
+    # 5 deg/tick sweep over the last 4 ticks -> 320 deg/s.
+    for t in range(1997, 2001):
+        snaps[(t, AID)]["yaw"] = (t - 1997) * 5.0
+    assert flick_speed(k, snaps) == pytest.approx(320.0, rel=0.02)
+
+
+def test_flick_speed_stationary_is_none():
+    k = {"tick": 2000, "attacker_sid": AID}
+    snaps = {(t, AID): {"yaw": 10.0, "pitch": 0.0} for t in range(1980, 2001)}
+    assert flick_speed(k, snaps) is None
+
+
+def test_victim_hold_dead_on_and_back_shot():
+    k = {"tick": 2000, "attacker_sid": AID, "victim_sid": VID}
+    # Attacker 1000uu along +X from the victim.
+    sv = {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0, "pitch": 0.0,
+          "duck_amount": 0.0}
+    sa = {"x": 1000.0, "y": 0.0, "z": 0.0, "yaw": 180.0, "pitch": 0.0,
+          "duck_amount": 0.0}
+    snaps = {(2000, VID): sv, (2000, AID): sa}
+    assert victim_hold_deg(k, 2000, snaps) == pytest.approx(0.0, abs=0.1)
+    sv_back = dict(sv, yaw=90.0)  # victim looking +Y, attacker along +X
+    snaps[(2000, VID)] = sv_back
+    assert victim_hold_deg(k, 2000, snaps) == pytest.approx(90.0, abs=0.1)
+
+
+def test_victim_hold_fails_closed():
+    k = {"tick": 2000, "attacker_sid": AID, "victim_sid": VID}
+    assert victim_hold_deg(k, None, {}) is None          # no LOS
+    assert victim_hold_deg(k, 2000, {}) is None           # no snapshots
+    # Stacked players: direction is meaningless.
+    s = {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0, "pitch": 0.0,
+         "duck_amount": 0.0}
+    snaps = {(2000, VID): s, (2000, AID): dict(s)}
+    assert victim_hold_deg(k, 2000, snaps) is None
+
+
+def test_rows_carry_flick_and_hold_fields():
+    ticks = list(range(KILL - LOS_LOOKBACK_TICKS, KILL + 1, LOS_STRIDE))
+    open_at = _peek_open_at()
+    got = detect_rewinds(
+        [_kill()],
+        snaps=_snaps_lookback(),
+        mesh_open_fn=_open_at_fn(open_at),
+    )
+    assert got, "insta row expected"
+    assert "flick_speed" in got[0] and "victim_hold_deg" in got[0]

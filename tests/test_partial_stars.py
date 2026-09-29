@@ -6,10 +6,9 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from shorts.demand_gate import candidate_score
-from shorts.fit_partial_stars import (
+from cs2archive.shorts.demand_gate import candidate_score
+from cs2archive.shorts.fit_partial_stars import (
     DAILY_NEW_MATCHES,
     fit_partial_stars,
     listener_holds_cloak,
@@ -74,7 +73,7 @@ def test_fit_does_not_put_source_or_age_on_candidate_score():
 
 
 def test_youtube_views_refresh_by_stored_video_id():
-    from shorts.fit_partial_stars import refresh_youtube_views
+    from cs2archive.shorts.fit_partial_stars import refresh_youtube_views
 
     rows = [
         {"clip_id": "yt1", "source": "blast_highlights", "views": 10},
@@ -86,7 +85,7 @@ def test_youtube_views_refresh_by_stored_video_id():
 
 
 def test_stored_clips_take_stage_from_row_match_stage(tmp_path: Path):
-    from shorts.fit_partial_stars import observations_from_allstar_jsonl
+    from cs2archive.shorts.fit_partial_stars import observations_from_allstar_jsonl
 
     jsonl = tmp_path / "obs.jsonl"
     jsonl.write_text(json.dumps({
@@ -106,7 +105,7 @@ def test_stored_clips_take_stage_from_row_match_stage(tmp_path: Path):
 
 
 def test_known_stages_fill_empty_match_rows():
-    from shorts.scrape_allstar_hltv import apply_known_stages
+    from cs2archive.shorts.scrape_allstar_hltv import apply_known_stages
 
     rows = [
         {"match_id": "1", "slug": "a-vs-b-x", "match_stage": None},
@@ -181,7 +180,7 @@ def test_player_partial_star_is_recognised_pro_only():
 
 
 def test_listener_urls_come_before_popular_backfill():
-    from shorts.scrape_allstar_hltv import prioritize_pending
+    from cs2archive.shorts.scrape_allstar_hltv import prioritize_pending
 
     pending = prioritize_pending(
         [
@@ -196,7 +195,7 @@ def test_listener_urls_come_before_popular_backfill():
 
 
 def test_listener_skips_non_popular_events(tmp_path: Path):
-    from shorts.scrape_allstar_hltv import _listener_unseen
+    from cs2archive.shorts.scrape_allstar_hltv import _listener_unseen
 
     path = tmp_path / "hltv.json"
     path.write_text(json.dumps({
@@ -222,7 +221,7 @@ def test_listener_skips_non_popular_events(tmp_path: Path):
 
 
 def test_cloudflare_rows_are_not_done(tmp_path: Path):
-    from shorts.scrape_allstar_hltv import _load_done
+    from cs2archive.shorts.scrape_allstar_hltv import _load_done
 
     path = tmp_path / "obs.jsonl"
     path.write_text(

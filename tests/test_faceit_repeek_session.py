@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
 
 from scrapers.faceit import hold_browser_until_both, run_download_then_repeek
 from scrapers.repeek_snapshot import RepeekCaptureError

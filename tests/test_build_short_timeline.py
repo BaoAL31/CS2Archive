@@ -9,9 +9,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-from shorts.build_short_timeline import detect_shorts as _detect_shorts
-from shorts.build_short_timeline import _winner_by_round_from_demo
+from cs2archive.shorts.build_short_timeline import detect_shorts as _detect_shorts
+from cs2archive.shorts.build_short_timeline import _winner_by_round_from_demo
 
 
 def detect_shorts(*args, **kwargs):
@@ -529,7 +528,7 @@ def test_4k_with_two_high_tier_victims_detected():
 
 def test_build_from_action_timeline_detects_4k(tmp_path):
     """build_short_timeline_from_action converts an action_timeline.json and detects a 4K."""
-    from shorts.build_short_timeline import build_short_timeline_from_action
+    from cs2archive.shorts.build_short_timeline import build_short_timeline_from_action
 
     at = {
         "demo_path": "demos/faceit/test.dem",
@@ -586,7 +585,7 @@ def test_build_from_action_timeline_detects_4k(tmp_path):
 
 def test_build_from_action_preserves_demo_path(tmp_path):
     """Action timeline conversion preserves the demo_path in the output."""
-    from shorts.build_short_timeline import build_short_timeline_from_action
+    from cs2archive.shorts.build_short_timeline import build_short_timeline_from_action
 
     at = {
         "demo_path": "demos/faceit/my-match.dem",
@@ -622,7 +621,7 @@ def test_build_from_action_preserves_demo_path(tmp_path):
 def test_pros_only_filters_randos_and_canonicalizes_nick():
     """pros_only=True drops non-catalogued POV players and rewrites the
     surviving short's pov_nick to the canonical nickname."""
-    import shorts.build_short_timeline as bst
+    import cs2archive.shorts.build_short_timeline as bst
 
     kill_events = [
         {"tick": 1000, "round": 1, "attacker_sid": "PRO1", "victim_sid": "B", "weapon": "ak47", "victim_weapon": "ak47"},
@@ -651,7 +650,7 @@ def test_pros_only_filters_randos_and_canonicalizes_nick():
 
 def test_pros_only_false_keeps_everyone():
     """pros_only=False (opt-out) keeps randos and leaves pov_nick as-is."""
-    import shorts.build_short_timeline as bst
+    import cs2archive.shorts.build_short_timeline as bst
 
     kill_events = [
         {"tick": 1000, "round": 1, "attacker_sid": "RANDO", "victim_sid": "B", "weapon": "ak47", "victim_weapon": "ak47"},
@@ -1154,7 +1153,7 @@ def test_flick_gun_kill_detected():
 
 
 def test_flick_stacks_on_ace_cut():
-    from shorts.clip_observation import kinds_from_cut
+    from cs2archive.shorts.clip_observation import kinds_from_cut
 
     kill_events = [
         {"tick": 1000 + i * 50, "round": 1, "attacker_sid": "A",

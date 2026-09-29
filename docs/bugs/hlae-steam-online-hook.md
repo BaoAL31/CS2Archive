@@ -1,9 +1,40 @@
 # HLAE hook failures (Steam online) — long-running bug
 
 > Read this before debugging “CS2 opened the demo but wrote no video”, `Game error`, `Raw files not found`, or a leftover vanilla demo viewer on the desktop.
-> Implementation: `scripts/hook_aware.py` (`run_csdm_hook_aware`). Version gate: `scripts/pov/render_version_check.py`. **Do not** run `scripts/misc/steam_mode.py` unless the user explicitly asked — both `--offline` and `--online` call `steam.exe -shutdown` first.
+> Implementation: `cs2archive/render/hook_aware.py` (`run_csdm_hook_aware`). Version gate: `cs2archive/pov/render_version_check.py`. **Do not** run `cs2archive/misc/steam_mode.py` unless the user explicitly asked — both `--offline` and `--online` call `steam.exe -shutdown` first.
 
 The missing-recording failure now has a **causally tested CSDM initialization defect** (see September 21 below). The clean fix is now installed locally for CSDM 3.20.1. The broader historical association with Steam online/offline remains unproven. Older theories and mitigations below are retained as investigation history, not established explanations.
+
+## 2026-09-27: process-query failures are no longer read as "hook absent" (CR-10)
+
+**A contributor to this bug class was removed.** `hook_aware.py`'s process queries used to return an
+empty set / `False` when `tasklist` failed, so a *failed measurement* was indistinguishable from a
+*negative result*. Two places therefore aborted good renders:
+
+- the hook poll loop — a failed `tasklist` made `AfxHookSource2` look absent, so after
+  `HOOK_INJECT_GRACE` it set `fail_reason = "no HLAE hook in 60s"` and aborted;
+- the ffmpeg delta — a failed query made `new_ffmpeg` False, so `missing_ffmpeg_after_hook()` reported
+  a working hook as failed.
+
+Queries now return `ProcessQuery(known, pids)` with an explicit `UNKNOWN`, retried 3x before giving up.
+An unknown reading never produces "no hook"/"no ffmpeg": the poll tolerates `UNKNOWN_POLL_CAP` (5)
+**consecutive** unknowns — reset on any known reading — and then aborts with the distinct reason
+`could not determine process state (tasklist failed N polls in a row)`, which is what you will now see
+in the log instead of a false "no HLAE hook".
+
+**Accepted trade-off, so it is not a surprise.** If `tasklist` fails persistently, a render no longer
+fails fast: it runs to `hook_timeout` (120s) on each attempt. With `hook_retries + 1` attempts that is
+roughly 6 minutes before it gives up — with an honest message instead of a wrong one. A false abort on
+a render that was hooking fine is worse than a slow, correct abort.
+
+Related, same pass: `_await_no_cs2` used to return "cs2 is dead" on an unknown reading, walking
+straight into the corpse-poisoning loop described in its own docstring; `kill_stale_processes` no
+longer reports a false "clean" when it cannot verify; `_taskkill_pid` returns a status so a failed
+kill is no longer indistinguishable from success. See `docs/reviews/council-log.md` (CR-10).
+
+Not addressed here: `kill_stale_processes` and `_clear_all_cs2` still kill by image name / global
+query with no ownership check, so two concurrent renders can kill each other's processes — tracked as
+CR-18 (needs per-render pid ownership).
 
 ## 2026-09-24: HLAE was too old for CS2 1.41.8.2 (check this FIRST)
 
@@ -34,6 +65,7 @@ whenever CS2 moves the offsets:
 
 | CS2 build | Required HLAE |
 |---|---|
+| 1.41.8.6 | **HLAE 2.192.6** (AfxHookSource2 0.41.6, 2026-09-26) — upstream hotfix, *not* a 1.41.8.6 offset adjustment |
 | 1.41.8.5 | **HLAE 2.192.5** (AfxHookSource2 0.41.5, 2026-09-26) |
 | 1.41.8.3 | **HLAE 2.192.4** (AfxHookSource2 0.41.4, 2026-09-24) |
 | 1.41.8.2 | **HLAE 2.192.3** (AfxHookSource2 0.41.3, 2026-09-23) |

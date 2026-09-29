@@ -1,7 +1,7 @@
 """Style-01 (performance proof) thumbnail — same layout as html_examples.html #proof.
 
 Renders via Chromium so CSS (drop-shadow, contain, Montserrat) matches the study.
-FACEIT pipeline step 6 calls this through ``scripts/faceit/faceit_thumbnail.py``.
+FACEIT pipeline step 6 calls this through ``cs2archive/faceit/faceit_thumbnail.py``.
 """
 from __future__ import annotations
 

@@ -9,13 +9,10 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-FIXTURES = ROOT / "scripts" / "highlights" / "fixtures"
-sys.path.insert(0, str(ROOT / "scripts"))
-from _pathsetup import ensure
+FIXTURES = ROOT / "cs2archive" / "highlights" / "fixtures"
 
-ensure()
 
-from highlights.build_edit_timeline import (  # noqa: E402
+from cs2archive.highlights.build_edit_timeline import (  # noqa: E402
     _extract_players_from_action_timeline,
     _fix_edit_timeline,
     _load_action_timeline,

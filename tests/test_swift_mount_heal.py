@@ -15,13 +15,11 @@ from pathlib import Path
 import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
-sys.path.insert(0, str(PROJECT_ROOT / "scripts" / "overlay"))
 
 
 @pytest.fixture()
 def fake_csgo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    import swift_demoui as sd
+    import cs2archive.overlay.swift_demoui as sd
     monkeypatch.setattr(sd, "_live_render_processes", lambda: False)
     csgo = tmp_path / "csgo"
     csgo.mkdir()
@@ -49,7 +47,7 @@ def test_stranded_mount_heals_and_restores(fake_csgo):
 
 
 def test_unrelated_gameinfo_error_still_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    import swift_demoui as sd
+    import cs2archive.overlay.swift_demoui as sd
     monkeypatch.setattr(sd, "_live_render_processes", lambda: False)
     csgo = tmp_path / "csgo2"
     csgo.mkdir()

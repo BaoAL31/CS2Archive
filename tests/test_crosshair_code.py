@@ -5,13 +5,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "scripts"))
-from _pathsetup import ensure  # noqa: E402
 
-ensure()
 
-from crosshair_code import (  # noqa: E402
+from cs2archive.crosshair_code import (  # noqa: E402
     crosshair_to_convars,
     decode_crosshair,
     encode_crosshair,
@@ -95,7 +91,7 @@ def test_already_pixel_values_pass_through():
 
 
 def test_effective_height_clamps_to_desktop(monkeypatch):
-    import crosshair_code as cc
+    import cs2archive.crosshair_code as cc
 
     monkeypatch.setattr(cc, "effective_crosshair_height", lambda r: min(r, 1080))
     assert cc.effective_crosshair_height(1440) == 1080

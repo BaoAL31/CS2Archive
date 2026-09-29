@@ -9,7 +9,6 @@ import pytest
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
 
 from scrapers.repeek_snapshot import (  # noqa: E402
     RepeekCaptureError,

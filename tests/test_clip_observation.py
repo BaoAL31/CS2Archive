@@ -5,9 +5,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from shorts.clip_observation import (
+from cs2archive.shorts.clip_observation import (
     canonical_ranking_name,
     kinds_from_cut,
     observation_from_allstar,
@@ -67,7 +66,7 @@ def test_almost_and_nearly_are_not_kinds():
 
 
 def test_demo_kinds_fill_empty_categories_without_replacing_label_clutch():
-    from shorts.clip_observation import merge_label_and_demo_kinds
+    from cs2archive.shorts.clip_observation import merge_label_and_demo_kinds
 
     assert merge_label_and_demo_kinds(
         ("1v3_won", "ace"),
@@ -344,7 +343,7 @@ def test_talk_and_ewc_without_cs2_are_not_observations():
 
 def test_probe_slug_and_upsert_roundtrip(tmp_path):
     import json
-    from shorts.scrape_allstar_hltv import _probe_slug, upsert_row
+    from cs2archive.shorts.scrape_allstar_hltv import _probe_slug, upsert_row
     path = tmp_path / "probe.jsonl"
     assert _probe_slug(path, "2396947") is None
     upsert_row(path, {"match_id": "2396947", "slug": "s1", "clips": []})
@@ -355,7 +354,7 @@ def test_probe_slug_and_upsert_roundtrip(tmp_path):
 
 
 def test_playlist_id_parsing():
-    from shorts.scrape_allstar_hltv import _playlist_id
+    from cs2archive.shorts.scrape_allstar_hltv import _playlist_id
     html = '<iframe src="https://allstar.gg/iframe?playlist=6a9c957875f9014d58a945c1&x=1">'
     assert _playlist_id(html) == "6a9c957875f9014d58a945c1"
     assert _playlist_id("<html>no embeds here</html>") is None

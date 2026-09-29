@@ -6,11 +6,8 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
-from _pathsetup import ensure
-ensure()
 
-from overlay_pov import (  # noqa: E402
+from cs2archive.overlay.overlay_pov import (  # noqa: E402
     TICKRATE,
     _load_pov_play_tick_ranges,
     _load_round_tick_ranges_events,

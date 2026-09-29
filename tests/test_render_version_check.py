@@ -9,10 +9,8 @@ from unittest.mock import patch
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts" / "pov"))
 
-from render_version_check import (
+from cs2archive.pov.render_version_check import (
     INCOMPATIBLE_DEMO_PATCHES,
     RenderVersionError,
     assert_render_versions,
@@ -66,8 +64,8 @@ def test_check_demo_game_mismatch(tmp_path: Path):
     demo.write_bytes(b"PBDEMS2")
 
     with (
-        patch("render_version_check.read_demo_patch", return_value="1.41.8.1"),
-        patch("render_version_check.read_pe_version", return_value=(3, 20, 0, 0)),
+        patch("cs2archive.pov.render_version_check.read_demo_patch", return_value="1.41.8.1"),
+        patch("cs2archive.pov.render_version_check.read_pe_version", return_value=(3, 20, 0, 0)),
     ):
         result = check_render_versions(
             demo,
@@ -93,8 +91,8 @@ def test_incompatible_old_demo_patch(tmp_path: Path):
     old = next(iter(INCOMPATIBLE_DEMO_PATCHES))
 
     with (
-        patch("render_version_check.read_demo_patch", return_value=old),
-        patch("render_version_check.read_pe_version", return_value=(3, 20, 0, 0)),
+        patch("cs2archive.pov.render_version_check.read_demo_patch", return_value=old),
+        patch("cs2archive.pov.render_version_check.read_pe_version", return_value=(3, 20, 0, 0)),
     ):
         result = check_render_versions(
             demo,
@@ -119,8 +117,8 @@ def test_demo_below_min_renderable_is_too_old(tmp_path: Path):
     demo.write_bytes(b"PBDEMS2")
 
     with (
-        patch("render_version_check.read_demo_patch", return_value="1.41.5.0"),
-        patch("render_version_check.read_pe_version", return_value=(3, 20, 0, 0)),
+        patch("cs2archive.pov.render_version_check.read_demo_patch", return_value="1.41.5.0"),
+        patch("cs2archive.pov.render_version_check.read_pe_version", return_value=(3, 20, 0, 0)),
     ):
         result = check_render_versions(
             demo,
@@ -145,8 +143,8 @@ def test_slightly_older_demo_is_allowed(tmp_path: Path):
     demo.write_bytes(b"PBDEMS2")
 
     with (
-        patch("render_version_check.read_demo_patch", return_value="1.41.6.4"),
-        patch("render_version_check.read_pe_version", return_value=(3, 20, 0, 0)),
+        patch("cs2archive.pov.render_version_check.read_demo_patch", return_value="1.41.6.4"),
+        patch("cs2archive.pov.render_version_check.read_pe_version", return_value=(3, 20, 0, 0)),
     ):
         result = check_render_versions(
             demo,
@@ -173,7 +171,7 @@ def test_check_hlae_outdated(tmp_path: Path):
             return (2, 190, 2, 0)
         return (3, 20, 0, 0)
 
-    with patch("render_version_check.read_pe_version", side_effect=pe_ver):
+    with patch("cs2archive.pov.render_version_check.read_pe_version", side_effect=pe_ver):
         result = check_render_versions(
             None,
             steam_inf=steam_inf,
@@ -197,8 +195,8 @@ def test_assert_ok(tmp_path: Path):
     demo.write_bytes(b"PBDEMS2")
 
     with (
-        patch("render_version_check.read_demo_patch", return_value="1.41.7.2"),
-        patch("render_version_check.read_pe_version", return_value=(9, 9, 9, 0)),
+        patch("cs2archive.pov.render_version_check.read_demo_patch", return_value="1.41.7.2"),
+        patch("cs2archive.pov.render_version_check.read_pe_version", return_value=(9, 9, 9, 0)),
     ):
         vers = assert_render_versions(
             demo,
@@ -213,7 +211,7 @@ def test_assert_ok(tmp_path: Path):
 
 
 def test_hlae_bounds_for_cs2_table():
-    from render_version_check import hlae_bounds_for_cs2
+    from cs2archive.pov.render_version_check import hlae_bounds_for_cs2
 
     assert hlae_bounds_for_cs2("1.41.8.5") == ((2, 192, 5), None)
     assert hlae_bounds_for_cs2("1.41.8.4") == ((2, 192, 4), (2, 192, 5))
@@ -224,7 +222,7 @@ def test_hlae_bounds_for_cs2_table():
 
 
 def test_resolve_hlae_prefers_csdm_custom(tmp_path: Path):
-    from render_version_check import resolve_hlae_exe
+    from cs2archive.pov.render_version_check import resolve_hlae_exe
 
     custom = tmp_path / "HLAE-custom" / "HLAE.exe"
     custom.parent.mkdir()
@@ -250,7 +248,7 @@ def test_cs2_unpinned_hard_fails(tmp_path: Path):
     hlae.write_bytes(b"x")
     csdm.write_bytes(b"x")
 
-    with patch("render_version_check.read_pe_version", return_value=(2, 192, 5, 0)):
+    with patch("cs2archive.pov.render_version_check.read_pe_version", return_value=(2, 192, 5, 0)):
         result = check_render_versions(
             None,
             steam_inf=steam_inf,
@@ -274,7 +272,7 @@ def test_hlae_cs2_mismatch_hard_fails(tmp_path: Path):
             return (2, 192, 4, 0)  # too old for 1.41.8.5
         return (3, 20, 0, 0)
 
-    with patch("render_version_check.read_pe_version", side_effect=pe_ver):
+    with patch("cs2archive.pov.render_version_check.read_pe_version", side_effect=pe_ver):
         result = check_render_versions(
             None,
             steam_inf=steam_inf,
@@ -298,7 +296,7 @@ def test_hlae_too_new_for_cs2_hard_fails(tmp_path: Path):
             return (2, 192, 5, 0)  # built for 1.41.8.5
         return (3, 20, 0, 0)
 
-    with patch("render_version_check.read_pe_version", side_effect=pe_ver):
+    with patch("cs2archive.pov.render_version_check.read_pe_version", side_effect=pe_ver):
         result = check_render_versions(
             None,
             steam_inf=steam_inf,

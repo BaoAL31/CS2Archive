@@ -14,7 +14,7 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-from overlay.lineup_freeze import (  # noqa: E402
+from cs2archive.overlay.lineup_freeze import (  # noqa: E402
     dedupe_throws_by_lineup,
     expand_offsets_for_freezes,
     classify_throws_straightforward,
@@ -22,6 +22,8 @@ from overlay.lineup_freeze import (  # noqa: E402
     expand_frame,
     freeze_frame_plan,
     is_intuitive_lob,
+    keep_best_per_type,
+    keep_first_per_util,
     reconstruct_pristine_timeline,
     select_window_throws,
     split_straightforward,
@@ -29,7 +31,7 @@ from overlay.lineup_freeze import (  # noqa: E402
 
 
 def _without_cs2util(monkeypatch: pytest.MonkeyPatch):
-    import overlay.lineup_freeze as lf
+    import cs2archive.overlay.lineup_freeze as lf
     monkeypatch.setattr(lf, "_cs2util", lambda name: None)
 
 
@@ -48,105 +50,166 @@ def _throw(tid, tick, util="smoke", x=0.0, y=0.0, z=0.0, **kw):
         "land_z": 0.0,
         "is_renderable": True,
         "flight_ticks": 100,
+        "enemies_flashed": 0,
+        "damage_dealt": 0.0,
     }
     row.update(kw)
     return row
 
 
-def test_dedupe_keeps_earliest_per_release_cell():
+def _best(ids, throws):
+    return [t["throw_id"] for t in keep_best_per_type(throws)]
+
+
+def test_best_per_type_prefers_blinding_flash():
+    # t15116 flashed nobody; t45498 blinded one enemy — the dud must not
+    # shadow the lineup (kyousuke Ancient round 3 vs round 8).
     throws = [
-        _throw("a", 1000, x=10, y=20, z=30),
-        _throw("b", 2000, x=15, y=25, z=32),  # same cell as a
-        _throw("c", 3000, x=5000, y=20, z=30),  # far cell, same util -> still dropped
-        _throw("d", 4000, util="flash", x=10, y=20, z=30),  # other type: separate
+        _throw("early", 15116, util="flash", x=-355, y=0, z=0,
+               land_x=163, land_y=0, land_z=0, enemies_flashed=0),
+        _throw("late", 45498, util="flash", x=-524, y=0, z=0,
+               land_x=-220, land_y=0, land_z=0, enemies_flashed=1),
     ]
-    kept = dedupe_throws_by_lineup(throws)
-    assert [t["throw_id"] for t in kept] == ["a", "d"]
+    assert _best(None, throws) == ["late"]
 
 
-def test_dedupe_idempotent():
+def test_best_per_type_damage_breaks_blind_ties():
     throws = [
-        _throw("a", 1000, x=10, y=20, z=30),
-        _throw("b", 2000, x=15, y=25, z=32),
-        _throw("c", 3000, x=5000, y=20, z=30),
+        _throw("a", 1000, util="he", x=0, y=0, z=0,
+               land_x=300, land_y=0, land_z=0, damage_dealt=10.0),
+        _throw("b", 2000, util="he", x=0, y=0, z=0,
+               land_x=300, land_y=0, land_z=0, damage_dealt=45.0),
     ]
-    once = dedupe_throws_by_lineup(throws)
-    twice = dedupe_throws_by_lineup(once)
-    assert [t["throw_id"] for t in once] == [t["throw_id"] for t in twice]
+    assert _best(None, throws) == ["b"]
 
 
-def test_dedupe_keeps_throws_without_release_coords():
+def test_best_per_type_longer_range_breaks_quiet_ties():
     throws = [
-        _throw("a", 1000, x=10, y=20, z=30),
+        _throw("short", 1000, util="smoke", x=0, y=0, z=0,
+               land_x=200, land_y=0, land_z=0),
+        _throw("long", 2000, util="smoke", x=0, y=0, z=0,
+               land_x=1200, land_y=0, land_z=0),
+    ]
+    assert _best(None, throws) == ["long"]
+
+
+def test_best_per_type_earliest_breaks_full_ties():
+    throws = [
+        _throw("late", 2000, util="smoke", x=0, y=0, z=0,
+               land_x=500, land_y=0, land_z=0),
+        _throw("early", 1000, util="smoke", x=0, y=0, z=0,
+               land_x=500, land_y=0, land_z=0),
+    ]
+    assert _best(None, throws) == ["early"]
+
+
+def test_best_per_type_keeps_all_decoys_and_sorts_by_tick():
+    throws = [
+        _throw("d2", 3000, util="decoy"),
+        _throw("s2", 2500, x=0, y=0, z=0, land_x=7000, land_y=0, land_z=0),
+        _throw("d1", 500, util="decoy"),
+        _throw("s1", 1000, x=0, y=0, z=0, land_x=9000, land_y=0, land_z=0),
+    ]
+    assert _best(None, throws) == ["d1", "s1", "d2"]
+
+
+def test_select_window_throws_prefers_watchable_repeat():
+    from cs2archive.overlay.overlay_utilcams import _play_window_for_throw  # noqa
+    ranges = {1: (10000, 20000)}
+    throws = [
+        _throw("cut", 100, x=10, y=0, z=0),      # freeze cut, same lineup...
+        _throw("live", 15000, x=15, y=0, z=0),  # ...as this watchable repeat
+    ]
+    in_window = select_window_throws(throws, ranges)
+    assert [t["throw_id"] for t in in_window] == ["live"]
+    kept = keep_best_per_type(in_window)
+    assert [t["throw_id"] for t in kept] == ["live"]
+    assert _play_window_for_throw(100, ranges) is None
+
+
+def test_best_per_type_missing_metrics_default_to_zero():
+    throws = [
         {"throw_id": "mystery", "throw_tick": 1500, "util_type": "flash",
          "is_renderable": True, "flight_ticks": 50},
+        _throw("plain", 1000, util="flash", x=0, y=0, z=0,
+               land_x=100, land_y=0, land_z=0),
     ]
-    kept = dedupe_throws_by_lineup(throws)
-    assert [t["throw_id"] for t in kept] == ["a", "mystery"]
+    # mystery: no coords/metrics (range 0) vs plain range 100 -> plain wins.
+    assert _best(None, throws) == ["plain"]
 
 
-def test_dedupe_same_util_no_coords_still_dedupes():
+def test_best_per_type_idempotent():
     throws = [
-        _throw("a", 1000, x=10, y=20, z=30),
-        {"throw_id": "mystery", "throw_tick": 1500, "util_type": "smoke",
-         "is_renderable": True, "flight_ticks": 50},
+        _throw("a", 1000, enemies_flashed=1),
+        _throw("b", 2000),
     ]
-    kept = dedupe_throws_by_lineup(throws)
-    assert [t["throw_id"] for t in kept] == ["a"]
+    once = keep_best_per_type(throws)
+    twice = keep_best_per_type(once)
+    assert [t["throw_id"] for t in once] == [t["throw_id"] for t in twice] == ["a"]
 
 
-def test_dedupe_keeps_earliest_regardless_of_input_order():
-    throws = [
-        _throw("late", 2000, x=5000, y=0, z=0),
-        _throw("early", 1000, x=10, y=0, z=0),
-        _throw("flash", 1500, util="flash", x=0, y=0, z=0),
-    ]
-    assert [t["throw_id"] for t in dedupe_throws_by_lineup(throws)] == ["early", "flash"]
-
-
-def test_dedupe_collapses_same_landing_far_release():
-    # Real case (donk Mirage con smokes): same landing, releases 270u apart.
-    throws = [
-        _throw("first", 11129, x=-721, y=-1341, z=-93,
-               land_x=29, land_y=-2324, land_z=-38),
-        _throw("repeat", 17072, x=-991, y=-1379, z=-91,
-               land_x=22, land_y=-2314, land_z=-38),
-    ]
-    assert [t["throw_id"] for t in dedupe_throws_by_lineup(throws)] == ["first"]
-
-
-def test_dedupe_collapses_boundary_straddle_releases():
-    # Releases 5u apart but straddling a 96u grid boundary collapse by
-    # distance (grid cells would split them).
-    throws = [
-        _throw("a", 30987, x=-678, y=-1156, z=-103,
-               land_x=-637, land_y=-732, land_z=-266),
-        _throw("b", 67360, x=-682, y=-1151, z=-107,
-               land_x=-635, land_y=-745, land_z=-265),
-    ]
-    assert [t["throw_id"] for t in dedupe_throws_by_lineup(throws)] == ["a"]
-
-
-def test_dedupe_keeps_different_type_same_spot():
+def test_best_per_type_keeps_different_types():
     throws = [
         _throw("smoke", 1000, x=0, y=0, z=0, land_x=100, land_y=100, land_z=0),
         _throw("flash", 2000, util="flash", x=0, y=0, z=0, land_x=100, land_y=100, land_z=0),
     ]
-    assert [t["throw_id"] for t in dedupe_throws_by_lineup(throws)] == ["smoke", "flash"]
+    assert _best(None, throws) == ["smoke", "flash"]
 
 
-def test_select_window_throws_prefers_watchable_repeat():
-    from overlay.overlay_utilcams import _play_window_for_throw  # noqa
-    ranges = {1: (10000, 20000)}
+def _first(ids, throws):
+    return [t["throw_id"] for t in keep_first_per_util(throws)]
+
+
+def test_first_per_util_keeps_distinct_spots_same_type():
+    # Same type, different landing clusters -> each gets its own PiP
+    # (ZywOo nuke round-4 vs round-14 fires).
     throws = [
-        _throw("cut", 100, x=10, y=0, z=0),      # freeze cut, same lineup...
-        _throw("live", 15000, x=15, y=0, z=0),   # ...as this watchable repeat
+        _throw("r4fire", 21626, util="fire", x=0, y=0, z=0,
+               land_x=1575, land_y=-2394, land_z=-558),
+        _throw("r14fire", 80055, util="fire", x=0, y=0, z=0,
+               land_x=159, land_y=-2115, land_z=-310),
     ]
-    in_window = select_window_throws(throws, ranges)
-    assert [t["throw_id"] for t in in_window] == ["live"]
-    kept = dedupe_throws_by_lineup(in_window)
-    assert [t["throw_id"] for t in kept] == ["live"]
-    assert _play_window_for_throw(100, ranges) is None
+    assert _first(None, throws) == ["r4fire", "r14fire"]
+
+
+def test_first_per_util_skips_same_spot_repeat():
+    # Same landing cluster twice -> PiP'd once (first occurrence wins, no
+    # ranking: the later blind does not displace the earlier dud).
+    throws = [
+        _throw("dud", 1000, util="flash", x=0, y=0, z=0,
+               land_x=100, land_y=100, land_z=0, enemies_flashed=0),
+        _throw("blind", 2000, util="flash", x=0, y=0, z=0,
+               land_x=100, land_y=100, land_z=0, enemies_flashed=2),
+    ]
+    assert _first(None, throws) == ["dud"]
+
+
+def test_first_per_util_missing_landing_never_collapses():
+    throws = [
+        {"throw_id": "a", "throw_tick": 1000, "util_type": "smoke"},
+        {"throw_id": "b", "throw_tick": 2000, "util_type": "smoke"},
+    ]
+    assert _first(None, throws) == ["a", "b"]
+
+
+def test_first_per_util_keeps_all_decoys_and_sorts_by_tick():
+    throws = [
+        _throw("d2", 3000, util="decoy"),
+        _throw("s2", 2500, x=0, y=0, z=0, land_x=7000, land_y=0, land_z=0),
+        _throw("d1", 500, util="decoy"),
+        _throw("s1", 1000, x=0, y=0, z=0, land_x=9000, land_y=0, land_z=0),
+    ]
+    assert _first(None, throws) == ["d1", "s1", "s2", "d2"]
+
+
+def test_first_per_util_idempotent():
+    throws = [
+        _throw("a", 1000, x=0, y=0, z=0, land_x=100, land_y=0, land_z=0),
+        _throw("b", 2000, x=0, y=0, z=0, land_x=200, land_y=0, land_z=0),
+    ]
+    once = keep_first_per_util(throws)
+    twice = keep_first_per_util(once)
+    assert [t["throw_id"] for t in once] == [t["throw_id"] for t in twice] == ["a", "b"]
 
 
 def test_classify_fails_safe_without_cs2util(tmp_path, monkeypatch):
@@ -175,7 +238,7 @@ def test_intuitive_lob_requires_blocked_los_and_far_exit():
     # Open sightline is already handled by classify_throw.
     assert is_intuitive_lob(los_open=True, exit_dist=900.0) is False
     # Boundary is inclusive at LOFT_EXIT_MAX.
-    from overlay.lineup_freeze import LOFT_EXIT_MAX
+    from cs2archive.overlay.lineup_freeze import LOFT_EXIT_MAX
     assert is_intuitive_lob(los_open=False, exit_dist=LOFT_EXIT_MAX) is True
     assert is_intuitive_lob(los_open=False, exit_dist=LOFT_EXIT_MAX - 1.0) is False
 
@@ -268,7 +331,7 @@ def test_pip_mapping_stays_put_across_a_freeze():
     round, so the naive linear map places a later PiP tens of frames off.
     The pristine map + expand_frame keeps it exact.
     """
-    from overlay.overlay_utilcams import _map_throw_tick_to_frame
+    from cs2archive.overlay.overlay_utilcams import _map_throw_tick_to_frame
 
     rs, re = 10000, 20000          # 10000 ticks of gameplay
     pristine = {1: (0, 599)}       # 600 pristine frames
@@ -304,7 +367,7 @@ def _ratings_fixture(path: Path) -> Path:
 
 def _titlize(ratings: Path, *extra: str) -> dict:
     r = subprocess.run(
-        [sys.executable, str(PROJECT_ROOT / "scripts" / "pov" / "generate_title.py"),
+        [sys.executable, str(PROJECT_ROOT / "cs2archive" / "pov" / "generate_title.py"),
          str(ratings), "--player", "Aleksib", "--map", "Nuke",
          "--variant", "overlay", *extra],
         capture_output=True, text=True, timeout=60,

@@ -6,11 +6,8 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
-from _pathsetup import ensure
-ensure()
 
-from concat_rounds import validate_round_offsets_sidecar  # noqa: E402
+from cs2archive.pov.concat_rounds import validate_round_offsets_sidecar  # noqa: E402
 
 
 def _good_sidecar() -> dict:

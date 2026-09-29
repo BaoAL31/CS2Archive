@@ -162,10 +162,22 @@ def _kill_attacker_id(kill: dict) -> str:
 def load_kill_timeline(demo_path: str | Path) -> tuple[list[dict], float] | None:
     """Kills already parsed by shorts extraction (or highlights). Never re-parse."""
     stem = Path(demo_path).stem
-    for path in (
+    cands: list[Path] = []
+    try:
+        from cs2archive.paths import find_pov_dirs, hl_dir
+        for pov in find_pov_dirs(stem):
+            base = pov / "shorts"
+            if base.is_dir():
+                for sub in sorted(base.glob("shorts-*/action_timeline.json")):
+                    cands.append(sub)
+        cands.append(hl_dir(stem) / "action_timeline.json")
+    except Exception:
+        pass
+    cands.extend([
         _PROJECT_ROOT / "renders" / "shorts" / f"shorts-{stem}" / "action_timeline.json",
         _PROJECT_ROOT / "renders" / f"hl-{stem}" / "action_timeline.json",
-    ):
+    ])
+    for path in cands:
         if not path.is_file():
             continue
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -205,6 +217,65 @@ def rank_killfeed_kills(
         reverse=True,
     )
     return [(indexed[i], scores[i]) for i in order]
+
+
+def load_action_context(demo_path: str | Path) -> tuple[list[dict], dict] | None:
+    """POV-agnostic action-timeline context for the thumbnail tiebreak.
+
+    Returns (kills_all, stakes_by_round) from the POV-local cache
+    (``renders/pov-{stem}_*/action_timeline.json``), falling back to the
+    multi-pros hl- cache. None when unreadable — callers keep the
+    density-only ranking.
+    """
+    try:
+        from cs2archive.paths import find_action_timeline
+        path = find_action_timeline(Path(demo_path).stem)
+    except Exception:
+        return None
+    if path is None:
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    kills_all = data.get("kills_all") or []
+    if not kills_all:
+        return None
+    stakes_by_round: dict[int, dict] = {}
+    for r in data.get("rounds") or []:
+        try:
+            stakes_by_round[int(r.get("round", 0))] = r.get("stakes") or {}
+        except (TypeError, ValueError):
+            continue
+    return kills_all, stakes_by_round
+
+
+def kill_bg_bonus(kill: dict, stakes_by_round: dict) -> int:
+    """Tiebreak bonus for one timeline kill (density stays primary).
+
+    +2 full-buy round on both sides (no eco), +1 force/no-eco round,
+    +2 pistol-vs-rifle punch-up, +1 headshot. Eco/pistol/unknown rounds
+    score no stakes bonus — farming is not thumbnail material.
+    """
+    from cs2archive.weapons import weapon_tier
+
+    bonus = 0
+    try:
+        rn = int(kill.get("round") or 0)
+    except (TypeError, ValueError):
+        rn = 0
+    buys = (stakes_by_round.get(rn) or {}).get("buys") or {}
+    vals = [v for v in buys.values() if v]
+    if vals and all(v == "full" for v in vals):
+        bonus += 2
+    elif vals and "eco" not in vals and "unknown" not in vals:
+        bonus += 1
+    if kill.get("headshot"):
+        bonus += 1
+    if (weapon_tier(str(kill.get("weapon") or "")) == 1
+            and weapon_tier(str(kill.get("victim_weapon") or "")) >= 4):
+        bonus += 2
+    return bonus
 
 
 def killfeed_chain_start_tick(
@@ -309,7 +380,7 @@ def round_spans_from_demo(
 ) -> list[tuple[int, int, int]]:
     """(round, start_tick, end_tick) matching CSDM's recorded POV window."""
     try:
-        from overlay.overlay_pov import _load_pov_play_tick_ranges
+        from cs2archive.overlay.overlay_pov import _load_pov_play_tick_ranges
         ranges = _load_pov_play_tick_ranges(Path(demo_path), str(steam_id))
     except Exception as e:
         print(f"  [bg] round-span parse failed: {e}", flush=True)
@@ -434,6 +505,35 @@ def extract_killfeed_frame(
     ranked = rank_killfeed_kills(kills, steam_id, tickrate)
     if not ranked:
         return None
+
+    # Stakes tiebreak (density stays primary): equal-feed windows prefer
+    # full-buy rounds, punch-up weapons and headshots over eco farming.
+    # Missing/unreadable timeline cache keeps the density-only ranking.
+    if demo_path:
+        try:
+            ctx = load_action_context(demo_path)
+        except Exception as e:
+            print(f"  [bg] action context failed: {e}", flush=True)
+            ctx = None
+        if ctx:
+            kills_all, stakes_by_round = ctx
+            want = str(steam_id)
+            bonus_by_tick: dict[int, int] = {}
+            for k in kills_all:
+                if _kill_attacker_id(k) != want:
+                    continue
+                try:
+                    tick = int(k["tick"])
+                except (TypeError, ValueError):
+                    continue
+                bonus_by_tick.setdefault(
+                    tick, kill_bg_bonus(k, stakes_by_round))
+            ranked = sorted(
+                ranked,
+                key=lambda kn: (kn[1], bonus_by_tick.get(int(kn[0]["tick"]), 0),
+                                int(kn[0]["tick"])),
+                reverse=True,
+            )
 
     seek_t = None
     picked = None

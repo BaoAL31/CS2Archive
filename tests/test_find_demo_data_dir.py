@@ -12,18 +12,15 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "scripts"))
-from _pathsetup import ensure  # noqa: E402
 
-ensure()
 
-from overlay._common import _CS2UTIL_ROOT, _CS2UTIL_SCRIPTS, TICKRATE  # noqa: E402
+from cs2archive.overlay._common import _CS2UTIL_ROOT, _CS2UTIL_SCRIPTS, TICKRATE  # noqa: E402
 
 for _p in (str(_CS2UTIL_SCRIPTS), str(_CS2UTIL_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from overlay import overlay_utilcams as ouc  # noqa: E402
+from cs2archive.overlay import overlay_utilcams as ouc  # noqa: E402
 
 
 def _touch_demo_dir(results: Path, project: str, demo_id: str, *, throws: bool = True) -> Path:

@@ -5,9 +5,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from shorts.make_short_meta import _is_top10_opponent, _make_title
+from cs2archive.shorts.make_short_meta import _is_top10_opponent, _make_title
 
 
 def test_vitality_is_top10():

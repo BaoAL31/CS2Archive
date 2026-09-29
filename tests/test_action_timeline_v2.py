@@ -11,12 +11,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
-from _pathsetup import ensure
 
-ensure()
 
-from highlights.build_action_timeline import (  # noqa: E402
+from cs2archive.highlights.build_action_timeline import (  # noqa: E402
     _derive_moments,
     _pov_candidates,
 )
@@ -250,7 +247,7 @@ def _hurt(tick, rnd, vid, hp):
 
 
 def test_danger_when_pro_survives_low():
-    import highlights.build_action_timeline as bat
+    import cs2archive.highlights.build_action_timeline as bat
     ks = [_kill(2000, 1, E1, MATE)]
     deaths = {1: [(2000, MATE)]}
     hurts = [_hurt(1900, 1, PRO, 17.0)]
@@ -268,7 +265,7 @@ def test_no_danger_when_pro_dies_immediately():
     ks = [_kill(2000, 1, E1, MATE), _kill(2050, 1, E1, PRO)]
     deaths = {1: [(2000, MATE), (2050, PRO)]}
     hurts = [_hurt(2050, 1, PRO, 0.0)]
-    import highlights.build_action_timeline as bat
+    import cs2archive.highlights.build_action_timeline as bat
     ms = bat._derive_moments(
         ks, deaths, {1: 1000}, {1: 9000}, {1: 3}, {1: "t_killed"}, [],
         dict(TEAMS_5V5), dict(PRO_SIDS), util_throws=[], all_hurts=hurts)

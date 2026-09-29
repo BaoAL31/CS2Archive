@@ -11,9 +11,9 @@ from pathlib import Path
 
 from rich.console import Console
 
-from config import settings
-from downloader import extract_demo, file_size_mb, is_already_downloaded, record_download
-from models import DemoSource, DownloadResult, DownloadStatus, MatchInfo
+from cs2archive.config import settings
+from cs2archive.downloader import extract_demo, file_size_mb, is_already_downloaded, record_download
+from cs2archive.models import DemoSource, DownloadResult, DownloadStatus, MatchInfo
 
 console = Console(force_terminal=True)
 

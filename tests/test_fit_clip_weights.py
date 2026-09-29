@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 
-from shorts.fit_clip_weights import (
+from cs2archive.shorts.fit_clip_weights import (
     features_from_clip,
     predict_log_views,
     spearman,

@@ -5,10 +5,8 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "faceit"))
 
-from build_stat_strips import (
+from cs2archive.faceit.build_stat_strips import (
     aggregate_window,
     display_nicks,
     fmt_matches,
@@ -19,7 +17,7 @@ from build_stat_strips import (
     parse_rounds,
     rating_is_hot,
 )
-from faceit_names import nick_alias_parts
+from cs2archive.faceit.faceit_names import nick_alias_parts
 
 
 def test_level_icons_resolve_for_all_levels():

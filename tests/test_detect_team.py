@@ -5,9 +5,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from shorts.detect_team import orgs_from_folder
+from cs2archive.shorts.detect_team import orgs_from_folder
 
 
 def test_natus_vincere_vs_m80_does_not_eat_m80():

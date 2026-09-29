@@ -5,10 +5,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-import render_pov
-from render_pov import resolve_output_dir
+import cs2archive.pov.render_pov as render_pov
+from cs2archive.pov.render_pov import resolve_output_dir
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 

@@ -5,9 +5,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from shorts.popular_events import is_popular_event
+from cs2archive.shorts.popular_events import is_popular_event
 
 
 def test_blast_porto_and_ewc_and_major_kept():

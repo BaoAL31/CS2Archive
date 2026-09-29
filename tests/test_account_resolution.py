@@ -14,7 +14,7 @@ import pytest
 
 @pytest.fixture()
 def accounts_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    import _backlog_common as bc
+    import cs2archive._backlog_common as bc
     p = tmp_path / "player_accounts.json"
     p.write_text(json.dumps([
         {"nickname": "donk", "faceit_nickname": "donk666",
@@ -31,12 +31,12 @@ def accounts_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def test_find_account_by_steam(accounts_file: Path):
-    from _backlog_common import find_account
+    from cs2archive._backlog_common import find_account
     assert find_account(steam_id="76561198386265483")["nickname"] == "donk"
 
 
 def test_find_account_by_faceit_nickname(accounts_file: Path):
-    from _backlog_common import find_account
+    from cs2archive._backlog_common import find_account
     acct = find_account(player="donk666")
     assert acct["nickname"] == "donk"
     assert acct["capture_width"] == 1280
@@ -44,17 +44,17 @@ def test_find_account_by_faceit_nickname(accounts_file: Path):
 
 
 def test_find_account_nickname_case_insensitive(accounts_file: Path):
-    from _backlog_common import find_account
+    from cs2archive._backlog_common import find_account
     assert find_account(player="S1MPLE")["steam_id"] == "76561198034202275"
 
 
 def test_find_account_steam_beats_nick(accounts_file: Path):
-    from _backlog_common import find_account
+    from cs2archive._backlog_common import find_account
     acct = find_account(player="s1mple", steam_id="76561198386265483")
     assert acct["nickname"] == "donk"
 
 
 def test_find_account_miss_returns_empty(accounts_file: Path):
-    from _backlog_common import find_account
+    from cs2archive._backlog_common import find_account
     assert find_account(player="nosuchplayer") == {}
     assert find_account() == {}

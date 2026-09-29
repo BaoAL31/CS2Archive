@@ -12,7 +12,7 @@ from typing import Optional
 from bs4 import BeautifulSoup
 from rich.console import Console
 
-from config import settings
+from cs2archive.config import settings
 
 console = Console(force_terminal=True)
 

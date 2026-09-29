@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from scripts.misc import install_csdm_startup_fix as fix
+from cs2archive.misc import install_csdm_startup_fix as fix
 
 
 @pytest.fixture
@@ -72,7 +72,7 @@ def test_failed_settings_write_can_be_recovered(deployment, monkeypatch):
 
 
 def test_production_preflight_preserves_plugin_and_initialization(deployment):
-    from scripts.hook_aware import ensure_csdm_steam_launch
+    from cs2archive.render.hook_aware import ensure_csdm_steam_launch
 
     settings, _, _, _ = deployment
     fix.install(*deployment)

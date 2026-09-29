@@ -6,11 +6,9 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts" / "upload"))
-sys.path.insert(0, str(Path(r"D:\Projects\CS2UtilArchive\scripts")))
 
 from publish_schedule import SLOT_TIMES
-from shorts_player_day import meta_publish_date_local, player_blocked_slots, pov_nick_from_meta_path
+from cs2archive.upload.shorts_player_day import meta_publish_date_local, player_blocked_slots, pov_nick_from_meta_path
 
 
 def test_pov_nick_from_timeline(tmp_path: Path) -> None:

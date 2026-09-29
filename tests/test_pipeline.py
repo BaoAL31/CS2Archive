@@ -22,8 +22,8 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 
-from config import settings
-from models import DemoSource, MatchInfo
+from cs2archive.config import settings
+from cs2archive.models import DemoSource, MatchInfo
 
 console = Console(force_terminal=True)
 

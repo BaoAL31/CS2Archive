@@ -5,13 +5,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "scripts"))
-from _pathsetup import ensure  # noqa: E402
 
-ensure()
 
-from overlay.swift_demoui import _strip_markup, patch_runtime  # noqa: E402
+from cs2archive.overlay.swift_demoui import _strip_markup, patch_runtime  # noqa: E402
 
 _EVIL = "<span class='decorated-player-name__control mount'>blyka</span>"
 
@@ -43,7 +39,7 @@ def test_patch_runtime_strips_names_and_cleans_display():
 
 
 def test_render_autoexec_sanitizes_rename_values(tmp_path: Path, monkeypatch):
-    import render_pov
+    import cs2archive.pov.render_pov as render_pov
 
     monkeypatch.setattr(render_pov, "GAME_CFG", tmp_path)
     monkeypatch.setattr(render_pov, "AUTOEXEC_RENDER", tmp_path / "autoexec_render.cfg")
@@ -58,7 +54,7 @@ def test_render_autoexec_sanitizes_rename_values(tmp_path: Path, monkeypatch):
 
 
 def test_merge_voice_names_prefers_canonical_keeps_demo():
-    from render_pov import _merge_voice_names
+    from cs2archive.pov.render_pov import _merge_voice_names
 
     out = _merge_voice_names(
         {"76561199032006224": "kyousuke"},
@@ -69,7 +65,7 @@ def test_merge_voice_names_prefers_canonical_keeps_demo():
 
 
 def test_demo_player_names_uses_recorded_names(tmp_path: Path, monkeypatch):
-    import render_pov
+    import cs2archive.pov.render_pov as render_pov
 
     class _Info:
         def iterrows(self):
@@ -92,7 +88,7 @@ def test_demo_player_names_uses_recorded_names(tmp_path: Path, monkeypatch):
 
 
 def test_faceit_rename_map_sanitizes_names(tmp_path: Path, monkeypatch):
-    import pipeline
+    import cs2archive.pov.pipeline as pipeline
 
     class _Info:
         def iterrows(self):
@@ -107,12 +103,12 @@ def test_faceit_rename_map_sanitizes_names(tmp_path: Path, monkeypatch):
 
     monkeypatch.setitem(sys.modules, "demoparser2", type("M", (), {"DemoParser": _DP})())
     import types
-    faceit_pkg = types.ModuleType("scripts.faceit")
-    faceit_pkg.__path__ = [str(ROOT / "scripts" / "faceit")]
-    faceit_names = types.ModuleType("scripts.faceit.faceit_names")
+    faceit_pkg = types.ModuleType("cs2archive.faceit")
+    faceit_pkg.__path__ = [str(ROOT / "cs2archive" / "faceit")]
+    faceit_names = types.ModuleType("cs2archive.faceit.faceit_names")
     faceit_names.known_pro_steam_ids = lambda: {"76561199646115626": _EVIL}
-    monkeypatch.setitem(sys.modules, "scripts.faceit", faceit_pkg)
-    monkeypatch.setitem(sys.modules, "scripts.faceit.faceit_names", faceit_names)
+    monkeypatch.setitem(sys.modules, "cs2archive.faceit", faceit_pkg)
+    monkeypatch.setitem(sys.modules, "cs2archive.faceit.faceit_names", faceit_names)
     demo = tmp_path / "match.dem"
     demo.write_bytes(b"0")
 
@@ -122,7 +118,7 @@ def test_faceit_rename_map_sanitizes_names(tmp_path: Path, monkeypatch):
 def test_cached_rename_map_parses_once(tmp_path: Path, monkeypatch):
     import types
 
-    import pipeline
+    import cs2archive.pov.pipeline as pipeline
 
     calls = []
     monkeypatch.setattr(

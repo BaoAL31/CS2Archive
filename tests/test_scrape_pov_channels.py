@@ -6,9 +6,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "misc"))
 
-import scrape_pov_channels as scraper
+import cs2archive.misc.scrape_pov_channels as scraper
 
 
 def test_channel_reference_accepts_video_handle_and_channel_url():

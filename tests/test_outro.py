@@ -1,4 +1,4 @@
-"""Tests for scripts/pov/generate_outro.py"""
+"""Tests for cs2archive/pov/generate_outro.py"""
 
 from __future__ import annotations
 
@@ -7,11 +7,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
-from _pathsetup import ensure
-ensure()
 
-import generate_outro
+import cs2archive.pov.generate_outro as generate_outro
 
 FFMPEG = r"C:\Users\jembo\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
 

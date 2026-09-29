@@ -6,12 +6,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
-from _pathsetup import ensure
 
-ensure()
 
-from highlights.build_edit_timeline import (  # noqa: E402
+from cs2archive.highlights.build_edit_timeline import (  # noqa: E402
     _build_batch_prompt,
     _edit_timeline_few_shot_examples,
 )

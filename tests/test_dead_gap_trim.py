@@ -5,9 +5,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from shorts.dead_gap_trim import GAP_MIN, KEEP_AFTER_KILL, RESUME_BEFORE_KILL, plan_cuts
+from cs2archive.shorts.dead_gap_trim import GAP_MIN, KEEP_AFTER_KILL, RESUME_BEFORE_KILL, plan_cuts
 
 
 def test_no_cut_when_kills_are_tight():

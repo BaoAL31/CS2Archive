@@ -1,11 +1,10 @@
-"""Tests for the FACEIT POV title generation (scripts/faceit/faceit_title.py)."""
+"""Tests for the FACEIT POV title generation (cs2archive/faceit/faceit_title.py)."""
 import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PROJECT_ROOT / "scripts" / "faceit"))
 
-import faceit_title as ft  # noqa: E402
+import cs2archive.faceit.faceit_title as ft  # noqa: E402
 
 
 def test_title_with_kd_and_elo():

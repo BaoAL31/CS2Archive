@@ -6,9 +6,8 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from shorts.demand_gate import filter_publishable_shorts, passes_shorts_demand_gate
+from cs2archive.shorts.demand_gate import filter_publishable_shorts, passes_shorts_demand_gate
 
 STARS = {
     "intercept": 5.0,
@@ -66,7 +65,7 @@ def test_hltv_ranks_keepers_by_candidate_score_descending():
 
 
 def test_hltv_1v3_ace_scores_above_either_kind_alone():
-    from shorts.demand_gate import candidate_score
+    from cs2archive.shorts.demand_gate import candidate_score
 
     both = _cut(kill_ticks=[1, 2, 3, 4, 5])
     clutch_only = _cut(kill_ticks=[1, 2, 3])
@@ -121,14 +120,14 @@ def test_hltv_navi_opponent_is_partial_star_not_hard_keep():
 
 
 def test_hltv_unset_player_opponent_stage_and_kinds_add_nothing():
-    from shorts.demand_gate import candidate_score
+    from cs2archive.shorts.demand_gate import candidate_score
 
     baseline = _cut(short_type="4k", clutch_initial_count=None, kill_ticks=[1])
     assert candidate_score(baseline, STARS) == STARS["intercept"]
 
 
 def test_hltv_source_and_clip_age_are_not_in_candidate_score():
-    from shorts.demand_gate import candidate_score
+    from cs2archive.shorts.demand_gate import candidate_score
 
     cut = _cut(
         kill_ticks=[1, 2, 3, 4, 5],
@@ -144,7 +143,7 @@ def test_hltv_source_and_clip_age_are_not_in_candidate_score():
 
 
 def test_hltv_stage_is_not_in_candidate_score():
-    from shorts.demand_gate import candidate_score
+    from cs2archive.shorts.demand_gate import candidate_score
 
     plain = _cut(kill_ticks=[1, 2, 3, 4, 5])
     playoff = _cut(kill_ticks=[1, 2, 3, 4, 5], stage="playoff")
@@ -223,8 +222,7 @@ def test_filter_publishable_shorts_counts_drops():
 
 
 def test_skipped_meta_is_not_pending() -> None:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts" / "upload"))
-    import upload_pending_shorts as ups
+    import cs2archive.upload.upload_pending_shorts as ups
 
     meta = {
         "upload_status": "skipped",
@@ -240,8 +238,7 @@ def test_skipped_meta_is_not_pending() -> None:
 
 
 def test_upload_gate_reads_nick_and_folder(tmp_path: Path) -> None:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts" / "upload"))
-    import upload_pending_shorts as ups
+    import cs2archive.upload.upload_pending_shorts as ups
 
     faceit_dir = tmp_path / "demos" / "faceit" / "match"
     faceit_dir.mkdir(parents=True)
@@ -268,8 +265,7 @@ def test_upload_gate_reads_nick_and_folder(tmp_path: Path) -> None:
 
 
 def test_hltv_upload_below_intercept_is_slot_floor(tmp_path: Path) -> None:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts" / "upload"))
-    import upload_pending_shorts as ups
+    import cs2archive.upload.upload_pending_shorts as ups
 
     folder = tmp_path / "shorts-latto-baseline"
     folder.mkdir()
@@ -292,8 +288,7 @@ def test_hltv_upload_below_intercept_is_slot_floor(tmp_path: Path) -> None:
 
 
 def test_hltv_upload_above_intercept_passes(tmp_path: Path) -> None:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts" / "upload"))
-    import upload_pending_shorts as ups
+    import cs2archive.upload.upload_pending_shorts as ups
 
     folder = tmp_path / "shorts-latto-ace"
     folder.mkdir()
@@ -307,8 +302,7 @@ def test_hltv_upload_above_intercept_passes(tmp_path: Path) -> None:
 
 
 def test_mark_skipped_stops_future_pending(tmp_path: Path) -> None:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts" / "upload"))
-    import upload_pending_shorts as ups
+    import cs2archive.upload.upload_pending_shorts as ups
 
     meta_path = tmp_path / "upload_meta_shorts.json"
     meta = {

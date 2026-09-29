@@ -1666,17 +1666,20 @@ def highlights_run_dir(demo_path: Path) -> Path:
     return PROJECT_ROOT / "renders" / f"hl-{demo_path.stem}"
 
 
-def ensure_action_timeline(demo_path: Path) -> Path | None:
+def ensure_action_timeline(demo_path: Path,
+                           output: Path | None = None) -> Path | None:
     """Build + cache the action timeline for a demo, or reuse the cache.
 
-    One home for both products: ``renders/hl-{stem}/action_timeline.json``
-    (the thumbnail kill-frame picker already reads this path). Rebuilds when
-    the cached ``timeline_version`` is older than ``TIMELINE_VERSION``.
-    Failures return None — callers must treat that as "no timeline", never
-    as an error (backlog cards and hooks must still land).
+    Default home is ``renders/hl-{stem}/action_timeline.json`` (the
+    multi-pros highlights pipeline). Pass ``output`` for a POV-local copy —
+    the POV flow keeps its cache inside the pov folder and never creates
+    hl-* dirs. Rebuilds when the cached ``timeline_version`` is older than
+    ``TIMELINE_VERSION``. Failures return None — callers must treat that as
+    "no timeline", never as an error (backlog cards and hooks must still
+    land).
     """
     demo_path = Path(demo_path)
-    out = highlights_run_dir(demo_path) / "action_timeline.json"
+    out = Path(output) if output else highlights_run_dir(demo_path) / "action_timeline.json"
     if out.is_file():
         try:
             cached = json.loads(out.read_text(encoding="utf-8"))

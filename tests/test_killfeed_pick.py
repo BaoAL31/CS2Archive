@@ -5,7 +5,6 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from thumbnail.utils import (
     KILLFEED_AFTER_SECONDS,
@@ -99,7 +98,7 @@ def test_attacker_steam_id_from_shorts_timeline():
 
 
 def test_persist_action_timeline_writes_kills(tmp_path):
-    from shorts.build_short_timeline import persist_action_timeline
+    from cs2archive.shorts.build_short_timeline import persist_action_timeline
 
     path = persist_action_timeline(
         tmp_path / "match.dem",

@@ -1,0 +1,119 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cs2archive"
+version = "0.1.0"
+description = "CS2 demo -> POV Archive / Highlight Reel video pipeline"
+requires-python = ">=3.10"
+
+# Declared for documentation only. The conda env already provides all of these, so install
+# this package with `pip install -e . --no-deps` to avoid pip re-resolving (and potentially
+# upgrading) the working environment. requirements.txt is the acquisition-only subset and is
+# deliberately not the source of truth here.
+dependencies = [
+    "httpx[http2]>=0.27.0",
+    "Pillow>=10.0.0",
+    "rembg>=0.2.0",
+    "playwright>=1.48.0",
+    "cloakbrowser>=0.3.30",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.0.0",
+    "patool>=2.2.0",
+    "py7zr>=0.22.0",
+    "rich>=13.9.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    "python-dotenv>=1.0.0",
+    "aiofiles>=24.1.0",
+    "zstandard>=0.22.0",
+]
+
+# Console entry points exist only for modules that already expose a callable main().
+# Three modules (pov/create_backlog, hltv/match_listener, faceit/create_faceit_backlog) run
+# their logic in an `if __name__ == "__main__"` block instead; those are invoked with
+#   python -m cs2archive.pov.create_backlog ...
+# until a later pass gives them a real main(argv).
+[project.scripts]
+cs2archive-pipeline = "cs2archive.pov.pipeline:main"
+cs2archive-render-pov = "cs2archive.pov.render_pov:main"
+cs2archive-concat-rounds = "cs2archive.pov.concat_rounds:main"
+cs2archive-refresh-stars = "cs2archive.hltv.refresh_stars:main"
+cs2archive-score-cards = "cs2archive.hltv.score_cards:main"
+cs2archive-upload-pending = "cs2archive.upload.upload_pending:main"
+cs2archive-daily-notable = "cs2archive.faceit.daily_notable:main"
+cs2archive-render-shorts = "cs2archive.shorts.render_shorts:main"
+cs2archive-build-action-timeline = "cs2archive.highlights.build_action_timeline:main"
+cs2archive-overlay-pov = "cs2archive.overlay.overlay_pov:main"
+
+[tool.setuptools.packages.find]
+# cs2archive/ is the moved scripts/ tree. commands/, scrapers/ and thumbnail/ stay at the
+# repository root for this pass (council D1) but are declared here so they are importable
+# from the installed distribution with no sys.path manipulation at all.
+include = ["cs2archive*", "commands*", "scrapers*", "thumbnail*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# NOTE: pytest 9.1.1 does NOT accept collect_ignore_glob as an ini option (it warns "Unknown config
+# option" and ignores it). The CR-16 collection suppression therefore lives as a conftest.py
+# variable in tests/conftest.py, and check_waivers.py audits it there.
+
+# ── Lint gate (CR-13) ────────────────────────────────────────────────────────────────────────
+#
+# Policy, agreed by the review council:
+#   * The gate selects only crash-level rules: F (pyflakes) + E9 (syntax/runtime errors).
+#   * Everything waived below MUST carry a `CR-<n>` token and an `expires YYYY-MM-DD` date.
+#     .github/scripts/check_waivers.py fails CI on a waiver with no token, no expiry, or an
+#     expired one, so a suppression cannot silently outlive the ticket that justifies it.
+#   * Waivers are the ratchet: adding a new one is a visible config diff.
+#
+# Run it exactly as CI does (no conda-env changes; ruff is pinned):
+#     uvx ruff@0.16.9 check .
+[tool.ruff]
+# target-version drives only ruff's own parsing/upgrade decisions here.
+# line-length is INFORMATIONAL ONLY: E501 is not selected (the gate is F+E9), so long lines are not
+# flagged. Kept because the formatter and any future E501 opt-in will read it.
+target-version = "py310"
+line-length = 120
+extend-exclude = [".tmp", "tmp", "renders", "youtube", "demos", ".cache", ".pipeline", ".listener", "tools", "exports", "grafipy-out"]
+
+[tool.ruff.lint]
+select = ["F", "E9"]
+# CR-15 (expires 2026-11-15): deferred lint debt, counts measured 2026-09-27.
+#   F401 unused-import   216 sites — mostly deliberate re-exports and lazy imports; removing them
+#                        mechanically can drop a live re-export, so this needs the CR-04/CR-15
+#                        import-cleanup pass, not a bulk --fix.
+#   F541 f-string-no-placeholder 51 sites — cosmetic.
+#   F841 unused-local    20 sites — CAREFUL, this one is not purely cosmetic: several sites are in
+#                        tests (tests/test_pipeline.py:201 `failed`,
+#                        tests/test_overlay_sidecar_skip_failed.py:232 `round_end_sec` / :235
+#                        `frame_count`) where a computed-but-unused value may be a forgotten
+#                        assertion. Triage each site under CR-15; do not bulk-delete.
+ignore = ["F401", "F541", "F841"]
+
+[tool.ruff.lint.per-file-ignores]
+# Each entry is a waiver with an owner and an expiry, enforced by check_waivers.py.
+
+# render_pov.py's F821 waiver is GONE (CR-15 fixed 2026-09-27): the `b`/`_b` comprehension in
+# _rename_sequence_files and the undefined `unmapped_seqs` in the positional-pairing fallback are
+# both corrected, so the gate covers this file again. Verified by removing the waiver and running
+# `uvx ruff check .` clean.
+
+# CR-15 (expires 2026-11-15): 9x F821 `pd` — all inside deferred string annotations
+# ("pd.DataFrame | None") in detect_shorts' signature. pandas is an optional import in this
+# module, so the annotation is never evaluated at runtime. False positives; the real fix is the
+# CR-02 decomposition of this file (repo_pattern -> TYPE_CHECKING import).
+"cs2archive/shorts/build_short_timeline.py" = ["F821"]
+
+# CR-15 (expires 2026-11-15): 2x F821 in return annotations (`googleapiclient.discovery.Resource`,
+# `date | None`). Deferred annotations, never evaluated. False positives.
+"cs2archive/upload/upload_youtube.py" = ["F821"]
+
+# CR-15 (expires 2026-11-15): F811 redefinition of `subprocess` (line 267) and `re` (line 408 loop
+# variable shadows the import). Held uncommitted by the concurrent agent.
+"cs2archive/overlay/overlay_utilcams.py" = ["F811", "F402"]
+
+# CR-15 (expires 2026-11-15): 2x F811 redefinition of `re` (lines 195, 392). Held uncommitted by
+# the concurrent agent.
+"cs2archive/overlay/render_util_cams.py" = ["F811"]

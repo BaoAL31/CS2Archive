@@ -11,8 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-from shorts.render_shorts import (
+from cs2archive.shorts.render_shorts import (
     render_shorts,
     _build_csdm_config,
     _composite_9x16,
@@ -59,7 +58,7 @@ def test_csdm_config_structure(tmp_path):
     out_dir = tmp_path / "renders" / "test"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("shorts.render_shorts._get_player_crosshair_cvars", return_value=[]):
+    with patch("cs2archive.shorts.render_shorts._get_player_crosshair_cvars", return_value=[]):
         config = _build_csdm_config(shorts, demo, out_dir)
 
     assert "demoPath" in config
@@ -95,10 +94,10 @@ def test_csdm_subprocess_called(tmp_path):
     mock_seq_view = MagicMock()
     mock_seq_view.return_value = []
 
-    with patch("shorts.render_shorts._run_csdm_hook_aware") as mock_hook, \
-         patch("shorts.render_shorts._get_player_crosshair_cvars", return_value=[]), \
-         patch("shorts.render_shorts._find_sequence_files", mock_seq_view), \
-         patch("shorts.render_shorts._composite_9x16") as mock_composite:
+    with patch("cs2archive.shorts.render_shorts._run_csdm_hook_aware") as mock_hook, \
+         patch("cs2archive.shorts.render_shorts._get_player_crosshair_cvars", return_value=[]), \
+         patch("cs2archive.shorts.render_shorts._find_sequence_files", mock_seq_view), \
+         patch("cs2archive.shorts.render_shorts._composite_9x16") as mock_composite:
         try:
             render_shorts(timeline_path, batch_size=0)
         except RuntimeError:
@@ -113,7 +112,7 @@ def test_csdm_subprocess_called(tmp_path):
 
 def test_output_resolution_1080x1920(tmp_path, monkeypatch):
     """Given a source, composite produces 1080x1920 output."""
-    from shorts.render_shorts import _render_kill_feed_pip
+    from cs2archive.shorts.render_shorts import _render_kill_feed_pip
 
     ffmpeg = None
     for p in [
@@ -150,7 +149,7 @@ def test_output_resolution_1080x1920(tmp_path, monkeypatch):
 
 def test_output_has_duration(tmp_path, monkeypatch):
     """Output has non-zero duration."""
-    from shorts.render_shorts import _render_kill_feed_pip
+    from cs2archive.shorts.render_shorts import _render_kill_feed_pip
 
     ffmpeg = None
     for p in [
@@ -254,7 +253,7 @@ def test_kill_feed_overlay_present_by_default():
 
 def test_kill_feed_overlay_positioned_top_right_of_canvas():
     """Kill feed overlay must be at the top-right of the foreground footage."""
-    from shorts import render_shorts as rmod
+    from cs2archive.shorts import render_shorts as rmod
     fc = _capture_filter_str()
     import re
     m = re.search(r"\[tmp\]\[pip\]overlay=(\d+):(\d+)", fc)
@@ -276,7 +275,7 @@ def test_kill_feed_can_be_disabled():
 
 def test_kill_feed_crop_constants_within_source():
     """Kill feed crop stays within the 1920x1080 source and at top edge (y=0)."""
-    from shorts import render_shorts as rmod
+    from cs2archive.shorts import render_shorts as rmod
     assert 0 < rmod.KILLFEED_CROP_X
     assert rmod.KILLFEED_CROP_X + rmod.KILLFEED_CROP_W <= 1920
     assert 0 <= rmod.KILLFEED_CROP_Y < 50
@@ -318,7 +317,7 @@ def test_kill_feed_input_count():
 
 def test_render_kill_feed_pip_creates_file():
     """_render_kill_feed_pip calls ffmpeg and writes the kill-feed PiP file."""
-    from shorts.render_shorts import _render_kill_feed_pip
+    from cs2archive.shorts.render_shorts import _render_kill_feed_pip
     captured: list[list[str]] = []
     def fake_run(cmd, *a, **k):
         captured.append(cmd)
@@ -348,8 +347,8 @@ def test_render_kill_feed_pip_creates_file():
 
 def test_render_kill_feed_pip_uses_pre_renderer_constants():
     """The pre-renderer uses KILLFEED_CROP_* module constants."""
-    from shorts import render_shorts as rmod
-    from shorts.render_shorts import _render_kill_feed_pip
+    from cs2archive.shorts import render_shorts as rmod
+    from cs2archive.shorts.render_shorts import _render_kill_feed_pip
     captured: list[list[str]] = []
     def fake_run(cmd, *a, **k):
         captured.append(cmd)
@@ -368,7 +367,7 @@ def test_render_kill_feed_pip_uses_pre_renderer_constants():
 
 def test_render_kill_feed_pip_runtime_failure_raises():
     """ffmpeg failure surfaces as RuntimeError with stderr excerpt."""
-    from shorts.render_shorts import _render_kill_feed_pip
+    from cs2archive.shorts.render_shorts import _render_kill_feed_pip
     fake_stat = MagicMock(st_size=2_000_000)
     fail_run = MagicMock(
         returncode=1,
@@ -385,7 +384,7 @@ def test_output_file_naming(monkeypatch):
     """Outputs are named short_001.mp4, short_002.mp4, etc."""
     # Build index manually — _render_shorts iterates enumerate(zip(seq_list, shorts))
     # Verify naming pattern
-    with patch('shorts.render_shorts.render_shorts') as mock_rs:
+    with patch('cs2archive.shorts.render_shorts.render_shorts') as mock_rs:
         pass
 
 
@@ -398,10 +397,10 @@ def test_skip_already_rendered(tmp_path):
     existing = out_dir / "short_001.mp4"
     existing.write_bytes(b"\x00" * 2_000_000)  # 2 MB
 
-    with patch("shorts.render_shorts._probe_resolution", return_value=(OUT_WIDTH, OUT_HEIGHT)):
-        with patch("shorts.render_shorts._composite_9x16") as mock_comp:
+    with patch("cs2archive.shorts.render_shorts._probe_resolution", return_value=(OUT_WIDTH, OUT_HEIGHT)):
+        with patch("cs2archive.shorts.render_shorts._composite_9x16") as mock_comp:
             # This simulates the skip check
-            import shorts.render_shorts as rmod
+            import cs2archive.shorts.render_shorts as rmod
             if existing.exists() and existing.stat().st_size >= 1_048_576:
                 w, h = (OUT_WIDTH, OUT_HEIGHT)
                 assert w == OUT_WIDTH and h == OUT_HEIGHT

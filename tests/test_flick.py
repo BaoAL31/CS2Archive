@@ -5,9 +5,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from shorts.flick import CONVERT_TICKS, is_flick, is_flick_converted
+from cs2archive.shorts.flick import CONVERT_TICKS, is_flick, is_flick_converted
 
 
 def _held(n: int, yaw: float = 10.0, pitch: float = 5.0) -> tuple[list[float], list[float]]:
@@ -147,8 +146,8 @@ def _snap_yaw(n: int = 33) -> tuple[list[float], list[float]]:
 
 def test_collect_flick_kills_flags_late_snap():
     import pandas as pd
-    from shorts.build_short_timeline import _collect_flick_kills
-    from shorts.flick import PRE_TICKS
+    from cs2archive.shorts.build_short_timeline import _collect_flick_kills
+    from cs2archive.shorts.flick import PRE_TICKS
 
     kill_tick = 2000
     aid = "76561198000000000"
@@ -176,8 +175,8 @@ def test_collect_flick_kills_flags_late_snap():
 
 def test_collect_flick_kills_skips_tracking_and_knife():
     import pandas as pd
-    from shorts.build_short_timeline import _collect_flick_kills
-    from shorts.flick import PRE_TICKS
+    from cs2archive.shorts.build_short_timeline import _collect_flick_kills
+    from cs2archive.shorts.flick import PRE_TICKS
 
     kill_tick = 2000
     aid = "76561198000000000"
@@ -210,8 +209,8 @@ def test_collect_flick_kills_skips_tracking_and_knife():
 
 def test_collect_uses_looser_awp_gates():
     import pandas as pd
-    from shorts.build_short_timeline import _collect_flick_kills
-    from shorts.flick import PRE_TICKS
+    from cs2archive.shorts.build_short_timeline import _collect_flick_kills
+    from cs2archive.shorts.flick import PRE_TICKS
 
     kill_tick = 2000
     aid = "76561198000000000"

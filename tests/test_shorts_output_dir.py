@@ -8,9 +8,8 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from shorts import discard_empty_shorts_dir, resolve_output_dir
+from cs2archive.shorts import discard_empty_shorts_dir, resolve_output_dir
 
 
 def test_hltv_with_player(monkeypatch, tmp_path):
@@ -20,7 +19,7 @@ def test_hltv_with_player(monkeypatch, tmp_path):
     abs_demo_root.mkdir(parents=True)
     demo = abs_demo_root / "spirit-vs-falcons-m3-nuke.dem"
     demo.write_text("")
-    monkeypatch.setattr("shorts.RENDERS_DIR", tmp_path / "renders")
+    monkeypatch.setattr("cs2archive.shorts.RENDERS_DIR", tmp_path / "renders")
 
     out = resolve_output_dir(demo, player="76561198000000000")
     assert out == tmp_path / "renders" / "shorts" / "shorts-spirit-vs-falcons-m3-nuke"
@@ -34,7 +33,7 @@ def test_faceit_no_player_needed(monkeypatch, tmp_path):
     abs_demo_root.mkdir(parents=True)
     demo = abs_demo_root / "team-teses-vs-svnonethree.dem"
     demo.write_text("")
-    monkeypatch.setattr("shorts.RENDERS_DIR", tmp_path / "renders")
+    monkeypatch.setattr("cs2archive.shorts.RENDERS_DIR", tmp_path / "renders")
 
     out = resolve_output_dir(demo)
     assert out == tmp_path / "renders" / "shorts" / "shorts-team-teses-vs-svnonethree"
@@ -48,7 +47,7 @@ def test_hltv_absolute_path(monkeypatch, tmp_path):
     abs_demo_root.mkdir(parents=True)
     demo = abs_demo_root / "match-slug-map.dem"
     demo.write_text("")
-    monkeypatch.setattr("shorts.RENDERS_DIR", tmp_path / "renders")
+    monkeypatch.setattr("cs2archive.shorts.RENDERS_DIR", tmp_path / "renders")
 
     out = resolve_output_dir(demo, player="123456789")
     assert out == tmp_path / "renders" / "shorts" / "shorts-match-slug-map"
@@ -56,14 +55,14 @@ def test_hltv_absolute_path(monkeypatch, tmp_path):
 
 
 def test_hltv_player_ignored(monkeypatch, tmp_path):
-    """Player is accepted but ignored — single per-match hl- folder."""
+    """Player is accepted but ignored — legacy per-demo fallback tree."""
     fake_project = tmp_path / "project"
     fake_project.mkdir()
     abs_demo_root = fake_project / "demos" / "hltv" / "some-match"
     abs_demo_root.mkdir(parents=True)
     demo = abs_demo_root / "some-map.dem"
     demo.write_text("")
-    monkeypatch.setattr("shorts.RENDERS_DIR", tmp_path / "renders")
+    monkeypatch.setattr("cs2archive.shorts.RENDERS_DIR", tmp_path / "renders")
 
     out = resolve_output_dir(demo)
     assert out.name == "shorts-some-map"
@@ -71,7 +70,7 @@ def test_hltv_player_ignored(monkeypatch, tmp_path):
 
 def test_hltv_faceit_same_prefix(monkeypatch, tmp_path):
     """Both HLTV and FACEIT use the shorts/shorts- layout."""
-    monkeypatch.setattr("shorts.RENDERS_DIR", tmp_path / "renders")
+    monkeypatch.setattr("cs2archive.shorts.RENDERS_DIR", tmp_path / "renders")
 
     hltv_demo = tmp_path / "demos" / "hltv" / "m" / "m.dem"
     hltv_demo.parent.mkdir(parents=True)
@@ -87,7 +86,7 @@ def test_hltv_faceit_same_prefix(monkeypatch, tmp_path):
 
 
 def test_unknown_path_raises(monkeypatch, tmp_path):
-    monkeypatch.setattr("shorts.RENDERS_DIR", tmp_path / "renders")
+    monkeypatch.setattr("cs2archive.shorts.RENDERS_DIR", tmp_path / "renders")
     demo = tmp_path / "demos" / "someother" / "match.dem"
     demo.parent.mkdir(parents=True)
     demo.write_text("")
@@ -116,7 +115,7 @@ def test_discard_empty_shorts_dir_keeps_real_shorts(tmp_path):
 
 
 def test_idempotent(monkeypatch, tmp_path):
-    monkeypatch.setattr("shorts.RENDERS_DIR", tmp_path / "renders")
+    monkeypatch.setattr("cs2archive.shorts.RENDERS_DIR", tmp_path / "renders")
     demo = tmp_path / "demos" / "hltv" / "m" / "m.dem"
     demo.parent.mkdir(parents=True)
     demo.write_text("")

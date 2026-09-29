@@ -19,7 +19,7 @@ from pathlib import Path
 from PIL import Image
 from rich.console import Console
 
-from config import settings
+from cs2archive.config import settings
 from scrapers.hltv_player_resolver import (
     avatar_cache_eligible,
     find_account_by_player_key,
@@ -363,7 +363,7 @@ def _has_hltv_identity(resolution: dict | None) -> bool:
 
 def _promote_hltv_identity(account: object | None, resolution: dict) -> None:
     """Persist resolved HLTV profile fields on the player account after a successful fetch."""
-    from player_accounts import update_hltv_player
+    from cs2archive.player_accounts import update_hltv_player
 
     if account is None:
         return
@@ -391,7 +391,7 @@ def _fetch_avatar_cloak(
     fetcher: CloakAvatarFetcher | None = None,
 ) -> Path:
     """Sync avatar fetch using CloakBrowser. Returns path to saved PNG."""
-    from player_accounts import list_accounts
+    from cs2archive.player_accounts import list_accounts
 
     key_norm = normalize_pipeline_player_key(key)
     AVATAR_DIR.mkdir(parents=True, exist_ok=True)

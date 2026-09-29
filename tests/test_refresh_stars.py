@@ -3,12 +3,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "misc"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "hltv"))
 
-from scrape_pov_channels import DEFAULT_CHANNELS
-import refresh_stars
+from cs2archive.misc.scrape_pov_channels import DEFAULT_CHANNELS
+import cs2archive.hltv.refresh_stars as refresh_stars
 
 
 def test_player_scrape_includes_own_and_competitors():

@@ -4,15 +4,33 @@ import sys
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "pov"))
-from overlay.swift_demoui import (
+from cs2archive.overlay.swift_demoui import (
     PACKAGE, mounted_hud, patch_runtime, read_vpk, write_vpk,
     restore, validate_render_profile, require_swift_capture,
 )
 
 
-def test_mount_restores_exact_gameinfo_after_render_failure(tmp_path):
+@pytest.fixture(autouse=True)
+def _deterministic_render_processes(monkeypatch):
+    """Pin live-render detection so this file does not depend on the real machine.
+
+    CR-16: mounted_hud() consults _live_render_processes() to decide whether an existing
+    mount may be stolen/restored. That reads real tasklist output, so a transient query
+    failure (or an unrelated cs2/HLAE process on the box) changed the decision and made
+    these tests intermittent — they pass alone and fail in a full run. The subject here is
+    mount/restore semantics, not process detection: the refusal logic itself is covered in
+    tests/test_swift_mount_heal.py, which patches the function deliberately.
+    """
+    monkeypatch.setattr("cs2archive.overlay.swift_demoui._live_render_processes", lambda: [])
+
+
+def test_mount_restores_exact_gameinfo_after_render_failure(tmp_path, monkeypatch):
+    # CR-16: the nested block below asserts the "session already active" refusal, which
+    # mounted_hud only raises when a live renderer is detected. That used to depend on real
+    # ambient processes, so the test passed or failed with whatever happened to be running on the
+    # machine. State the intent explicitly instead.
+    monkeypatch.setattr("cs2archive.overlay.swift_demoui._live_render_processes",
+                        lambda: ["cs2.exe:4242"])
     csgo = tmp_path / "csgo"
     csgo.mkdir()
     original = b'"GameInfo"\r\n{\r\n SearchPaths\r\n {\r\n  Game csgo // base\r\n }\r\n}\r\n'
@@ -123,8 +141,8 @@ def test_pinned_runtime_filters_team_after_slot_change_and_never_changes_audio(t
 
 
 def test_renderer_mounts_prepared_hud_with_names_and_restores_on_failure(tmp_path, monkeypatch):
-    import render_pov
-    from overlay import swift_demoui
+    import cs2archive.pov.render_pov as render_pov
+    from cs2archive.overlay import swift_demoui
     from types import SimpleNamespace
     gameinfo = tmp_path / "gameinfo.gi"
     original = b"SearchPaths\n{\n Game csgo\n}\n"

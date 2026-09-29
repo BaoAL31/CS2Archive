@@ -9,14 +9,11 @@ import pandas as pd
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "scripts"))
-from _pathsetup import ensure
 
-ensure()
 
-import render_util_cams as ruc  # noqa: E402
-import overlay_pov as op  # noqa: E402
-from overlay._common import cameras_for_util_type, clip_is_done  # noqa: E402
+import cs2archive.overlay.render_util_cams as ruc  # noqa: E402
+import cs2archive.overlay.overlay_pov as op  # noqa: E402
+from cs2archive.overlay._common import cameras_for_util_type, clip_is_done  # noqa: E402
 
 
 @pytest.fixture
@@ -54,9 +51,9 @@ def test_pip_render_disables_input_overlay_burn():
     flight_*.mp4 the PiP reads, so a burn would leak keycaps into the PiP.
     """
     import inspect
-    from overlay._common import prefer_cs2util_scripts
+    from cs2archive.overlay._common import prefer_cs2util_scripts
     prefer_cs2util_scripts()
-    from scripts.render.csdm_session import BatchRenderOptions
+    from render.csdm_session import BatchRenderOptions
     assert BatchRenderOptions(data_dir="x").burn_input_overlay is True
     assert BatchRenderOptions(data_dir="x", burn_input_overlay=False).burn_input_overlay is False
     src = inspect.getsource(ruc._render_util_cams)

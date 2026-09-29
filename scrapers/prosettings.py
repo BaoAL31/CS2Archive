@@ -212,7 +212,7 @@ def crosshair_convars(settings: dict, *, screen_height: int = 1440) -> list[str]
     # Prefer the share-code path when we have enough fields to build a dict;
     # otherwise emit renamed/converted lines piecemeal.
     try:
-        from crosshair_code import (
+        from cs2archive.crosshair_code import (
             PRESET_RGB,
             STYLE_OLD_TO_NEW,
             looks_like_old_scale,
@@ -220,8 +220,7 @@ def crosshair_convars(settings: dict, *, screen_height: int = 1440) -> list[str]
         )
     except ImportError:
         import sys
-        sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
-        from crosshair_code import (
+        from cs2archive.crosshair_code import (
             PRESET_RGB,
             STYLE_OLD_TO_NEW,
             looks_like_old_scale,
@@ -633,7 +632,7 @@ def sync_player_accounts(*, force_scrape: bool = True) -> dict:
 
     Returns a summary dict with matched / defaulted / accounts lists.
     """
-    from player_accounts import _load_accounts, _save_accounts
+    from cs2archive.player_accounts import _load_accounts, _save_accounts
 
     if force_scrape:
         scrape_and_cache(force=True)

@@ -1,0 +1,51 @@
+# tests/known_failures.txt
+#
+# CR-13 (expires 2026-11-15) — pre-existing test failures, baselined so a NEW failure fails the
+# build instead of hiding in the noise.
+#
+# Format: one `<STATUS> <test id>` per line, STATUS being FAILED or ERROR, exactly as pytest
+# reports it. The status is compared too: a known id that flips from FAILED to ERROR fails the
+# check, because that means collection or fixture breakage rather than the same known defect.
+#
+# How to use:
+#   python .github/scripts/check_known_failures.py            # strict: fail on NEW or flip
+#   python .github/scripts/check_known_failures.py --update   # rewrite from a run
+#
+# Rules (agreed with the review council):
+#   * Entries may only be listed with a CR-<n> ticket named here and an expiry date above;
+#     .github/scripts/check_waivers.py enforces both, and that the ticket exists in the register.
+#   * The safe direction (listed but passing) is a warning, never a failure, and never rewritten
+#     silently.
+#
+# Clusters, so this file does not read as N unrelated silences:
+#   * Five entries in test_build_short_timeline.py share one root cause — tracked as CR-17.
+#   * Four entries in test_render_shorts.py reference renamed killfeed constants and fail on
+#     AttributeError (the source module no longer defines them) — CR-15/CR-03 territory.
+#
+# NOTE: measured WITH the gitignored runtime state present (.data/, .cache/). Without it, this
+# script reports SKIPPED instead of comparing.
+
+# --- measured 2026-09-28: 14 entries ---
+
+FAILED tests/test_build_short_timeline.py::test_2v4_2v5_counted
+FAILED tests/test_build_short_timeline.py::test_clutch_detected
+FAILED tests/test_build_short_timeline.py::test_clutch_detected_when_30s_disadvantage
+FAILED tests/test_build_short_timeline.py::test_mixed_timeline_coexists
+FAILED tests/test_build_short_timeline.py::test_zero_kill_defuse_clutch
+FAILED tests/test_hltv_player_resolver.py::test_avatar_cache_eligible
+FAILED tests/test_hltv_scoring.py::test_queue_sorts_by_weight_then_rating
+FAILED tests/test_hltv_scoring.py::test_select_prefers_weight_over_rating
+FAILED tests/test_merge_pro_solo_interrupt.py::test_fix_drops_nonpro_solo_keeps_nonpro_multi
+FAILED tests/test_overlay_sidecar_skip_failed.py::test_overlay_sidecar_critical_errors_only
+FAILED tests/test_render_shorts.py::test_kill_feed_crop_constants_within_source
+FAILED tests/test_render_shorts.py::test_kill_feed_overlay_positioned_top_right_of_canvas
+FAILED tests/test_render_shorts.py::test_render_kill_feed_pip_uses_pre_renderer_constants
+FAILED tests/test_render_shorts.py::test_scale_scales_foreground_wider
+# The next entry was the concurrent agent's in-flight HP-gate change; it landed
+# (their test expectation caught up) and the test now passes — removed 2026-09-29.
+#
+# The next entry is the concurrent agent's in-flight render_version_check drift:
+# their source added an upper bound for CS2 1.41.8.5 but their test expectation
+# has not caught up (CR-13, expires 2026-11-15). Remove when their change lands.
+FAILED tests/test_render_version_check.py::test_hlae_bounds_for_cs2_table
+
