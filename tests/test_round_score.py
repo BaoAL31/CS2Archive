@@ -5,12 +5,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
-from _pathsetup import ensure
 
-ensure()
 
-from highlights.round_score import (  # noqa: E402
+from cs2archive.highlights.round_score import (  # noqa: E402
     _stars_pro,
     score_rounds,
     select_rounds,
@@ -68,3 +65,39 @@ def test_locks_and_victim_moment_ignored():
     atl["moments"][1]["primary_pro_sid"] = PRO
     picked = select_rounds(atl)
     assert 1 in picked and 3 in picked  # locks hold despite weak content
+
+
+def _staked_round(rn, buys):
+    return {"round": rn, "start_tick": 1000 * rn, "freeze_end_tick": None,
+            "end_tick": 1000 * rn + 500, "winner_team": 2,
+            "win_reason": "t_killed",
+            "score_after": {"2": rn, "3": 0}, "match_point_for": None,
+            "overtime": False, "closes_map": None, "alive": [],
+            "stakes": {"buy_source": "ticks", "buys": buys}}
+
+
+def test_buys_veto_taints_round():
+    farm = _mom("multikill", 2, kill_count=4, tier_ok=True,
+                attacker_team=2, victim_teams=[3])
+    atl = {"rounds": [_staked_round(1, {"2": "full", "3": "full"}),
+                      _staked_round(2, {"2": "full", "3": "eco"}),
+                      _staked_round(3, {"2": "full", "3": "full"})],
+           "moments": [_mom("opener", 1), farm,
+                       _mom("multikill", 3, kill_count=4, tier_ok=True,
+                            attacker_team=2, victim_teams=[3])]}
+    sc = score_rounds(atl)
+    # round 2's 4K was farmed off an eco buy: tainted (halved), so the plain
+    # full-buy 4K in round 3 outscores it.
+    assert sc[2][0] < sc[3][0]
+    assert "eco-taint" in sc[2][1]
+
+
+def test_buys_taint_inert_without_teams_or_ticks():
+    v2farm = _mom("multikill", 2, kill_count=4, tier_ok=True)
+    atl = {"rounds": [_staked_round(1, {"2": "full", "3": "full"}),
+                      _staked_round(2, {"2": "full", "3": "eco"}),
+                      _staked_round(3, {"2": "full", "3": "full"})],
+           "moments": [_mom("opener", 1), v2farm, _mom("opener", 3)]}
+    sc = score_rounds(atl)
+    assert "eco-taint" not in sc[2][1]  # no victim_teams: no veto
+    assert sc[2][0] == 40.0

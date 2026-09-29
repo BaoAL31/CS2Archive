@@ -4,12 +4,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from _pathsetup import ensure
 
-ensure()
 
-from highlights.build_multipov_timeline import (  # noqa: E402
+from cs2archive.highlights.build_multipov_timeline import (  # noqa: E402
     _force_coverage,
     _schedule,
     build_multipov_timeline,
@@ -132,3 +129,80 @@ def test_budget_trims_lowest_value_per_second():
     picked_types = [m["type"] for m in edit["picked"]]
     assert "clutch" in picked_types  # best value-per-second survives
     assert edit["stats"]["total_duration_s"] <= 60.0
+
+
+def test_force_coverage_never_resurrects_zero_value_moment():
+    # A buys-vetoed 4K as a pro's only moment must not ship at 0.0.
+    at = {
+        "timeline_version": 3,
+        "stakes_version": 2,
+        "rounds": [{"round": 1, "start_tick": 0, "end_tick": 5000,
+                    "stakes": {"buy_source": "ticks",
+                               "buys": {"2": "full", "3": "eco"}}}],
+        "moments": [
+            {"id": "a", "type": "multikill", "round": 1,
+             "start_tick": 1000, "end_tick": 2000, "kill_ticks": [],
+             "primary_pro_sid": PRO, "label": "4K", "kill_count": 4,
+             "tier_ok": True, "attacker_team": 2, "victim_teams": [3],
+             "attacker_steam_id": PRO},
+        ],
+    }
+    edit = build_multipov_timeline(at, max_minutes=5)
+    assert edit["stats"]["picked_count"] == 0
+    assert edit["stats"]["pros_covered"] == 0
+
+
+def test_force_coverage_still_covers_positive_moments():
+    at = {
+        "timeline_version": 3,
+        "stakes_version": 2,
+        "rounds": [{"round": 1, "start_tick": 0, "end_tick": 5000,
+                    "stakes": {"buy_source": "ticks",
+                               "buys": {"2": "full", "3": "eco"}}}],
+        "moments": [
+            {"id": "a", "type": "multikill", "round": 1,
+             "start_tick": 1000, "end_tick": 2000, "kill_ticks": [],
+             "primary_pro_sid": PRO, "label": "4K", "kill_count": 4,
+             "tier_ok": True, "attacker_team": 2, "victim_teams": [3],
+             "attacker_steam_id": PRO},
+            {"id": "b", "type": "opener", "round": 1,
+             "start_tick": 3000, "end_tick": 4000, "kill_ticks": [],
+             "primary_pro_sid": PRO2, "label": "OPENER",
+             "attacker_steam_id": PRO2},
+        ],
+    }
+    edit = build_multipov_timeline(at, max_minutes=5)
+    assert [m["id"] for m in edit["picked"]] == ["b"]
+    assert edit["stats"]["pros_covered"] == 1
+
+
+def test_v2_multimoment_parity_pins_full_pipeline():
+    # Rich v2 fixture (no stakes anywhere): tier-fail taint, rando discount,
+    # diversity cap, budget trim and coverage must behave exactly as before.
+    at = {
+        "timeline_version": 2,
+        "rounds": [{"round": 1, "start_tick": 0, "end_tick": 64000},
+                   {"round": 2, "start_tick": 64000, "end_tick": 128000}],
+        "moments": [
+            _mom("multikill", 1, 0, 3200, PRO, kill_count=4,
+                 tier_ok=False, attacker_steam_id=PRO),   # vetoed, value 0
+            _mom("multikill", 1, 6400, 9600, PRO, kill_count=3,
+                 tier_ok=True, attacker_steam_id=PRO),    # 25, covers PRO
+            _mom("opener", 1, 12800, 13440, PRO,
+                 attacker_steam_id=PRO),                  # 5
+            _mom("multikill", 2, 64000, 67200, PRO2, kill_count=4,
+                 tier_ok=True, attacker_steam_id=RANDO),  # 40*0.3 = 12
+            _mom("duel", 2, 70400, 71040, PRO2),          # 30, covers PRO2
+        ],
+    }
+    edit = build_multipov_timeline(at, max_minutes=5)
+    got = [(m["id"], m["value"]) for m in edit["picked"]]
+    # the tier-failed 4K taints round 1 (vetoed itself to 0), halving the
+    # farm-adjacent opener to 2.5; rando 4K discounts to 12.0.
+    assert got == [
+        ("r1-multikill-6400", 25.0),
+        ("r1-opener-12800", 2.5),
+        ("r2-multikill-64000", 12.0),
+        ("r2-duel-70400", 30.0),
+    ]
+    assert edit["stats"]["pros_covered"] == 2
