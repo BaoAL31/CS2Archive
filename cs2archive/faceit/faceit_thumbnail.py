@@ -161,9 +161,9 @@ def main() -> None:
     ap.add_argument("--sidecar", default=None,
                     help="round_offsets JSON (defaults to <video-stem>.round_offsets.json)")
     ap.add_argument("--variant", choices=["raw", "overlay"], default="raw")
-    ap.add_argument("--keyboard", action="store_true", default=False,
+    ap.add_argument("--keyboard", action=argparse.BooleanOptionalAction, default=True,
                     help="Overlay video includes the keyboard input overlay "
-                         "(badge reads INPUTS + UTIL CAMS; default: UTIL CAMS).")
+                         "(badge reads INPUTS + UTIL CAMS; --no-keyboard: UTIL CAMS).")
     ap.add_argument("--output", required=True, help="youtube dir to write thumbnail.jpg")
     args = ap.parse_args()
 

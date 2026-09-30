@@ -16,6 +16,7 @@ Long-running Steam-online flake (symptoms, mitigations, unknown):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -487,6 +488,61 @@ def ensure_csdm_steam_launch(settings_path: Path = CSDM_SETTINGS) -> bool:
     return True
 
 
+def check_csdm_startup_fix(
+    settings_path: Path = CSDM_SETTINGS,
+    game_dir: Path = CS2_GAME_DIR,
+) -> str | None:
+    """Warn reason when the CSDM startup fix is inactive, else None.
+
+    The 2026-09-21 fix silently reverted during the 09-24 HLAE pin swap
+    (settings lost cs2PluginVersion + +csdm_initialize), re-opening the
+    ClientFullyConnect frame-hook race that opens a vanilla demo viewer
+    instead of recording. Called from prepare_steam_hlae so no render can
+    silently lose it again. Read-only: never writes settings.
+    """
+    from cs2archive.misc.install_csdm_startup_fix import (  # noqa: E402
+        COMMAND,
+        PATCHED_SHA256,
+        VERSION,
+        plugin_dir,
+    )
+    try:
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return f"CSDM settings unreadable: {settings_path}"
+    playback = data.get("playback") if isinstance(data, dict) else None
+    if not isinstance(playback, dict):
+        return "CSDM settings have no playback section"
+    if playback.get("cs2PluginVersion") != VERSION:
+        return (f"cs2PluginVersion is {playback.get('cs2PluginVersion')!r}, "
+                f"expected {VERSION!r} (startup fix inactive)")
+    if COMMAND not in str(playback.get("launchParameters") or "").split():
+        return f"{COMMAND} missing from launchParameters (startup fix inactive)"
+    named = plugin_dir() / f"server_{VERSION}.dll"
+    if not named.is_file():
+        return f"startup-fix plugin missing: {named}"
+    try:
+        if hashlib.sha256(named.read_bytes()).hexdigest() != PATCHED_SHA256:
+            return f"startup-fix plugin hash mismatch: {named}"
+    except OSError as exc:
+        return f"startup-fix plugin unreadable: {named} ({exc})"
+    mounted = game_dir / "game" / "csgo" / "bin" / "win64" / "server.dll"
+    if mounted.is_file():
+        # The installer never replaces the game binary — it only adds the
+        # named plugin beside CSDM's stock copy. A game install whose
+        # mounted dll IS the patched build means someone overwrote it by
+        # hand. (Plain CS2 updates change this hash routinely; that drift
+        # belongs to the version gate, not this check.)
+        try:
+            if hashlib.sha256(mounted.read_bytes()).hexdigest() == PATCHED_SHA256:
+                return (f"mounted game server.dll is the patched build ({mounted}) — "
+                        "the fix was copied into the game install by hand; "
+                        "restore stock and reinstall cleanly")
+        except OSError:
+            pass
+    return None
+
+
 def _csdm_launch_env() -> dict[str, str]:
     env = os.environ.copy()
     env.update(_STEAM_OVERLAY_ENV)
@@ -523,6 +579,7 @@ def prepare_steam_hlae(
     overlay = block_steam_overlay(steam_dir)
     launch = ensure_csdm_steam_launch(settings_path)
     still_live = _live_overlay_dlls(steam_dir) if steam_dir.is_dir() else []
+    startup_fix = check_csdm_startup_fix(settings_path, game_dir)
     bits = []
     if appids:
         bits.append(f"steam_appid.txt x{len(appids)}")
@@ -530,6 +587,13 @@ def prepare_steam_hlae(
         bits.append("overlay DLLs blocked")
     if launch:
         bits.append("CSDM -steam -insecure -nominidumps +sv_lan 1")
+    if startup_fix is None:
+        bits.append("startup fix active")
+    else:
+        print(f"  [WARN] CSDM startup fix INACTIVE: {startup_fix} — "
+              "the ClientFullyConnect race is live; reinstall with "
+              "`python -m cs2archive.misc.install_csdm_startup_fix install`",
+              flush=True)
     if still_live:
         bits.append(f"STILL LIVE {', '.join(still_live)}")
         print(
@@ -917,15 +981,24 @@ def run_csdm_hook_aware(
                             pass
                     return None
 
-                proc.wait(timeout=14400)
+                try:
+                    proc.wait(timeout=14400)
+                except subprocess.TimeoutExpired:
+                    # First video landed but the batch stalled mid-way
+                    # (CSDM hung with the process alive). Without this
+                    # guard the TimeoutExpired escaped as a raw traceback
+                    # after 4h instead of a clean failure.
+                    print("  [WARN] CSDM process stalled after the first "
+                          "sequence (4h batch wait) — killing and failing",
+                          flush=True)
+                    kill_stale_processes()
+                    return None
         finally:
             if on_attempt_end:
                 try:
                     on_attempt_end()
                 except Exception:
                     pass
-
-        # Determine the produced video.
         if pick_output is not None:
             newest = pick_output(output_dir, before)
         else:

@@ -552,7 +552,16 @@ def _render_event_rounds_cli(demo_part: str, output_dir: Path, steam_id: str,
         "--width", str(args.width),
         "--height", str(args.height),
         "--cfg", str(seq_cfg.resolve()),
-    ] + BASE_FLAGS
+    ] + BASE_FLAGS + [
+        # BASE_FLAGS pins the video codec but not audio: CSDM's default audio
+        # is MP3 44.1k, so a mixed MP3/AAC container hits the stream-copy
+        # concat and the overlay's audio decode dies at the seam — r9 went
+        # voice-only on kyousuke/Mirage. Same audio codec family as the
+        # trimmed-round config (_pov_ffmpeg_settings): one codec across
+        # every round clip.
+        "--ffmpeg-audio-codec", "aac",
+        "--ffmpeg-audio-bitrate", "256",
+    ]
     # csdm writes per-round sequence files; caller renames them below.
     with _voice_hud_session(demo_part, output_dir, steam_id, args):
         run_csdm(cmd, f"rounds {missing_global[0]}-{missing_global[-1]}",

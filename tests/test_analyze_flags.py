@@ -10,7 +10,7 @@ from pathlib import Path
 from cs2archive.pov.pipeline import flag_round_risks
 from cs2archive.pov.round_windows import (
     CSDM_PLAY_LEAD_TICKS,
-    DEFUSE_PRE_TAIL_TICKS,
+    DEFUSE_KEEP_AFTER_ACTION_TICKS,
     SAVE_KEEP_TICKS,
     RoundWindow,
     plan_round_windows,
@@ -313,7 +313,7 @@ def test_obvious_defuse_trims_when_ts_dead_and_2s_left() -> None:
     d = _defuse_base(plant=plant, defuse=defuse, last_action=last)
     wins = plan_round_windows(d, steam_id=POV)
     assert wins[0].trimmed
-    assert wins[0].end_tick == defuse - DEFUSE_PRE_TAIL_TICKS
+    assert wins[0].end_tick == last + DEFUSE_KEEP_AFTER_ACTION_TICKS
     assert "defuse" in wins[0].reason
 
 

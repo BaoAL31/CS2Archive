@@ -44,12 +44,15 @@ from cs2archive.faceit.intro_prepend import (  # noqa: E402
     _swap_autoexec,
 )
 from cs2archive.csdm_segments import sequence, tick_range_config  # noqa: E402
+from cs2archive.config import settings  # noqa: E402
+from cs2archive.render.hook_aware import run_csdm_hook_aware  # noqa: E402
 from cs2archive.shorts.render_shorts import (  # noqa: E402
     _ffmpeg_settings,
     _find_sequence_files,
     _resolve_player_resolution,
-    _run_csdm_hook_aware,
 )
+
+CSDM = settings.csdm_cmd
 
 # Shorts-format HUD: killfeed only. Kept in the cfg as well as in the CSDM
 # sequence envelope (showOnlyDeathNotices) — belt and braces, same as
@@ -259,6 +262,26 @@ def render_hook(timeline_path: Path, width: int | None = None,
                     pass
         segments_dir.mkdir(parents=True, exist_ok=True)
         cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        from cs2archive.pov.render_version_check import (  # noqa: E402
+            RenderVersionError,
+            assert_render_versions,
+        )
+        try:
+            vers = assert_render_versions(demo_path)
+            print(
+                f"  [OK] versions demo={vers.get('demo')} cs2={vers.get('cs2')} "
+                f"hlae={vers.get('hlae')} csdm={vers.get('csdm')}"
+            )
+        except RenderVersionError as e:
+            payload = json.dumps({
+                "error": True,
+                "step": 5,
+                "step_name": "hook",
+                "code": e.code,
+                "message": e.message,
+            })
+            print(f"[PIPELINE_ERROR] {payload}")
+            raise SystemExit(1)
         # Write the game's render autoexec ourselves (crosshair + viewmodel +
         # rename + spec-lock, exactly like the POV render) instead of relying
         # on the leftover file from a previous render.
@@ -271,14 +294,36 @@ def render_hook(timeline_path: Path, width: int | None = None,
         _write_spec_lock_cfg(demo_name)
         _swap_autoexec(AUTOEXEC_RENDER)
         try:
-            _run_csdm_hook_aware(cfg_path, segments_dir, "hook",
-                                 hook_timeout=hook_timeout, hook_retries=hook_retries)
+            # Hardened detector (hook_aware): AfxHook query + ffmpeg delta +
+            # fast fail with a named stage. The legacy shorts poller only
+            # counted sequence files and burned the full timeout blind.
+            # hook_retries counts TOTAL attempts here; the wrapper counts
+            # EXTRA attempts after the first.
+            cmd = [CSDM, "video", "--config-file", str(cfg_path.resolve())]
+            video = run_csdm_hook_aware(
+                cmd, "hook", segments_dir,
+                hook_timeout=hook_timeout,
+                hook_retries=max(0, hook_retries - 1),
+            )
+            if video is None:
+                print(f"[ERROR] CS2 failed to hook (no sequence produced "
+                      f"in {hook_timeout:.0f}s per attempt).",
+                      file=sys.stderr)
+                raise SystemExit(1)
         finally:
             _restore_autoexec()
         segs = _find_sequence_files(segments_dir, expected)
         if len(segs) < expected:
-            print(f"[ERROR] expected {expected} segment(s), found {len(segs)}",
-                  file=sys.stderr)
+            # A partial CSDM batch (sequence 1 rendered, the rest died)
+            # must not ship a truncated cold open: zip(flat, segs) would
+            # silently shorten hook_render.json. Fail loudly instead.
+            payload = json.dumps({
+                "error": True, "step": 5, "step_name": "hook",
+                "code": "HOOK_PARTIAL_SEGMENTS",
+                "message": f"expected {expected} segment(s), found {len(segs)}",
+            })
+            print(f"[PIPELINE_ERROR] {payload}")
+            raise SystemExit(1)
     else:
         print("  [resume] all segments present, skipping CSDM")
 

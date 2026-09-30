@@ -1448,7 +1448,7 @@ class Pipeline:
                 getattr(self.args, "overlay_batches", 10),
                 util_cams_root=self.render_dir / "utility_cams",
                 work_dir=work_dir,
-                keyboard=bool(getattr(self.args, "keyboard", False)),
+                keyboard=bool(getattr(self.args, "keyboard", True)),
                 freeze=bool(getattr(self.args, "freeze", False)),
                 include_straightforward=(not bool(
                     getattr(self.args, "straightforward_filter", False))),
@@ -2080,7 +2080,7 @@ class Pipeline:
                 cmd += ["--video", str(pov_vid)]
             if self.steam_id:
                 cmd += ["--steam-id", self.steam_id]
-            if bool(getattr(self.args, "keyboard", False)):
+            if bool(getattr(self.args, "keyboard", True)):
                 cmd += ["--keyboard"]
             kd = self._faceit_kd()
             if kd is not None:
@@ -2128,7 +2128,7 @@ class Pipeline:
         ]
         if bg_override is not None:
             cmd += ["--background", str(bg_override)]
-        if bool(getattr(self.args, "keyboard", False)):
+        if bool(getattr(self.args, "keyboard", True)):
             cmd += ["--keyboard"]
         if self.steam_id:
             cmd += ["--steam-id", self.steam_id]
@@ -2253,7 +2253,7 @@ class Pipeline:
         if self.tournament and not self.is_faceit:
             titlize_args += ["--tournament", self.tournament]
         if not self.is_faceit and variant == "overlay" \
-                and bool(getattr(self.args, "keyboard", False)):
+                and bool(getattr(self.args, "keyboard", True)):
             titlize_args += ["--keyboard"]
 
         r = self._run_py(titlize_args, capture_output=True, text=True, timeout=15)
@@ -2369,10 +2369,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--keyboard",
-        action="store_true",
-        default=False,
-        help="Also overlay real-time keyboard/mouse input sprites in step 4 "
-             "(default: off — util-cam PiPs only).",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Overlay real-time keyboard/mouse input sprites in step 4 "
+             "(default: on — util-cam PiPs plus input overlay; --no-keyboard "
+             "for PiPs only).",
     )
     parser.add_argument(
         "--overlay-style",

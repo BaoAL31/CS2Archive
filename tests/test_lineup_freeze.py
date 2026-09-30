@@ -377,7 +377,7 @@ def _titlize(ratings: Path, *extra: str) -> dict:
 
 
 def test_overlay_branding_drops_input_by_default(tmp_path):
-    meta = _titlize(_ratings_fixture(tmp_path))
+    meta = _titlize(_ratings_fixture(tmp_path), "--no-keyboard")
     assert "input overlay" not in meta["tags"]
     assert "keyboard overlay" not in meta["tags"]
     assert "mouse input" not in meta["tags"]

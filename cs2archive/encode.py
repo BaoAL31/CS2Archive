@@ -55,6 +55,10 @@ CAPTURE = NVENC(preset="p7", cq=15)
 SCALE = NVENC(preset="p5", cq=8, maxrate="200M", bufsize="400M")
 # FREEZE: overlay/lineup_freeze PiP clips. Same numbers as SCALE but p7 (short clips, cheap).
 FREEZE = NVENC(preset="p7", cq=8, maxrate="200M", bufsize="400M")
+# DISSOLVE: concat_rounds' obvious-defuse junction pass. Same situation as
+# SCALE (input already encoded, re-encoded again by scale + overlay after),
+# so the same numbers — distinct name so the site stays greppable.
+DISSOLVE = NVENC(preset="p5", cq=8, maxrate="200M", bufsize="400M")
 
 # ── delivery ────────────────────────────────────────────────────────────────────────────────────
 # FINAL: uploaded verbatim (YouTube copy + outro append are -c copy). 1440p text/UI edges are the
@@ -87,7 +91,7 @@ PREVIEW = NVENC(preset="p7")
 BY_NAME = {
     "capture": CAPTURE, "scale": SCALE, "freeze": FREEZE, "final": FINAL,
     "final_nocap": FINAL_NOCAP, "edit": EDIT, "edit_bare": EDIT_BARE,
-    "bilibili": BILIBILI, "preview": PREVIEW,
+    "bilibili": BILIBILI, "preview": PREVIEW, "dissolve": DISSOLVE,
 }
 
 

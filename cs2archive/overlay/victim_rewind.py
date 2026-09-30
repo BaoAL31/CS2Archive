@@ -428,6 +428,7 @@ def _reasons_for_kill(
     smokes: list[dict],
     flick_kills: set[tuple[str, int]],
     mesh_open_fn,
+    trade_kills: list[dict] | None = None,
 ) -> tuple[list[str], dict]:
     weapon = _weapon(k)
     aid = str(k.get("attacker_sid") or "")
@@ -457,7 +458,9 @@ def _reasons_for_kill(
     elif snap:
         reasons.append("flick")
 
-    if (peek or slow_peek) and _is_gun(weapon) and not is_trade(k, kills):
+    if (peek or slow_peek) and _is_gun(weapon) and not is_trade(
+        k, trade_kills if trade_kills is not None else kills,
+    ):
         # No HP requirement: a 0.25s LOS flick onto a tagged victim is still
         # an elite reaction (kyousuke 61341/61460: 16/20 HP). Missing snaps
         # still fail closed (hp None -> reject).
@@ -518,6 +521,7 @@ def detect_rewinds(
     smokes: list[dict] | None = None,
     flick_kills: set[tuple[str, int]] | None = None,
     mesh_open_fn=None,
+    trade_kills: list[dict] | None = None,
 ) -> list[dict]:
     """Return at most one rewind payload per kill. All matching reasons are kept."""
     fires = fires or []
@@ -534,6 +538,7 @@ def detect_rewinds(
             smokes=smokes,
             flick_kills=flick_kills,
             mesh_open_fn=mesh_open_fn,
+            trade_kills=trade_kills,
         )
         if not reasons:
             continue
@@ -631,8 +636,6 @@ def detect_from_demo(demo_path: Path, player: str | None = None) -> list[dict]:
                 continue
             aid = _sid(row.get("attacker_steamid"))
             vid = _sid(row.get("user_steamid"))
-            if player and aid != str(player):
-                continue
             weapon = str(row.get("weapon", "") or "").strip().lower()
             kills.append({
                 "tick": tick,
@@ -649,6 +652,13 @@ def detect_from_demo(demo_path: Path, player: str | None = None) -> list[dict]:
                 "thrusmoke": _as_bool(row.get("thrusmoke")),
                 "distance": float(row.get("distance") or 0.0) if row.get("distance") == row.get("distance") else 0.0,
             })
+
+    # The trade check (is_trade) needs everyone's kills — a teammate's death
+    # at the victim's hands is what disqualifies a trade — but snapshots and
+    # output stay POV-scoped (perf + the caller's contract).
+    all_kills = kills
+    kills = [k for k in all_kills
+             if not player or k["attacker_sid"] == str(player)]
 
     needed: set[int] = set()
     sids: set[str] = set()
@@ -701,6 +711,7 @@ def detect_from_demo(demo_path: Path, player: str | None = None) -> list[dict]:
         smokes=smokes,
         flick_kills=flick_kills,
         mesh_open_fn=mesh_open_fn,
+        trade_kills=all_kills,
     )
 
 

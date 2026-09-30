@@ -229,3 +229,101 @@ def test_first_sighting_is_reported_once():
     v2 = hook_aware.classify_hook_poll(_q(1), unknown_streak=0, hooked_at=1.0, elapsed=2.0)
     assert v1.first_sighting is True
     assert v2.first_sighting is False
+
+
+def _startup_settings(tmp_path, *, plugin, params):
+    import json
+
+    from pathlib import Path
+
+    path = Path(tmp_path) / "settings.json"
+    path.write_text(
+        json.dumps({"playback": {
+            "cs2PluginVersion": plugin, "launchParameters": params}}),
+        encoding="utf-8")
+    return path
+
+
+def test_startup_fix_check_flags_inactive_plugin(monkeypatch, tmp_path):
+    import cs2archive.misc.install_csdm_startup_fix as fix
+
+    monkeypatch.setattr(fix, "VERSION", "x_fix_1")
+    reason = hook_aware.check_csdm_startup_fix(
+        _startup_settings(tmp_path, plugin="latest",
+                          params="-steam +csdm_initialize"),
+        tmp_path / "game")
+    assert reason is not None and "x_fix_1" in reason
+
+
+def test_startup_fix_check_flags_missing_token(monkeypatch, tmp_path):
+    import cs2archive.misc.install_csdm_startup_fix as fix
+
+    monkeypatch.setattr(fix, "VERSION", "x_fix_1")
+    monkeypatch.setattr(fix, "COMMAND", "+x_init")
+    reason = hook_aware.check_csdm_startup_fix(
+        _startup_settings(tmp_path, plugin="x_fix_1", params="-steam"),
+        tmp_path / "game")
+    assert reason is not None and "+x_init" in reason
+
+
+def test_startup_fix_check_flags_unreadable_settings(tmp_path):
+    reason = hook_aware.check_csdm_startup_fix(
+        tmp_path / "nope.json", tmp_path / "game")
+    assert reason is not None
+
+
+def test_startup_fix_check_active_world(monkeypatch, tmp_path):
+    import hashlib
+
+    import cs2archive.misc.install_csdm_startup_fix as fix
+
+    payload = b"patched-plugin-bytes"
+    game_dll = b"game-dll-bytes"
+    monkeypatch.setattr(fix, "VERSION", "x_fix_1")
+    monkeypatch.setattr(fix, "COMMAND", "+x_init")
+    monkeypatch.setattr(fix, "PATCHED_SHA256",
+                        hashlib.sha256(payload).hexdigest())
+    monkeypatch.setattr(fix, "STOCK_SHA256",
+                        hashlib.sha256(game_dll).hexdigest())
+    plugin_dir = tmp_path / "csdm-plugins"
+    plugin_dir.mkdir()
+    (plugin_dir / "server_x_fix_1.dll").write_bytes(payload)
+    monkeypatch.setattr(fix, "plugin_dir", lambda: plugin_dir)
+    game = tmp_path / "game"
+    mounted = game / "game" / "csgo" / "bin" / "win64"
+    mounted.mkdir(parents=True)
+    (mounted / "server.dll").write_bytes(game_dll)
+    reason = hook_aware.check_csdm_startup_fix(
+        _startup_settings(tmp_path, plugin="x_fix_1",
+                          params="-steam +x_init"),
+        game)
+    assert reason is None
+
+
+def test_startup_fix_check_flags_hand_patched_game_dll(monkeypatch, tmp_path):
+    """The installer never replaces the game binary — a mounted server.dll
+    that hashes to the patched build means a hand copy, which is
+    unsupported. Plain CS2 updates change this hash routinely; that drift
+    belongs to the version gate, not this check."""
+    import hashlib
+
+    import cs2archive.misc.install_csdm_startup_fix as fix
+
+    payload = b"patched-plugin-bytes"
+    monkeypatch.setattr(fix, "VERSION", "x_fix_1")
+    monkeypatch.setattr(fix, "COMMAND", "+x_init")
+    monkeypatch.setattr(fix, "PATCHED_SHA256",
+                        hashlib.sha256(payload).hexdigest())
+    plugin_dir = tmp_path / "csdm-plugins"
+    plugin_dir.mkdir()
+    (plugin_dir / "server_x_fix_1.dll").write_bytes(payload)
+    monkeypatch.setattr(fix, "plugin_dir", lambda: plugin_dir)
+    game = tmp_path / "game"
+    mounted = game / "game" / "csgo" / "bin" / "win64"
+    mounted.mkdir(parents=True)
+    (mounted / "server.dll").write_bytes(payload)
+    reason = hook_aware.check_csdm_startup_fix(
+        _startup_settings(tmp_path, plugin="x_fix_1",
+                          params="-steam +x_init"),
+        game)
+    assert reason is not None and "by hand" in reason

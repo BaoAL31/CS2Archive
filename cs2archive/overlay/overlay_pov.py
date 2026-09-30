@@ -1024,7 +1024,7 @@ def run_overlay(
     util_cams_root: Path | None = None,
     work_dir: Path | None = None,
     allow_missing_util_cams: bool = False,
-    keyboard: bool = False,
+    keyboard: bool = True,
     freeze: bool = False,
     include_straightforward: bool = True,
     overlay_style: str = "auto",
@@ -1033,9 +1033,9 @@ def run_overlay(
 ) -> None:
     """Apply utility throw flight PiP (plus optional keyboard overlay) onto video_path (in place).
 
-    ``keyboard=False`` (default) skips the demoparser2 input extraction, key
-    sprites, and keyboard filter entirely — output is util-cam PiPs only.
-    Pass ``keyboard=True`` (or ``--keyboard``) for the input overlay.
+    ``keyboard=True`` (default) adds the demoparser2 input extraction, key
+    sprites, and keyboard filter — output is util-cam PiPs plus the input
+    overlay. Pass ``keyboard=False`` (or ``--no-keyboard``) for PiPs only.
 
     ``overlay_style="auto"`` (default) picks the button preset with the most
     press contrast for the map (amber on Nuke, ghost-cyan on warm sand maps);
@@ -1747,9 +1747,10 @@ def main() -> None:
                          help="Force an overlay without PiPs even when some util-cam "
                               "flight clips are missing (default: hard-fail so broken "
                               "output is never shipped silently).")
-    parser.add_argument("--keyboard", action="store_true", default=False,
-                         help="Also overlay real-time keyboard/mouse input sprites "
-                              "(default: off — util-cam PiPs only).")
+    parser.add_argument("--keyboard", action=argparse.BooleanOptionalAction,
+                         default=True,
+                         help="Overlay real-time keyboard/mouse input sprites "
+                              "(default: on; --no-keyboard for util-cam PiPs only).")
     parser.add_argument("--overlay-style", default="auto",
                          help="Button preset for --keyboard: auto (default, picks "
                               "by map contrast), classic, broadcast or ghost.")

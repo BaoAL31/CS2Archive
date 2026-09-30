@@ -8,6 +8,7 @@ pinned by a golden test (`tests/test_encode_profiles.py`):
 |---|---|---|---|
 | `CAPTURE` | p7 / cq15 | none | `render_pov` CSDM capture config (mezzanine) |
 | `SCALE` | p5 / cq8 | maxrate 200M (bufsize 400M) | `concat_rounds` 1080p→1440p upscale |
+| `DISSOLVE` | p5 / cq8 | maxrate 200M (bufsize 400M) | `concat_rounds` obvious-defuse junction pass (same numbers as SCALE, distinct name) |
 | `FREEZE` | p7 / cq8 | maxrate 200M | `lineup_freeze` PiP clips |
 | `FINAL` | p7 / cq15 | maxrate 60M (bufsize 120M) | delivered export: `overlay_encode`, prepends, `assemble_reel` |
 | `FINAL_NOCAP` | p7 / cq15 | none | intermediates that get re-encoded later |
@@ -131,4 +132,4 @@ After rendering all rounds with `python scripts/pov/render_pov.py`, join them in
 ```powershell
 python scripts/pov/concat_rounds.py <renders_folder>
 ```
-Output is `combined.mp4` in the same folder. Concat is incremental (one batch at a time with ffmpeg stream copy), then upscaled to 1440p via CUDA Lanczos. Each batch file is deleted after successful append — remaining `batch-*.mp4` files on disk indicate which batches still need to be concat'd on resume.
+Output is `combined.mp4` in the same folder. Concat is incremental (one batch at a time with ffmpeg stream copy), then upscaled to 1440p via CUDA Lanczos. Each batch file is deleted after successful append — remaining `batch-*.mp4` files on disk indicate which batches still need to be concat'd on resume. Rounds trimmed as obvious defuses (`round_windows.json`) are dissolved into the next round pre-scale in one uniform NVENC pass (xfade 1.2s + audio acrossfade, `DISSOLVE` profile, AAC audio); each dissolve shortens the timeline by the fade, so later `round_offsets` shift — tracked idempotently in `combined.dissolves.json`.

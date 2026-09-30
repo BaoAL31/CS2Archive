@@ -43,6 +43,7 @@ from cs2archive.highlights.build_action_timeline import (  # noqa: E402
 from cs2archive.paths import pov_dir as _pov_dir  # noqa: E402
 from cs2archive.weapons import headshot_bonus, weapon_tier  # noqa: E402
 from cs2archive.pov.hook_plan import plan_hook, planned_seconds  # noqa: E402
+from thumbnail.utils import KILLFEED_POV_SECONDS  # noqa: E402
 
 # Ordered tiers, best first. ``tier_rank`` is the position here.
 #
@@ -137,8 +138,17 @@ def _kills(short: dict) -> int:
     return len(short.get("kill_ticks") or [])
 
 
-def tier_of(short: dict) -> str | None:
-    """Best tier name for a detected short, or None if it does not qualify."""
+def tier_of(short: dict, tickrate: int = 64) -> str | None:
+    """Best tier name for a detected short, or None if it does not qualify.
+
+    Multikills (5k / 4k / punch_up, incl. the perfect_shots fold-back) only
+    keep their tier when every kill would still be on the HUD killfeed —
+    first-to-last kill within ``KILLFEED_POV_SECONDS`` (the thumbnail
+    script's rule). A 4k spread across the round reads as four solos to a
+    viewer; it must not headline a cold open. Dropped multikills vanish as
+    a tier but their kills still flow through the separate single
+    detectors (insta / punch_up_single), so nothing fast is lost.
+    """
     st = short.get("short_type")
     kills = _kills(short)
     if st == "clutch":
@@ -153,12 +163,36 @@ def tier_of(short: dict) -> str | None:
         # Ammo-efficiency shorts are not a tier any more, but a >=4-kill one was
         # EXCLUDED from the 4k short by the detector — fold it back so the hook
         # still sees it. A sub-4-kill 4-tap is not hook material.
-        return "4k" if kills >= 4 else None
+        if kills < 4:
+            return None
+        return "4k" if _multikill_fits_killfeed(short, tickrate) else None
     if kills >= 5:
-        return "5k"
+        return "5k" if _multikill_fits_killfeed(short, tickrate) else None
     if kills >= 4:
+        if not _multikill_fits_killfeed(short, tickrate):
+            return None
         return "punch_up" if short.get("punch_up_tags") else "4k"
     return None
+
+
+def _multikill_fits_killfeed(short: dict, tickrate: int = 64) -> bool:
+    """True when every kill of this multikill sits on the feed together.
+
+    POV killfeed rows live ``KILLFEED_POV_SECONDS`` (7.5s — the Thumbnail
+    rule in thumbnail/utils.py). A multikill whose first kill already
+    faded is not a multikill on screen; it must not keep the tier.
+    """
+    try:
+        ticks = sorted(int(t) for t in (short.get("kill_ticks") or []))
+    except (TypeError, ValueError):
+        return False
+    if len(ticks) < 2:
+        return True
+    try:
+        window = max(1, int(round(float(tickrate) * KILLFEED_POV_SECONDS)))
+    except (TypeError, ValueError):
+        window = int(round(64 * KILLFEED_POV_SECONDS))
+    return ticks[-1] - ticks[0] <= window
 
 
 def _rank_reason(tier: str, short: dict) -> str:
@@ -203,7 +237,7 @@ def _map_mesh_available(map_name: str) -> bool:
 
 INSTA_PAIR_SECONDS = 3.0  # non-flick insta kills must pair within this to qualify
 INSTA_CLEAN_HP = 90.0  # ...and at least one victim at/above this (0 disables)
-INSTA_RULE_VERSION = 7  # bumped whenever the insta rule changes (stale caches rebuild)
+INSTA_RULE_VERSION = 8  # bumped whenever the insta rule changes (stale caches rebuild)
 
 # ── Peek-kill vs back-shot (council-reviewed taper) ─────────────────────
 # victim_hold_deg = angle between the victim's view and the direction to the
@@ -570,6 +604,13 @@ def timeline_moment_candidates(moments: list[dict], player_sid: str,
     ``timeline_kills`` (the slice's kills) funds the headshot bonus for the
     POV player's own headshot kills in the moment; ``rows`` (rewind rows)
     fund the peek/flick enrichment on the same ticks.
+    Kill sets are POV-only: a moment window can carry teammates' kills
+    (e.g. T-on-T teamkills inside a duel engagement) and the planner chains
+    + windows on every tick it is given — other people's kills under a
+    spec-locked camera are dead air, so ticks outside ``timeline_kills``
+    are dropped, and moments with no POV kill left are skipped outright.
+    (``timeline_kills=None`` keeps the legacy unfiltered sets; the only
+    production caller always passes them.)
     """
     by_tick: dict[int, dict] = {}
     for k in timeline_kills or []:
@@ -592,6 +633,8 @@ def timeline_moment_candidates(moments: list[dict], player_sid: str,
         if t not in _MOMENT_TIER_TYPES or t not in enabled:
             continue
         kills = sorted({int(k) for k in (m.get("kill_ticks") or [])})
+        if timeline_kills is not None:
+            kills = [tick for tick in kills if tick in by_tick]
         if not kills:
             continue
         hs_bonus = 0.0
@@ -629,6 +672,10 @@ def timeline_moment_candidates(moments: list[dict], player_sid: str,
             "start_tick": int(m.get("start_tick", kills[0])),
             "end_tick": int(m.get("end_tick", kills[-1])),
             "kill_ticks": kills,
+            # Trade moments are per-kill revenge by construction, so every
+            # kill here is a trade (duel/opener carry none — a revenge kill
+            # within 5s would have its own trade moment and merge).
+            "trade_ticks": list(kills) if t == "trade" else [],
             "round_win_tick": None,
             "clutch_initial_count": "",
             "rank_reason": f"{t} moment ({m.get('id', '?')})",
@@ -708,6 +755,13 @@ def _sort_key(m: dict):
             m["start_tick"])
 
 
+# A traded kill forfeits the maximum reaction credit an insta can earn: the
+# ttk term peaks at (0.5 - 0) * 200 = 100, so each traded tick deters 100.
+# Tier/kill/headshot points are untouched — a traded 2K still outscores a
+# traded single, it just never earns reaction credit for the revenge.
+TRADE_DETER_POINTS = 100.0
+
+
 def moment_quality(m: dict) -> float:
     """Impressiveness score for one picked moment (higher = better).
 
@@ -716,8 +770,9 @@ def moment_quality(m: dict) -> float:
     (every headshot the same, counted once per kill tick no matter how many
     fused candidates reference it — chained kills add up, so 2 headshots
     outscore 1), then faster reactions, then bigger clutch disadvantages.
-    Pure — drives the least-impressive-first assembly order so the hook
-    builds to its climax.
+    Traded kills deter flat (see TRADE_DETER_POINTS) — a revenge kill never
+    earns reaction credit. Pure — drives the least-impressive-first assembly
+    order so the hook builds to its climax.
     """
     rank = int(m.get("tier_rank", 99))
     score = (len(TIER_ORDER) - rank) * 1000.0
@@ -741,6 +796,10 @@ def moment_quality(m: dict) -> float:
             score += max(0.0, 0.5 - float(ttk)) * 200.0
         except (TypeError, ValueError):
             pass
+    try:
+        score -= len(m.get("trade_ticks") or []) * TRADE_DETER_POINTS
+    except TypeError:
+        pass
     initial = str(m.get("clutch_initial_count") or "")
     if "v" in initial:
         try:
@@ -797,6 +856,16 @@ def _merge_moments(target: dict, src: dict) -> None:
                 except (TypeError, ValueError):
                     continue
     target["peek_ticks"] = merged_peek
+    # Trade ticks union like kills: a traded kill stays deterred no matter
+    # which chain absorbs it.
+    merged_trade: set[int] = set()
+    for src_ticks in (target.get("trade_ticks"), src.get("trade_ticks")):
+        for k in src_ticks or []:
+            try:
+                merged_trade.add(int(k))
+            except (TypeError, ValueError):
+                continue
+    target["trade_ticks"] = sorted(merged_trade)
     # Flick speed: the fastest crosshair wins — never summed.
     try:
         f_src = src.get("flick_speed")
@@ -904,6 +973,32 @@ def fill_to_target(chains: list[dict], *, tickrate: int,
     return picked, total
 
 
+def enforce_footage_budget(chains: list[dict], tickrate: int,
+                           max_seconds: float,
+                           all_kill_ticks: list[int] | None = None,
+                           ) -> list[dict]:
+    """Drop the weakest chains until the PLANNED footage fits max_seconds.
+
+    The budget bounds what gets rendered, so it must measure planned windows
+    (what the viewer sees), not uncut detection spans: a two-kill moment can
+    span ~60s of detection while shipping 4s, and budgeting spans evicts good
+    chains on phantom footage. Quality must already be stamped (weakest drops
+    first); always keeps at least one chain. Pure.
+    """
+    chains = list(chains)
+    while len(chains) > 1:
+        total = sum(
+            planned_seconds(plan_hook([m], tickrate,
+                                      all_kill_ticks=all_kill_ticks), tickrate)
+            for m in chains)
+        if total <= max_seconds:
+            break
+        chains.remove(min(chains,
+                          key=lambda m: (m.get("quality", 0.0),
+                                         m.get("start_tick", 0))))
+    return chains
+
+
 def build_hook_timeline(
     demo_path: Path,
     player: str | None = None,
@@ -946,7 +1041,7 @@ def build_hook_timeline(
             nick = (s.get("pov_nick") or "").strip().lower()
             if want not in (sid, nick):
                 continue
-        tier = tier_of(s)
+        tier = tier_of(s, int(timeline.get("tickrate") or 64))
         if tier is None or tier not in enabled:
             continue
         nick = s.get("pov_nick") or (player or "Unknown")
@@ -1004,14 +1099,6 @@ def build_hook_timeline(
     candidates.sort(key=_sort_key)
     chains = pick_moments(candidates, tickrate, max_moments)
 
-    # Upper bound (existing): drop the weakest chains until the (uncut)
-    # footage fits max_seconds.
-    while len(chains) > 1:
-        total = sum((m["end_tick"] - m["start_tick"]) / tickrate for m in chains)
-        if total <= max_seconds:
-            break
-        chains.pop()
-
     # Target fill: stamp quality levels, then accumulate best-first until
     # the PLANNED footage reaches min_seconds — the minimum number of
     # segments to reach the bar. Short of the bar: no hook (normal skip).
@@ -1025,6 +1112,8 @@ def build_hook_timeline(
                             if str(k.get("attacker_steam_id") or "") == str(sid)})
     except (TypeError, ValueError):
         all_ticks = []
+    chains = enforce_footage_budget(chains, tickrate, max_seconds,
+                                    all_kill_ticks=all_ticks or None)
     picked, planned_total = fill_to_target(chains, tickrate=tickrate,
                                            min_seconds=min_seconds,
                                            all_kill_ticks=all_ticks or None)

@@ -51,3 +51,10 @@ def test_scale_profile_matches_the_mezzanine_upscale_pass():
 def test_every_named_profile_is_reachable_by_name():
     for name, profile in encode.BY_NAME.items():
         assert encode.args_for(name) == encode.codec_args(profile)
+
+
+def test_dissolve_profile_mirrors_scale():
+    # concat_rounds' obvious-defuse junction pass: same situation as SCALE
+    # (already-encoded input, re-encoded again by scale + overlay after), so
+    # the same numbers under a distinct name. Pinned so drift shows up here.
+    assert encode.codec_args(encode.DISSOLVE) == encode.codec_args(encode.SCALE)

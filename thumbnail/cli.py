@@ -93,10 +93,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--keyboard",
-        action="store_true",
-        default=False,
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Overlay video includes the keyboard input overlay (adds the "
-             "W/ INPUT OVERLAY badge pill; default: util-cams badge only).",
+             "W/ INPUT OVERLAY badge pill; --no-keyboard for util-cams badge only).",
     )
     parser.add_argument("--output", "-o", help="Output path (defaults to youtube/...)")
     args = parser.parse_args()

@@ -15,7 +15,11 @@ import time
 from pathlib import Path
 
 from cs2archive.config import settings
-from cs2archive.pov.round_windows import load_voided_rounds
+from cs2archive.pov.round_windows import load_round_windows, load_voided_rounds
+from cs2archive.pov.save_transition import (
+    FADE_SECONDS as DISSOLVE_FADE_SECONDS,
+    dissolve_junctions,
+)
 from cs2archive import encode
 
 FFMPEG = settings.ffmpeg_exe
@@ -460,6 +464,77 @@ def concat_rounds(folder: Path, allow_gaps: bool = False) -> Path:
             # for whatever rounds we have (critical for --skip-failed-rounds)
 
     total_rounds = len(round_offsets)
+
+    # Dissolve obvious-defuse round ends (crossfade into the next round).
+    # Single uniform NVENC re-encode pre-scale — no stream-copy seams — so each
+    # dissolve shortens the timeline by the fade and later offsets shift.
+    # Marker-idempotent: concat resume reuses baked dissolves, only new
+    # junctions are processed (times are always read from current offsets).
+    if seq_fields:
+        final_prd: dict[int, float] = dict(seq_fields["per_round_durations"])
+    else:
+        final_prd = {}
+    if not final_prd:
+        _srs = sorted(round_offsets)
+        for _i, _rn in enumerate(_srs):
+            _nx = _srs[_i + 1] if _i + 1 < len(_srs) else None
+            final_prd[_rn] = (
+                round_offsets[_nx] - round_offsets[_rn]
+                if _nx is not None else cumulative - round_offsets[_rn]
+            )
+    _windows = load_round_windows(folder / "round_windows.json")
+    _requested = sorted(
+        w.number for w in _windows
+        if w.trimmed and "obvious defuse trim" in (w.reason or "")
+        and w.number in round_offsets
+    )
+    _marker_path = folder / "combined.dissolves.json"
+    try:
+        _raw_marker = json.loads(_marker_path.read_text(encoding="utf-8"))
+        if not isinstance(_raw_marker, dict):
+            raise ValueError("marker is not a JSON object")
+        _done = {int(x) for x in _raw_marker.get("rounds", [])}
+    except FileNotFoundError:
+        _done = set()
+    except (OSError, TypeError, ValueError):
+        raise RuntimeError(
+            f"DISSOLVE_MARKER_CORRUPT: {_marker_path} unreadable — delete it "
+            f"and {combined.name} to redo concat from clips"
+        )
+    if _requested and not set(_requested) >= _done:
+        raise RuntimeError(
+            f"DISSOLVE_MISMATCH: round_windows.json wants dissolves for "
+            f"{_requested} but {combined.name} already dissolved {sorted(_done)}; "
+            f"delete {combined.name} and {_marker_path.name} to redo concat from clips"
+        )
+    _new_rounds = [r for r in _requested if r not in _done]
+    if _new_rounds:
+        _srs = sorted(round_offsets)
+        _times = []
+        for r in _new_rounds:
+            _nx = next((x for x in _srs if x > r), None)
+            _times.append(round_offsets[_nx] if _nx is not None else cumulative)
+        _tmp = folder / "_dissolve.mp4"
+        _kept = dissolve_junctions(
+            combined, _times, _tmp, fade_seconds=DISSOLVE_FADE_SECONDS)
+        _tmp.replace(combined)
+        _kept_rounds = [_new_rounds[_times.index(t)] for t in _kept]
+        for r in _kept_rounds:
+            final_prd[r] -= DISSOLVE_FADE_SECONDS
+        cumulative = 0.0
+        for _rn in _srs:
+            round_offsets[_rn] = cumulative
+            cumulative += final_prd[_rn]
+        for b in batch_offsets:
+            _rng = list(range(b["round_start"], b["round_end"] + 1))
+            if all(x in final_prd for x in _rng):
+                b["duration_seconds"] = sum(final_prd[x] for x in _rng)
+        _marker_path.write_text(json.dumps({
+            "rounds": sorted(_done | set(_kept_rounds)),
+            "fade": DISSOLVE_FADE_SECONDS,
+            "total": round(cumulative, 3),
+        }, indent=2), encoding="utf-8")
+
     payload = {
         "total_rounds": total_rounds,
         "total_duration_seconds": cumulative,
@@ -471,7 +546,7 @@ def concat_rounds(folder: Path, allow_gaps: bool = False) -> Path:
             str(k): list(v) for k, v in seq_fields["per_round_ticks"].items()
         }
         payload["per_round_durations"] = {
-            str(k): round(v, 3) for k, v in seq_fields["per_round_durations"].items()
+            str(k): round(v, 3) for k, v in final_prd.items() if k in seq_fields["per_round_durations"]
         }
     with open(offset_path, "w") as f:
         json.dump(payload, f, indent=2)

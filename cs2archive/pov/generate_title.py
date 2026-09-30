@@ -143,10 +143,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--keyboard",
-        action="store_true",
-        default=False,
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Overlay video includes the keyboard/mouse input overlay "
-             "(default: off — util-cam PiPs only; drops input tags/desc).",
+             "(default: on; --no-keyboard drops input tags/desc).",
     )
     parser.add_argument("--crosshair-code", default="",
                         help="POV player's crosshair share code (from csdm analysis)")
@@ -300,7 +300,7 @@ def main() -> None:
     ]))
 
     if args.variant == "overlay":
-        if bool(getattr(args, "keyboard", False)):
+        if bool(getattr(args, "keyboard", True)):
             extra_overlay_tags = [
                 "input overlay",
                 "utility cam",

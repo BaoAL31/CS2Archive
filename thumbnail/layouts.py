@@ -64,10 +64,10 @@ def _draw_pill(
 def _draw_overlay_badge(img: Image.Image, keyboard: bool = True) -> None:
     """Draw stacked pills in top-left corner for the overlay variant.
 
-    With the keyboard input overlay on (legacy), the primary pill reads
+    With the keyboard input overlay on (default), the primary pill reads
     ``W/ INPUT OVERLAY`` (always-on keyboard state) and a secondary
-    ``+ UTIL CAMS`` pill is stacked below. With keyboard off (default),
-    a single ``W/ UTIL CAMS`` pill is drawn instead.
+    ``+ UTIL CAMS`` pill is stacked below. With keyboard off
+    (``--no-keyboard``), a single ``W/ UTIL CAMS`` pill is drawn instead.
     """
     from PIL import ImageDraw, ImageFont
 

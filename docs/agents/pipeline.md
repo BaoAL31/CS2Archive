@@ -20,10 +20,10 @@ Reads all POV metadata from the backlog file. Runs steps 1-6 in order (analyze �
 
 **Uploading is a separate step.** The pipeline stops at step 6 (thumbnail) and writes `upload_meta.json` (with `youtube_id=null`, `upload_status="pending"`). Run `python scripts/upload/upload_pending.py` afterward. Step 4 (overlay) is the default product. `--raw-only` skips overlay entirely — no overlay work directory or util_cams are created. `--until 3` also stops before overlay.
 
-**Overlay step (step 4) does three things (input + freeze are opt-in):**
+**Overlay step (step 4) does three things (freeze is opt-in, keyboard is opt-out):**
 
 1. Renders utility throw flight clips via CSDM `build_flight_command()` (chase camera) then composites as PiP overlays at bottom-left. PiPs are **keycap-free**: the render passes `burn_input_overlay=False` so CS2UtilArchive's keyboard/mouse burn never lands on the clip, and the PiP reads the flight-only source (`pip_cameras_for_util_type`). This matters most for single-camera he/flash jobs, whose deliverable path IS the standalone `flight_<throw>.mp4`.
-2. With `--keyboard`, extracts keyboard states via demoparser2 and composites the input sprites (**OFF by default**).
+2. Extracts keyboard states via demoparser2 and composites the input sprites (**ON by default**; `--no-keyboard` for PiPs only).
 3. With `--freeze`, inserts lineup freeze holds in the main POV before each non-straightforward throw (**OFF by default**). Non-straightforward = CS2UtilArchive `classify_throw` plus a CS2Archive tightened-open-lob gate: a blocked sightline whose trajectory stays in the thrower's own air volume for ≥250u (`LOFT_EXIT_MAX`) is intuitive, not a lineup. The pre-pass rewrites the sidecar offsets/durations *expanded* for the holds (batch boundaries + the voice mix need that), but the compositor maps demo ticks against the **pristine** timeline and then pushes each frame past the holds (`freeze_frame_plan` / `expand_frame`). Re-mapping on the expanded sidecar stretched each frozen round and made the PiP after a hold drift.
 
 Throw clips are rendered in sequence via CSDM/HLAE — this takes ~1-2 minutes per throw. For a full match with 20+ throws, budget 30-60 minutes.
@@ -128,7 +128,7 @@ HTTP errors (500/502/503/504) up to 20×; the subprocess-level retry in
 
 ### Overlay-only (default)
 
-The pipeline produces **one** upload from a backlog entry: the util-cam overlay at `youtube/{run_id}_overlay/` (util-cam badge on the thumbnail; `W/ INPUT OVERLAY` pill + input tags/desc only with `--keyboard`). `--raw-only` writes `youtube/{run_id}/` instead and skips step 4.
+The pipeline produces **one** upload from a backlog entry: the util-cam overlay at `youtube/{run_id}_overlay/` (thumbnail badge + `W/ INPUT OVERLAY` pill + input tags/desc by default; `--no-keyboard` drops to the `UTIL CAMS` badge). `--raw-only` writes `youtube/{run_id}/` instead and skips step 4.
 
 **Data flow:**
 1. Step 3 (concat): writes `combined.mp4` in the render dir. Raw-only copies it to `youtube/{run_id}/`. Overlay-only does **not** copy combined into the youtube dir (step 4 writes the overlay there).
@@ -200,7 +200,7 @@ After completing the pipeline for a POV (default overlay-only):
 youtube/
 └── {run_id}_overlay/
     ├── thumbnail.png       (1280×720 PNG, with overlay badge)
-    ├── video.mp4           (util-cam POV; + keyboard sprites with --keyboard)
+    ├── video.mp4           (util-cam POV + keyboard sprites by default)
     └── upload_meta.json    (no title suffix; overlay note in description/tags)
 ```
 

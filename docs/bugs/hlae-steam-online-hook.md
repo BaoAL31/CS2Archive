@@ -5,6 +5,21 @@
 
 The missing-recording failure now has a **causally tested CSDM initialization defect** (see September 21 below). The clean fix is now installed locally for CSDM 3.20.1. The broader historical association with Steam online/offline remains unproven. Older theories and mitigations below are retained as investigation history, not established explanations.
 
+## 2026-09-30: the startup fix had silently reverted; hook renders bypass the hardened detector
+
+A standalone hook render stalled exactly like the 09-21 controls (`HOOK-FAIL (no sequence in 150s)`, vanilla viewer on the desktop; retry recovered). Investigation found the 09-21 fix **inactive for six days**: the 09-24 HLAE pin swap rewrote `~/.csdm/settings.json` back to `cs2PluginVersion: "latest"` with no `+csdm_initialize` (proved by settings backups + the stock hash of the mounted `server.dll`; the patched DLL was still on disk, unreferenced, journal gone). Fix `check_csdm_startup_fix()` in `hook_aware.py` now runs inside `prepare_steam_hlae()` on every render: it asserts the plugin selection, the init token, and the plugin hash, and prints `[HLAE] Steam preflight: … startup fix active` or a loud `[WARN] CSDM startup fix INACTIVE`. The fix was reinstalled (`python -m cs2archive.misc.install_csdm_startup_fix install`).
+
+Same incident found `render_hook.py` never used the hardened wrapper — it called the legacy shorts poller (`render_shorts._run_csdm_hook_aware`), which only counts sequence files and burned the full 150s blind. It now calls `hook_aware.run_csdm_hook_aware` (AfxHook query + ffmpeg delta + named-stage fast fail) and the version gate (`assert_render_versions`, step 5 hook codes) before launch. `hook_retries` keeps its TOTAL-attempts contract (mapped to the wrapper's extra-attempts count).
+
+**Council review (4/4 APPROVED-WITH-DEFECTS, no blockers) — consensus minors applied same day:**
+- Post-engage `proc.wait(timeout=14400)` (the wrapper's batch-completion wait) is now guarded: a CSDM process that stalls mid-batch after the first sequence kills + fails cleanly instead of escaping a raw `TimeoutExpired` traceback after 4h (`hook_aware.py`).
+- A partial CSDM batch (sequence 1 rendered, the rest died) no longer ships a truncated cold open: `render_hook.py` raises `[PIPELINE_ERROR] HOOK_PARTIAL_SEGMENTS` + `SystemExit(1)` instead of `zip(flat, segs)` silently shortening `hook_render.json`.
+- The plugin-dir lookup is `install_csdm_startup_fix.plugin_dir()` (derives from the real `csdm_cmd` path, `%LOCALAPPDATA`/`~` fallback) — an unset env no longer yields a relative path that read as a false `plugin missing`; the same path is shared by the installer and the preflight so they cannot drift.
+- The all-attempts-failed error no longer prints a wrong attempt count (`hook_retries` was the TOTAL contract; the message dropped it).
+- Left as design decisions (not applied): the startup-fix check stays warn-only — an opt-in hard gate (`--require-startup-fix`) was proposed to fail fast instead of costing a render + retries; and the Shorts flow (`render_shorts.py:890`) still uses its own legacy blind poller (no external importers — it is a separate product, follow-up ticket).
+
+**How to verify the fix on the next real render:** the hardened path prints lines the legacy poller could never print — `hooked (AfxHookSource2 in Ns)` then `ffmpeg pid in Ns` — plus `[HLAE] Steam preflight: … startup fix active`. Their absence (or a `[WARN] CSDM startup fix INACTIVE`) is the signal.
+
 ## 2026-09-27: process-query failures are no longer read as "hook absent" (CR-10)
 
 **A contributor to this bug class was removed.** `hook_aware.py`'s process queries used to return an

@@ -13,9 +13,10 @@ count as a save while teammates are still fighting. A 30s save and a 60s save
 both show 15s of idle.
 
 Obvious defuse tails: CT POV alive, bomb defused with at least 2s still on the
-clock, and every T already dead. The record window stops 3s before the defuse
-completes so a free plant-defuse is not played out. A last-second defuse or a
-live T is kept in full.
+clock, and every T already dead. The record window stops 5s after the POV
+team's last action so a decided round exits instead of playing out the dead
+defuse hold (no team action on record: falls back to 3s before the defuse
+completes). A last-second defuse or a live T is kept in full.
 
 Native CSDM play already starts at freeze-128; save/defuse trims use that same
 start so buy time is not pulled back in.
@@ -35,7 +36,8 @@ SAVE_IDLE_TICKS = 30 * 64  # 30s with no fight before round end = committed save
 SAVE_KEEP_TICKS = 15 * 64  # show this much idle after last action, then cut
 BOMB_LIFETIME_TICKS = 2624  # plant->explode ~41s @64 tick (CS2 C4)
 DEFUSE_MIN_LEFT_TICKS = 128  # skip obvious defuse only if >=2s left on the bomb
-DEFUSE_PRE_TAIL_TICKS = 192  # stop 3s before a comfortable defuse completes
+DEFUSE_PRE_TAIL_TICKS = 192  # fallback: stop 3s before the defuse completes
+DEFUSE_KEEP_AFTER_ACTION_TICKS = 320  # cut 5s after the last team action
 VOIDED_FILE = ".voided_rounds.json"
 WINDOWS_FILE = "round_windows.json"
 
@@ -309,9 +311,10 @@ def _obvious_defuse_cut_end(
     if not _all_dead_by(kills, number, t_ids, defuse):
         return None
     last = _last_action_tick(data, kills, number, _teammate_steam_ids(data, steam_id))
-    cut = defuse - DEFUSE_PRE_TAIL_TICKS
     if last is not None:
-        cut = max(cut, last + 64)
+        cut = last + DEFUSE_KEEP_AFTER_ACTION_TICKS
+    else:
+        cut = defuse - DEFUSE_PRE_TAIL_TICKS
     if cut >= end or cut <= 0:
         return None
     return cut
@@ -453,6 +456,32 @@ def plan_round_windows(data: dict, steam_id: str | None = None) -> list[RoundWin
 def dump_round_windows(windows: list[RoundWindow], path: Path) -> None:
     path.write_text(json.dumps([asdict(w) for w in windows], indent=2),
                     encoding="utf-8")
+
+
+def load_round_windows(path: Path) -> list[RoundWindow]:
+    """Read back a ``round_windows.json`` written by :func:`dump_round_windows`.
+
+    Returns [] when the file is missing or corrupt (concat treats that as
+    "no dissolve junctions" rather than failing the step).
+    """
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return []
+    out: list[RoundWindow] = []
+    try:
+        for row in raw:
+            out.append(RoundWindow(
+                number=int(row["number"]),
+                start_tick=int(row["start_tick"]),
+                end_tick=int(row["end_tick"]),
+                skip=bool(row.get("skip", False)),
+                trimmed=bool(row.get("trimmed", False)),
+                reason=str(row.get("reason", "")),
+            ))
+    except (TypeError, ValueError, KeyError):
+        return []
+    return out
 
 
 def load_voided_rounds(folder: Path) -> set[int]:

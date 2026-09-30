@@ -89,6 +89,33 @@ def undo(settings_path: Path, journal: Path) -> None:
     # Keep the inactive named DLL; never delete or replace the stock plugin.
 
 
+def plugin_dir() -> Path:
+    """CSDM's stock cs2 plugin dir.
+
+    Derived from the real csdm command path when available (a non-default
+    install location), falling back to %LOCALAPPDATA%; an unset env never
+    yields a relative path (that read as a false 'plugin missing').
+    """
+    try:
+        from cs2archive.config import settings
+
+        cmd = str(settings.csdm_cmd or "")
+        if cmd:
+            cmd_path = Path(cmd)
+            if not cmd_path.is_file() and cmd_path.suffix == "":
+                for cand in (cmd_path.with_suffix(".cmd"),
+                             cmd_path.with_suffix(".exe")):
+                    if cand.is_file():
+                        cmd_path = cand
+                        break
+            if cmd_path.is_file():
+                return cmd_path.resolve().parent / "resources" / "static" / "cs2"
+    except Exception:
+        pass
+    base = os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")
+    return Path(base) / "Programs" / "cs-demo-manager" / "resources" / "static" / "cs2"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["install", "undo"])
@@ -100,7 +127,7 @@ def main() -> None:
         raise SystemExit(f"Close CS2/CSDM before changing plugin settings (processes {busy})")
     settings_path = Path.home() / ".csdm/settings.json"
     journal = ROOT / ".data/csdm-startup-fix-install.json"
-    binary_dir = Path(os.environ["LOCALAPPDATA"]) / "Programs/cs-demo-manager/resources/static/cs2"
+    binary_dir = plugin_dir()
     if args.action == "install":
         install(settings_path, binary_dir, args.binary, journal)
     else:

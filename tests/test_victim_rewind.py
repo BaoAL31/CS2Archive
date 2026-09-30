@@ -352,6 +352,30 @@ def test_insta_kill_rejects_trade():
     assert got == []
 
 
+def test_insta_kill_rejects_trade_with_pov_scoped_kills():
+    """Production path: detect_from_demo filters to POV kills, so the trade
+    exclusion must run against the FULL kill list (trade_kills). Teammate
+    dies at the victim's hands 6 ticks before the POV's kill — same shape
+    as kyousuke/Mirage r9 (68429 -> 68435)."""
+    prior = _kill(
+        tick=KILL - 6,
+        attacker_sid=VID,
+        victim_sid="9",
+        attacker_team=3,
+        victim_team=2,
+        headshot=False,
+        hitgroup="chest",
+    )
+    k = _kill()
+    got = detect_rewinds(
+        [k],
+        trade_kills=[prior, k],
+        snaps=_snaps_lookback(),
+        mesh_open_fn=_open_at_fn(_peek_open_at()),
+    )
+    assert got == []
+
+
 def test_flick_without_peek_still_qualifies():
     """Yaw-flick is enough; headshot, peek, and isolated fire are not required."""
     ticks = list(range(KILL - LOS_LOOKBACK_TICKS, KILL + 1, LOS_STRIDE))

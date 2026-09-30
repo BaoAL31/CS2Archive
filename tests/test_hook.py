@@ -59,6 +59,20 @@ def test_punch_up_is_its_own_tier():
     assert tier_of(_short(kill_ticks=[1, 2, 3, 4], punch_up_tags=["ak"])) == "punch_up"
 
 
+def test_slow_multikill_loses_its_tier():
+    # A 4k/5k spread across the round reads as solos on the HUD feed: POV
+    # killfeed rows live 7.5s (the thumbnail script's rule), so only kills
+    # that flood the feed together keep the multikill tier.
+    spread = [1, 200, 400, 600]  # 599 ticks ≈ 9.4s at 64tps
+    assert tier_of(_short(kill_ticks=spread)) is None
+    assert tier_of(_short(kill_ticks=spread + [700])) is None
+    assert tier_of(_short(kill_ticks=spread, punch_up_tags=["ak"])) is None
+    quick = [1000, 1100, 1200, 1300]  # 300 ticks ≈ 4.7s
+    assert tier_of(_short(kill_ticks=quick)) == "4k"
+    assert tier_of(_short(kill_ticks=quick, punch_up_tags=["ak"])) == "punch_up"
+    assert tier_of(_short(kill_ticks=quick + [1400])) == "5k"
+
+
 def test_three_kill_multikill_does_not_qualify():
     # The Shorts extractor only emits multikills at >= 4 kills; a 3k must not
     # silently become a hook.
@@ -406,9 +420,31 @@ def test_missing_hp_blocks_pair_but_not_solos():
     assert [m["kill_ticks"] for m in out] == [[61341], [61460]]
 
 
+def test_footage_budget_measures_planned_not_uncut():
+    from cs2archive.pov.build_hook_timeline import enforce_footage_budget
+    # 56s uncut detection span shipping one 2s window must not blow the budget.
+    wide = _cand(1000, tier_rank=8, start=0, end=3600)
+    wide["quality"] = 4000.0
+    tight = _cand(5000, tier_rank=6, start=4900, end=5200)
+    tight["quality"] = 6000.0
+    kept = enforce_footage_budget([wide, tight], TICKRATE, 60.0)
+    assert kept == [wide, tight]
+
+
+def test_footage_budget_drops_weakest_first():
+    from cs2archive.pov.build_hook_timeline import enforce_footage_budget
+    weak = _cand(1000, tier_rank=8, start=0, end=3600)
+    weak["quality"] = 4000.0
+    strong = _cand(5000, tier_rank=6, start=4900, end=5200)
+    strong["quality"] = 6000.0
+    assert enforce_footage_budget([weak, strong], TICKRATE, 3.0) == [strong]
+    # Never drops the last chain, however far over budget.
+    assert enforce_footage_budget([weak], TICKRATE, 0.5) == [weak]
+
+
 def test_rule_version_bumps_cache():
     from cs2archive.pov.build_hook_timeline import INSTA_RULE_VERSION, timeline_matches
-    assert INSTA_RULE_VERSION == 7
+    assert INSTA_RULE_VERSION == 8
     assert timeline_matches({"params": {"tiers": [], "min_round": 2,
                                         "max_moments": 3, "max_seconds": 30.0,
                                         "rule_version": 7}},
@@ -655,6 +691,34 @@ def test_moment_candidates_respect_enabled_tiers():
         moments, "x", enabled)] == ["opener"]
 
 
+def _tkill_row(tick, sid="x"):
+    return {"tick": tick, "attacker_steam_id": sid}
+
+
+def test_moment_candidates_keep_pov_kills_only():
+    # r9-duel-3 carries two T-on-T teamkills around the POV's own kill.
+    moments = [_amoment("r9-duel-3", "duel", rnd=9,
+                        kills=(68096, 68429, 68435), start=67776, end=68563)]
+    out = timeline_moment_candidates(
+        moments, "x", _penabled(), timeline_kills=[_tkill_row(68435)])
+    assert [m["kill_ticks"] for m in out] == [[68435]]
+
+
+def test_moment_candidates_drop_all_teammate_moments():
+    moments = [_amoment("r9-duel-3", "duel", rnd=9,
+                        kills=(68096, 68429), start=67776, end=68563)]
+    out = timeline_moment_candidates(
+        moments, "x", _penabled(), timeline_kills=[_tkill_row(68435)])
+    assert out == []
+
+
+def test_moment_candidates_unfiltered_without_timeline_kills():
+    moments = [_amoment("r9-duel-3", "duel", rnd=9,
+                        kills=(68096, 68429, 68435), start=67776, end=68563)]
+    out = timeline_moment_candidates(moments, "x", _penabled())
+    assert [m["kill_ticks"] for m in out] == [[68096, 68429, 68435]]
+
+
 # ── headshot bonus (every headshot the same, bodies nothing) ──────
 
 def test_headshot_bonus_flat_across_guns():
@@ -699,6 +763,25 @@ def test_hs_bonus_never_breaks_tier_order():
                   "clutch_initial_count": "", "start_tick": 2,
                   "hs_bonus": 75.0}
     assert moment_quality(weak_punch) > moment_quality(rich_insta)
+
+
+def test_trade_deters_insta_scale_points():
+    from cs2archive.pov.build_hook_timeline import TRADE_DETER_POINTS
+    assert TRADE_DETER_POINTS == 100.0  # ceiling of the (0.5 - ttk) * 200 scale
+    clean = _cand(68435, tier_rank=8)
+    traded = _cand(68435, tier_rank=8, trade_ticks=[68435])
+    assert moment_quality(clean) - moment_quality(traded) == 100.0
+
+
+def test_trade_deter_survives_chain_merge():
+    from cs2archive.pov.build_hook_timeline import _merge_moments
+    target = _cand(68435, tier_rank=8, start=67776, end=68563)
+    src = _cand(68435, tier_rank=11, start=68115, end=68563,
+                trade_ticks=[68435])
+    _merge_moments(target, src)
+    assert target["trade_ticks"] == [68435]
+    assert target["tier_rank"] == 8  # best tier still wins
+    assert moment_quality(_cand(68435, tier_rank=8)) - moment_quality(target) == 100.0
 
 
 def test_moment_candidates_score_heads_up():
@@ -976,3 +1059,91 @@ def test_transitive_bridge_merges_two_chains():
     picked = pick_moments([p1, p2, bridge], TICKRATE, 3)
     assert len(picked) == 1
     assert picked[0]["kill_ticks"] == [100, 350, 600]
+
+
+def _hook_timeline(tmp_path, *, steam_id="7"):
+    import json
+
+    demo = tmp_path / "m.dem"
+    demo.write_bytes(b"0")
+    tl = {
+        "picked": [{
+            "label": "IN", "tier": "insta_kill", "round": 3,
+            "start_tick": 1000, "end_tick": 1200, "kill_ticks": [1100],
+            "pov_steam_id": steam_id, "pov_nick": "kyousuke",
+        }],
+        "demo_path": str(demo), "map": "de_mirage", "tickrate": 64,
+        "player": {"steam_id": steam_id, "nick": "kyousuke"},
+    }
+    path = tmp_path / "hook_timeline.json"
+    path.write_text(json.dumps(tl), encoding="utf-8")
+    return path
+
+
+def test_render_hook_uses_hardened_wrapper_and_version_gate(monkeypatch, tmp_path):
+    """The hook must render through hook_aware (AfxHook query + ffmpeg
+    delta + fast named-stage failure), never the legacy shorts poller —
+    and it must pass the version gate first like the POV render."""
+    import cs2archive.pov.render_hook as rh
+    import cs2archive.pov.render_version_check as rvc
+
+    gated: list = []
+    monkeypatch.setattr(
+        rvc, "assert_render_versions",
+        lambda demo: gated.append(demo) or
+        {"demo": "d", "cs2": "c", "hlae": "h", "csdm": "s"})
+    monkeypatch.setattr(rh, "canonical_nick", lambda sid, nick: "kyousuke")
+    monkeypatch.setattr(
+        rh, "_player_cvars",
+        lambda *a, **k: ([], {"source": "t", "screen_height": 960}))
+    monkeypatch.setattr(rh, "_pov_kill_ticks", lambda *a, **k: [1100])
+    monkeypatch.setattr(rh, "_swap_autoexec", lambda *a, **k: None)
+    monkeypatch.setattr(rh, "_restore_autoexec", lambda *a, **k: None)
+    calls: dict = {}
+
+    def fake_hardened(cmd, label, outdir, *, hook_timeout=120.0,
+                      hook_retries=2, **kw):
+        calls.update(cmd=cmd, label=label, outdir=outdir,
+                     timeout=hook_timeout, retries=hook_retries)
+        return outdir / "seg.mp4"
+
+    monkeypatch.setattr(rh, "run_csdm_hook_aware", fake_hardened)
+    monkeypatch.setattr(rh, "_find_sequence_files",
+                        lambda d, n: [tmp_path / "seg.mp4"])
+    out = rh.render_hook(_hook_timeline(tmp_path), width=1280, height=960,
+                         min_seconds=1.0)
+    assert gated, "version gate must run before the CSDM launch"
+    assert calls["label"] == "hook"
+    assert calls["cmd"][:2] == [rh.CSDM, "video"]
+    assert "--config-file" in calls["cmd"]
+    # render_hook's hook_retries counts TOTAL attempts; the hardened
+    # wrapper counts EXTRA attempts after the first.
+    assert calls["retries"] == 1
+    assert calls["timeout"] == 150.0
+    assert out == tmp_path
+    assert (tmp_path / "hook_render.json").is_file()
+
+
+def test_render_hook_hook_failure_exits_loudly(monkeypatch, tmp_path):
+    """A hardened-wrapper None (all attempts failed) must still fail the
+    render loudly — the legacy path called sys.exit(1)."""
+    import pytest
+
+    import cs2archive.pov.render_hook as rh
+    import cs2archive.pov.render_version_check as rvc
+
+    monkeypatch.setattr(
+        rvc, "assert_render_versions",
+        lambda demo: {"demo": "d", "cs2": "c", "hlae": "h", "csdm": "s"})
+    monkeypatch.setattr(rh, "canonical_nick", lambda sid, nick: "kyousuke")
+    monkeypatch.setattr(
+        rh, "_player_cvars",
+        lambda *a, **k: ([], {"source": "t", "screen_height": 960}))
+    monkeypatch.setattr(rh, "_pov_kill_ticks", lambda *a, **k: [1100])
+    monkeypatch.setattr(rh, "_swap_autoexec", lambda *a, **k: None)
+    monkeypatch.setattr(rh, "_restore_autoexec", lambda *a, **k: None)
+    monkeypatch.setattr(rh, "run_csdm_hook_aware",
+                        lambda *a, **k: None)
+    with pytest.raises(SystemExit):
+        rh.render_hook(_hook_timeline(tmp_path), width=1280, height=960,
+                       min_seconds=1.0)
