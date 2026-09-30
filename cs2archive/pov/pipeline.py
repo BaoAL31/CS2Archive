@@ -1346,7 +1346,13 @@ class Pipeline:
 
         # Skip if the overlay variant already has a valid video (resume from
         # a previous successful run where .overlay_work was cleaned).
-        if not self.skip_overlay:
+        # An explicitly passed --overlay-style/--overlay-anim forces a
+        # re-render in the requested look even when a video exists.
+        overlay_look_pinned = (
+            getattr(self.args, "overlay_style", None) not in (None, "auto")
+            or getattr(self.args, "overlay_anim", "instant") != "instant"
+        )
+        if not self.skip_overlay and not overlay_look_pinned:
             dst = self.youtube_dir / "video.mp4"
             if dst.is_file() and dst.stat().st_size > 100_000:
                 # Re-overlay if the source combined.mp4 was re-baked after this
@@ -1446,6 +1452,9 @@ class Pipeline:
                 freeze=bool(getattr(self.args, "freeze", False)),
                 include_straightforward=(not bool(
                     getattr(self.args, "straightforward_filter", False))),
+                overlay_style=getattr(self.args, "overlay_style", None) or "auto",
+                overlay_anim=getattr(self.args, "overlay_anim", "instant") or "instant",
+                map_name=getattr(self, "map_name", None),
             )
         except SystemExit as exc:
             code = exc.code if isinstance(exc.code, int) else 1
@@ -2364,6 +2373,20 @@ def main() -> None:
         default=False,
         help="Also overlay real-time keyboard/mouse input sprites in step 4 "
              "(default: off — util-cam PiPs only).",
+    )
+    parser.add_argument(
+        "--overlay-style",
+        default=None,
+        help="Button preset for --keyboard: classic, broadcast, ghost, or auto "
+             "(default: auto picks by map contrast — amber on Nuke, ghost-cyan "
+             "on warm sand maps). Passing it explicitly re-renders the overlay.",
+    )
+    parser.add_argument(
+        "--overlay-anim",
+        default="instant",
+        choices=("instant", "decay", "soft"),
+        help="Press animation for --keyboard (default: instant cut; decay/soft "
+             "add a short release tail). Non-default forces overlay re-render.",
     )
     parser.add_argument(
         "--freeze",

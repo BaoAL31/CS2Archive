@@ -65,6 +65,11 @@ from render.overlay_assets import (
     generate_key_assets,
     overlay_png_input_paths,
     build_png_overlay_filter,
+    normalize_overlay_style,
+    style_for_map,
+    overlay_anim_params,
+    list_overlay_styles,
+    list_overlay_anims,
 )
 from render.overlay_layout import _OVERLAY_SIGNALS
 from input_overlay_decode import (
@@ -978,6 +983,38 @@ def _apply_lineup_freezes(
     return _result(True, freezes, round_offsets, per_round_durations, round_frame_ranges)
 
 
+_MAP_TOKENS = ("nuke", "dust2", "mirage", "inferno", "ancient", "anubis",
+               "train", "cache", "overpass", "vertigo", "office")
+
+
+def _detect_map_name(demo_path: Path, explicit: str | None) -> str:
+    """Map name for style auto-pick: explicit > throws.parquet > demo stem."""
+    if explicit:
+        return explicit
+    try:
+        from cs2archive.overlay.overlay_utilcams import _find_demo_data_dir
+        data_dir = _find_demo_data_dir(demo_path)
+        if data_dir is not None:
+            for pq in (Path(data_dir) / "throws.parquet",
+                       Path(data_dir) / "data" / "throws.parquet"):
+                if pq.is_file():
+                    import pandas as pd
+                    df = pd.read_parquet(pq, columns=None)
+                    for col in ("map", "map_name"):
+                        if col in df.columns and len(df):
+                            val = str(df[col].iloc[0] or "")
+                            if val:
+                                return val
+                    break
+    except Exception:
+        pass
+    stem = demo_path.stem.lower()
+    for tok in _MAP_TOKENS:
+        if tok in stem:
+            return tok
+    return ""
+
+
 def run_overlay(
     video_path: Path,
     demo_path: Path,
@@ -990,12 +1027,21 @@ def run_overlay(
     keyboard: bool = False,
     freeze: bool = False,
     include_straightforward: bool = True,
+    overlay_style: str = "auto",
+    overlay_anim: str = "instant",
+    map_name: str | None = None,
 ) -> None:
     """Apply utility throw flight PiP (plus optional keyboard overlay) onto video_path (in place).
 
     ``keyboard=False`` (default) skips the demoparser2 input extraction, key
     sprites, and keyboard filter entirely — output is util-cam PiPs only.
-    Pass ``keyboard=True`` (or ``--keyboard``) for the legacy input overlay.
+    Pass ``keyboard=True`` (or ``--keyboard``) for the input overlay.
+
+    ``overlay_style="auto"`` (default) picks the button preset with the most
+    press contrast for the map (amber on Nuke, ghost-cyan on warm sand maps);
+    pass ``classic``/``broadcast``/``ghost`` (or ``--overlay-style``) to pin
+    one. ``overlay_anim="instant"`` (default) cuts pressed states on/off;
+    ``decay``/``soft`` (or ``--overlay-anim``) add a short release tail.
 
     ``freeze=False`` (default) skips the lineup freeze-frame pre-pass
     entirely — no holds inserted, sidecar untouched. Pass ``freeze=True``
@@ -1251,6 +1297,15 @@ def run_overlay(
         _kb_thread.start()
 
     # -- Step 2: Generate keyboard sprite PNGs -----------------------------------
+    kb_style = "classic"
+    fade_frames, fade_steps = overlay_anim_params(overlay_anim)
+    if keyboard:
+        if (overlay_style or "auto") == "auto":
+            kb_style = style_for_map(_detect_map_name(demo_path, map_name))
+        else:
+            kb_style = normalize_overlay_style(overlay_style)
+        _log(f"Keyboard overlay: style={kb_style} anim={overlay_anim} "
+             f"(fade {fade_frames}f/{fade_steps} steps)")
     if work_dir is not None:
         work_dir = Path(work_dir)
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -1266,7 +1321,8 @@ def run_overlay(
         if keyboard:
             t2 = time.time()
             _log(f"Generating key cap sprites...")
-            assets = generate_key_assets(work_dir / "sprites", video_height=height)
+            assets = generate_key_assets(work_dir / "sprites", video_height=height,
+                                           style=kb_style)
             png_inputs = overlay_png_input_paths(assets)
             _log(f"{len(png_inputs)} PNGs ({time.time()-t2:.1f}s)")
         else:
@@ -1375,8 +1431,8 @@ def run_overlay(
                 placement="bottom-center",
                 video_width=width,
                 video_height=height,
-                pressed_release_fade_frames=0,
-                pressed_release_fade_steps=0,
+                pressed_release_fade_frames=fade_frames,
+                pressed_release_fade_steps=fade_steps,
                 video_label="[0:v]",
                 png_input_offset=1,
             )
@@ -1432,6 +1488,8 @@ def run_overlay(
                         "start_frame": int(batch_start_frame),
                         "end_frame": int(batch_end_frame),
                         "keyboard": bool(keyboard),
+                        "overlay_style": kb_style if keyboard else "",
+                        "overlay_anim": str(overlay_anim) if keyboard else "",
                         "pips": sorted(
                             f"{Path(c.clip_path).name}@{c.start_frame}-{c.end_frame}"
                             for c in batch_pips),
@@ -1459,8 +1517,8 @@ def run_overlay(
                             placement="bottom-center",
                             video_width=width,
                             video_height=height,
-                            pressed_release_fade_frames=0,
-                            pressed_release_fade_steps=0,
+                            pressed_release_fade_frames=fade_frames,
+                            pressed_release_fade_steps=fade_steps,
                             video_label="[0:v]",
                             png_input_offset=1,
                         )
@@ -1692,6 +1750,15 @@ def main() -> None:
     parser.add_argument("--keyboard", action="store_true", default=False,
                          help="Also overlay real-time keyboard/mouse input sprites "
                               "(default: off — util-cam PiPs only).")
+    parser.add_argument("--overlay-style", default="auto",
+                         help="Button preset for --keyboard: auto (default, picks "
+                              "by map contrast), classic, broadcast or ghost.")
+    parser.add_argument("--overlay-anim", default="instant",
+                         help="Press animation for --keyboard: instant (default), "
+                              "decay or soft (short release tails).")
+    parser.add_argument("--map", default=None,
+                         help="Map name for --overlay-style auto (default: detect "
+                              "from throws.parquet / demo filename).")
     parser.add_argument("--freeze", action="store_true", default=False,
                          help="Freeze each unique non-straightforward lineup's aim "
                               "frame in the main POV before the throw (default: off).")
@@ -1713,7 +1780,9 @@ def main() -> None:
                 util_cams_root=args.util_cams_root, work_dir=args.work_dir,
                 allow_missing_util_cams=args.allow_missing_util_cams,
                 keyboard=args.keyboard, freeze=args.freeze,
-                include_straightforward=(not args.straightforward_filter))
+                include_straightforward=(not args.straightforward_filter),
+                overlay_style=args.overlay_style, overlay_anim=args.overlay_anim,
+                map_name=args.map)
 
 
 if __name__ == "__main__":
