@@ -133,29 +133,18 @@ def _native_resolution(steam_id: str,
                        w_override: int | None, h_override: int | None) -> tuple[int, int]:
     """Native capture resolution of the POV render.
 
-    Prefers explicit --native-width/--native-height; falls back to the player's
-    ``capture_width``/``capture_height`` from player_accounts.json; defaults to
-    1280x960. The intro footage must render at this native res to match the POV
-    render (which is then upscaled to the final video size).
+    Prefers explicit --native-width/--native-height; otherwise the same
+    aspect-correct machine maximum the POV render uses (CR-17 — the pro's own
+    resolution is ignored, how tall we can capture at their aspect ratio is
+    what matters). The intro footage must render at this res to match the POV
+    render, which is then upscaled to the final video size.
     """
-    w = h = None
-    try:
-        import json as _json
-        data = _json.loads(
-            (Path(__file__).resolve().parents[2] / ".data" / "player_accounts.json")
-            .read_text(encoding="utf-8")
-        )
-        players = data if isinstance(data, list) else data.get("players", [])
-        for p in players:
-            if str(p.get("steam_id")) == str(steam_id):
-                w = p.get("capture_width")
-                h = p.get("capture_height")
-                break
-    except Exception:
-        pass
-    w = w_override or w or 1280
-    h = h_override or h or 960
-    return int(w), int(h)
+    if w_override and h_override:
+        return int(w_override), int(h_override)
+    from cs2archive.capture_res import capture_size_for_aspect, capture_size_for_steam_id
+
+    cap = capture_size_for_steam_id(steam_id) or capture_size_for_aspect("")
+    return (int(w_override or cap[0]), int(h_override or cap[1]))
 
 
 def render_footage(demo: Path, steam_id: str, render_dir: Path,

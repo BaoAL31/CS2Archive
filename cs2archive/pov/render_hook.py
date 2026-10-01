@@ -49,7 +49,6 @@ from cs2archive.render.hook_aware import run_csdm_hook_aware  # noqa: E402
 from cs2archive.shorts.render_shorts import (  # noqa: E402
     _ffmpeg_settings,
     _find_sequence_files,
-    _resolve_player_resolution,
 )
 
 CSDM = settings.csdm_cmd
@@ -178,9 +177,11 @@ def render_hook(timeline_path: Path, width: int | None = None,
 
     sid = moments[0]["pov_steam_id"]
     if width is None or height is None:
-        # Same source render_pov.py uses for the POV capture resolution, so the
-        # hook framing matches the footage it is prepended to.
-        width, height, _scaling = _resolve_player_resolution(sid)
+        # Same policy as render_pov.py (CR-17): tallest capture at the POV's own
+        # aspect ratio, so the hook framing matches the footage it precedes.
+        from cs2archive.capture_res import capture_size_for_aspect, capture_size_for_steam_id
+
+        width, height = capture_size_for_steam_id(sid) or capture_size_for_aspect("")
 
     # Canonical nick (player_accounts by steam_id): the timeline may carry the
     # demo's raw name, which misses the prosettings lookup and drops the hook

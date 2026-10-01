@@ -1003,9 +1003,9 @@ def main() -> None:
     parser.add_argument("--output", "-o", help="Output folder")
     parser.add_argument("--framerate", type=int, default=60)
     parser.add_argument("--width", type=int, default=None,
-                        help="Render width (default: 2560, or player's capture_width from player_accounts.json).")
+                        help="Render width (default: machine max for the POV's aspect ratio).")
     parser.add_argument("--height", type=int, default=None,
-                        help="Render height (default: 1440, or player's capture_height from player_accounts.json).")
+                        help="Render height (default: machine max for the POV's aspect ratio).")
     parser.add_argument("--batches", type=int, default=1,
                         help="Number of render batches (default: 1). Rounds are divided equally across batches. "
                              "E.g. --batches 3 with 30 rounds produces 3 batches of 10 rounds each. "
@@ -1067,12 +1067,14 @@ def main() -> None:
                              "specifically problematic demos.")
     args = parser.parse_args()
 
-    # Resolve capture resolution from player_accounts.json if available.
-    # Fall back to 2560×1440 (16:9) when the player is not found or has no
-    # capture dimensions set, or when the user explicitly passed --width/--height.
-    _DEFAULT_W, _DEFAULT_H = 2560, 1440
+    # Capture resolution: ignore the pro's own in-game resolution (CR-17).
+    # Render at the tallest resolution this machine supports AT THE POV'S
+    # ASPECT RATIO; concat_rounds then stretches that native frame to the 16:9
+    # export target (no letterboxing, ever). Falls back to the 16:9 machine max.
+    from cs2archive.capture_res import capture_size_for_aspect, capture_size_for_player
+
+    _acct = None
     if args.width is None or args.height is None:
-        _player_width, _player_height = None, None
         try:
             _accounts_path = _PROJECT_ROOT / ".data" / "player_accounts.json"
             if _accounts_path.exists():
@@ -1081,16 +1083,14 @@ def main() -> None:
                     (a for a in _accounts if a.get("steam_id") == args.steam_id),
                     None,
                 )
-                if _acct:
-                    _player_width = _acct.get("capture_width")
-                    _player_height = _acct.get("capture_height")
         except Exception:
             pass
+    _cap_w, _cap_h = capture_size_for_player(_acct) or capture_size_for_aspect("")
 
     if args.width is None:
-        args.width = _player_width if _player_width and _player_width >= 800 else _DEFAULT_W
+        args.width = _cap_w
     if args.height is None:
-        args.height = _player_height if _player_height and _player_height >= 600 else _DEFAULT_H
+        args.height = _cap_h
 
     _kill_stale_processes()
     _check_nvenc()
@@ -1197,7 +1197,7 @@ def main() -> None:
     total_rounds = sum(get_round_count(p) for p in parts)
     print(f"  {args.batches} batch(es) across {total_rounds} round(s)")
     print(f"  Resolution: {args.width}x{args.height} "
-          f"(from player_accounts.json if available, else default)")
+          f"(aspect-correct machine max; pro's own resolution ignored)")
 
     if args.batches < 1:
         print("[ERROR] --batches must be >= 1")

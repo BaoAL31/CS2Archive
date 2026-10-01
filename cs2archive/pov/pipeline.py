@@ -851,27 +851,29 @@ class Pipeline:
             render_args += ["--voice-indicators", self._voice_indicator_style()]
         if skip_failed:
             render_args += ["--skip-failed-rounds"]
-        # HLAE captures at the player's prosettings resolution (4:3 1280x960
-        # for stretched players). Concat stretches that to the 16:9 export
-        # (default 2560x1440). CLI --width/--height overrides the capture.
-        cap_w = int(self.meta.get("capture_width") or 0)
-        cap_h = int(self.meta.get("capture_height") or 0)
+        # Capture resolution comes from the aspect-correct machine maximum
+        # (CR-17): the pro's own in-game resolution is ignored, only its aspect
+        # ratio survives. Concat stretches that native frame to the 16:9 export
+        # (default 2560x1440). CLI --width/--height still overrides.
+        from cs2archive.capture_res import capture_size_for_aspect
+
+        aspect = self.meta.get("aspect_ratio") or self.meta.get("resolution") or ""
+        if not aspect:
+            acct = self._account_record()
+            aspect = str(acct.get("aspect_ratio") or acct.get("resolution") or "")
+        cap_w, cap_h = capture_size_for_aspect(aspect)
         if export_w >= 800 and export_h >= 600:
             hlae_w, hlae_h = export_w, export_h
-        elif cap_w >= 800 and cap_h >= 600:
-            hlae_w, hlae_h = cap_w, cap_h
         else:
-            hlae_w, hlae_h = 2560, 1440
+            hlae_w, hlae_h = cap_w, cap_h
         render_args += ["--width", str(hlae_w), "--height", str(hlae_h)]
         if export_w >= 800 and export_h >= 600:
             print(f"  [capture] {hlae_w}x{hlae_h} (CLI --width/--height)")
-        elif cap_w >= 800 and cap_h >= 600:
+        else:
             print(f"  [capture] {hlae_w}x{hlae_h} "
                   f"{self.meta.get('aspect_ratio', '')} "
-                  f"{self.meta.get('scaling_mode', '')} "
-                  f"(concat stretches to export)")
-        else:
-            print(f"  [capture] {hlae_w}x{hlae_h} (export default)")
+                  f"(aspect-correct machine max; pro resolution ignored; "
+                  f"concat stretches to export)")
         player = (self.meta.get("player") or "").strip()
         if player:
             render_args += ["--player", player]

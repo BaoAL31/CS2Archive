@@ -263,32 +263,35 @@ def _prepare_avatar_overlay(
 
 
 def _resolve_player_resolution(steam_id: str) -> tuple[int, int, str]:
-    """Look up capture_width/capture_height + scaling_mode from player_accounts.json.
-    
-    Falls back to _DEFAULT_SRC_WIDTH × _DEFAULT_SRC_HEIGHT (1920×1080) + "Native"
-    when the player is not found or has no capture dimensions.
-    
+    """Capture resolution for this POV's shorts render.
+
+    Same policy as the POV / hook / intro renders (CR-17): the pro's own
+    resolution is ignored — capture at the aspect-correct machine maximum
+    (``cs2archive/capture_res.py``), so a 4:3 POV renders 1440x1080 rather than
+    the pro's 1280x960 and the HUD scale matches the 16:9 clips.
+
     Returns: (width, height, scaling_mode) where scaling_mode is one of
-    "Stretched", "Black Bars", "Native" (per prosettings/launch options).
+    "Stretched", "Black Bars", "Native" (per prosettings/launch options) — it
+    still decides the 4:3 -> 16:9 pre-stretch in the compositor.
     """
+    from cs2archive.capture_res import capture_size_for_aspect, capture_size_for_steam_id
+
+    scaling_mode = "Native"
     accounts_path = _PROJECT_ROOT / ".data" / "player_accounts.json"
-    if not accounts_path.exists():
-        return (_DEFAULT_SRC_WIDTH, _DEFAULT_SRC_HEIGHT, "Native")
-    try:
-        accounts = json.loads(accounts_path.read_text(encoding="utf-8"))
-        match = next(
-            (a for a in accounts if a.get("steam_id") == steam_id),
-            None,
-        )
-        if match:
-            w = match.get("capture_width")
-            h = match.get("capture_height")
-            scaling_mode = match.get("scaling_mode") or "Native"
-            if w and w >= 800 and h and h >= 600:
-                return (int(w), int(h), str(scaling_mode))
-    except Exception:
-        pass
-    return (_DEFAULT_SRC_WIDTH, _DEFAULT_SRC_HEIGHT, "Native")
+    if accounts_path.exists():
+        try:
+            accounts = json.loads(accounts_path.read_text(encoding="utf-8"))
+            match = next(
+                (a for a in accounts if a.get("steam_id") == steam_id),
+                None,
+            )
+            if match:
+                scaling_mode = str(match.get("scaling_mode") or "Native")
+        except Exception:
+            pass
+
+    size = capture_size_for_steam_id(steam_id) or capture_size_for_aspect("")
+    return (int(size[0]), int(size[1]), scaling_mode)
 
 
 def _get_player_crosshair_cvars(

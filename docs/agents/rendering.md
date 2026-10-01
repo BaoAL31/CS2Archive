@@ -45,7 +45,18 @@ HLAE must match the running CS2 build: `render_version_check.py` hard-fails befo
 
 Render at **2560×1440** even for 1080p-targeted uploads. YouTube allocates VP9 codec (higher bitrate) to 1440p+ uploads, while 1080p gets H.264. Video looks sharper even when watched at 1080p because YouTube uses better encoding.
 
-Capture follows the POV's prosettings resolution (4:3 1280×960 for stretched players); `concat_rounds.py` stretches it to the 2560×1440 upload target. Per-round render and concat upscale use **h264_nvenc CQ 15** (match quality end-to-end).
+Capture resolution is the **aspect-correct machine maximum**, not the pro's own
+(`cs2archive/capture_res.py`, CR-17). Only the POV's aspect ratio survives from
+prosettings / `player_accounts.json`: 4:3 → 1440×1080, 16:9 → 1920×1080,
+16:10 → 1728×1080, 5:4 → 1350×1080 on this 1080p rig. `concat_rounds.py`
+**stretches** that native frame to the 2560×1440 upload target — no letterbox,
+no pillarbox, ever.
+
+Height must stay within the desktop height: **HLAE clamps height but keeps the
+requested width**, so `--width 1920 --height 1440` on a 1080p desktop yields a
+1920×1080 (16:9) clip — the 4:3 framing is silently lost. Width is capped at the
+desktop width by the same reasoning. Per-round render and concat upscale use
+**h264_nvenc CQ 15** (match quality end-to-end).
 
 ## Scoreboard Avatar-Box Calibration
 
