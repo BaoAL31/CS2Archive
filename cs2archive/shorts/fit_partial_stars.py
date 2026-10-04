@@ -13,7 +13,9 @@ STARS_PATH = ROOT / ".data" / "partial_stars.json"
 ALLSTAR_JSONL = ROOT / ".data" / "allstar_hltv_probe.jsonl"
 TO_JSONL = ROOT / ".data" / "to_shorts_observations.jsonl"
 DEMO_KIND_STAMPS = ROOT / ".data" / "demo_kind_stamps.json"
-LISTENER_LOCK = ROOT / ".listener" / "hltv.json.lock"
+# Must match the daemon's live lock: DEFAULT_STATE (".listener/hltv.json",
+# daemon.py:85) with_suffix(".lock") at daemon.py:1415 -> ".listener/hltv.lock".
+LISTENER_LOCK = ROOT / ".listener" / "hltv.lock"
 YOUTUBE_VIDEO_URL = "https://www.googleapis.com/youtube/v3/videos"
 _YT_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 WINDOW_DAYS = 180
@@ -27,7 +29,14 @@ STAGE_LEVELS = ("group", "playoff", "grand_final")
 
 
 def rows_in_window(rows: list[dict], *, window_days: int = WINDOW_DAYS) -> list[dict]:
-    """Drop Clip Observations older than 180 days. Unknown age is kept."""
+    """Drop Clip Observations older than 180 days. Unknown age is kept.
+
+    The computed age is stamped back onto each kept row as ``age_days``
+    (a copy — never mutates caller data) so the downstream ridge's
+    ``clip_age`` control column carries the same time axis the window
+    enforces (F6: previously computed-then-discarded, leaving clip_age
+    an all-zero column).
+    """
     out: list[dict] = []
     for row in rows:
         age = row.get("age_days")
@@ -43,6 +52,11 @@ def rows_in_window(rows: list[dict], *, window_days: int = WINDOW_DAYS) -> list[
                     age = None
         if age is not None and float(age) > window_days:
             continue
+        if age is not None and row.get("age_days") is None:
+            try:
+                row = {**row, "age_days": float(age)}
+            except (TypeError, ValueError):
+                pass
         out.append(row)
     return out
 
@@ -294,15 +308,20 @@ def observations_from_to_jsonl(path: Path | None = None) -> list[dict]:
     if not dest.is_file():
         return []
     out: list[dict] = []
+    corrupt = 0
     for line in dest.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         try:
             row = json.loads(line)
         except json.JSONDecodeError:
+            corrupt += 1
             continue
         if isinstance(row, dict) and row.get("source") and row.get("source") != "allstar":
             out.append(row)
+    if corrupt:
+        print(f"[partial-stars] skipped {corrupt} corrupt line(s) in {dest}",
+              flush=True)
     return out
 
 
@@ -316,19 +335,30 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
 
 def observations_from_allstar_jsonl(path: Path | None = None) -> list[dict]:
     from cs2archive.shorts.clip_observation import observations_from_match_row, parse_stage
+    from cs2archive.shorts.popular_events import is_popular_event
 
     dest = path or ALLSTAR_JSONL
     if not dest.is_file():
         return []
     out: list[dict] = []
+    corrupt = 0
+    unpopular = 0
     for line in dest.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         try:
             row = json.loads(line)
         except json.JSONDecodeError:
+            corrupt += 1
             continue
         if not isinstance(row, dict):
+            continue
+        # F10: the archive backfill filters at event level only, so
+        # qualifier/academy/CCT rows leak into the store — re-apply the
+        # popularity gate at fit time instead of fitting them.
+        if not is_popular_event(str(row.get("slug") or ""),
+                                str(row.get("event_slug") or "")):
+            unpopular += 1
             continue
         clips = row.get("clips") or []
         if clips and isinstance(clips[0], dict) and "kinds" in clips[0] and "source" in clips[0]:
@@ -339,6 +369,12 @@ def observations_from_allstar_jsonl(path: Path | None = None) -> list[dict]:
                 out.append({**c, "stage": stage} if stage else c)
             continue
         out.extend(observations_from_match_row(row))
+    if corrupt:
+        print(f"[partial-stars] skipped {corrupt} corrupt line(s) in {dest}",
+              flush=True)
+    if unpopular:
+        print(f"[partial-stars] excluded {unpopular} non-popular row(s) "
+              f"from {dest}", flush=True)
     if dest.resolve() == ALLSTAR_JSONL.resolve():
         out = apply_demo_kind_stamps(out, load_demo_kind_stamps())
     return out
@@ -368,10 +404,17 @@ def refresh_partial_stars(
         if to_rows:
             _write_jsonl(to_path, refresh_youtube_views(to_rows, fetched))
     stars = fit_partial_stars(rows)
+    # F6 provenance stamp: the fit previously carried no fitted_at, row
+    # count or window, so its age was unknowable at read time.
+    stars["fitted_at"] = datetime.now(timezone.utc).isoformat()
+    stars["rows"] = len(rows)
+    stars["window_days"] = WINDOW_DAYS
     dest = out_path or STARS_PATH
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps(stars, indent=2) + "\n", encoding="utf-8")
     stars["_rows"] = len(rows)
+    print(f"[partial-stars] fit {len(rows)} rows -> {dest.name} "
+          f"(fitted_at={stars['fitted_at']})", flush=True)
     return stars
 
 

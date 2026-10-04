@@ -633,7 +633,6 @@ def scrape_one_match(page, match_ref: str, base: str,
                 f"[match] unknown slug for {mid}; pass the full HLTV URL")
     url = f"{base}/matches/{mid}/{slug}"
     html, cf = _goto(page, url)
-    html, cf = _goto(page, url)
     if not cf:
         # Allstar iframes are loading="lazy" — scroll so they enter the DOM.
         try:

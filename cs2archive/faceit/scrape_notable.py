@@ -78,18 +78,6 @@ def _is_notable_perf(line: dict, kd_min: float, adr_min: float, kills_min: int) 
 
 FACEIT_STAR_FLOOR = 1.40
 
-# HLTV top-10 team starters count as stars even when POV channels post too
-# few of their videos to measure demand (support/IGL roles like TeSeS) —
-# but only with a standout line. Lobby context alone routes to the
-# highlight feed, never to a solo render.
-# 250k is the rank_bonus() tier for ranks 6-10; top-5 pay 400k.
-ORG_STAR_RAW_FLOOR = 250_000
-
-# Standout-line bars for the org-star clause (mirror collect() defaults).
-ORG_STANDOUT_KD = 1.5
-ORG_STANDOUT_ADR = 100.0
-ORG_STANDOUT_KILLS = 30
-
 # Lobby-level stardom for the highlight track: combined org-rank bonus
 # across the lobby's Recognised Pros. 800k = two top-5 starters' worth
 # (e.g. donk + magixx vs kyousuke + TeSeS pays 1.6M).
@@ -97,34 +85,26 @@ HIGHLIGHT_LOBBY_RAW_FLOOR = 800_000
 
 
 def is_good_faceit_pov(c: dict) -> bool:
-    """Watchable solo POV: demand-index star, or org star + standout line.
+    """Watchable solo POV: demand-index star OR recent breakout, any line.
 
-    Qualifies when the POV player's YouTube demand index is
-    >= FACEIT_STAR_FLOOR (live CS2ArchiveStarRefresh file, else the
-    research table) *with* enough sample evidence behind the entry
-    (demand_star_supported: recent videos or a deep track record —
-    stale long-window-only thin samples must not auto-pass) — any
-    line, losses count — or when they are an HLTV top-10-org starter
-    (>= ORG_STAR_RAW_FLOOR, read from the cached ranking, no network
-    here) *with* a standout line. A mediocre line that only looks
-    interesting because the lobby is stacked belongs to the highlight
-    feed (see is_highlight_lobby), not to a solo render. K/D scales
-    the star bonus, not eligibility. nocries (below the floor, no
-    ranked org) stays out; a solo s1mple does not.
+    Single shared predicate (F3): delegates to
+    scoring.demand_eligibility at FACEIT_STAR_FLOOR — star means index
+    >= floor with sample evidence (demand_star_supported: recent
+    videos or a deep track record; stale long-window-only thin samples
+    must not auto-pass) — losses count — or a recent breakout video
+    (30d, 30x channel median with absolute reach; the median-based
+    index buries one-off spikes, so the max is read instead). There is
+    deliberately no org-rank fallback: a top-10-org starter with no
+    measurable audience demand does not earn a solo render on lobby
+    context (that lobby belongs to the highlight feed, see
+    is_highlight_lobby). K/D scales the star bonus, not eligibility.
     """
     nick = (c.get("player") or "").casefold()
     if not nick:
         return False
-    index = load_player_demand_index().get(nick)
-    if (index is not None and float(index) >= FACEIT_STAR_FLOOR
-            and _scoring.demand_star_supported(nick)):
-        return True
-    if not _is_notable_perf(c, ORG_STANDOUT_KD, ORG_STANDOUT_ADR, ORG_STANDOUT_KILLS):
-        return False
-    try:
-        return star_bonus_for_pros([c.get("player") or ""]) >= ORG_STAR_RAW_FLOOR
-    except Exception:
-        return False
+    star, spike, _, _, _ = _scoring.demand_eligibility(
+        nick, star_floor=FACEIT_STAR_FLOOR)
+    return bool(star or spike)
 
 
 def is_highlight_lobby(rec: dict) -> bool:
@@ -239,7 +219,12 @@ def make_player_candidates(rec: dict, stream: str, ranking: dict | None = None) 
             raw_star = _scoring.demand_as_raw_star(nick, DEMAND_INDEX_PATH)
         star = star_bonus(raw_star, won, kd)
         demand = market_demand_bonus(nick)
-        elo = lobby_elo_bonus(_num(rec.get("avg_elo"), float))
+        # F8: avg_elo is intentionally None at gate time (no lobby-ELO
+        # fetch at scrape — the 429 driver; resolved once per pick at
+        # backlog time), so this chip is structurally 0 here and the
+        # scrape ranks on pros/demand/perf only. Explicit, not accidental.
+        elo = lobby_elo_bonus(_num(rec.get("avg_elo"), float)) \
+            if rec.get("avg_elo") else 0
         costars = costar_bonus(match_pros) if won else 0
         perf = _perf_bonus(kd, adr, kills, won)
         return {

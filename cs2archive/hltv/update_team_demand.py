@@ -336,6 +336,40 @@ def build_index(
     }
 
 
+def _refresh_velocity(rows: list[dict], now: datetime) -> list[dict]:
+    """Recompute age and views/day from stored views so old captures age.
+
+    F5: the player path (update_player_demand.refresh_velocity) does this
+    every refresh; the team path never did, so rows captured at age 27
+    stayed "recent" for the life of the file and views_per_day sat
+    frozen at capture time. Same keys, same semantics.
+    """
+    out = []
+    for source in rows:
+        published = _parse_published(source.get("published_at"))
+        if published is None:
+            out.append(source)
+            continue
+        age_days = max((now - published).total_seconds() / 86400, 1 / 24)
+        row = dict(source)
+        row["age_days"] = round(age_days, 3)
+        row["views_per_day"] = round(_num(source.get("views")) / age_days, 2)
+        out.append(row)
+    return out
+
+
+def _in_window(rows: list[dict], now: datetime, days: int) -> list[dict]:
+    """Keep rows published inside the window (F5: WINDOW_DAYS is real now)."""
+    cutoff = now - timedelta(days=days)
+    out = []
+    for row in rows:
+        published = _parse_published(row.get("published_at"))
+        if published is None or published < cutoff:
+            continue
+        out.append(row)
+    return out
+
+
 def load_team_demand(path: Path | None = None) -> dict:
     target = path or TEAM_DEMAND_PATH
     if not target.exists():
@@ -382,10 +416,17 @@ def refresh(*, scrape: bool = True, days: int = REFRESH_DAYS) -> dict:
         history = upsert_history_rows(history, new_rows)
     OUTDIR.mkdir(parents=True, exist_ok=True)
     write_history(HISTORY_PATH, history)
-    payload = build_index(history, now=now)
+    # F5: age every row off its publish date (never trust stored
+    # age_days/views_per_day) and fit only inside WINDOW_DAYS — the
+    # player path's refresh_velocity + in_window, ported verbatim.
+    aged = _refresh_velocity(history, now)
+    payload = build_index(_in_window(aged, now, WINDOW_DAYS), now=now)
+    payload["history_videos"] = len(history)
     payload["scraped"] = len(new_rows)
     TEAM_DEMAND_PATH.parent.mkdir(parents=True, exist_ok=True)
-    TEAM_DEMAND_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp = TEAM_DEMAND_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(TEAM_DEMAND_PATH)
     return payload
 
 

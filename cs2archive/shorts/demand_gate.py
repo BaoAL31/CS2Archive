@@ -16,6 +16,8 @@ DEMAND_PATH = ROOT / ".data" / "player_demand_index.json"
 STARS_PATH = ROOT / ".data" / "partial_stars.json"
 
 SHORTS_INDEX_FLOOR = 1.0
+# Retired by F9: the players-branch minimum is superseded by the shared
+# scoring.payload_star_supported evidence rule. Kept so old imports don't break.
 SHORTS_MIN_VIDEOS = 8
 HOOK_ORG_KEYS = frozenset({
     "navi",
@@ -73,21 +75,49 @@ def candidate_score(short: dict, stars: dict, *, orgs: list[str] | None = None) 
 
 
 def _player_qualifies(nick: str, payload: dict) -> bool:
+    """1.0 floor with the one shared sample-evidence predicate (F9).
+
+    Previously two ad-hoc branches: a bare index hit (>= 1.0, no
+    sample requirement at all) vs the players-section path (>= 8
+    videos) — the same thin sample passed one and failed the other.
+    Both now go through scoring.payload_star_supported (recent >= 3
+    in 30d or lifetime >= 25, current rule version). The 1.0 bar
+    itself is unchanged: unifying the clip-layer bar to the 1.40
+    long-form render bar would collapse the qualifying pool onto ~3
+    supported pros against a one-short-per-day slot.
+    """
+    from cs2archive.scoring import (
+        PLAYER_DEMAND_STALE_DAYS,
+        payload_star_supported,
+    )
+
     key = nick.casefold()
     if not key:
         return False
-    index = {
-        str(name).casefold(): float(value)
-        for name, value in (payload.get("index") or {}).items()
-    }
-    if key in index and index[key] >= SHORTS_INDEX_FLOOR:
+    try:
+        index = {
+            str(name).casefold(): float(value)
+            for name, value in (payload.get("index") or {}).items()
+        }
+        # Players-detail entries below INDEX_FLOOR (1.08) never enter
+        # ``index`` but still carry measured stars for the 1.0 bar.
+        for name, info in (payload.get("players") or {}).items():
+            if not isinstance(info, dict):
+                continue
+            try:
+                detail_value = float(info.get("index") or 0)
+            except (TypeError, ValueError):
+                continue
+            index.setdefault(str(name).casefold(), detail_value)
+    except (TypeError, ValueError):
+        return False
+    if index.get(key, 0.0) < SHORTS_INDEX_FLOOR:
+        return False
+    # B1: the staleness bound is enforced, not just logged — a stale
+    # live payload carries no Shorts evidence either.
+    if payload_star_supported(nick, payload,
+                              max_age_days=PLAYER_DEMAND_STALE_DAYS):
         return True
-    for name, info in (payload.get("players") or {}).items():
-        if str(name).casefold() != key or not isinstance(info, dict):
-            continue
-        videos = int(info.get("videos") or 0)
-        value = float(info.get("index") or 0)
-        return videos >= SHORTS_MIN_VIDEOS and value >= SHORTS_INDEX_FLOOR
     if payload.get("index") or payload.get("players"):
         return False
     try:

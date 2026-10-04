@@ -25,7 +25,10 @@
 # NOTE: measured WITH the gitignored runtime state present (.data/, .cache/). Without it, this
 # script reports SKIPPED instead of comparing.
 
-# --- measured 2026-09-28: 14 entries ---
+# --- measured 2026-09-28: 14 entries, 12 remaining after F1 DOCFIX ---
+# (2026-10-04: test_queue_sorts_by_weight_then_rating and
+# test_select_prefers_weight_over_rating were inverted to the shipped
+# rating-ordered policy and removed from the baseline.)
 
 FAILED tests/test_build_short_timeline.py::test_2v4_2v5_counted
 FAILED tests/test_build_short_timeline.py::test_clutch_detected
@@ -33,8 +36,6 @@ FAILED tests/test_build_short_timeline.py::test_clutch_detected_when_30s_disadva
 FAILED tests/test_build_short_timeline.py::test_mixed_timeline_coexists
 FAILED tests/test_build_short_timeline.py::test_zero_kill_defuse_clutch
 FAILED tests/test_hltv_player_resolver.py::test_avatar_cache_eligible
-FAILED tests/test_hltv_scoring.py::test_queue_sorts_by_weight_then_rating
-FAILED tests/test_hltv_scoring.py::test_select_prefers_weight_over_rating
 FAILED tests/test_merge_pro_solo_interrupt.py::test_fix_drops_nonpro_solo_keeps_nonpro_multi
 FAILED tests/test_overlay_sidecar_skip_failed.py::test_overlay_sidecar_critical_errors_only
 FAILED tests/test_render_shorts.py::test_kill_feed_crop_constants_within_source

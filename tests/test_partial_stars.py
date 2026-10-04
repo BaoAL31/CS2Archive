@@ -90,6 +90,8 @@ def test_stored_clips_take_stage_from_row_match_stage(tmp_path: Path):
     jsonl = tmp_path / "obs.jsonl"
     jsonl.write_text(json.dumps({
         "match_id": "1",
+        "slug": "spirit-vs-furia-iem-katowice-2026",
+        "event_slug": "iem-katowice-2026",
         "match_stage": "Quarter-final",
         "clips": [{
             "source": "allstar",
@@ -121,7 +123,8 @@ def test_refresh_writes_stars_without_deleting_observation_store(tmp_path: Path)
     jsonl = tmp_path / "obs.jsonl"
     jsonl.write_text(json.dumps({
         "match_id": "1",
-        "slug": "furia-vs-natus-vincere-x",
+        "slug": "spirit-vs-furia-iem-katowice-2026",
+        "event_slug": "iem-katowice-2026",
         "match_stage": "Grand Final",
         "clips": [{
             "clip_id": "c1",

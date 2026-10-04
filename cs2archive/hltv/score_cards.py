@@ -4,7 +4,7 @@ Chips (same 250k-scale as FACEIT notable, minus lobby ELO):
 
   match_team      both teams' highlight-channel demand, summed (cap 400k)
   match_highlight this fixture's recent highlight views (cap 200k)
-  star            POV player's org rank / 2, K/D >= 1 (cap 200k)
+  star            POV player's org rank / 2, K/D-scaled within [0.5, 2.0] (cap 400k)
   demand          max(POV-channel index, highlight-named player index) (cap 200k)
   rating          HLTV Rating 3.0 above 1.00 (cap 160k)
 
@@ -251,7 +251,10 @@ def _index_demo_kinds(demo_stems: set[str]) -> dict[tuple[str, str], tuple[str, 
                 _offer(nick, _extractor_kind(short))
         # Unfiltered multikills (e.g. eco 4Ks the extractor drops) still
         # count: each shorts base carries the raw kill table next to it.
+        # Kills accumulate across every readable timeline of the stem
+        # (deduped by action path); only the last table used to win.
         seen_caches: set[str] = set()
+        kills_all: list = []
         for path in tls:
             action = path.parent.parent / "action_timeline.json"
             key = str(action).lower()
@@ -263,8 +266,9 @@ def _index_demo_kinds(demo_stems: set[str]) -> dict[tuple[str, str], tuple[str, 
                          .get("kills") or [])
             except (OSError, json.JSONDecodeError, AttributeError):
                 continue
+            kills_all.extend(k for k in kills if isinstance(k, dict))
         by_round: dict[tuple, list] = {}
-        for kill in kills:
+        for kill in kills_all:
             if not isinstance(kill, dict):
                 continue
             aid = str(kill.get("attacker_steam_id") or "")

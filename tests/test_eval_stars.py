@@ -150,7 +150,11 @@ def test_gate_block_math():
         {"player": "Bust", "performance_index": 2.0, "channel_top_quartile": True},
     ]
     index = {"hero": 1.5, "bust": 1.0}
-    block = gate_block(rows, index, threshold=1.25)
+    details = {
+        "Hero": {"videos": 30, "recent_videos": 5},
+        "Bust": {"videos": 30, "recent_videos": 5},
+    }
+    block = gate_block(rows, index, threshold=1.25, details=details)
     assert (block["flagged"], block["base_rate"]) == (2, 0.5)
     assert block["precision"] == pytest.approx(0.5)
     assert block["recall"] == pytest.approx(0.5)

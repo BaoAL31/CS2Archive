@@ -8,6 +8,12 @@ from pathlib import Path
 
 
 from cs2archive.shorts.demand_gate import filter_publishable_shorts, passes_shorts_demand_gate
+from cs2archive.scoring import DEMAND_RULE_VERSION
+
+
+def _fresh_stamp() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
 
 STARS = {
     "intercept": 5.0,
@@ -152,24 +158,31 @@ def test_hltv_stage_is_not_in_candidate_score():
     assert candidate_score(gf, STARS) == candidate_score(plain, STARS)
 
 PAYLOAD = {
+    "updated_at": _fresh_stamp(),
     "index": {"donk": 1.53, "m0nesy": 1.28, "tn1r": 1.19},
     "players": {
-        "donk": {"videos": 551, "index": 1.53},
-        "m0NESY": {"videos": 259, "index": 1.28},
-        "tN1R": {"videos": 20, "index": 1.19},
-        "ZywOo": {"videos": 139, "index": 1.05},
-        "b1t": {"videos": 64, "index": 1.0},
-        "w0nderful": {"videos": 44, "index": 0.69},
-        "makazze": {"videos": 32, "index": 0.69},
-        "r1nkle": {"videos": 4, "index": 0.9},
+        "donk": {"videos": 551, "recent_videos": 100, "index": 1.53},
+        "m0NESY": {"videos": 259, "recent_videos": 40, "index": 1.28},
+        "tN1R": {"videos": 20, "recent_videos": 0, "index": 1.19},
+        "ZywOo": {"videos": 139, "recent_videos": 0, "index": 1.05},
+        "b1t": {"videos": 64, "recent_videos": 10, "index": 1.0},
+        "w0nderful": {"videos": 44, "recent_videos": 0, "index": 0.69},
+        "makazze": {"videos": 32, "recent_videos": 0, "index": 0.69},
+        "r1nkle": {"videos": 4, "recent_videos": 0, "index": 0.9},
     },
+    "method": {"rule_version": DEMAND_RULE_VERSION},
 }
 
 
 def test_demand_player_passes_without_org():
     assert passes_shorts_demand_gate("donk", payload=PAYLOAD)
     assert passes_shorts_demand_gate("m0NESY", payload=PAYLOAD)
-    assert passes_shorts_demand_gate("tN1R", payload=PAYLOAD)
+
+
+def test_thin_long_window_only_sample_is_dropped():
+    """F9: 20 videos but 0 recent is not evidence (was: passed on the
+    bare index branch with no sample requirement)."""
+    assert not passes_shorts_demand_gate("tN1R", payload=PAYLOAD)
 
 
 def test_measured_star_just_under_notable_floor_still_passes():

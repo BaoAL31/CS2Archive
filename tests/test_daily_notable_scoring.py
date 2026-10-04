@@ -14,6 +14,11 @@ import cs2archive.faceit.scrape_notable as sn
 import cs2archive.faceit.update_player_demand as upd
 
 
+def _fresh_stamp() -> str:
+    from datetime import timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
 @pytest.fixture(autouse=True)
 def _frozen_demand_file(tmp_path, monkeypatch):
     monkeypatch.setattr(sn, "DEMAND_INDEX_PATH", tmp_path / "missing.json")
@@ -304,7 +309,14 @@ def test_is_good_faceit_pov_is_demand_only(monkeypatch):
         "donk": 1.45, "s1mple": 1.50, "nocries": 0.76, "mzinho": 0.62,
         "blamef": 0.62, "neityu": 0.50,
     })
-    monkeypatch.setattr(sn._scoring, "load_demand_payload", lambda *a, **k: {})
+    monkeypatch.setattr(sn._scoring, "load_demand_payload", lambda *a, **k: {
+        "updated_at": _fresh_stamp(),
+        "players": {
+            "donk": {"videos": 30, "recent_videos": 5},
+            "s1mple": {"videos": 30, "recent_videos": 5},
+        },
+        "method": {"rule_version": sn._scoring.DEMAND_RULE_VERSION},
+    })
     donk = {
         "player": "donk", "won": True, "kd": 1.5, "adr": 85.0, "kills": 18,
     }
@@ -352,12 +364,14 @@ def test_demand_star_supported_sample_gate(monkeypatch):
     count for the gate; recent evidence or a deep track record does. No
     live payload -> the fallback table keeps the old behaviour."""
     payload = {
+        "updated_at": _fresh_stamp(),
         "index": {"jboen": 1.63, "latto": 1.78, "s1mple": 1.8},
         "players": {
             "JBOEN": {"videos": 8, "recent_videos": 0},
             "latto": {"videos": 12, "recent_videos": 3},
             "s1mple": {"videos": 262, "recent_videos": 70},
         },
+        "method": {"rule_version": sn._scoring.DEMAND_RULE_VERSION},
     }
     monkeypatch.setattr(sn._scoring, "load_demand_payload",
                         lambda *a, **k: payload)
@@ -368,22 +382,60 @@ def test_demand_star_supported_sample_gate(monkeypatch):
 
 
 def test_demand_star_supported_without_live_payload():
-    """Missing live file -> the research fallback table (no sample
-    counts) keeps the old behaviour: supported."""
+    """Missing live file -> no sample evidence -> NOT supported (F2
+    fail-closed: a dead refresh narrows the gate loudly, never widens
+    it to the research table)."""
     from pathlib import Path
-    assert sn._scoring.demand_star_supported(
+    assert not sn._scoring.demand_star_supported(
         "jboen", path=Path("Z:/definitely/missing.json"))
+
+
+def test_demand_payload_status_flags_stale_rule_and_age(monkeypatch):
+    """Stale rule_version or old updated_at is not fresh (F2 guard)."""
+    import datetime as _dt
+    scoring = sn._scoring
+    now = _dt.datetime.now(_dt.timezone.utc)
+    base = {
+        "updated_at": now.isoformat(),
+        "index": {"latto": 1.78},
+        "players": {"latto": {"videos": 12, "recent_videos": 3}},
+        "method": {"rule_version": scoring.DEMAND_RULE_VERSION},
+    }
+    monkeypatch.setattr(scoring, "load_demand_payload", lambda *a, **k: dict(base))
+    fresh, _ = scoring.demand_payload_status()
+    assert fresh
+    old = dict(base, method={"rule_version": 1})
+    monkeypatch.setattr(scoring, "load_demand_payload", lambda *a, **k: old)
+    assert not scoring.demand_payload_status()[0]
+    assert not scoring.demand_star_supported("latto")
+    aged = dict(base, updated_at=(now - _dt.timedelta(days=30)).isoformat())
+    monkeypatch.setattr(scoring, "load_demand_payload", lambda *a, **k: aged)
+    assert not scoring.demand_payload_status()[0]
+    assert not scoring.demand_star_supported("latto")
+    monkeypatch.setattr(scoring, "load_demand_payload", lambda *a, **k: {})
+    assert not scoring.demand_payload_status()[0]
+    # B1: a stale payload refuses BOTH arms — even a 250x breakout in a
+    # 30-day-old payload must not pass the gate.
+    stale_spike = dict(base,
+                       updated_at=(now - _dt.timedelta(days=30)).isoformat(),
+                       breakouts={"latto": 250.0})
+    monkeypatch.setattr(scoring, "load_demand_payload",
+                        lambda *a, **k: stale_spike)
+    star, spike, _, _, _ = scoring.demand_eligibility("latto")
+    assert star is False and spike is False
 
 
 def test_demand_star_needs_sample_evidence_for_gate(monkeypatch):
     """Replay of the 2026-09-29 shape: JBOEN/mezii/xfl0ud (recent=0,
     thin 8-video windows) auto-passed the gate on presence alone."""
     payload = {
+        "updated_at": _fresh_stamp(),
         "index": {"jboen": 1.63, "mezii": 1.59},
         "players": {
             "JBOEN": {"videos": 8, "recent_videos": 0},
             "mezii": {"videos": 8, "recent_videos": 0},
         },
+        "method": {"rule_version": sn._scoring.DEMAND_RULE_VERSION},
     }
     monkeypatch.setattr(sn, "load_player_demand_index",
                         lambda *a, **k: payload["index"])
@@ -394,18 +446,18 @@ def test_demand_star_needs_sample_evidence_for_gate(monkeypatch):
     assert not sn.is_good_faceit_pov({**quiet, "player": "jboen"})
 
 
-def test_org_star_needs_standout_line_for_solo_pov(monkeypatch):
-    """Replay of 1-75510475: TeSeS (Falcons, no measurable demand) with a
-    25/20 mid line must NOT get a solo render — that lobby belongs to the
-    highlight feed. A TeSeS banger still qualifies."""
-    import cs2archive.faceit.hltv_ranking as hltv_ranking
-    monkeypatch.setattr(sn, "load_player_demand_index", lambda *a, **k: {})
-    monkeypatch.setattr(
-        hltv_ranking, "_ROSTER_CACHE",
-        {"teses": "Falcons", "kyousuke": "Falcons"},
-    )
-    monkeypatch.setattr(hltv_ranking, "_load_cache", lambda: {"Falcons": 2})
-    assert sn.is_good_faceit_pov(
+def test_no_org_fallback_without_demand(monkeypatch):
+    """No measurable demand, no solo render — even for a top-2-org
+    starter with a banger line. The lobby belongs to the highlight
+    feed; a demand-index star still qualifies on any line."""
+    monkeypatch.setattr(sn, "load_player_demand_index",
+                        lambda *a, **k: {"s1mple": 1.50})
+    monkeypatch.setattr(sn._scoring, "load_demand_payload", lambda *a, **k: {
+        "updated_at": _fresh_stamp(),
+        "players": {"s1mple": {"videos": 30, "recent_videos": 5}},
+        "method": {"rule_version": sn._scoring.DEMAND_RULE_VERSION},
+    })
+    assert not sn.is_good_faceit_pov(
         {"player": "TeSeS", "kd": 2.0, "adr": 110.0, "kills": 28})
     assert not sn.is_good_faceit_pov(
         {"player": "TeSeS", "kd": 1.25, "adr": 79.7, "kills": 25})
@@ -415,15 +467,20 @@ def test_org_star_needs_standout_line_for_solo_pov(monkeypatch):
     assert not sn.is_good_faceit_pov(
         {"player": "nocries", "kd": 2.5, "adr": 140.0, "kills": 30})
     assert not sn.is_good_faceit_pov({})
+    # Demand star qualifies with no line to speak of.
+    assert sn.is_good_faceit_pov(
+        {"player": "s1mple", "kd": 0.9, "adr": 70.0, "kills": 12})
 
 
-def test_org_star_floor_is_top_ten_teams(monkeypatch):
+def test_org_bonus_alone_never_qualifies(monkeypatch):
+    """Even a mocked top-tier org bonus buys nothing without demand —
+    the gate reads the demand index only."""
     monkeypatch.setattr(sn, "load_player_demand_index", lambda *a, **k: {})
     monkeypatch.setattr(
         sn, "star_bonus_for_pros",
-        lambda pros, ranking=None: 250_000 if pros[0] == "navi-pro" else 120_000,
+        lambda pros, ranking=None: 400_000,
     )
-    assert sn.is_good_faceit_pov(
+    assert not sn.is_good_faceit_pov(
         {"player": "navi-pro", "kd": 2.0, "adr": 110.0, "kills": 25})
     assert not sn.is_good_faceit_pov(
         {"player": "astralis-pro", "kd": 2.0, "adr": 110.0, "kills": 25})

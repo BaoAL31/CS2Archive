@@ -235,7 +235,10 @@ def test_minus_kd_keeps_org_star():
     assert scored["rating_bonus"] == 48_000
 
 
-def test_select_prefers_weight_over_rating():
+def test_select_prefers_rating_over_weight():
+    """F1 DOCFIX: the live queue is rating-ordered by decision — a
+    300k-weight 1.3 card loses its map group to a 40k-weight 1.9, and
+    the top card overall is the highest rating across maps."""
     cards = [
         ("backlog/nobody.json", {
             "player": "x", "map": "Mirage", "rating": 1.9, "weight": 40_000,
@@ -247,19 +250,20 @@ def test_select_prefers_weight_over_rating():
             "player": "y", "map": "Nuke", "rating": 2.1, "weight": 50_000,
         }),
     ]
-    assert listener.select_best_card(cards)[0][0] == "backlog/donk.json"
+    assert listener.select_best_card(cards)[0][0] == "backlog/other-map.json"
 
 
-def test_queue_sorts_by_weight_then_rating():
+def test_queue_sorts_by_rating_then_path():
+    """F1 DOCFIX: queued cards sort by rating desc, then path."""
     cards = [
         ("backlog/high-rating.json", {"rating": 2.4, "weight": 10_000}),
         ("backlog/star.json", {"rating": 1.3, "weight": 400_000}),
         ("backlog/mid.json", {"rating": 1.8, "weight": 10_000}),
     ]
     assert listener.sort_card_records(cards) == [
-        "backlog/star.json",
         "backlog/high-rating.json",
         "backlog/mid.json",
+        "backlog/star.json",
     ]
 
 

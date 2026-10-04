@@ -15,8 +15,10 @@ Protocol (no leakage):
    performance feeds the star.
 3. Held-out = videos published at/after the cutoff. Each is scored with the
    fitted star (unknown player -> neutral 1.0, exactly as production does).
-4. Report rank correlation, star-band lift, the ``>= 1.25`` gate's precision /
-   recall / lift over the base rate, and a threshold sweep.
+4. Report rank correlation, star-band lift, the ``>= 1.40`` gate's precision /
+   recall / lift over the base rate, and a threshold sweep. The gate graded
+   is the shipped production rule (star >= floor with sample evidence, OR
+   a recent breakout) — not the index value alone.
 
 ``--mode in-sample`` instead scores the shipped ``.data/player_demand_index.json``
 over the whole scrape. Those numbers are circular by construction (the index is
@@ -44,6 +46,7 @@ from cs2archive.faceit.update_player_demand import (  # noqa: E402
     DEMAND_PATH,
     RECENT_DAYS,
     WINDOW_DAYS,
+    breakout_map,
     build_index,
     canonical_player,
     in_window,
@@ -55,7 +58,8 @@ from cs2archive.misc.analyze_pov_market import analyze_rows  # noqa: E402
 from cs2archive.shorts.fit_clip_weights import spearman  # noqa: E402
 
 OUT_DEFAULT = ROOT / "exports" / "pov_market" / "star_eval.json"
-STAR_FLOOR = 1.25
+# Production gate floor (F4: was 1.25, grading a rule that no longer ships).
+STAR_FLOOR = 1.40
 NEUTRAL_STAR = 1.0
 MIN_DURATION_S = 300
 MIN_AGE_DAYS = 2.0
@@ -68,8 +72,8 @@ MIN_HOLDOUT_VIDEOS = 10
 BANDS = (
     (None, 1.0, "<1.00"),
     (1.0, 1.08, "1.00 no star"),
-    (1.08, 1.25, "1.08-1.24"),
-    (1.25, 1.50, "1.25-1.49"),
+    (1.08, 1.40, "1.08-1.39"),
+    (1.40, 1.50, "1.40-1.49"),
     (1.5, None, "1.50+"),
 )
 SWEEP_THRESHOLDS = tuple(round(1.0 + 0.05 * i, 2) for i in range(17))  # 1.00 .. 1.80
@@ -297,14 +301,56 @@ def raw_signal_predictor(details: dict[str, dict]):
 
 
 def gate_block(rows: list[dict], index: dict[str, float], *,
-               threshold: float = STAR_FLOOR, target: str = "channel_top_quartile") -> dict:
-    """Confusion metrics for ``star >= threshold`` against a top-quartile target."""
+               threshold: float = STAR_FLOOR, target: str = "channel_top_quartile",
+               details: dict[str, dict] | None = None,
+               breakouts: dict[str, float] | None = None) -> dict:
+    """Confusion metrics for the production gate against a top-quartile target.
+
+    F4: flags the shipped rule — (star >= threshold with sample
+    evidence) OR recent breakout — not the index value alone. ``details``
+    is the fit's per-player sample table (videos/recent_videos);
+    ``breakouts`` maps casefolded nick to max PI.
+    """
+    from cs2archive.scoring import (
+        BREAKOUT_PI,
+        DEMAND_DEEP_TRACK_RECORD,
+        DEMAND_RECENT_MIN_VIDEOS,
+    )
+
+    def _supported(player: str) -> bool:
+        if not details:
+            return False
+        info = details.get(player)
+        if not isinstance(info, dict):
+            low = player.casefold()
+            info = next((v for k, v in details.items()
+                         if str(k).casefold() == low), None)
+        if not isinstance(info, dict):
+            return False
+        try:
+            recent_n = int(info.get("recent_videos") or 0)
+            videos_n = int(info.get("videos") or 0)
+        except (TypeError, ValueError):
+            return False
+        return (recent_n >= DEMAND_RECENT_MIN_VIDEOS
+                or videos_n >= DEMAND_DEEP_TRACK_RECORD)
+
+    def _flagged(row: dict) -> bool:
+        player = str(row.get("player") or "")
+        if predict_star(index, row) >= threshold and _supported(player):
+            return True
+        if breakouts:
+            try:
+                return float(breakouts.get(player.casefold()) or 0) >= BREAKOUT_PI
+            except (TypeError, ValueError):
+                return False
+        return False
+
     flagged = hits = successes = 0
     for row in rows:
-        star = predict_star(index, row)
         good = bool(row.get(target))
         successes += int(good)
-        if star >= threshold:
+        if _flagged(row):
             flagged += 1
             hits += int(good)
     n = len(rows)
@@ -331,8 +377,11 @@ def gate_block(rows: list[dict], index: dict[str, float], *,
 
 
 def gate_sweep(rows: list[dict], index: dict[str, float], *,
-               thresholds=SWEEP_THRESHOLDS, target: str = "channel_top_quartile") -> list[dict]:
-    return [gate_block(rows, index, threshold=value, target=target)
+               thresholds=SWEEP_THRESHOLDS, target: str = "channel_top_quartile",
+               details: dict[str, dict] | None = None,
+               breakouts: dict[str, float] | None = None) -> list[dict]:
+    return [gate_block(rows, index, threshold=value, target=target,
+                       details=details, breakouts=breakouts)
             for value in thresholds]
 
 
@@ -536,6 +585,15 @@ def evaluate(rows: list[dict], *, mode: str = "time-split",
         oldest_holdout = min(row["published_at"] for row in scored)
         assert not newest_fit or newest_fit < oldest_holdout, "time split leaked"
 
+    # F4: grade the shipped star-OR-breakout rule — breakouts as of the
+    # cutoff in time-split mode (no future leakage), whole-scrape in
+    # the (already circular) in-sample mode.
+    try:
+        breakouts = breakout_map(
+            fit_rows if cutoff else prepared, aliases,
+            cutoff if cutoff else now)
+    except Exception:
+        breakouts = {}
     stars = [predict_star(index, row) for row in scored]
     covered = [row for row in scored if row["player"].casefold() in index]
     result = {
@@ -575,13 +633,16 @@ def evaluate(rows: list[dict], *, mode: str = "time-split",
             "raw_signal_all": correlation_block(scored, raw_signal_predictor(details)),
             "subscribers_baseline": _subscriber_block(scored),
         },
-        "gate": gate_block(scored, index, threshold=floor),
+        "gate": gate_block(scored, index, threshold=floor,
+                           details=details, breakouts=breakouts),
         "gate_pooled_target": gate_block(
-            scored, index, threshold=floor, target="pooled_top_quartile"
+            scored, index, threshold=floor, target="pooled_top_quartile",
+            details=details, breakouts=breakouts,
         ),
         "precision_at_k": precision_at_k(scored, index),
         "bands": band_table(scored, index),
-        "sweep": gate_sweep(scored, index),
+        "sweep": gate_sweep(scored, index, details=details,
+                            breakouts=breakouts),
         "players": player_table(scored, index, details),
     }
     result["player_level"] = player_level_block(result["players"], floor=floor)

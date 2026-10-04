@@ -26,6 +26,11 @@ ROOT = Path(__file__).resolve().parents[2]
 from cs2archive.misc.analyze_pov_market import analyze_rows  # noqa: E402
 from cs2archive.config import settings  # noqa: E402
 from cs2archive.player_accounts import list_accounts  # noqa: E402
+from cs2archive.scoring import (  # noqa: E402
+    BREAKOUT_DAYS as _BREAKOUT_DAYS,
+    BREAKOUT_PI as _BREAKOUT_PI,
+    DEMAND_RULE_VERSION as _DEMAND_RULE_VERSION,
+)
 from cs2archive.misc.scrape_pov_channels import (  # noqa: E402
     DEFAULT_CHANNELS,
     collect,
@@ -54,6 +59,19 @@ INDEX_FLOOR = 1.08
 INDEX_CAP = 1.80
 LONG_BLEND = 0.3
 SHORT_BLEND = 0.7
+# Breakout window/threshold for the solo gate's breakout clause: a
+# Recognised Pro with a long-form video (age >= 2d, like analyze_rows,
+# velocity floored at 7d so 2-7d front-load inflation cannot qualify)
+# published inside BREAKOUT_DAYS whose views/day clear BREAKOUT_PI times
+# its channel median (leave-one-out) with absolute reach (BREAKOUT_VIEWS
+# views or BREAKOUT_VPD views/day) earns a solo render even when their
+# median-based index sits below the star floor (medians bury one-off
+# breakouts).
+BREAKOUT_DAYS = _BREAKOUT_DAYS
+BREAKOUT_PI = _BREAKOUT_PI
+BREAKOUT_VIEWS = 5000.0
+BREAKOUT_VPD = 300.0
+VELOCITY_FLOOR_DAYS = 7.0
 
 
 def _parse_published(value: str | None) -> datetime | None:
@@ -120,6 +138,85 @@ def in_window(rows: list[dict], now: datetime, days: int) -> list[dict]:
             continue
         out.append(row)
     return out
+
+
+def _row_age_days(row: dict, now: datetime) -> float | None:
+    published = _parse_published(row.get("published_at"))
+    if published is None:
+        return None
+    return max((now - published).total_seconds() / 86400, 1 / 24)
+
+
+def breakout_map(
+    rows: list[dict],
+    aliases: dict[str, str],
+    now: datetime,
+    *,
+    window_days: int = BREAKOUT_DAYS,
+    pi_floor: float = BREAKOUT_PI,
+) -> dict[str, float]:
+    """Best recent performance index per Recognised Pro.
+
+    Mirrors analyze_rows' exclusions (long-form only, age >= 2d) with two
+    additions the council measured in: velocity is floored at
+    VELOCITY_FLOOR_DAYS (2-7d front-load inflation would otherwise qualify
+    fresh clips on its own), and the channel baseline is leave-one-out
+    (a player's own rows never carry their own channel median). The
+    qualifying video also needs absolute reach (BREAKOUT_VIEWS views or
+    BREAKOUT_VPD views/day) so a 100x spike on a near-zero channel cannot
+    qualify. Returns ``{canonical_nick: max_pi}`` for videos published
+    inside *window_days*, keeping only players clearing *pi_floor*.
+    """
+    from statistics import median
+
+    eligible: list[tuple[dict, float, float, float]] = []
+    for row in rows:
+        try:
+            duration = float(row.get("duration_seconds") or 0)
+        except (TypeError, ValueError):
+            duration = 0
+        if duration and duration < 300:
+            continue
+        age = _row_age_days(row, now)
+        if age is None or age < 2:
+            continue
+        try:
+            views = float(row.get("views") or 0)
+        except (TypeError, ValueError):
+            continue
+        floored = views / max(age, VELOCITY_FLOOR_DAYS)
+        eligible.append((row, age, views, floored))
+    # Baselines mirror analyze_rows (all eligible rows) so PI stays
+    # comparable with the index; the reach filter applies to candidates
+    # only, never to the baseline.
+    by_channel: dict[str, list[tuple[int, float]]] = {}
+    for pos, (row, _age, _views, vpd) in enumerate(eligible):
+        by_channel.setdefault(row.get("channel") or "?", []).append((pos, vpd))
+    loo_median: dict[tuple[str, str], float] = {}
+    for channel, items in by_channel.items():
+        for skip, _vpd in items:
+            rest = [v for pos, v in items if pos != skip]
+            if rest:
+                loo_median[(channel, str(skip))] = median(rest)
+    cutoff = now - timedelta(days=window_days)
+    best: dict[str, float] = {}
+    for pos, (row, age, views, vpd) in enumerate(eligible):
+        if views < BREAKOUT_VIEWS and vpd < BREAKOUT_VPD:
+            continue
+        if (_parse_published(row.get("published_at")) or now) < cutoff:
+            continue
+        raw = (row.get("primary_player") or "").strip()
+        player = aliases.get(raw.casefold()) if raw else None
+        if not player:
+            continue
+        base = loo_median.get((row.get("channel") or "?", str(pos))) or 0
+        if not base:
+            continue
+        pi = vpd / base
+        key = player.casefold()
+        if pi > best.get(key, 0.0):
+            best[key] = pi
+    return {nick: round(pi, 1) for nick, pi in best.items() if pi >= pi_floor}
 
 
 def recognised_aliases() -> dict[str, str]:
@@ -232,6 +329,7 @@ def refresh(*, scrape: bool = True, days: int = REFRESH_DAYS) -> dict:
     long_report = analyze_rows(in_window(aged, now, WINDOW_DAYS), source=str(HISTORY_PATH))
     recent_report = analyze_rows(in_window(aged, now, RECENT_DAYS), source="recent")
     index, details = build_index(long_report, recent_report, aliases)
+    breakouts = breakout_map(in_window(aged, now, WINDOW_DAYS), aliases, now)
     payload = {
         "updated_at": now.isoformat(),
         "window_days": WINDOW_DAYS,
@@ -241,12 +339,19 @@ def refresh(*, scrape: bool = True, days: int = REFRESH_DAYS) -> dict:
         "scraped": len(new_rows),
         "index": index,
         "players": details,
+        "breakouts": breakouts,
         "method": {
+            "rule_version": _DEMAND_RULE_VERSION,
             "performance_index": long_report["method"]["performance_index"],
             "min_videos": MIN_VIDEOS,
             "recent_min_videos": RECENT_MIN_VIDEOS,
             "thin_sample_cap": 1.35,
             "thin_sample": THIN_SAMPLE,
+            "breakout_days": BREAKOUT_DAYS,
+            "breakout_pi": BREAKOUT_PI,
+            "breakout_views": BREAKOUT_VIEWS,
+            "breakout_vpd": BREAKOUT_VPD,
+            "velocity_floor_days": VELOCITY_FLOOR_DAYS,
             "long_blend": LONG_BLEND,
             "short_blend": SHORT_BLEND,
             "index_floor": INDEX_FLOOR,
@@ -256,7 +361,9 @@ def refresh(*, scrape: bool = True, days: int = REFRESH_DAYS) -> dict:
         },
     }
     DEMAND_PATH.parent.mkdir(parents=True, exist_ok=True)
-    DEMAND_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp = DEMAND_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(DEMAND_PATH)
     return payload
 
 

@@ -52,6 +52,8 @@ from cs2archive.faceit.scrape_notable import (  # noqa: E402
     star_bonus_for_pros,
 )
 from cs2archive.faceit.update_player_demand import refresh as refresh_player_demand
+from cs2archive.faceit.gate_ledger import record_gate_scrape
+from cs2archive.scoring import log_demand_payload_status  # noqa: E402
 
 STATE_FILE = ROOT / ".data" / "notable_daily.json"
 DEMO_DIR = ROOT / "demos" / "faceit"
@@ -247,8 +249,7 @@ async def discover_faceit_tracks(
 ) -> tuple[list[dict], list[dict]]:
     """One scrape, two tracks: (solo POV picks, highlight lobby dicts).
 
-    Solo picks are watchable POVs (demand star, or org star + standout
-    line), one per player and match. Highlight lobbies are stacked-pro
+    Solo picks are watchable POVs (demand-index star only), one per player and match. Highlight lobbies are stacked-pro
     lobbies for the (WIP) highlight path — no line requirement, one entry
     per match, skipped when already recorded (hl:<match_id> in used or a
     feed file on disk).
@@ -264,18 +265,23 @@ async def discover_faceit_tracks(
             )
         except Exception as exc:
             print(f"[DEMAND] skipped ({exc})")
+    # F2 staleness guard: loud once-per-run freshness check (covers the
+    # listener path, which never refreshes inline, and manual runs).
+    log_demand_payload_status()
     data = await collect(
         hours=hours, count=count, min_pros=2,
         perf_kd=1.5, perf_adr=100.0, perf_kills=30, perf_limit=120,
         today_only=False, exclude_today=False,
     )
     today = datetime.now().strftime("%Y-%m-%d")
+    good = [c for c in data["candidates"] if is_good_faceit_pov(c)]
     picks, _, _ = select(
         {"used": state.get("used") or []},
-        [c for c in data["candidates"] if is_good_faceit_pov(c)],
+        good,
         n,
         today,
     )
+    record_gate_scrape("listener", data["candidates"])
     used = set(state.get("used") or [])
     lobbies: list[dict] = []
     for m in data["multi"]:
@@ -476,6 +482,7 @@ async def pick_for_day(
         {"used": state.get("used") or [], "pool": old_pool},
         fresh, n, today,
     )
+    record_gate_scrape("manual", fresh)
     pool_by_id = {c["id"]: c for c in old_pool}
     for c in fresh:
         pool_by_id[c["id"]] = c
