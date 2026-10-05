@@ -5,6 +5,7 @@ hard cuts, fades the tail to black (the dip-to-black into the intro card is
 completed by the intro head's matching fade-in, so the prepend itself stays a
 plain stream copy), scales to the POV's exact resolution/fps, and encodes with
 the overlay final-export profile — so the later prepend is a plain stream copy.
+Each clip's top-bar score digits are blurred first (alive counts stay sharp).
 
 The clip order is the timeline's edit order (climax last): the hook builds up
 and ends on the best moment.
@@ -31,6 +32,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 from cs2archive.config import settings  # noqa: E402
 from cs2archive import encode
+from cs2archive.hud_score_blur import score_blur_filter  # noqa: E402
 
 FFMPEG = settings.ffmpeg_exe
 FFPROBE = settings.ffprobe_exe
@@ -87,20 +89,33 @@ def _probe_video(path: Path) -> tuple[int, int, float]:
 
 
 def build_hook_filter(vid_idx: list[int], aud_idx: list[int], end_fade: float,
-                      total: float, width: int, height: int, fps: float) -> str:
+                       total: float, width: int, height: int, fps: float,
+                       score_blur: bool = True,
+                       src_size: tuple[int, int] | None = None) -> str:
     """filter_complex joining clips with hard cuts plus a tail fade to black.
 
     ``vid_idx``/``aud_idx`` are the ffmpeg input indexes carrying each clip's
     video/audio. Clips join via ``concat`` (jump cuts — no dissolves), then the
     tail fades to black over ``end_fade`` seconds so the hook meets the intro
     card's fade-in as a dip-to-black across the stream-copy cut.
+
+    With *score_blur* (default) each clip's score row is blurred before the
+    join — the compact alive-count numbers stay sharp
+    (``cs2archive/hud_score_blur.py``). *src_size* is the clips' own
+    resolution (the blur runs pre-scale); ``assemble()`` probes it from the
+    first clip, defaulting to the output size.
     """
     n = len(vid_idx)
     parts: list[str] = []
+    sw, sh = src_size or (width, height)
     for i, (v, a) in enumerate(zip(vid_idx, aud_idx)):
-        parts.append(f"[{v}:v]fps={fps:g},format=yuv420p,settb=AVTB[v{i}]")
+        vsrc = f"v{v}"
+        if score_blur:
+            parts.append(score_blur_filter(f"{v}:v", f"sb{i}", sw, sh, tag=f"sb{i}"))
+            vsrc = f"sb{i}"
+        parts.append(f"[{vsrc}]fps={fps:g},format=yuv420p,settb=AVTB[v{i}]")
         parts.append(f"[{a}:a]aformat=sample_fmts=fltp:sample_rates=48000:"
-                     f"channel_layouts=stereo,asetpts=PTS-STARTPTS[a{i}]")
+                     f"channel_layouts=stereo,asetpts=PTS-STARTPTS,volume=0.85[a{i}]")
 
     v_chain = "".join(f"[v{i}][a{i}]" for i in range(n))
     parts.append(f"{v_chain}concat=n={n}:v=1:a=1[jv][ja]")
@@ -119,7 +134,8 @@ def build_hook_filter(vid_idx: list[int], aud_idx: list[int], end_fade: float,
 
 
 def assemble(clips: list[Path], out_path: Path, end_fade: float = END_FADE_DEFAULT,
-             width: int = OUT_W, height: int = OUT_H, fps: float = OUT_FPS) -> Path:
+              width: int = OUT_W, height: int = OUT_H, fps: float = OUT_FPS,
+              score_blur: bool = True) -> Path:
     if not clips:
         raise ValueError("no clips to assemble")
 
@@ -151,7 +167,11 @@ def assemble(clips: list[Path], out_path: Path, end_fade: float = END_FADE_DEFAU
             aud_idx.append(next_idx)
             next_idx += 1
 
-    fc = build_hook_filter(vid_idx, aud_idx, end_fade, total, width, height, fps)
+    # Score blur runs pre-scale at the clips' own (capture) resolution —
+    # probe it from the first clip (all clips in one hook share it).
+    sw, sh, _ = _probe_video(clips[0])
+    fc = build_hook_filter(vid_idx, aud_idx, end_fade, total, width, height, fps,
+                         score_blur=score_blur, src_size=(sw, sh))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_name(out_path.name + ".part.mp4")
@@ -185,6 +205,10 @@ def main() -> int:
     ap.add_argument("--pov-video", type=Path, default=None,
                     help="Finished POV video — output resolution/fps are copied "
                          "from it so the prepend stays a stream copy")
+    ap.add_argument("--no-score-blur", action="store_true", default=False,
+                    help="Skip blurring the top-bar score digits (debug / "
+                         "geometry tuning — the blur boxes live in "
+                         "cs2archive/hud_score_blur.py)")
     args = ap.parse_args()
 
     if not args.render_json.is_file():
@@ -209,7 +233,8 @@ def main() -> int:
         print(f"  [pov] {args.pov_video.name}: {width}x{height} @ {fps:g}fps")
 
     out = args.out or (args.render_json.resolve().parent / "hook.mp4")
-    assemble(clips, out, end_fade=args.end_fade, width=width, height=height, fps=fps)
+    assemble(clips, out, end_fade=args.end_fade, width=width, height=height, fps=fps,
+             score_blur=not args.no_score_blur)
     dur, _ = _probe(out)
     print(f"  [OK] {out} ({dur:.2f}s, {out.stat().st_size / 1e6:.1f} MB)")
     return 0

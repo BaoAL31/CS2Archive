@@ -231,7 +231,7 @@ def _ffmpeg_encode(
     if include_audio:
         audio_map_args = ["-map", "0:a?"]
         audio_codec_args = ["-c:a", "aac", "-b:a", "256k",
-                            "-af", "asetpts=PTS-STARTPTS"]
+                            "-af", "asetpts=PTS-STARTPTS,volume=0.85"]
     else:
         audio_map_args = ["-an"]
         audio_codec_args: list[str] = []
@@ -323,6 +323,7 @@ def _remux_source_audio(overlay_path: Path, source_path: Path) -> None:
         "-map", "0:v", "-map", "1:a?",
         "-c:v", "copy",
         "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2",
+        "-af", "volume=0.85",
         "-movflags", "+faststart",
         "-shortest",
         str(tmp),
