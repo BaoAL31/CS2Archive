@@ -4,6 +4,11 @@ Reads ``short_timeline.json``, renders tick-range source clips at the player's
 native capture resolution (from player_accounts.json, e.g. 1280×960 for donk),
 then composites each into 1080×1920 with edge mirror blur header/footer.
 
+HUD policy: full player HUD with the compact alive-count team bar (N vs N
+numbers, not the avatar row — the row does not survive the 9:16 centre crop);
+the two score digits are blurred in the composite so a short leaks no score
+(``cs2archive/hud_score_blur.py``).
+
 Usage:
     python cs2archive/shorts/render_shorts.py <short_timeline.json> [--player <steam_id>]
     python cs2archive/shorts/render_shorts.py <short_timeline.json> --batches 4
@@ -26,6 +31,12 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 from cs2archive.shorts import resolve_output_dir  # noqa: E402
 from cs2archive.shorts.dead_gap_trim import apply_dead_gap_trim  # noqa: E402
 from cs2archive.shorts.make_short_meta import make_meta  # noqa: E402
+from cs2archive.hud_score_blur import (  # noqa: E402
+    COMPACT_PLAYERCOUNT_CFG,
+    HUD_POLICY,
+    score_blur_filter,
+)
+from cs2archive.chat_hide import CHAT_HIDE_CFG  # noqa: E402
 from cs2archive.config import settings  # noqa: E402
 from cs2archive.csdm_segments import sequence, tick_range_config  # noqa: E402
 from cs2archive import encode
@@ -160,6 +171,27 @@ def _probe_resolution(path: Path) -> tuple[int, int]:
         return (0, 0)
     parts = r.stdout.strip().split(",")
     return (int(parts[0]), int(parts[1]))
+
+
+def _hud_stamp_path(out_dir: Path) -> Path:
+    return out_dir / "hud_policy.json"
+
+
+def _hud_stamp_ok(out_dir: Path) -> bool:
+    """True when *out_dir* was produced under the current HUD policy.
+
+    A policy change (e.g. killfeed-only -> full HUD + score blur) must
+    invalidate stale outputs: size/resolution resume checks alone would
+    silently keep the old pixels.
+    """
+    try:
+        return json.loads(_hud_stamp_path(out_dir).read_text(encoding="utf-8")).get("hud") == HUD_POLICY
+    except Exception:
+        return False
+
+
+def _write_hud_stamp(out_dir: Path) -> None:
+    _hud_stamp_path(out_dir).write_text(json.dumps({"hud": HUD_POLICY}, indent=2), encoding="utf-8")
 
 
 def _ffmpeg_settings(use_cpu: bool = False) -> dict:
@@ -338,9 +370,11 @@ def _build_csdm_config(
         cvars = crosshair_cache.get(pov_sid, [])
 
         cfg_lines = [
-            "cl_draw_only_deathnotices 1",
+            "cl_draw_only_deathnotices 0",
+            "cl_drawhud 1",
+            *COMPACT_PLAYERCOUNT_CFG,
             "crosshair 1",
-            "cl_chatfilters 63",
+            *CHAT_HIDE_CFG,
             "snd_mvp_volume 0",
             "cl_showfps 0",
             "net_graph 0",
@@ -537,6 +571,7 @@ def _composite_9x16(
     avatar_height: int = AVATAR_DEFAULT_HEIGHT,
     avatar_bottom_margin: int = AVATAR_BOTTOM_MARGIN,
     use_cpu: bool = False,
+    score_blur: bool = True,
 ) -> None:
     """Composite a source clip into 1080x1920 via ffmpeg filter chain.
 
@@ -597,14 +632,19 @@ def _composite_9x16(
         stretched_w, stretched_h = src_width, src_height
         _dbg("9x16", f"{src.name}: 1080x1920 canvas, src={src_width}x{src_height} ({scaling_mode}), scale={scale}x, blur_sigma={gblur_sigma}")
 
-    # Optional stretch pre-filter applied to [0:v] before split into bg/fg/pip_src.
-    # Two-stage: scale+stretch first (output=[base]), then split from [base].
+    # Optional stretch pre-filter applied to [0:v], then the score-digit blur
+    # (full-HUD policy: alive counts stay sharp). Both stages are
+    # resolution-independent; bg/fg/pip all split from [sbase] afterwards.
     if stretch:
-        pre_stretch = f"[0:v]scale={stretched_w}:{stretched_h}:flags=spline,setsar=1[base];"
-        split_pre = "[base]split="
+        pre = f"[0:v]scale={stretched_w}:{stretched_h}:flags=spline,setsar=1[base];"
+        pre += (score_blur_filter("base", "sbase", stretched_w, stretched_h, tag="ssb")
+                if score_blur else "[base]null[sbase]") + ";"
+    elif score_blur:
+        pre = score_blur_filter("0:v", "sbase", src_width, src_height, tag="ssb") + ";"
     else:
-        pre_stretch = ""
-        split_pre = "[0:v]split="
+        pre = ""
+    split_src = "[sbase]" if (stretch or score_blur) else "[0:v]"
+    split_pre = f"{split_src}split="
 
     if scale == 1.0:
         fg_chain = (
@@ -660,10 +700,7 @@ def _composite_9x16(
             cmd.extend(["-i", str(kill_feed_path)])
             pip_scale_chain = f"[1:v]scale={scaled_pip_w}:{scaled_pip_h}[scaled_pip];" if actual_pip_scale != 1.0 else ""
             pip_in = "[scaled_pip]" if actual_pip_scale != 1.0 else "[1:v]"
-            if stretch:
-                split_part = f"{pre_stretch}{split_pre}2[bg_src][fg_src];"
-            else:
-                split_part = "[0:v]split=2[bg_src][fg_src];"
+            split_part = f"{pre}{split_pre}2[bg_src][fg_src];"
             filter_str = (
                 f"{split_part}"
                 f"{bg_chain};"
@@ -680,11 +717,8 @@ def _composite_9x16(
             if actual_pip_scale != 1.0:
                 pip_chain += f",scale={scaled_pip_w}:{scaled_pip_h}"
             pip_chain += "[pip];"
-            
-            if stretch:
-                split_part = f"{pre_stretch}{split_pre}3[bg_src][fg_src][pip_src];"
-            else:
-                split_part = "[0:v]split=3[bg_src][fg_src][pip_src];"
+
+            split_part = f"{pre}{split_pre}3[bg_src][fg_src][pip_src];"
             filter_str = (
                 f"{split_part}"
                 f"{bg_chain};"
@@ -712,10 +746,7 @@ def _composite_9x16(
             str(dst),
         ])
     else:
-        if stretch:
-            split_part = f"{pre_stretch}{split_pre}2[bg_src][fg_src];"
-        else:
-            split_part = "[0:v]split=2[bg_src][fg_src];"
+        split_part = f"{pre}{split_pre}2[bg_src][fg_src];"
         vf = (
             f"{split_part}"
             f"{bg_chain};"
@@ -792,6 +823,7 @@ def render_shorts(
     hook_timeout: float = 150.0,
     hook_retries: int = 2,
     use_cpu: bool = False,
+    score_blur: bool = True,
 ) -> Path:
     """Render all shorts from a timeline JSON.
     
@@ -846,18 +878,23 @@ def render_shorts(
     # Early resume: if every short's final output already exists at the target
     # resolution, skip the whole pipeline (CSDM render + composite). The per-short
     # composite skip below alone is pointless — it fires AFTER the expensive
-    # CSDM segment render.
+    # CSDM segment render. The HUD stamp must also match: size/resolution alone
+    # would silently keep killfeed-only pixels after a HUD-policy change.
     if not composite_only:
-        all_done = True
-        for short in shorts:
-            dst = _short_output_path(out_dir, short, name)
-            if not (dst.exists() and dst.stat().st_size >= 1_048_576):
-                all_done = False
-                break
-            w, h = _probe_resolution(dst)
-            if not (w == OUT_WIDTH and h == OUT_HEIGHT):
-                all_done = False
-                break
+        if not _hud_stamp_ok(out_dir):
+            _dbg("hud", "HUD policy changed or first render — full re-render, no resume")
+            all_done = False
+        else:
+            all_done = True
+            for short in shorts:
+                dst = _short_output_path(out_dir, short, name)
+                if not (dst.exists() and dst.stat().st_size >= 1_048_576):
+                    all_done = False
+                    break
+                w, h = _probe_resolution(dst)
+                if not (w == OUT_WIDTH and h == OUT_HEIGHT):
+                    all_done = False
+                    break
         if all_done:
             print(f"  [SKIP] all {len(shorts)} short(s) already rendered at "
                   f"{OUT_WIDTH}x{OUT_HEIGHT} — CSDM/composite skipped")
@@ -874,40 +911,59 @@ def render_shorts(
             return out_dir
 
     if not composite_only:
-        # Fresh render: clear stale segments, then run CSDM for each batch
-        if segments_dir.exists():
-            import shutil
-            shutil.rmtree(segments_dir)
-        segments_dir.mkdir(parents=True, exist_ok=True)
+        # Fresh render: clear stale segments, then run CSDM for each batch.
+        # The launch autoexec carries tv_nochat (chat_hide): per-sequence cfg
+        # alone loses the race against server lines printed on the sequence's
+        # first tick, which then linger ~12s with no cvar to clear them.
+        from cs2archive.faceit.intro_prepend import (  # noqa: E402
+            AUTOEXEC_RENDER,
+            _restore_autoexec,
+            _swap_autoexec,
+        )
+        from cs2archive.pov.render_pov import _write_render_autoexec  # noqa: E402
+        _write_render_autoexec([], None, None, False)
+        _swap_autoexec(AUTOEXEC_RENDER)
+        try:
+            if segments_dir.exists():
+                import shutil
+                shutil.rmtree(segments_dir)
+            segments_dir.mkdir(parents=True, exist_ok=True)
 
-        for batch_idx, batch in enumerate(batches):
-            batch_start = sum(len(b) for b in batches[:batch_idx])
-            batch_end = batch_start + len(batch) - 1
-            _dbg("batch", f"batch {batch_idx + 1}/{len(batches)}: shorts {batch_start + 1}-{batch_end + 1}")
+            for batch_idx, batch in enumerate(batches):
+                batch_start = sum(len(b) for b in batches[:batch_idx])
+                batch_end = batch_start + len(batch) - 1
+                _dbg("batch", f"batch {batch_idx + 1}/{len(batches)}: shorts {batch_start + 1}-{batch_end + 1}")
 
-            config = _build_csdm_config(batch, demo_path, segments_dir, src_w, src_h, rename, use_cpu=use_cpu)
-            conf_path = out_dir / f"batch_{batch_idx + 1}_config.json"
-            conf_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+                config = _build_csdm_config(batch, demo_path, segments_dir, src_w, src_h, rename, use_cpu=use_cpu)
+                conf_path = out_dir / f"batch_{batch_idx + 1}_config.json"
+                conf_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
-            if hook_timeout > 0 and hook_retries > 0:
-                _run_csdm_hook_aware(
-                    conf_path, segments_dir,
-                    f"batch {batch_idx + 1}/{len(batches)}",
-                    hook_timeout, hook_retries,
-                )
-            else:
-                ret = _run_csdm(conf_path)
-                if ret != 0:
-                    raise RuntimeError(
-                        f"CSDM batch {batch_idx + 1} failed (exit {ret})")
-            _dbg("csdm", f"batch {batch_idx + 1} rendered")
+                if hook_timeout > 0 and hook_retries > 0:
+                    _run_csdm_hook_aware(
+                        conf_path, segments_dir,
+                        f"batch {batch_idx + 1}/{len(batches)}",
+                        hook_timeout, hook_retries,
+                    )
+                else:
+                    ret = _run_csdm(conf_path)
+                    if ret != 0:
+                        raise RuntimeError(
+                            f"CSDM batch {batch_idx + 1} failed (exit {ret})")
+                _dbg("csdm", f"batch {batch_idx + 1} rendered")
 
-            seq_files = _find_sequence_files(segments_dir, len(batch), batch)
-            if len(seq_files) != len(batch):
-                _dbg("render", f"[WARN] Expected {len(batch)} sequence files, found {len(seq_files)}")
+                seq_files = _find_sequence_files(segments_dir, len(batch), batch)
+                if len(seq_files) != len(batch):
+                    _dbg("render", f"[WARN] Expected {len(batch)} sequence files, found {len(seq_files)}")
+        finally:
+            _restore_autoexec()
     else:
         if not segments_dir.exists():
             raise FileNotFoundError(f"No existing segments dir for --composite-only: {segments_dir}")
+        if score_blur and not _hud_stamp_ok(out_dir):
+            raise RuntimeError(
+                "HUD policy changed since these segments were rendered "
+                "(killfeed-only sources have no score to blur and no team bar "
+                "to keep) — re-run without --composite-only for a full render")
         _dbg("composite", f"composite-only: reusing {len(shorts)} source clips from {segments_dir}")
 
     # Composite each segment into 9:16
@@ -920,7 +976,7 @@ def render_shorts(
     for i, (seg_file, short) in enumerate(zip(seq_files, shorts)):
         dst = _short_output_path(out_dir, short, name)
         out_name = dst.name
-        if dst.exists() and dst.stat().st_size >= 1_048_576:
+        if _hud_stamp_ok(out_dir) and dst.exists() and dst.stat().st_size >= 1_048_576:
             w, h = _probe_resolution(dst)
             if w == OUT_WIDTH and h == OUT_HEIGHT:
                 _dbg("composite", f"[SKIP] {out_name} already rendered at {OUT_WIDTH}x{OUT_HEIGHT}")
@@ -958,7 +1014,7 @@ def render_shorts(
             scale=scale, kill_feed_path=kf_path, pip_scale=pip_scale,
             scaling_mode=scaling_mode, avatar_path=avatar_path,
             avatar_height=avatar_height, avatar_bottom_margin=avatar_bottom_margin,
-            use_cpu=use_cpu,
+            use_cpu=use_cpu, score_blur=score_blur,
         )
         w, h = _probe_resolution(dst)
         dur = _probe_duration(dst)
@@ -967,6 +1023,7 @@ def render_shorts(
 
     # Generate YouTube-Shorts upload meta. Team/org is detected from the demo
     # itself (scripts.shorts.detect_team) — never from memory.
+    _write_hud_stamp(out_dir)
     if make_meta_on:
         try:
             meta = make_meta(out_dir, tournament=tournament, year=year)
@@ -1009,8 +1066,12 @@ def main() -> int:
     ap.add_argument("--year", type=str, default="2026",
                    help="Year suffix for the auto-detected tournament hashtag (default: 2026)")
     ap.add_argument("--no-rename", action="store_true",
-                   help="Disable automatic HUD player-name rename to canonical nickname "
-                        "(mirv_replace_name). Default: on.")
+                    help="Disable automatic HUD player-name rename to canonical nickname "
+                         "(mirv_replace_name). Default: on.")
+    ap.add_argument("--no-score-blur", action="store_true",
+                    help="Skip blurring the top-bar score digits (debug / "
+                         "geometry tuning — the blur boxes live in "
+                         "cs2archive/hud_score_blur.py)")
     ap.add_argument("--hook-timeout", type=float, default=150.0,
                    help="Seconds to wait for HLAE to hook CS2 and emit a sequence file "
                         "before treating it as a hook failure (default: 150). "
@@ -1046,10 +1107,10 @@ def main() -> int:
                        avatar_height=args.avatar_height,
                        avatar_bottom_margin=args.avatar_bottom_margin,
                        avatar_outline_width=args.avatar_outline_width,
-                       rename=not args.no_rename, make_meta_on=not args.no_meta,
-                       tournament=args.tournament, year=args.year,
-                       hook_timeout=args.hook_timeout, hook_retries=args.hook_retries,
-                       use_cpu=use_cpu)
+                        rename=not args.no_rename, make_meta_on=not args.no_meta,
+                        tournament=args.tournament, year=args.year,
+                        hook_timeout=args.hook_timeout, hook_retries=args.hook_retries,
+                        use_cpu=use_cpu, score_blur=not args.no_score_blur)
         return 0
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)

@@ -97,7 +97,10 @@ def test_csdm_subprocess_called(tmp_path):
     with patch("cs2archive.shorts.render_shorts._run_csdm_hook_aware") as mock_hook, \
          patch("cs2archive.shorts.render_shorts._get_player_crosshair_cvars", return_value=[]), \
          patch("cs2archive.shorts.render_shorts._find_sequence_files", mock_seq_view), \
-         patch("cs2archive.shorts.render_shorts._composite_9x16") as mock_composite:
+         patch("cs2archive.shorts.render_shorts._composite_9x16") as mock_composite, \
+         patch("cs2archive.pov.render_pov._write_render_autoexec"), \
+         patch("cs2archive.faceit.intro_prepend._swap_autoexec"), \
+         patch("cs2archive.faceit.intro_prepend._restore_autoexec"):
         try:
             render_shorts(timeline_path, batch_size=0)
         except RuntimeError:

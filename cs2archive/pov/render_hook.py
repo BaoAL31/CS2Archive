@@ -4,10 +4,12 @@ Reads ``hook_timeline.json`` (from ``build_hook_timeline.py``), plans the
 kill-anchored sub-clips (``hook_plan.py``), then renders one CSDM sequence per
 window at the player's capture resolution.
 
-HUD policy (the whole point of this product): ``cl_draw_only_deathnotices 1``
-plus CSDM's ``showOnlyDeathNotices`` — scoreboard, round timer, money and team
-scores are hidden, the killfeed stays. Same as the Shorts format, so a hook
-leaks no result information. The player's own crosshair is restored and their
+HUD policy: full player HUD with the compact alive-count team bar plus
+killfeed (``cl_draw_only_deathnotices 0`` + ``cl_drawhud 1`` +
+``cl_teamcounter_playercount_instead_of_avatars`` — ``5 vs 4`` numbers, not
+the wide avatar row), and the two score digits are blurred in post
+(``cs2archive/hud_score_blur.py``) so a hook still leaks no result
+information. The player's own crosshair is restored and their
 in-HUD name is rewritten to the canonical nickname (``mirv_replace_name``).
 
 Segments stay at the capture resolution; ``assemble_hook.py`` scales them to
@@ -46,6 +48,8 @@ from cs2archive.faceit.intro_prepend import (  # noqa: E402
 from cs2archive.csdm_segments import sequence, tick_range_config  # noqa: E402
 from cs2archive.config import settings  # noqa: E402
 from cs2archive.render.hook_aware import run_csdm_hook_aware  # noqa: E402
+from cs2archive.hud_score_blur import COMPACT_PLAYERCOUNT_CFG  # noqa: E402
+from cs2archive.chat_hide import CHAT_HIDE_CFG  # noqa: E402
 from cs2archive.shorts.render_shorts import (  # noqa: E402
     _ffmpeg_settings,
     _find_sequence_files,
@@ -53,13 +57,15 @@ from cs2archive.shorts.render_shorts import (  # noqa: E402
 
 CSDM = settings.csdm_cmd
 
-# Shorts-format HUD: killfeed only. Kept in the cfg as well as in the CSDM
-# sequence envelope (showOnlyDeathNotices) — belt and braces, same as
-# render_shorts._build_csdm_config.
+# Full-HUD policy: the compact alive-count team bar (N vs N numbers, not the
+# wide avatar row) stays visible; CSDM's showOnlyDeathNotices stays OFF and
+# the score digits are blurred in post (assemble_hook.py) instead.
 HOOK_CFG_LINES = [
-    "cl_draw_only_deathnotices 1",
+    "cl_draw_only_deathnotices 0",
+    "cl_drawhud 1",
+    *COMPACT_PLAYERCOUNT_CFG,
     "crosshair 1",
-    "cl_chatfilters 63",
+    *CHAT_HIDE_CFG,
     "snd_mvp_volume 0",
     "cl_showfps 0",
     "net_graph 0",
@@ -143,7 +149,7 @@ def build_config(plan: list[dict], demo_path: Path, out_dir: Path,
             sequences.append(sequence(
                 n, int(w["start_tick"]), int(w["end_tick"]), sid,
                 "\n".join(cfg_lines) + "\n",
-                show_only_death_notices=True,
+                show_only_death_notices=False,
                 player_voices=False,
             ))
             n += 1
@@ -225,7 +231,7 @@ def render_hook(timeline_path: Path, width: int | None = None,
         wins = ", ".join(f"{w['start_tick']}-{w['end_tick']}" for w in m["windows"])
         print(f"  {m['label']:22s} r{m.get('round')}  {len(m['windows'])} clip(s): {wins}")
     print(f"  demo: {demo_path}")
-    print(f"  capture: {width}x{height} @ {framerate}fps (HUD: killfeed only)")
+    print(f"  capture: {width}x{height} @ {framerate}fps (HUD: full + N-vs-N team bar, score blurred in post)")
     print(f"  out: {out_dir}")
 
     cfg = build_config(plan, demo_path, segments_dir, width, height,

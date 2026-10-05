@@ -396,19 +396,23 @@ def _cfg_without_comments() -> str:
     return "\n".join(lines) + "\n"
 
 
-def _sequence_cfg(player_cvars: list[str] | None = None) -> str:
+def _sequence_cfg(player_cvars: list[str] | None = None,
+                  rename_map: dict[str, str] | None = None) -> str:
     """POV base cfg + inlined player crosshair/viewmodel (last wins).
 
     CSDM runs the sequence ``cfg`` string as console commands. Nested
     ``exec render_crosshair`` is unreliable there — hooks already inline
     cvars for that reason. Player cvars must be literal lines at the end.
+    mirv_replace_name overrides ride the same exec (proven in the hook
+    path): launch-time autoexec alone does not apply them, the per-round
+    sequence cfg does.
     """
     base = _cfg_without_comments()
     skip = (
         "cl_crosshairstyle ", "cl_crosshaircolor ", "cl_crosshairsize ",
         "cl_crosshairthickness ", "cl_crosshairgap ", "cl_crosshairdot ",
         "cl_crosshair_drawoutline ", "cl_crosshair_outlinethickness ",
-        "cl_crosshair_length ", "cl_crosshair_thickness ", "cl_crosshair_gap ",
+        "cl_crosshair_length ", "cl_crosshair_thickness ",
         "cl_crosshaircolor_r ", "cl_crosshaircolor_g ", "cl_crosshaircolor_b ",
         "cl_crosshaircolor_a ", "cl_crosshairalpha ", "cl_crosshairusealpha ",
         "cl_crosshair_recoil ", "cl_crosshair_t ",
@@ -426,6 +430,10 @@ def _sequence_cfg(player_cvars: list[str] | None = None) -> str:
         cv = (cv or "").strip()
         if cv:
             lines.append(cv)
+    for rl in rename_cfg_lines(rename_map):
+        rl = (rl or "").strip()
+        if rl:
+            lines.append(rl)
     return "\n".join(lines) + "\n"
 
 
@@ -457,7 +465,8 @@ def _render_trimmed_windows(
     args,
 ) -> None:
     """Record trimmed round tick windows via CSDM --config-file (not --event rounds)."""
-    cfg_text = _sequence_cfg(getattr(args, "player_cvars", None))
+    cfg_text = _sequence_cfg(getattr(args, "player_cvars", None),
+                             getattr(args, "rename_map", None))
     sequences = []
     global_rounds = []
     overrides: dict[int, tuple[int, int]] = {}
@@ -541,7 +550,8 @@ def _render_event_rounds_cli(demo_part: str, output_dir: Path, steam_id: str,
                              args) -> None:
     """One CLI --event rounds attempt. Raises SystemExit via run_csdm on failure."""
     seq_cfg = output_dir / "pov_sequence.cfg"
-    seq_cfg.write_text(_sequence_cfg(getattr(args, "player_cvars", None)), encoding="utf-8")
+    seq_cfg.write_text(_sequence_cfg(getattr(args, "player_cvars", None),
+                                       getattr(args, "rename_map", None)), encoding="utf-8")
     cmd = [
         CSDM, "video", str(Path(demo_part).resolve()),
         "--steamids", steam_id,
@@ -895,21 +905,22 @@ def rename_cfg_lines(rename_map: dict[str, str] | None) -> list[str]:
 def _write_render_autoexec(cvars: list[str], rename_map: dict[str, str] | None = None,
                            player_name: str | None = None,
                            hide_avatars: bool = False) -> None:
-    # cl_chatfilters 63: hide ALL chat — cl_chatfilters is unreliable for
-    # demo/GOTV relayed admin/system lines (48 didn't catch them), so kill the
-    # chat box entirely; HUD/banners untouched. Must match assets/cs2_pov.cfg —
-    # the cfg execs this autoexec AFTER setting its own value, so this file wins.
-    # Voice stays fully ON during render. These MUST be in the game's
-    # autoexec.cfg (runs at launch, BEFORE the demo loads) — if set later they
-    # don't apply to demo playback. tv_listen_voice_indices -1 (both halves =
+    # Chat/console text: cs2archive.chat_hide owns the cvar list. The relayed
+    # "Console: ..." server lines that used to bleed into every full-HUD render
+    # are TextMsg prints — killed by cl_showtextmsg 0 (plus hidehud 128 for the
+    # chat panel). cl_chatfilters/tv_relaytextchat do NOT exist in CS2 and were
+    # no-ops. These MUST be in the game's autoexec.cfg (runs at launch, BEFORE
+    # the demo loads) — a sequence cfg alone loses the race against a print
+    # issued while CSDM is seeking.
+    # Voice stays fully ON during render. tv_listen_voice_indices -1 (both halves =
     # 64-slot bitmask all-set) enables hearing every recorded player.
     # It does not repair the native speaker HUD; Swift handles that separately.
-    lines = ["crosshair 1", "cl_chatfilters 63", "snd_mvp_volume 0",
-             "snd_mute_losefocus 0", "voice_enable 1", "voice_modenable 1",
-             "tv_listen_voice_indices -1",
-             "tv_listen_voice_indices_h -1",
-             "tv_relaytextchat 2",
-             "spec_autodirector 0"]
+    from cs2archive.chat_hide import CHAT_HIDE_CFG
+    lines = ["crosshair 1", *CHAT_HIDE_CFG, "snd_mvp_volume 0",
+              "snd_mute_losefocus 0", "voice_enable 1", "voice_modenable 1",
+              "tv_listen_voice_indices -1",
+              "tv_listen_voice_indices_h -1",
+              "spec_autodirector 0"]
     # Auto-team FACEIT lobbies (no tournament, team Unknown) have no
     # resolvable Steam avatars — the scoreboard avatar panels render as
     # missing-texture checkers. Hide them there; keep them for real rosters.
@@ -1042,7 +1053,7 @@ def main() -> None:
                          "'{\"76561198012345678\":\"kyousuke\"}'. Injects "
                          "'mirv_replace_name byXuid add x<steamid> \"name\"' into the render cfg. "
                          "Applies to the in-game scoreboard/killfeed/observer HUD; chat is NOT "
-                         "replaced (use tv_nochat true if you must hide chat).")
+                         "replaced (chat/console text is hidden outright via cs2archive.chat_hide).")
     parser.add_argument("--hide-avatars", action="store_true", default=False,
                         help="Hide scoreboard avatar images (auto-team lobbies with no "
                              "resolvable Steam avatars render them as missing-texture "
@@ -1174,6 +1185,7 @@ def main() -> None:
 
     # Stashed for sequence cfg inlining (trimmed + --event rounds paths).
     args.player_cvars = list(cvars)
+    args.rename_map = dict(rename_map)
 
     if cvars or rename_map or demo_name:
         print(f"  Player crosshair/viewmodel ({len(cvars)} cvars)"

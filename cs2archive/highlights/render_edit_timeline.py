@@ -31,6 +31,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 from cs2archive.config import settings
 from cs2archive.csdm_segments import sequence, tick_range_config
+from cs2archive.chat_hide import CHAT_HIDE_CFG
 from cs2archive import encode
 
 CSDM = settings.csdm_cmd
@@ -212,7 +213,7 @@ def _build_csdm_config(
 
         cfg_lines = [
             "crosshair 1",
-            "cl_chatfilters 63",
+            *CHAT_HIDE_CFG,
             "snd_mvp_volume 0",
             "cl_draw_only_deathnotices 0",
             "cl_drawhud 1",

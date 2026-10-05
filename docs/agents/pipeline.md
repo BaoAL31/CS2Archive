@@ -36,12 +36,26 @@ resuming old footage. Swift must be captured in step 2; see
 **Hook cold open (inside step 5, first — before the intro card):** every POV
 gets a no-spoiler highlight prepended: the POV player's best moments
 (`cs2archive/pov/build_hook_timeline.py` → `render_hook.py` → `assemble_hook.py`),
-rendered with `cl_draw_only_deathnotices 1` (killfeed only, the Shorts HUD) so
-no score/round/timer leaks. The hook renders under its own autoexec with the
+rendered with the full player HUD but the compact alive-count team bar
+(`cl_teamcounter_playercount_instead_of_avatars`, N vs N — the Shorts HUD)
+with the score digits blurred at assembly, so no score leaks. The hook renders under its own autoexec with the
 same cfg inputs as the POV (canonical nick → prosettings crosshair/viewmodel,
 rename map, spec-lock); auto-team FACEIT lobbies (no tournament) additionally
 hide scoreboard avatars (`--hide-avatars`, same flag on POV/hook/intro renders)
 since unresolvable Steam avatars show as missing-texture checkers.
+
+**Chat / console text is hidden in every full-HUD render** (Shorts, Hook, POV,
+highlights) via `cs2archive/chat_hide.py`. The relayed server lines that bled
+into the bottom-left (`Console: This server's password has been changed to: …`)
+are `TextMsg` HUD prints — they are printed *while the demo plays*, so CSDM's
+fast seek can leave them inside their display window at the start of a segment.
+The kill is `cl_showtextmsg 0` (plus `hidehud 128`, the chat bitmask) and it
+must live in the **launch autoexec** (active before the demo loads), not only in
+the per-sequence cfg. `tv_nochat` only covers SourceTV spectator chat, and
+`cl_chatfilters` / `tv_relaytextchat` / `hud_saytext_time` **do not exist in
+CS2** — those older lines were no-ops. Bumping `HUD_POLICY`
+(`cs2archive/hud_score_blur.py`) invalidates cached segments so a policy change
+re-renders instead of recompositing.
 
 - Order delivered: hook → card + buy phase → POV → outro. Step 5 runs the
   intro first, then prepends the hook in front, so the intro's buy-phase
