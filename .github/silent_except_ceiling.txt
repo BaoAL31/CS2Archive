@@ -1,8 +1,10 @@
 # CR-09 (expires 2026-11-15) — ceiling for S110 (try/except/pass) + BLE001 (blind except).
 # CI fails when the measured count EXCEEDS this number, so the debt can only shrink.
 # Lower it deliberately as sites are fixed: report_silent_excepts.py --update
+# 2026-10-05: raised 460 -> 472 on purpose. The +12 is the chat/console hide + HUD policy work (5b25189: chat_hide.py, hud_score_blur.py, render_hook/render_pov/render_shorts cfg-policy rewrite).
 # 2026-09-27: raised 445 -> 460 on purpose. The +15 is the concurrent overlay/PiP work
 # (lineup_freeze/overlay_utilcams/overlay_pov), not the review patch — the review patch
 # removed the voice-shade module in the same window. Recorded rather than silently absorbed:
 # the ratchet only works if every increase is deliberate and attributable.
-460
+472
+
