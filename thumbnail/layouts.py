@@ -182,6 +182,31 @@ def _draw_tournament_logo(
         print(f"  [WARN] tournament logo composite failed: {e}")
 
 
+def _draw_tournament_label(
+    img: Image.Image,
+    label: str,
+    center_x: int,
+    center_y: int,
+) -> None:
+    """Tournament as a text chip (same dark rounded panel as the logo) instead
+    of a logo image, for tournaments without a badge asset."""
+    from PIL import ImageFont
+
+    try:
+        font = ImageFont.truetype(str(FONT_PATH), 44)
+    except Exception:
+        font = ImageFont.load_default()
+
+    from thumbnail.generator import SHADOW_COLOR, SHADOW_OFFSET, STROKE_WIDTH
+
+    draw = ImageDraw.Draw(img)
+    draw.text((center_x + SHADOW_OFFSET, center_y + SHADOW_OFFSET), label, font=font,
+              fill=SHADOW_COLOR, anchor="mm",
+              stroke_width=STROKE_WIDTH, stroke_fill=SHADOW_COLOR)
+    draw.text((center_x, center_y), label, font=font, fill=(255, 255, 255, 255), anchor="mm",
+              stroke_width=STROKE_WIDTH, stroke_fill=SHADOW_COLOR)
+
+
 def generate(
     bg_path: Path,
     avatar_path: Path,
@@ -195,6 +220,7 @@ def generate(
     variant: str = "raw",
     keyboard: bool = False,
     tournament_logo: Path | None = None,
+    tournament_label: str = "",
 ) -> Image.Image:
     bg = load_background(bg_path)
 
@@ -205,6 +231,7 @@ def generate(
     pw, ph = player_img.size
     px = 48
     py = HEIGHT - ph + 40  # clear the overlay pills (hair was under badge)
+
     bg.paste(player_img, (px, py), player_img)
 
     _draw_text_scrim(bg)
@@ -217,8 +244,6 @@ def generate(
     GOLD = FONT_SIZES["player"]  # same box as name -> even gaps above/below KD
 
     match_line = match_detail.strip()
-    if map_name:
-        match_line = f"{match_line}  ·  {map_name}" if match_line else map_name
 
     lines = [
         (player_name, FONT_SIZES["player"], TEXT_COLOR, 0),
@@ -227,6 +252,8 @@ def generate(
     ]
     if tournament_logo is not None:
         lines.append((None, FONT_SIZES["tiny"], TEXT_COLOR, LOGO_SLOT_TOP_GAP))
+    elif tournament_label:
+        lines.append((None, FONT_SIZES["small"], TEXT_COLOR, LOGO_SLOT_TOP_GAP))
 
     heights = [_line_height(s) for _, s, _f, _g in lines]
     total = sum(heights) + sum(g for _, _, _, g in lines)
@@ -236,6 +263,8 @@ def generate(
         cursor += gap
         if text is None and tournament_logo is not None:
             _draw_tournament_logo(bg, tournament_logo, text_x, cursor)
+        elif text is None and tournament_label:
+            _draw_tournament_label(bg, tournament_label, text_x, cursor + h // 2)
         else:
             draw_text(draw, text, text_x, cursor + h // 2, size, anchor="mm", fill=fill)
         cursor += h

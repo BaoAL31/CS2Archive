@@ -84,6 +84,7 @@ def main() -> None:
     parser.add_argument("--steam-id", help="Player Steam64 ID (required with --video)")
     parser.add_argument("--tournament", "-t", help="Tournament name (e.g. IEM Atlanta 2026)")
     parser.add_argument("--tournament-logo", help="Path to a logo image to draw over the tournament name")
+    parser.add_argument("--tournament-label", default="", help="Text chip (e.g. 'EPL 24') drawn instead of a logo badge")
     parser.add_argument(
         "--variant",
         choices=["raw", "overlay"],
@@ -165,6 +166,7 @@ def main() -> None:
         variant=args.variant,
         keyboard=args.keyboard,
         tournament_logo=Path(args.tournament_logo) if args.tournament_logo else None,
+        tournament_label=args.tournament_label,
     )
     img = img.convert("RGB")
     img.save(output_path.with_suffix(".jpg"), "JPEG", quality=95, subsampling=0)

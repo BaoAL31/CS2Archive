@@ -95,6 +95,18 @@ def _tournament_logo_path(tournament: str, hf_root: str) -> Path | None:
     return None
 
 
+def _tournament_label(tournament: str, hf_root: str) -> str:
+    """Text chip for the thumbnail instead of a logo badge (e.g. 'EPL 24')."""
+    import re
+
+    t = (tournament or "").lower()
+    h = (hf_root or "").lower()
+    if "esl pro league" in t or "esl-pro-league" in h or "esl_pro_league" in h:
+        m = re.search(r"season[ _-]*(\d+)", t) or re.search(r"season[ _-]*(\d+)", h)
+        return f"EPL {m.group(1)}" if m else "EPL"
+    return ""
+
+
 def pipeline_error(step: int, code: str, message: str) -> str:
     payload = json.dumps({
         "error": True,
@@ -2139,6 +2151,10 @@ class Pipeline:
         ewc_logo = _tournament_logo_path(self.tournament, self.hf_root)
         if ewc_logo:
             cmd += ["--tournament-logo", str(ewc_logo)]
+        else:
+            tlabel = _tournament_label(self.tournament, self.hf_root)
+            if tlabel:
+                cmd += ["--tournament-label", tlabel]
         cmd += ["--output", str(youtube_dir)]
 
         r = self._run_py(cmd, timeout=900)
