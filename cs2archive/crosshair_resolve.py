@@ -67,10 +67,18 @@ def demo_crosshair_cvars(
                 code = pl.get("crosshairShareCode")
                 if code:
                     from cs2archive.crosshair_code import decode_crosshair, crosshair_to_convars
-                    cvars = crosshair_to_convars(
-                        decode_crosshair(code), screen_height=screen_height)
+                    try:
+                        cvars = crosshair_to_convars(
+                            decode_crosshair(code), screen_height=screen_height)
+                    except ValueError as exc:
+                        # FACEIT demos often carry stale/garbage share codes;
+                        # a bad code must fall through to game defaults,
+                        # never abort the render (contract: [] + source none).
+                        print(f"  [WARN] demo share code undecodable "
+                              f"({exc}); using game-default crosshair")
+                        return []
                 break
-    return cvars
+        return cvars
 
 
 def resolve_crosshair_cvars(

@@ -17,6 +17,10 @@ REPEEK_ID = "mokknliiomknodkdmpcellamkopbdmao"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FACEIT_SESSION = PROJECT_ROOT / ".sessions" / "faceit"
 DEBUG_PROFILE = Path.home() / ".chrome-debug"
+# Staging for fresh standalone captures. The POV pipeline copies the
+# panes into its own ``{pov}/stat-strips/`` (create_repeek_intro +
+# paths.drop_legacy_match_strips), so this legacy tree should be empty
+# between a capture and the POV copy — never a permanent home.
 STRIPS_ROOT = PROJECT_ROOT / "renders" / "stat-strips"
 
 NEED_PLAYERS = 10

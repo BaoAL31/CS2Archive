@@ -31,6 +31,7 @@ _TAGS = ["Shorts"]
 # Matched against the demo's parent folder name (e.g. "...-esports-world-cup").
 _EVENT_TAGS = {
     "esports-world-cup": ("Esports World Cup", "esportworldcup"),
+    "esl-pro-league": ("ESL Pro League", "eslproleague"),
     "blast-open-porto": ("BLAST Open Porto", "blastopenporto"),
     "blast-bounty": ("BLAST Bounty", "blastbounty"),
 }
@@ -149,7 +150,12 @@ def _clean_nick(nick: str) -> str:
     return str(nick).rstrip("-_")
 
 
-def _make_title(nick: str, short_type: str, opp: str | None, mname: str, tournament_tag: str = "", clutch: str | None = None, kills: int = 0, punch_tags: list[str] | None = None, start_tick: int = 0) -> tuple[str, str]:
+def _hashtag(word: str | None) -> str:
+    clean = "".join(c for c in str(word or "").lower() if c.isalnum())
+    return f"#{clean}" if clean else ""
+
+
+def _make_title(nick: str, short_type: str, opp: str | None, mname: str, tournament_tag: str = "", clutch: str | None = None, kills: int = 0, punch_tags: list[str] | None = None, start_tick: int = 0, pov_org: str | None = None) -> tuple[str, str]:
     # Format hash ignores the live opponent string so filling in a top-10 org
     # does not reshuffle the skeleton (onic stays hyphen-hook, Vitality is spliced in).
     nick = _clean_nick(nick)
@@ -225,7 +231,7 @@ def _make_title(nick: str, short_type: str, opp: str | None, mname: str, tournam
             ("they-couldnt", f"{opp} couldn't stop {nick}'s ACE" if opp else f"{nick}'s {ace} {vs}"),
         )
     else:
-        kind = f"{gun_sp}4K".strip()
+        kind = f"{gun_sp}{nk or '4K'}".strip()
         going, looking, kadj = _adj(key, "going"), _adj(key, "looking"), _adj(key, "kind")
         hook = _pick(key + "|hookshape", (
             f"{nick} going {going} - {kind} {vs}",
@@ -246,6 +252,9 @@ def _make_title(nick: str, short_type: str, opp: str | None, mname: str, tournam
         line = f"{line} vs {opp}"
     base = f"{line} #cs2 #counterstrike"
     title = f"{base} {tournament_tag}".strip() if tournament_tag else base
+    extra = " ".join(t for t in (_hashtag(nick), _hashtag(pov_org), _hashtag(opp)) if t)
+    if extra:
+        title = f"{title} {extra}"
     return title, fmt
 
 
@@ -302,7 +311,7 @@ def make_meta(folder: str, tournament: str | None = None, year: str = "2026") ->
     title, title_format = _make_title(
         nick, short_type, opp_org, mname, tournament_tag,
         clutch=clutch, kills=kills, punch_tags=punch_tags,
-        start_tick=s.get("start_tick", 0),
+        start_tick=s.get("start_tick", 0), pov_org=pov_org,
     )
 
     meta = {

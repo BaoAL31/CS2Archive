@@ -36,26 +36,26 @@ def _cut(**kwargs) -> dict:
     return base
 
 
-def test_hltv_keeps_only_when_candidate_score_above_intercept():
+def test_hltv_extraction_retains_candidates_below_intercept_for_global_ranking():
     clutch_ace = _cut(kill_ticks=[1, 2, 3, 4, 5])
     baseline = _cut(short_type="4k", clutch_initial_count=None, kill_ticks=[1])
     kept, dropped = filter_publishable_shorts(
         [clutch_ace, baseline], source="hltv", stars=STARS,
     )
-    assert kept == [clutch_ace]
-    assert dropped == 1
+    assert kept == [clutch_ace, baseline]
+    assert dropped == 0
 
 
-def test_hltv_slot_floor_keeps_none_at_or_below_intercept():
+def test_hltv_does_not_spend_daily_slots_or_apply_an_intercept_floor():
     weak = _cut(short_type="4k", clutch_initial_count=None, kill_ticks=[1])
     kept, dropped = filter_publishable_shorts(
         [weak, dict(weak)], source="hltv", stars=STARS,
     )
-    assert kept == []
-    assert dropped == 2
+    assert kept == [weak, weak]
+    assert dropped == 0
 
 
-def test_hltv_ranks_keepers_by_candidate_score_descending():
+def test_hltv_acquisition_preserves_all_cuts_for_later_global_ranking():
     clutch_only = _cut(kill_ticks=[1, 2, 3])
     ace_only = _cut(
         short_type="4k", clutch_initial_count=None, kill_ticks=[1, 2, 3, 4, 5],
@@ -64,9 +64,7 @@ def test_hltv_ranks_keepers_by_candidate_score_descending():
     kept, dropped = filter_publishable_shorts(
         [clutch_only, ace_only, both], source="hltv", stars=STARS,
     )
-    assert kept[0] is both
-    assert kept[1] is ace_only
-    assert kept[2] is clutch_only
+    assert kept == [clutch_only, ace_only, both]
     assert dropped == 0
 
 
@@ -100,8 +98,8 @@ def test_hltv_cut_uses_other_fixture_side_when_opponent_unset():
         orgs=["FURIA", "NaVi"],
         stars=STARS,
     )
-    assert no_side == []
-    assert dropped_no == 1
+    assert len(no_side) == 1
+    assert dropped_no == 0
 
 
 def test_hltv_navi_opponent_is_partial_star_not_hard_keep():
@@ -116,8 +114,8 @@ def test_hltv_navi_opponent_is_partial_star_not_hard_keep():
         source="hltv",
         stars={**STARS, "opponent": {}},
     )
-    assert kept_zero == []
-    assert dropped_zero == 1
+    assert kept_zero == [navi]
+    assert dropped_zero == 0
     kept_star, dropped_star = filter_publishable_shorts(
         [navi], source="hltv", stars=STARS,
     )
@@ -132,7 +130,7 @@ def test_hltv_unset_player_opponent_stage_and_kinds_add_nothing():
     assert candidate_score(baseline, STARS) == STARS["intercept"]
 
 
-def test_hltv_source_and_clip_age_are_not_in_candidate_score():
+def test_hltv_prediction_includes_source_and_clip_age():
     from cs2archive.shorts.demand_gate import candidate_score
 
     cut = _cut(
@@ -145,17 +143,17 @@ def test_hltv_source_and_clip_age_are_not_in_candidate_score():
         "source": {"allstar": 9.0},
         "clip_age": 9.0,
     }
-    assert candidate_score(cut, polluted) == candidate_score(cut, STARS)
+    assert candidate_score(cut, polluted) == candidate_score(cut, STARS) + 9.0 + 90 * 9.0
 
 
-def test_hltv_stage_is_not_in_candidate_score():
+def test_hltv_prediction_includes_known_stage():
     from cs2archive.shorts.demand_gate import candidate_score
 
     plain = _cut(kill_ticks=[1, 2, 3, 4, 5])
     playoff = _cut(kill_ticks=[1, 2, 3, 4, 5], stage="playoff")
     gf = _cut(kill_ticks=[1, 2, 3, 4, 5], stage="grand_final")
-    assert candidate_score(playoff, STARS) == candidate_score(plain, STARS)
-    assert candidate_score(gf, STARS) == candidate_score(plain, STARS)
+    assert candidate_score(playoff, STARS) == candidate_score(plain, STARS) + 0.2
+    assert candidate_score(gf, STARS) == candidate_score(plain, STARS) + 0.4
 
 PAYLOAD = {
     "updated_at": _fresh_stamp(),
@@ -200,10 +198,11 @@ def test_falcons_opponent_does_not_rescue_unknown():
     assert not passes_shorts_demand_gate("z4KR", opponent="Falcons", payload=PAYLOAD)
 
 
-def test_navi_or_spirit_hook_rescues_unknown():
-    assert passes_shorts_demand_gate("JBa", opponent="NaVi", payload=PAYLOAD)
-    assert passes_shorts_demand_gate("try", orgs=["Legacy", "Natus Vincere"], payload=PAYLOAD)
-    assert passes_shorts_demand_gate(
+def test_navi_or_spirit_hook_no_longer_rescues_unknown():
+    # F10 council: org hook demoted to a tie-break rank bonus, never a pass.
+    assert not passes_shorts_demand_gate("JBa", opponent="NaVi", payload=PAYLOAD)
+    assert not passes_shorts_demand_gate("try", orgs=["Legacy", "Natus Vincere"], payload=PAYLOAD)
+    assert not passes_shorts_demand_gate(
         "gr1ks",
         text="gr1ks pulls off a 1v3 CLUTCH vs Spirit on Dust2",
         payload=PAYLOAD,
@@ -227,11 +226,13 @@ def test_filter_publishable_shorts_counts_drops():
     assert [s["pov_nick"] for s in kept] == ["donk"]
     assert dropped == 2
 
+    # F10 council: org hook is a rank bonus, so NaVi orgs no longer
+    # rescue non-qualifying POVs — kept list is unchanged.
     kept_navi, dropped_navi = filter_publishable_shorts(
         shorts, orgs=["M80", "NaVi"], payload=PAYLOAD, source="faceit",
     )
-    assert [s["pov_nick"] for s in kept_navi] == ["donk", "z4KR", "JBa"]
-    assert dropped_navi == 0
+    assert [s["pov_nick"] for s in kept_navi] == ["donk"]
+    assert dropped_navi == 2
 
 
 def test_skipped_meta_is_not_pending() -> None:
@@ -277,7 +278,7 @@ def test_upload_gate_reads_nick_and_folder(tmp_path: Path) -> None:
     assert ups._passes_demand(donk_meta_path, donk_meta, payload=PAYLOAD)
 
 
-def test_hltv_upload_below_intercept_is_slot_floor(tmp_path: Path) -> None:
+def test_hltv_upload_does_not_reapply_retired_intercept_veto(tmp_path: Path) -> None:
     import cs2archive.upload.upload_pending_shorts as ups
 
     folder = tmp_path / "shorts-latto-baseline"
@@ -293,7 +294,7 @@ def test_hltv_upload_below_intercept_is_slot_floor(tmp_path: Path) -> None:
         "instagram_status": "pending",
         "title": "latto 4K vs Vitality",
     }
-    assert not ups._passes_demand(meta_path, meta, stars=STARS)
+    assert ups._passes_demand(meta_path, meta, stars=STARS)
     ups._mark_skipped(meta_path, meta, "slot_floor")
     saved = json.loads(meta_path.read_text(encoding="utf-8"))
     assert saved["skip_reason"] == "slot_floor"

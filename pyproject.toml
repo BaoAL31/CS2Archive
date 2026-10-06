@@ -31,7 +31,7 @@ dependencies = [
 ]
 
 # Console entry points exist only for modules that already expose a callable main().
-# Three modules (pov/create_backlog, hltv/match_listener, faceit/create_faceit_backlog) run
+# Three modules (pov/create_backlog, listener/daemon, faceit/create_faceit_backlog) run
 # their logic in an `if __name__ == "__main__"` block instead; those are invoked with
 #   python -m cs2archive.pov.create_backlog ...
 # until a later pass gives them a real main(argv).

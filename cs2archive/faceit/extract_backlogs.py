@@ -12,7 +12,7 @@ Usage:
     python cs2archive/faceit/extract_backlogs.py <demo_path> --player <nick> --map <map>
         [--steam-id <id>] [--priority high|mid|low] [--match-id <id>]
         [--tournament <name>] [--match-date YYYY-MM-DD]
-        [--no-elo] [--no-shorts] [--include-all-players]
+        [--no-elo] [--shorts] [--include-all-players]
 
 ``--player`` is the POV player (single POV only — not a whole-match card).
 Pass ``--no-shorts`` to skip short extraction.
@@ -74,8 +74,9 @@ def main() -> None:
     ap.add_argument("--match-date", help="Match date YYYY-MM-DD (defaults to demo file date)")
     ap.add_argument("--no-elo", action="store_true",
                     help="Skip FACEIT ELO fetch (title/thumbnail omit ELO line)")
-    ap.add_argument("--no-shorts", action="store_true",
-                    help="Skip Shorts (4K/clutch) timeline extraction")
+    ap.add_argument("--shorts", action="store_true",
+                    help="Enable Shorts (4K/clutch) timeline extraction "
+                         "(off by default while the FACEIT shorts system is reworked)")
     ap.add_argument("--include-all-players", action="store_true",
                     help="Keep shorts for any player (default: Recognised Pros only)")
     args = ap.parse_args()
@@ -96,8 +97,8 @@ def main() -> None:
         no_elo=args.no_elo,
     )
 
-    if args.no_shorts:
-        print("[SKIP] shorts extraction disabled (--no-shorts)")
+    if not args.shorts:
+        print("[SKIP] shorts extraction disabled (default off; pass --shorts to enable)")
         return
 
     meta = json.loads(Path(backlog_file).read_text(encoding="utf-8"))

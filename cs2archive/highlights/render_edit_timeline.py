@@ -45,6 +45,19 @@ TARGET_WIDTH = 2560
 TARGET_HEIGHT = 1440
 TARGET_FRAMERATE = 60
 
+# HUD delta ONLY — crosshair/viewmodel/base come from
+# `render_pov.hud_sequence_cfg` (the POV's own cfg), which keeps this product on
+# the same crosshair as the POV render and includes
+# `cl_show_observer_crosshair 0`.
+HIGHLIGHT_HUD_LINES = [
+    "cl_draw_only_deathnotices 0",
+    "cl_drawhud 1",
+    *CHAT_HIDE_CFG,
+    "snd_mvp_volume 0",
+    "cl_showfps 0",
+    "net_graph 0",
+]
+
 # CSDM base flags (for config file, we set these in the JSON)
 # We'll use 64 fps for recording (CSDM internal), output will be 60
 CSDM_RECORD_FRAMERATE = 64
@@ -211,16 +224,11 @@ def _build_csdm_config(
         pov_sid = seg["pov_steam_id"]
         cvars = crosshair_cache.get(pov_sid, [])
 
-        cfg_lines = [
-            "crosshair 1",
-            *CHAT_HIDE_CFG,
-            "snd_mvp_volume 0",
-            "cl_draw_only_deathnotices 0",
-            "cl_drawhud 1",
-            "cl_showfps 0",
-            "net_graph 0",
-        ] + cvars
-        cfg_text = "\n".join(cfg_lines) + "\n"
+        # ONE cfg system: the shared POV base (incl. `cl_show_observer_crosshair 0`)
+        # + this product's HUD delta + the player's cvars last.
+        from cs2archive.pov.render_pov import hud_sequence_cfg
+
+        cfg_text = hud_sequence_cfg(HIGHLIGHT_HUD_LINES, cvars)
         sequences.append(sequence(seq_num, start_tick, end_tick, pov_sid, cfg_text))
         seq_num += 1
 

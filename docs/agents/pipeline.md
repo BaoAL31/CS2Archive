@@ -6,7 +6,7 @@
 
 `python scripts/pov/pipeline.py --backlog backlog/<match_slug>/<priority>/<slug>.json [--step N] [--until N]`
 
-Reads all POV metadata from the backlog file. Runs steps 1-6 in order (analyze → render → concat → overlay → outro → thumbnail), then writes `upload_meta.json` for each variant. **The pipeline does NOT upload** — a separate pass (`scripts/upload/upload_pending.py`) uploads every pending `upload_meta.json` under `youtube/`. Resumable — state saved to `.pipeline/{run_id}.json`. Use `--step N` to start at a specific step.
+Reads all POV metadata from the backlog file. Runs steps 1-6 in order (analyze → render → concat → overlay → outro → thumbnail), writes `upload_meta.json` for each variant, then **spawns the upload itself**: `cs2archive/upload/upload_pending.py --dir <overlay> --limit 1` in a new console (resumable, fire-and-forget). `--no-upload` skips the spawn — the listener passes it, because the listener owns the spawn so it can charge its daily-slot ledger. Resumable — state saved to `.pipeline/{run_id}.json`. Use `--step N` to start at a specific step.
 
 | Step | Name | Script for manual use / debugging |
 |---|---|---|
@@ -18,7 +18,7 @@ Reads all POV metadata from the backlog file. Runs steps 1-6 in order (analyze �
 | 6 | thumbnail | `python -m thumbnail <url> --player <nick> --map <map> --video <mp4> --demo <dem> --steam-id <id>` |
 | 7 | cleanup | `python scripts/pov/cleanup_renders.py <renders_folder>` |
 
-**Uploading is a separate step.** The pipeline stops at step 6 (thumbnail) and writes `upload_meta.json` (with `youtube_id=null`, `upload_status="pending"`). Run `python scripts/upload/upload_pending.py` afterward. Step 4 (overlay) is the default product. `--raw-only` skips overlay entirely — no overlay work directory or util_cams are created. `--until 3` also stops before overlay.
+**Uploading is automatic.** After step 6 the pipeline hands the finished video to `upload_pending.py` in its own console (default; `--no-upload` opts out, and the listener passes it so the listener's spawn/ledger stays the only one). `upload_pending.py` skips `completed` metas, retries crashed uploads, and purges the render dir once every variant is uploaded — running it by hand is a repair path, not the normal flow. Step 4 (overlay) is the default product. `--raw-only` skips overlay entirely — no overlay work directory or util_cams are created. `--until 3` also stops before overlay.
 
 **Overlay step (step 4) does three things (freeze is opt-in, keyboard is opt-out):**
 
@@ -103,10 +103,10 @@ Grep for `[PIPELINE_ERROR]` and parse the JSON. Each error has a unique `code` f
 ### Example
 
 ```
-# 1. Pipeline produces finished video + thumbnail + upload_meta.json (stops at step 6)
+# Pipeline: finished video + thumbnail + upload_meta.json, then spawns the upload
 python scripts/pov/pipeline.py --backlog backlog/spirit-vs-falcons-iem-cologne-major/high/tnir-mirage-spirit-vs-falcons-iem-cologne-major.json
 
-# 2. Separate upload pass — uploads every pending upload_meta.json under youtube/
+# Repair path only — uploads every pending upload_meta.json under youtube/
 python scripts/upload/upload_pending.py
 ```
 `upload_pending.py` retries crashed uploads: a failed (non-zero exit) upload is
@@ -128,7 +128,7 @@ HTTP errors (500/502/503/504) up to 20×; the subprocess-level retry in
 - **Render folder per POV** — `renders/pov-{demo-stem}_{player}/` (not demo-only). Multiple POVs on the same map share the match demo folder but never share a render folder. Legacy `pov-{demo-stem}/` (no player suffix) may still exist from older runs; safe to delete after confirming youtube output.
 - **`--resume-from-round N`** — deprecated. Render now uses filesystem-based resume: existing `batch-*.mp4` files ≥1MB are automatically skipped on re-run. To re-render a specific batch, manually delete its file.
 - **`--batches N`** — number of render batches (default: 1). Rounds are divided equally across N batches; the last batch gets fewer rounds if they don't divide evenly. Each batch produces one MP4 named `batch-{start:03d}-{end:03d}.mp4`. `--batches 1` renders all rounds in a single CSDM call (recommended — minimizes flaky HLAE hook launches).
-- **`--until N`** — stop after step N (e.g. `--until 5` runs through outro, skips thumbnail/cleanup). Default: run through step 6 (thumbnail; upload handled separately by `upload_pending.py`).
+- **`--until N`** — stop after step N (e.g. `--until 5` runs through outro, skips thumbnail/cleanup). Default: run through step 6 (thumbnail) and then spawn the upload.
 - **`--skip-failed-rounds`** — **[DANGER] NEVER set by default.** Skip round batches that fail during rendering instead of aborting the entire pipeline. Only use when a specific demo file is corrupted/incompatible (like the `100-thieves-vs-spirit-m3-dust2.dem` from BLAST Bounty 2026 Season 2 — that demo fails at round 1 with "Game error" for every player). Silently drops failed rounds, producing an incomplete POV video. Enabled per-invocation via CLI flag or the backlog entry's `pipeline_cmd` when the demo is known-broken. See backlog `skip_failed_rounds: true` entries for the canonical example.
 - **`--raw-only`** — produce `youtube/{run_id}/` with no overlay. Default is overlay-only at `youtube/{run_id}_overlay/`. State key: `skip_overlay`.
 - **`--overlay-only`** — deprecated no-op; overlay-only is already the default.
@@ -148,7 +148,7 @@ The pipeline produces **one** upload from a backlog entry: the util-cam overlay 
 1. Step 3 (concat): writes `combined.mp4` in the render dir. Raw-only copies it to `youtube/{run_id}/`. Overlay-only does **not** copy combined into the youtube dir (step 4 writes the overlay there).
 2. Step 4 (overlay): `run_overlay` on a work copy of combined; result copied to `youtube/{run_id}_overlay/video.mp4`. Skipped with `--raw-only`.
 3. Step 5 (outro) + step 6 (thumbnail): one dir, one `upload_meta.json`.
-4. Upload: `upload_pending.py` (listener uses `--dir <overlay> --limit 1`).
+4. Upload: spawned by the pipeline (`upload_pending.py --dir <overlay> --limit 1`); the listener does the same spawn but passes `--no-upload` to the pipeline so only one exists.
 
 **Resume:** `skip_overlay` in `.pipeline/{run_id}.json`. Legacy `overlay_only` / `dual_upload=False` still resume on the same variant. `--raw-only` always wins.
 
@@ -187,7 +187,7 @@ python scripts/pov/pipeline_chain.py --watch falcons-vs-mouz-m2-dust2_kyousuke_D
 
 ## Backlog Creation
 
-`python scripts/pov/create_backlog.py <hltv_url>` — downloads a match and generates prioritized backlog entries for every player/map combo. After cards are written it also extracts Recognised-Pro Shorts timelines (`--no-shorts` skips), then drops low-demand POVs (not in the YouTube demand index, and the match/title does not name NAVI / Spirit / Vitality — Falcons does not count). `upload_pending_shorts.py` writes `upload_status=skipped` on already-rendered clips that fail the same gate. Demos with zero qualifying shorts leave no folder under any `renders/pov-*/shorts/`.
+`python -m cs2archive.pov.create_backlog <hltv_url>` — downloads a match and generates prioritized backlog entries for every player/map combo. After cards are written it extracts Recognised-Pro Shorts candidate timelines (`--no-shorts` skips). HLTV extraction keeps candidates without a long-form demand veto, intercept cutoff or daily slot claims. `render_pending_shorts` ranks the entire pending pool by predicted typical Allstar views and permits two successful renders per Sydney day; `upload_pending_shorts` does not reapply the retired HLTV veto. Upload scheduling stays at one Short/day. Demos with no detected shorts leave no `renders/pov-*/shorts/` folder. See `shorts-picker.md` for model evaluation and recovery.
 
 **Demos are downloaded automatically.** The script calls into `acquire_match()` then scrapes HLTV Rating 3.0, creating a per-player backlog card ranked by rating. It validates that the `.dem` file for each map exists on disk — if not found, it raises `FileNotFoundError` with the expected path, rather than writing a placeholder.
 

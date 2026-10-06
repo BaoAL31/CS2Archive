@@ -50,6 +50,14 @@ class Settings(BaseSettings):
         description="Sibling CS2UtilArchive checkout (overlay kernel + throws.parquet)",
     )
     hf_home: Path = Field(default=Path(r"D:/.cache/huggingface"))
+    shorts_foundation_repo: str = Field(
+        default="HBaoAL/cs2-shorts-foundation",
+        description="HF dataset repo for Shorts foundation data (raw clips + action timelines).",
+    )
+    shorts_foundation_dir: Path = Field(
+        default=Path("data/shorts-foundation"),
+        description="Local staging dir for Shorts foundation data before HF sync.",
+    )
 
     # ── FACEIT ───────────────────────────────────────────────────────────
     faceit_data_api_base: str = "https://open.faceit.com/data/v4"

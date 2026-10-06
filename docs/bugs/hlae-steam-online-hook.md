@@ -80,6 +80,7 @@ whenever CS2 moves the offsets:
 
 | CS2 build | Required HLAE |
 |---|---|
+| 1.41.8.8 | **HLAE 2.192.6** (AfxHookSource2 0.41.6) — verified live 2026-10-02: hook engages in 4s, one-round render OK (251 MB, verify pass). The .6→.8 gap moved no hooked offsets. |
 | 1.41.8.6 | **HLAE 2.192.6** (AfxHookSource2 0.41.6, 2026-09-26) — upstream hotfix, *not* a 1.41.8.6 offset adjustment |
 | 1.41.8.5 | **HLAE 2.192.5** (AfxHookSource2 0.41.5, 2026-09-26) |
 | 1.41.8.3 | **HLAE 2.192.4** (AfxHookSource2 0.41.4, 2026-09-24) |

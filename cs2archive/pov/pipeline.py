@@ -373,6 +373,10 @@ class Pipeline:
         self.start_step = args.step if args.step is not None else 1
         self._cli_step = args.step  # None = no explicit --step → allow auto-skip
         self.end_step = args.until if args.until is not None else max(STEPS.keys())
+        # Post-pipeline upload spawn (default on: a hand-run pipeline uploads like
+        # the listener's does). The listener passes --no-upload because it owns the
+        # spawn so it can charge its daily-slot ledger.
+        self.auto_upload = bool(getattr(args, "auto_upload", True))
         # Default is no-cleanup (skip step 7) unless --cleanup is passed.
         # Default run therefore stops after thumbnail (step 6), producing the
         # finished video + upload_meta.json but NOT uploading or cleaning up.
@@ -722,6 +726,24 @@ class Pipeline:
         else:
             print(f"\n  [OK] Steps {self.start_step}-{self.end_step} done; "
                   f"youtube video not ready yet — keeping render intermediates.")
+        if self.end_step >= 6 and self.auto_upload:
+            self._start_upload()
+
+    def _start_upload(self) -> None:
+        """Hand the finished video to upload_pending.py in its own console.
+
+        A hand-run pipeline uploads like the listener's does; ``--no-upload``
+        opts out (the listener passes it, because the listener owns the spawn so
+        it can charge its daily-slot ledger and record the spawn).
+        """
+        from cs2archive.upload.spawn_upload import start_upload
+
+        meta_path = Path(self.youtube_dir) / "upload_meta.json"
+        if start_upload(meta_path):
+            print("  [upload] spawned in a new console (upload_pending.py)")
+        else:
+            print(f"  [upload] nothing pending for {meta_path.name} "
+                  f"(already uploaded/skipped)")
 
     def _run_py(self, args: list[str], **kwargs):
         # Unbuffered child output: if a render worker is ever hard-killed,
@@ -1307,8 +1329,41 @@ class Pipeline:
             shutil.copy2(str(work_sidecar), str(self.youtube_dir / "video.round_offsets.json"))
             print(f"  [OK] Copied expanded video.round_offsets.json "
                   f"(freeze windows included)")
+        else:
+            self._copy_round_offsets(self.youtube_dir)
+        self._clear_hook_marker(self.youtube_dir)
+
+    def _clear_hook_marker(self, youtube_dir: Path) -> None:
+        """Undo a previous hook prepend's sidecar bookkeeping.
+
+        The overlay output has no hook, so a sidecar still carrying
+        `hook_seconds` (and offsets shifted by it) described the *old* video.
+        Left alone, that marker makes step 5 skip the hook while every
+        downstream timestamp is displaced by the hook duration — the drift class
+        that has been "fixed" repeatedly. Prefer the un-hooked copy when the
+        prepend kept one; otherwise shift the offsets back.
+        """
+        sidecar = youtube_dir / "video.round_offsets.json"
+        nohook_sidecar = youtube_dir / "video.round_offsets.nohook.json"
+        try:
+            data = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
             return
-        self._copy_round_offsets(self.youtube_dir)
+        hook_s = float(data.get("hook_seconds") or 0)
+        if nohook_sidecar.is_file() and nohook_sidecar.stat().st_mtime > sidecar.stat().st_mtime:
+            shutil.copy2(nohook_sidecar, sidecar)
+            print("  [fix] restored un-hooked sidecar (overlay ran without a hook)")
+            return
+        if not hook_s:
+            return
+        print(f"  [fix] cleared hook marker ({hook_s:.3f}s) from the fresh overlay sidecar")
+        data["round_offsets"] = {
+            k: float(v) - hook_s for k, v in (data.get("round_offsets") or {}).items()}
+        data["total_duration_seconds"] = float(
+            data.get("total_duration_seconds", 0) or 0) - hook_s
+        data.pop("hook_seconds", None)
+        data.pop("hook_cfg_hash", None)
+        sidecar.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def step_concat(self) -> None:
         if not self.render_dir.exists():
@@ -1618,8 +1673,9 @@ class Pipeline:
 
         The hook is rendered separately from the POV because the POV footage
         carries the full HUD (scores/round timer = spoilers). Hook segments are
-        rendered with ``cl_draw_only_deathnotices 1`` (killfeed only, the Shorts
-        format) and re-encoded with the overlay final-export profile, so the
+        rendered with the full HUD but the compact alive-count team bar and
+        the score digits blurred at assembly (the Shorts HUD policy) and
+        re-encoded with the overlay final-export profile, so the
         prepend is a plain stream copy.
 
         A demo with no qualifying moment is a normal skip (not an error) — the
@@ -1636,13 +1692,20 @@ class Pipeline:
         if not video.exists():
             fail(step_num, "HOOK_VIDEO_MISSING", f"video.mp4 not found in {youtube_dir}")
         sidecar = youtube_dir / "video.round_offsets.json"
+        sidecar_hook_s = 0.0
+        prepended_cfg_hash = ""
         if sidecar.is_file():
             try:
-                if float(json.loads(sidecar.read_text()).get("hook_seconds", 0) or 0) > 0:
-                    print("  [skip] hook already prepended (sidecar hook_seconds set)")
-                    return
+                sidecar_data = json.loads(sidecar.read_text())
             except Exception:
-                pass
+                sidecar_data = {}
+            sidecar_hook_s = float(sidecar_data.get("hook_seconds", 0) or 0)
+            prepended_cfg_hash = str(sidecar_data.get("hook_cfg_hash") or "")
+            # NOTE: no early return here. The hook's own cfg is only known after
+            # render_hook/build_config runs, and a changed cfg/plan must re-render
+            # the hook before the prepend decision — an early return on
+            # `hook_seconds` is what let fixed hook code never reach videos that
+            # already had a hook. The skip happens below, after the hash check.
         if not self.demo_path or not self.demo_path.exists():
             fail(step_num, "HOOK_NO_DEMO", f"demo required for hook: {self.demo_path}")
         if not self.steam_id:
@@ -1741,6 +1804,49 @@ class Pipeline:
         if not hook_mp4.is_file() or hook_mp4.stat().st_size < 1_000_000:
             fail(step_num, "HOOK_NO_OUTPUT", f"hook missing or tiny: {hook_mp4}")
 
+        # The cfg render_hook just built (it re-renders segments whenever the
+        # plan/cfg/avatar policy changed — see its stale guard). Hashing the cfg
+        # that actually reached CSDM is what makes a hook-code change invalidate
+        # an existing prepend: `hook_seconds` alone cannot tell whether the
+        # pixels in video.mp4 still match the code.
+        current_cfg_hash = ""
+        try:
+            import hashlib
+            from cs2archive.pov.render_hook import HOOK_RENDER_VERSION
+            cfg_doc = json.loads((hook_dir / "hook_csdm.json").read_text(encoding="utf-8"))
+            cfgs = [s.get("cfg", "").strip()
+                    for s in (cfg_doc.get("sequences") or [])]
+            # The version token is what makes a *mechanism* change (e.g. the
+            # crosshair now also handed to CS2 as --cfg) invalidate a prepend
+            # whose cfg text is byte-identical but whose pixels are not.
+            cfgs.append(f"render_version={HOOK_RENDER_VERSION}")
+            current_cfg_hash = hashlib.sha256("\n".join(cfgs).encode()).hexdigest()[:16]
+        except Exception as e:  # noqa: BLE001
+            print(f"  [warn] could not hash hook cfg ({e}) — re-prepending")
+
+        nohook_video = youtube_dir / "video.nohook.mp4"
+        nohook_sidecar = youtube_dir / "video.round_offsets.nohook.json"
+        # Skip the (expensive) prepend only when the hook already in video.mp4 was
+        # built from this exact cfg.
+        if (sidecar_hook_s > 0 and current_cfg_hash
+                and current_cfg_hash == prepended_cfg_hash):
+            print("  [skip] hook already prepended (unchanged cfg)")
+            return
+        if sidecar_hook_s > 0:
+            if nohook_video.is_file():
+                # Hook changed: restore the un-hooked video + sidecar, then
+                # prepend the freshly rendered hook instead of shipping the
+                # stale one.
+                print(f"  [stale] hook cfg changed — re-prepending from "
+                      f"{nohook_video.name}")
+                shutil.copy2(nohook_video, video)
+                if nohook_sidecar.is_file():
+                    shutil.copy2(nohook_sidecar, sidecar)
+            else:
+                print("  [skip] hook already prepended (no un-hooked copy to "
+                      "rebuild from; re-run --step 4 to redo the hook)")
+                return
+
         # 4. Prepend: video stream-copy + audio decoded per-segment, joined
         # with the concat filter and encoded once to AAC 48k (mixed-encoder
         # segments can't share a `-c copy` audio join — the packets after the
@@ -1752,6 +1858,19 @@ class Pipeline:
         except Exception as e:  # noqa: BLE001
             fail(step_num, "HOOK_IMPORT_FAILED", f"intro_prepend.prepend: {e}")
         out = youtube_dir / "video.hook.mp4"
+        # Keep the un-hooked video + sidecar so a changed hook (crosshair/cfg/HUD)
+        # can be re-prepended without re-running the overlay. Without this the
+        # sidecar's `hook_seconds` marker made every later run skip the hook
+        # entirely, so fixed hook code never reached videos that already had one.
+        nohook_video = youtube_dir / "video.nohook.mp4"
+        nohook_sidecar = youtube_dir / "video.round_offsets.nohook.json"
+        if not nohook_video.exists():
+            try:
+                os.link(video, nohook_video)
+            except OSError:
+                shutil.copy2(video, nohook_video)
+        if sidecar.is_file() and not nohook_sidecar.exists():
+            shutil.copy2(sidecar, nohook_sidecar)
         _prepend_segment(hook_mp4, video, out)
         if not out.is_file() or out.stat().st_size < 1_000_000:
             fail(step_num, "HOOK_PREPEND_FAILED", f"prepend produced nothing: {out}")
@@ -1770,6 +1889,7 @@ class Pipeline:
                                      for k, v in (data.get("round_offsets") or {}).items()}
             data["total_duration_seconds"] = float(data.get("total_duration_seconds", 0) or 0) + hook_dur
             data["hook_seconds"] = hook_dur
+            data["hook_cfg_hash"] = current_cfg_hash
             fps = self._probe_fps(video) or 60.0
             if isinstance(data.get("freeze_windows"), list):
                 for w in data["freeze_windows"]:
@@ -2488,6 +2608,16 @@ def main() -> None:
         default=False,
         help="Enable POV-team voice comms and the Swift speaker HUD "
              "(native in-game rows, baked into the captured frames).",
+    )
+    parser.add_argument(
+        "--no-upload",
+        dest="auto_upload",
+        action="store_false",
+        default=True,
+        help="Do not spawn upload_pending.py after step 6. Default ON: the "
+             "finished video is handed to a resumable YouTube upload in a new "
+             "console (the listener passes this flag — it owns the spawn so it "
+             "can charge its daily-slot ledger).",
     )
     parser.add_argument(
         "--voice-indicators", choices=("swift", "off"), default="swift",

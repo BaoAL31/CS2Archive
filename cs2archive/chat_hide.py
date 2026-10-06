@@ -27,6 +27,17 @@ Verified against the live CS2 cvar dump (cs2.poggu.me/dumped-data/convar-list,
   harmless extra.
 - ``tv_show_allchat 0`` — EXISTS (``gamedll release``): stops the demo
   server relaying all chat into the playback view.
+- ``closecaption 0`` — EXISTS: "Enable close captioning." **This is what was
+  still drawing radio/voice lines on screen** after ``cl_showtextmsg 0``:
+  radio commands and voice lines surface as close captions, which the
+  text-message cvar does not touch. ``cc_subtitles 0`` (voice-overs only) is
+  set alongside it so a config that re-enables captions still hides the
+  sound-effect lines.
+- ``tv_relayradio 0`` — EXISTS: "Relay team radio commands to TV: 0=off, 1=on".
+  The radio text relayed into a spectator/TV view is its own switch.
+- ``sv_ignoregrenaderadio 1`` — EXISTS (gamedll): "Turn off Fire in the hole
+  messages". Server-side, so it may be refused on the demo's local server;
+  harmless and correct where it lands.
 - ``cl_chatfilters`` — **DOES NOT EXIST in CS2** (no such convar; the old
   ``cl_chatfilters 63`` lines were unknown-command no-ops).
 - ``tv_relaytextchat`` / ``hud_saytext_time`` — DO NOT EXIST in CS2 either.
@@ -44,4 +55,11 @@ CHAT_HIDE_CFG: list[str] = [
     "hidehud 128",
     "tv_nochat 1",
     "tv_show_allchat 0",
+    # Radio / voice lines are drawn as CLOSE CAPTIONS, a different subsystem
+    # from the TextMsg prints (cl_showtextmsg 0 does not touch them). All four
+    # verified against the live CS2 convar dump (2026-10).
+    "closecaption 0",
+    "cc_subtitles 0",
+    "tv_relayradio 0",
+    "sv_ignoregrenaderadio 1",
 ]

@@ -537,12 +537,32 @@ def _probe_audio(path: Path) -> tuple[bool, float]:
         return False, 0.0
 
 
+def _probe_audio_params(path: Path) -> tuple[str, int, int] | None:
+    """(codec, sample_rate, channels) of the first audio stream, or None."""
+    import json as _json
+    try:
+        r = subprocess.run(
+            [FFPROBE, "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_name,sample_rate,channels",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=120)
+        streams = _json.loads(r.stdout or "{}").get("streams") or []
+        if not streams:
+            return None
+        s = streams[0]
+        return (str(s.get("codec_name") or ""), int(s.get("sample_rate") or 0),
+                int(s.get("channels") or 0))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
 def prepend(segment: Path, video: Path, output: Path) -> Path:
     if output.is_file() and output.stat().st_size >= 1_000_000:
         print(f"  [skip] output exists: {output.name}")
         return output
     import tempfile
     output.parent.mkdir(parents=True, exist_ok=True)
+    _AOUT_TMP = "aout_pre"
     with tempfile.TemporaryDirectory() as td:
         lst = Path(td) / "files.txt"
         lst.write_text(
@@ -561,9 +581,38 @@ def prepend(segment: Path, video: Path, output: Path) -> Path:
         # first segment and the second segment's audio vanishes entirely.
         seg_audio, seg_dur = _probe_audio(segment)
         vid_audio, vid_dur = _probe_audio(video)
+        from cs2archive.audio_sync import crossfade_pad_filter
+
         abits: list[str] = []
         amaps: list[str] = []
         inputs: list[str] = ["-f", "concat", "-safe", "0", "-i", str(lst)]
+        # House format on both sides (the overlay remux normalizes the POV audio
+        # to AAC 48k stereo and the hook assembly encodes the same): the concat
+        # demuxer can join the AUDIO with the video instead of re-encoding it
+        # through a filter graph. Measured: the filter path below re-encodes the
+        # whole POV audio and drifts -0.25 ms/s (370 ms across a 25 min POV) —
+        # the "audio drifts as time goes on" report; `-c copy` is exact.
+        seg_params = _probe_audio_params(segment) if seg_audio else None
+        vid_params = _probe_audio_params(video) if vid_audio else None
+        if (seg_audio and vid_audio and seg_params == ("aac", 48000, 2)
+                and vid_params == ("aac", 48000, 2)):
+            cmd = [
+                FFMPEG, "-y", *inputs,
+                "-map", "0:v", "-map", "0:a",
+                "-c", "copy",
+                "-movflags", "+faststart", "-f", "mp4", str(tmp),
+            ]
+            print(f"  [prepend] {segment.name} + {video.name} "
+                  f"(audio copy join — same AAC 48k stereo) ...")
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=14400)
+            if r.returncode == 0 and tmp.is_file():
+                tmp.replace(output)
+                print(f"  [OK] output: {output}")
+                return output
+            print(f"  [warn] copy join failed (rc={r.returncode}), "
+                  f"falling back to the filter join")
+            tmp.unlink(missing_ok=True)
+
         if seg_audio:
             inputs += ["-i", str(segment)]
             abits.append("[1:a]aresample=48000,aformat=sample_fmts=fltp:"
@@ -590,8 +639,12 @@ def prepend(segment: Path, video: Path, output: Path) -> Path:
                          "channel_layouts=stereo[a1]")
             amaps.append("[a1]")
         # 20ms crossfade at the joint: no click even against segments rendered
-        # before the baked dip-to-black fades existed.
-        abits.append(f"{amaps[0]}{amaps[1]}acrossfade=d=0.02:c1=tri:c2=tri[aout]")
+        # before the baked dip-to-black fades existed. acrossfade OVERLAPS and so
+        # removes 20ms of audio while the video is a hard cut — pad the joined
+        # stream back by the same amount or the POV body plays 20ms early
+        # (measured -20.6 ms before this pad existed).
+        abits.append(f"{amaps[0]}{amaps[1]}acrossfade=d=0.02:c1=tri:c2=tri[{_AOUT_TMP}]")
+        abits.append(f"[{_AOUT_TMP}]{crossfade_pad_filter(0.02)}[aout]")
         cmd = [
             FFMPEG, "-y", *inputs,
             "-filter_complex", ";".join(abits),

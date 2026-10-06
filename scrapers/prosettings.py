@@ -183,7 +183,16 @@ _CROSSHAIR_STYLE_CVARS = {
     "static cross": 4,
     "legacy": 5,
     "hybrid": 5,
+    # "Dot Only" has no dedicated style value (CS2 styles 0-5 all draw
+    # lines; a lone dot is Classic Static + center dot + ~zero length).
+    # Map it to 4 and let the converter zero the length below, so the
+    # rendered crosshair is the dot the player actually uses.
+    "dot only": 4,
 }
+# Styles rendered as a lone center dot: line length is forced to 0 even
+# when the scraped settings carry a nonzero length (a dot-only crosshair
+# with visible lines contradicts itself; the dot is the spec).
+_DOT_ONLY_STYLES = frozenset({"dot only"})
 
 _PRESET_COLOR_CVARS = {
     "red": 0, "green": 1, "yellow": 2, "blue": 3, "cyan": 4, "teal": 4,
@@ -209,6 +218,13 @@ def crosshair_convars(settings: dict, *, screen_height: int = 1440) -> list[str]
     """
     if not settings:
         return []
+    settings = dict(settings)
+    if ((settings.get("cl_crosshairstyle") or "").strip().lower()
+            in _DOT_ONLY_STYLES):
+        # A lone dot has no visible lines: force length 0 even when the
+        # scraped page carries a nonzero length (the style is the spec).
+        settings["cl_crosshairsize"] = "0"
+        settings["cl_crosshair_length"] = "0"
     # Prefer the share-code path when we have enough fields to build a dict;
     # otherwise emit renamed/converted lines piecemeal.
     try:
@@ -300,10 +316,13 @@ def crosshair_convars(settings: dict, *, screen_height: int = 1440) -> list[str]
             f"cl_crosshaircolor_g {g}",
             f"cl_crosshaircolor_b {b}",
         ]
-    elif color == "custom":
+    else:
+        # "Custom" or no color name at all: raw RGB components are the
+        # color (some pages carry r/g/b without a name field — dropping
+        # them leaves the game's default color).
         for key in ("cl_crosshaircolor_r", "cl_crosshaircolor_g", "cl_crosshaircolor_b"):
             val = settings.get(key)
-            if val is not None and val != "":
+            if val not in (None, ""):
                 lines.append(f"{key} {val}")
     alpha = settings.get("cl_crosshairalpha") or settings.get("cl_crosshaircolor_a")
     use_alpha = _yes_no(settings.get("cl_crosshairusealpha"))

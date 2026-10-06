@@ -1,8 +1,8 @@
 """Render pending shorts — queue-aware, won't intercept active CSDM/CS2 sessions.
 
-Finds every shorts-*/short_timeline.json under renders/ that still needs
-rendering (final 1080x1920 mp4 missing or <1MB or wrong res), then renders
-them one-by-one, WAITING until no other CSDM/HLAE/CS2 render is active.
+Ranks all pending recognized-pro cuts by predicted typical Allstar views,
+then renders at most two successes per Sydney day. The candidate scan is
+global, never first-demo-wins. Failed attempts do not consume daily slots.
 
 This is the shorts equivalent of pipeline_chain / upload_pending: run it
 whenever, it will drain the queue without stealing CS2 from a running POV
@@ -10,7 +10,7 @@ overlay concat, highlight reel, or another shorts batch. Only one CSDM
 instance ever runs.
 
 Usage:
-    python cs2archive/shorts/render_pending_shorts.py              # render all pending, auto CPU/GPU
+    python cs2archive/shorts/render_pending_shorts.py              # globally pick up to two today
     python cs2archive/shorts/render_pending_shorts.py --dry-run    # list pending only
     python cs2archive/shorts/render_pending_shorts.py --once       # render one pending then exit
     python cs2archive/shorts/render_pending_shorts.py --cpu        # force CPU
@@ -33,6 +33,8 @@ import json
 import subprocess
 import sys
 import time
+from contextlib import nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 
 from cs2archive.config import settings
@@ -75,45 +77,13 @@ def _probe_res(path: Path) -> tuple[int,int]:
 
 
 def _short_output_path(out_dir: Path, short: dict) -> Path:
-    st = short["short_type"]
-    nick = short.get("pov_nick","unknown")
-    tick = short.get("start_tick",0)
-    if st=="4k":
-        base = f"{len(short.get('kill_ticks',[]))}k_multikill-{nick}-t{tick}"
-    elif st=="clutch":
-        cnt = short.get("clutch_initial_count","XvX")
-        base = f"{cnt}_clutch-{nick}-t{tick}"
-    elif st=="clutch_attempt":
-        cnt = short.get("clutch_initial_count","XvX")
-        base = f"{cnt}_attempt-{nick}-t{tick}"
-    else:
-        base = f"{st}-{nick}-t{tick}"
-    tags = short.get("punch_up_tags") or []
-    if tags: base = f"{base}_{'_'.join(tags)}"
-    return out_dir / f"{base}.mp4"
+    from cs2archive.shorts.output_paths import short_output_path
+    return short_output_path(out_dir, short)
 
 
-def _is_pending(tl_path: Path) -> bool:
-    try:
-        tl = json.loads(tl_path.read_text(encoding="utf-8"))
-    except: return False
-    shorts = tl.get("shorts",[])
-    if not shorts: return False
-    out_dir = tl_path.parent
-    for s in shorts:
-        dst = _short_output_path(out_dir, s)
-        if not dst.exists() or dst.stat().st_size < MIN_BYTES:
-            return True
-        w,h = _probe_res(dst)
-        if (w,h) != (OUT_W, OUT_H):
-            return True
-    return False
-
-
-def find_pending() -> list[Path]:
-    renders = _PROJECT_ROOT / "renders"
-    tls = sorted(renders.rglob("short_timeline.json"))
-    return [p for p in tls if _is_pending(p)]
+def _complete(path: Path) -> bool:
+    return (path.is_file() and path.stat().st_size >= MIN_BYTES
+            and _probe_res(path) == (OUT_W, OUT_H))
 
 
 def render_one(tl: Path, extra_args: list[str]) -> int:
@@ -125,9 +95,13 @@ def render_one(tl: Path, extra_args: list[str]) -> int:
 
 
 def main() -> int:
+    from cs2archive.shorts.shorts_picker import LEDGER
     ap = argparse.ArgumentParser(description="Render pending shorts (queue-aware, won't steal CSDM)")
     ap.add_argument("--dry-run", action="store_true", help="List pending timelines and exit")
     ap.add_argument("--once", action="store_true", help="Render one pending short then exit")
+    ap.add_argument("--limit", type=int, choices=(1, 2), default=2, help="At most N successes this pass; daily cap is always two")
+    ap.add_argument("--max-age-days", type=int, default=7, help="Expire unselected candidates after N days in the pool")
+    ap.add_argument("--ledger", type=Path, default=LEDGER, help="Versioned render-selection state (old extraction ledger is unused)")
     ap.add_argument("--loop", action="store_true", help="Poll forever: render pending, wait, repeat")
     ap.add_argument("--poll-secs", type=int, default=30, help="Seconds between blocking checks (default 30)")
     ap.add_argument("--cpu", action="store_true", help="Force CPU (libx264)")
@@ -136,6 +110,10 @@ def main() -> int:
     ap.add_argument("--batches", type=int, default=0, help="Pass --batches to render_shorts")
     ap.add_argument("--composite-only", action="store_true", help="Pass --composite-only to render_shorts")
     args, unknown = ap.parse_known_args()
+    if args.max_age_days < 1:
+        ap.error("max-age-days must be positive")
+    if any(token.split("=", 1)[0] in {"--output", "-o", "--name"} for token in unknown):
+        ap.error("output/name overrides are incompatible with picker accounting; use render_shorts directly")
 
     # extra args forwarded to render_shorts
     forward = []
@@ -147,38 +125,83 @@ def main() -> int:
     forward.extend(unknown)
 
     def do_pass() -> int:
-        pending = find_pending()
-        if not pending:
-            print("No pending shorts.", flush=True)
-            return 0
-        print(f"Pending: {len(pending)} timeline(s)", flush=True)
-        for p in pending:
-            print(f"  - {p.relative_to(_PROJECT_ROOT)}", flush=True)
-        if args.dry_run:
-            return 0
-        rendered = 0
-        for tl in pending:
-            # wait for any blocking CS2/HLAE/CSDM to clear (ffmpeg parallel safe)
-            while True:
-                blocking = _any_blocking()
-                if not blocking:
-                    break
-                print(f"  [wait] CSDM busy ({', '.join(blocking)}) — waiting {args.poll_secs}s...", flush=True)
-                time.sleep(args.poll_secs)
-            rc = render_one(tl, forward)
-            if rc != 0:
-                print(f"  [FAIL] {tl} rc={rc} — continuing to next", flush=True)
-            rendered += 1
-            if args.once:
-                break
-        print(f"\nDone. Rendered {rendered}/{len(pending)} pending.", flush=True)
-        return 0
+        from cs2archive.shorts.demand_gate import load_partial_stars
+        from cs2archive.shorts.fit_partial_stars import _recognised_steamids
+        from cs2archive.shorts.scrape_allstar_hltv import load_ratings_stages
+        from cs2archive.shorts.shorts_picker import (
+            PickerState, picker_lock, render_timeline, scan_candidates, sydney_day,
+        )
+        from cs2archive.shorts.view_prediction import validate_model
+
+        try:
+            model = load_partial_stars()
+            validate_model(model)
+            # Atomic ledger/model snapshots suffice for an advisory dry-run;
+            # only real selection takes the exclusive lock and creates files.
+            with (nullcontext() if args.dry_run else picker_lock(args.ledger)):
+                now = datetime.now(timezone.utc)
+                state = PickerState(args.ledger)
+                state.reconcile(_complete, now=now, persist=not args.dry_run)
+                candidates, stats = scan_candidates(_PROJECT_ROOT / "renders", model,
+                                                    _recognised_steamids(), complete=_complete,
+                                                    stages=load_ratings_stages())
+                from cs2archive.shorts.allstar_selector import rank_candidates_by_allstar
+                ranked, sel_report = rank_candidates_by_allstar(candidates)
+                candidates = [c for c, _clip in ranked]
+                clip_by_key = {c.key: clip for (c, clip) in ranked}
+                stats["allstar_selector"] = sel_report
+                picked, selection = state.select(candidates, now=now,
+                                                 limit=1 if args.once else args.limit,
+                                                 max_age_days=args.max_age_days)
+                print(f"[picker] Sydney {sydney_day(now)}: scan={stats}, selection={selection}", flush=True)
+                picked_ids = {c.key for c in picked}
+                for c in candidates:
+                    entry = state.entries.get(c.key, {})
+                    status = "PICK" if c.key in picked_ids else entry.get("state", "pending")
+                    clip = clip_by_key.get(c.key)
+                    views = clip.get("views") if clip else None
+                    print(f"  [{status}] allstar views={views if views is not None else '?'} "
+                          f"{c.short.get('pov_nick')} {c.short.get('short_type')} "
+                          f"{c.timeline}", flush=True)
+                if args.dry_run:
+                    return 0
+                state.save()
+                rendered = failed = 0
+                for c in picked:
+                    while _any_blocking():
+                        print(f"  [wait] CSDM busy; retry in {args.poll_secs}s", flush=True)
+                        time.sleep(args.poll_secs)
+                    now = datetime.now(timezone.utc)
+                    if state.completed_today(now) >= 2:
+                        break
+                    state.reserve(c, now=now, model=model)
+                    try:
+                        rc = render_one(render_timeline(c), forward)
+                        if rc != 0 or not _complete(c.video):
+                            raise RuntimeError(f"render rc={rc}; final video missing/invalid")
+                    except (OSError, RuntimeError) as exc:
+                        state.fail(c.key, str(exc))
+                        failed += 1
+                        print(f"  [FAIL] {c.timeline}: {exc}", flush=True)
+                        continue
+                    state.finish(c.key, now=datetime.now(timezone.utc))
+                    rendered += 1
+                print(f"Done: {rendered} successes, {failed} failures (failures do not consume slots)", flush=True)
+                return 1 if failed else 0
+        except (ValueError, KeyError) as exc:
+            print(f"[PICKER_ERROR] {exc}", flush=True)
+            return 2  # Invalid model/ledger is fatal, not a transient retry.
+        except OSError as exc:
+            print(f"[PICKER_ERROR] {exc}", flush=True)
+            return 1
 
     if args.loop:
         while True:
-            do_pass()
-            if not find_pending():
-                print(f"[loop] all done — sleeping {args.poll_secs}s...", flush=True)
+            status = do_pass()
+            if args.dry_run:
+                return status
+            if status == 2:
+                return status
             time.sleep(args.poll_secs)
     else:
         return do_pass()

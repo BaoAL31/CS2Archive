@@ -66,7 +66,6 @@ def _shorts_source(demo) -> str:
 def _passes_demand(meta_path: Path, meta: dict, *, payload: dict | None = None, stars: dict | None = None) -> bool:
     from cs2archive.shorts.demand_gate import (
         folder_orgs,
-        filter_publishable_shorts,
         passes_shorts_demand_gate,
     )
     from cs2archive.upload.shorts_player_day import pov_nick_from_meta_path
@@ -89,12 +88,9 @@ def _passes_demand(meta_path: Path, meta: dict, *, payload: dict | None = None, 
     source = _shorts_source(demo)
     if source == "faceit":
         return passes_shorts_demand_gate(nick, orgs=orgs, text=text, payload=payload)
-    if not shorts:
-        shorts = [{"pov_nick": nick}]
-    kept, _dropped = filter_publishable_shorts(
-        shorts, orgs=orgs, source="hltv", stars=stars,
-    )
-    return bool(kept)
+    # HLTV deliverables have already been selected by the view-ranked renderer.
+    # Never reapply the retired long-form demand or intercept veto at upload.
+    return bool(shorts)
 
 
 def _mark_skipped(meta_path: Path, meta: dict, reason: str) -> None:

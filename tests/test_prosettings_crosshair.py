@@ -93,6 +93,29 @@ def test_named_colors_and_unknown_style():
     assert crosshair_convars({}) == []
 
 
+def test_dot_only_style_renders_lone_dot():
+    # dem0n shape: style name + nonzero scraped length + dot. The style
+    # is the spec: Classic Static with zeroed lines, dot kept.
+    cvars = crosshair_convars({
+        "cl_crosshairstyle": "Dot Only", "cl_crosshairsize": "7",
+        "cl_crosshairthickness": "2", "cl_crosshairgap": "2",
+        "cl_crosshairdot": "Yes"})
+    assert "cl_crosshairstyle 4" in cvars
+    assert "cl_crosshair_length 0" in cvars
+    assert "cl_crosshairdot 1" in cvars
+
+
+def test_rgb_without_color_name_is_emitted():
+    # Some pages carry r/g/b components with no color-name field; the
+    # components are the color (previously dropped → game default color).
+    cvars = crosshair_convars({
+        "cl_crosshaircolor_r": "0", "cl_crosshaircolor_g": "255",
+        "cl_crosshaircolor_b": "255"})
+    assert "cl_crosshaircolor_r 0" in cvars
+    assert "cl_crosshaircolor_g 255" in cvars
+    assert "cl_crosshaircolor_b 255" in cvars
+
+
 def test_summary_names_style_size_color():
     out = scrape_player_crosshair("donk", session=_Sess())
 

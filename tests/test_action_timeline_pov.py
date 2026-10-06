@@ -97,7 +97,9 @@ def test_cache_hit_returns_path_without_build(monkeypatch, tmp_path):
     _fake_renders(monkeypatch, tmp_path)
     out = tmp_path / "renders" / "hl-demo" / "action_timeline.json"
     out.parent.mkdir(parents=True)
-    out.write_text(json.dumps({"timeline_version": atl.TIMELINE_VERSION}))
+    from cs2archive.shorts.event_data import EVENT_DATA_VERSION
+    out.write_text(json.dumps({"timeline_version": atl.TIMELINE_VERSION,
+                               "event_data_version": EVENT_DATA_VERSION}))
     assert atl.ensure_action_timeline(Path("demo.dem")) == out
 
 

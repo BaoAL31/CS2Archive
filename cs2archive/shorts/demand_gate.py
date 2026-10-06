@@ -1,12 +1,13 @@
-"""Gate which Recognised-Pro Shorts are worth a daily upload slot.
+"""Candidate acquisition policy and shared view score.
 
-HLTV cuts use Candidate score (Partial stars). FACEIT still uses the player
-index / NAVI-Spirit-Vitality hook until FACEIT scoring reuses the same model.
+HLTV extraction keeps recognized-pro candidates (recognition is enforced by
+the extractor). It does not spend slots or apply long-form demand/fame vetoes.
+Global predicted-view selection happens in render_pending_shorts. FACEIT's
+existing evidence gate is retained until it has its own clip-view validation.
 """
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 
 from cs2archive.scoring import load_demand_payload
@@ -14,191 +15,78 @@ from cs2archive.scoring import load_demand_payload
 ROOT = Path(__file__).resolve().parents[2]
 DEMAND_PATH = ROOT / ".data" / "player_demand_index.json"
 STARS_PATH = ROOT / ".data" / "partial_stars.json"
-
 SHORTS_INDEX_FLOOR = 1.0
-# Retired by F9: the players-branch minimum is superseded by the shared
-# scoring.payload_star_supported evidence rule. Kept so old imports don't break.
-SHORTS_MIN_VIDEOS = 8
-HOOK_ORG_KEYS = frozenset({
-    "navi",
-    "natusvincere",
-    "spirit",
-    "teamspirit",
-    "vitality",
-})
-_HOOK_TEXT = re.compile(
-    r"\bnavi\b|\bnatus\s*vincere\b|\bspirit\b|\bvitality\b",
-    re.IGNORECASE,
-)
-_ORG_KEY = re.compile(r"[^a-z0-9]+")
-
-
-def _org_key(name: str) -> str:
-    return _ORG_KEY.sub("", name.casefold())
-
-
-def _load_payload() -> dict:
-    """Raw demand payload from the canonical reader (CR-03: was a second copy of the file read)."""
-    return load_demand_payload(DEMAND_PATH)
+SHORTS_MIN_VIDEOS = 8  # Legacy import compatibility; evidence is shared below.
 
 
 def load_partial_stars(path: Path | None = None) -> dict:
     dest = path or STARS_PATH
-    if not dest.is_file():
-        return {"intercept": 0.0, "player": {}, "opponent": {}, "stage": {}, "kind": {}}
     try:
         data = json.loads(dest.read_text(encoding="utf-8"))
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        return {"intercept": 0.0, "player": {}, "opponent": {}, "stage": {}, "kind": {}}
+    except (OSError, ValueError):
+        return {}
     return data if isinstance(data, dict) else {}
 
 
 def candidate_score(short: dict, stars: dict, *, orgs: list[str] | None = None) -> float:
-    """Intercept + player + opponent + every active kind. Missing add 0.
-
-    Stage stays in the fit (so it does not leak into player/opponent/kind) but
-    is not in this score — same as source and Clip age.
-    """
-    from cs2archive.shorts.clip_observation import kinds_from_cut, opponent_of_cut
-
-    intercept = float(stars.get("intercept") or 0)
-    sid = str(short.get("pov_steam_id") or "")
-    player = float((stars.get("player") or {}).get(sid) or 0) if sid else 0.0
-    opp_canon = opponent_of_cut(short, orgs)
-    opponent = float((stars.get("opponent") or {}).get(opp_canon) or 0) if opp_canon else 0.0
-    kinds = short.get("kinds")
-    if not isinstance(kinds, (list, tuple)):
-        kinds = kinds_from_cut(short)
-    kind_table = stars.get("kind") or {}
-    kind_sum = sum(float(kind_table.get(k) or 0) for k in kinds)
-    return intercept + player + opponent + kind_sum
+    """Complete predicted log views; no manual bonuses or intercept cutoff."""
+    from cs2archive.shorts.view_prediction import cut_features, predict_log_views
+    return predict_log_views(cut_features(short, stars, orgs=orgs), stars)
 
 
 def _player_qualifies(nick: str, payload: dict) -> bool:
-    """1.0 floor with the one shared sample-evidence predicate (F9).
-
-    Previously two ad-hoc branches: a bare index hit (>= 1.0, no
-    sample requirement at all) vs the players-section path (>= 8
-    videos) — the same thin sample passed one and failed the other.
-    Both now go through scoring.payload_star_supported (recent >= 3
-    in 30d or lifetime >= 25, current rule version). The 1.0 bar
-    itself is unchanged: unifying the clip-layer bar to the 1.40
-    long-form render bar would collapse the qualifying pool onto ~3
-    supported pros against a one-short-per-day slot.
-    """
     from cs2archive.scoring import (
-        PLAYER_DEMAND_STALE_DAYS,
-        payload_star_supported,
+        BREAKOUT_PI, DEMAND_RULE_VERSION, PLAYER_DEMAND_STALE_DAYS,
+        payload_age_days, payload_rule_version, payload_star_supported,
     )
-
     key = nick.casefold()
     if not key:
         return False
     try:
-        index = {
-            str(name).casefold(): float(value)
-            for name, value in (payload.get("index") or {}).items()
-        }
-        # Players-detail entries below INDEX_FLOOR (1.08) never enter
-        # ``index`` but still carry measured stars for the 1.0 bar.
+        index = {str(k).casefold(): v for k, v in (payload.get("index") or {}).items()}
         for name, info in (payload.get("players") or {}).items():
-            if not isinstance(info, dict):
-                continue
-            try:
-                detail_value = float(info.get("index") or 0)
-            except (TypeError, ValueError):
-                continue
-            index.setdefault(str(name).casefold(), detail_value)
-    except (TypeError, ValueError):
+            if isinstance(info, dict):
+                index.setdefault(str(name).casefold(), info.get("index") or 0)
+        star = (float(index.get(key, 0)) >= SHORTS_INDEX_FLOOR
+                and payload_star_supported(nick, payload, max_age_days=PLAYER_DEMAND_STALE_DAYS))
+        breakouts = {str(k).casefold(): v for k, v in (payload.get("breakouts") or {}).items()}
+        age = payload_age_days(payload)
+        fresh = (payload_rule_version(payload) == DEMAND_RULE_VERSION
+                 and age is not None and age <= PLAYER_DEMAND_STALE_DAYS)
+        spike = fresh and float(breakouts.get(key, 0)) >= float(BREAKOUT_PI)
+        return bool(star or spike)
+    except (AttributeError, TypeError, ValueError):
         return False
-    if index.get(key, 0.0) < SHORTS_INDEX_FLOOR:
-        return False
-    # B1: the staleness bound is enforced, not just logged — a stale
-    # live payload carries no Shorts evidence either.
-    if payload_star_supported(nick, payload,
-                              max_age_days=PLAYER_DEMAND_STALE_DAYS):
-        return True
-    if payload.get("index") or payload.get("players"):
-        return False
-    try:
-        from cs2archive.scoring import PLAYER_DEMAND_INDEX
-    except Exception:
-        return False
-    return float(PLAYER_DEMAND_INDEX.get(key, 0)) >= SHORTS_INDEX_FLOOR
 
 
-def _orgs_qualify(orgs: list[str] | None) -> bool:
-    for org in orgs or []:
-        if _org_key(org) in HOOK_ORG_KEYS:
-            return True
-    return False
-
-
-def passes_shorts_demand_gate(
-    nick: str,
-    *,
-    opponent: str | None = None,
-    orgs: list[str] | None = None,
-    text: str = "",
-    payload: dict | None = None,
-) -> bool:
-    """True when this Short should take a public slot."""
-    data = _load_payload() if payload is None else payload
-    if _player_qualifies(nick, data):
-        return True
-    names = list(orgs or [])
-    if opponent:
-        names.append(opponent)
-    if _orgs_qualify(names):
-        return True
-    return bool(text and _HOOK_TEXT.search(text))
+def passes_shorts_demand_gate(nick: str, *, opponent: str | None = None,
+                             orgs: list[str] | None = None, text: str = "",
+                             payload: dict | None = None) -> bool:
+    """FACEIT-only demand evidence gate; org/text never rescue a player."""
+    return _player_qualifies(nick, load_demand_payload(DEMAND_PATH) if payload is None else payload)
 
 
 def folder_orgs(demo) -> list[str]:
-    """Display names of the two teams from an HLTV demo folder, if any."""
     try:
         from cs2archive.shorts.detect_team import orgs_from_folder
         return [disp for disp, _raw in orgs_from_folder(demo)]
-    except Exception:
+    except (OSError, ValueError):
         return []
 
 
-def filter_publishable_shorts(
-    shorts: list[dict],
-    *,
-    orgs: list[str] | None = None,
-    payload: dict | None = None,
-    source: str = "hltv",
-    stars: dict | None = None,
-) -> tuple[list[dict], int]:
-    """Keep shorts that pass the demand gate. Returns (kept, dropped_count)."""
-    if source == "faceit":
-        kept: list[dict] = []
-        dropped = 0
-        for short in shorts:
-            if passes_shorts_demand_gate(
-                str(short.get("pov_nick") or ""),
-                orgs=orgs,
-                opponent=short.get("opponent"),
-                payload=payload,
-            ):
-                kept.append(short)
-            else:
-                dropped += 1
-        return kept, dropped
+def filter_publishable_shorts(shorts: list[dict], *, orgs: list[str] | None = None,
+                              payload: dict | None = None, source: str = "hltv",
+                              stars: dict | None = None) -> tuple[list[dict], int]:
+    """Keep HLTV candidates; FACEIT retains its existing eligibility policy.
 
-    table = stars if stars is not None else load_partial_stars()
-    intercept = float(table.get("intercept") or 0)
-    scored: list[tuple[float, dict]] = []
-    dropped = 0
-    for short in shorts:
-        score = candidate_score(short, table, orgs=orgs)
-        if score > intercept:
-            scored.append((score, short))
-        else:
-            dropped += 1
-    scored.sort(key=lambda item: -item[0])
-    return [short for _, short in scored], dropped
+    No ledger writes and no daily selection during per-demo extraction.
+    ``stars`` remains accepted for compatibility; scoring is render-time only.
+    """
+    if source != "faceit":
+        return list(shorts), 0
+    data = load_demand_payload(DEMAND_PATH) if payload is None else payload
+    kept = [s for s in shorts if passes_shorts_demand_gate(str(s.get("pov_nick") or ""), payload=data)]
+    return kept, len(shorts) - len(kept)
 
 
 def filter_suffix(dropped_randos: int, dropped_demand: int, *, source: str = "hltv") -> str:
@@ -206,6 +94,5 @@ def filter_suffix(dropped_randos: int, dropped_demand: int, *, source: str = "hl
     if dropped_randos:
         bits.append(f"{dropped_randos} non-pro")
     if dropped_demand:
-        label = "low-demand" if source == "faceit" else "slot-floor"
-        bits.append(f"{dropped_demand} {label}")
+        bits.append(f"{dropped_demand} low-demand")
     return f" ({', '.join(bits)} filtered)" if bits else ""

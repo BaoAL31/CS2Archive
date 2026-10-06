@@ -127,6 +127,32 @@ def normalize_stage(stage: str) -> str:
     return stage.strip()
 
 
+# Only the deep rounds are worth naming in the description/tags. Group, Swiss,
+# upper/lower-bracket and quarter-final labels are noise — and the raw stage
+# string is scraped from HLTV, where a bad day leaks the map-veto list or the
+# whole info box into the field.
+_IMPORTANT_STAGES = frozenset({"Semi-Final", "Final", "Grand Final"})
+# A real stage label is short; anything longer is a scraped blob, so fall back to
+# the normalized name instead of pasting the blob into the description.
+_STAGE_MAX_CHARS = 60
+
+
+def show_stage(stage_raw: str) -> str:
+    """Stage text worth publishing: semi-finals, finals, grand finals only.
+
+    Returns the raw label when it is short and important, the normalized name
+    when an important stage hides in a long scrape, and ``""`` otherwise (the
+    caller then falls back to the tournament name alone).
+    """
+    if not stage_raw:
+        return ""
+    if normalize_stage(stage_raw) not in _IMPORTANT_STAGES:
+        return ""
+    if len(stage_raw) <= _STAGE_MAX_CHARS:
+        return stage_raw
+    return normalize_stage(stage_raw)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate YouTube video title and description")
     parser.add_argument("ratings_json", help="Path to ratings JSON file")
@@ -201,6 +227,9 @@ def main() -> None:
     # after the stage name, so it doesn't pollute description/stage tag.
     stage_raw = re.split(r"\s*\d+\.\s", stage_raw, maxsplit=1)[0].strip()
     stage = normalize_stage(stage_raw)
+    # Publish the stage only for the deep rounds (semi-final / final / grand
+    # final); anything earlier reads as clutter and is dropped.
+    stage_shown = show_stage(stage_raw)
 
     # Title sections with removable priority (None = never drop).
     # Trim priority when over YouTube's 100-char limit:
@@ -223,8 +252,8 @@ def main() -> None:
     desc_lines = [
         f"{args.player}'s POV on {args.map}",
     ]
-    if stage_raw:
-        desc_lines.append(f"{tournament} - {stage_raw}" if tournament else stage_raw)
+    if stage_shown:
+        desc_lines.append(f"{tournament} - {stage_shown}" if tournament else stage_shown)
     elif tournament:
         desc_lines.append(tournament)
     if team_a and team_b:
@@ -271,8 +300,8 @@ def main() -> None:
 
     description = "\n".join(desc_lines)
 
-    # Tags from normalized stage
-    stage_tag = stage if stage else None
+    # Tags from normalized stage (deep rounds only, same gate as the description)
+    stage_tag = stage if stage_shown else None
 
     tags = list(filter(None, [
         args.player,

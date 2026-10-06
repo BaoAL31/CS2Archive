@@ -612,7 +612,7 @@ def download_and_backlog(picks: list[dict]) -> None:
             cmd = [
                 PY, str(ROOT / "cs2archive/faceit/extract_backlogs.py"),
                 str(demo), "--player", str(c.get("player") or ""),
-                "--match-id", mid, "--no-shorts",
+                "--match-id", mid,
             ]
             if map_name:
                 cmd += ["--map", map_name]

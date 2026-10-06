@@ -150,9 +150,19 @@ def ensure_capture(match_id: str, *, force: bool,
                     shutil.copy2(meta, d / "repeek_meta.json")
                 assert_column_pngs(left, right)
                 print(f"[intro] reusing panes from {cand}", flush=True)
-                return d
             except (OSError, RepeekCaptureError):
                 continue
+            # Copied from a sibling POV — drop the legacy copy, but only
+            # when the destination itself is not the legacy dir.
+            try:
+                from cs2archive.paths import (
+                    PROJECT_ROOT, drop_legacy_match_strips,
+                )
+                if d != PROJECT_ROOT / "renders" / "stat-strips" / match_id:
+                    drop_legacy_match_strips(match_id)
+            except Exception:
+                pass
+            return d
     print(f"[intro] capturing Repeek left/right panes for {match_id} ...", flush=True)
     out = run_standalone(match_id, out_dir=d)
     left, right = out / "repeek_left.png", out / "repeek_right.png"
@@ -160,6 +170,12 @@ def ensure_capture(match_id: str, *, force: bool,
         raise RepeekCaptureError(
             "REPEEK_SCREENSHOT", f"capture did not produce panes in {out}",
         )
+    try:
+        from cs2archive.paths import PROJECT_ROOT, drop_legacy_match_strips
+        if out != PROJECT_ROOT / "renders" / "stat-strips" / match_id:
+            drop_legacy_match_strips(match_id)
+    except Exception:
+        pass
     return out
 
 

@@ -33,7 +33,7 @@ def test_rows_older_than_180_days_are_dropped_at_fit_time():
     assert stars["kind"] == {}
 
 
-def test_fit_does_not_put_source_or_age_on_candidate_score():
+def test_fit_saves_source_and_age_and_prediction_reconstructs_them():
     rows = [
         {
             "views": 100,
@@ -65,11 +65,12 @@ def test_fit_does_not_put_source_or_age_on_candidate_score():
         "source": "allstar",
         "clip_age": 5,
     }
-    assert "source" not in stars
-    assert candidate_score(cut, stars) == candidate_score(
-        {k: v for k, v in cut.items() if k not in {"source", "clip_age"}},
-        stars,
-    )
+    assert "allstar" in stars["source"]
+    assert "clip_age" in stars
+    from cs2archive.shorts.view_prediction import predict_log_views
+    assert candidate_score(cut, stars) == predict_log_views({
+        "steamid": "1", "kinds": ["ace"], "source": "allstar", "age_days": 5,
+    }, stars)
 
 
 def test_youtube_views_refresh_by_stored_video_id():

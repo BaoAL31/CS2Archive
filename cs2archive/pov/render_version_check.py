@@ -30,6 +30,7 @@ MIN_CSDM = (3, 20, 0)
 # installing a new HLAE for a CS2 update. A CS2 newer than the top row hard-fails
 # with RENDER_CS2_UNPINNED so a game update never silently burns HLAE retries.
 CS2_MIN_HLAE: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...] = (
+    ((1, 41, 8, 8), (2, 192, 6)),  # HLAE 2.192.6 hooks .8 fine (verified 2026-10-02 one-round render)
     ((1, 41, 8, 6), (2, 192, 6)),  # HLAE 2.192.6 / AfxHookSource2 0.41.6
     ((1, 41, 8, 5), (2, 192, 5)),  # HLAE 2.192.5 / AfxHookSource2 0.41.5
     ((1, 41, 8, 3), (2, 192, 4)),  # HLAE 2.192.4 / AfxHookSource2 0.41.4

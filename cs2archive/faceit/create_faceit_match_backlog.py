@@ -176,7 +176,7 @@ def _write_card(pro: dict, *, demo: Path, map_name: str, match_slug: str,
 
 def run(demo: Path, *, map_override: str = "", tournament: str = "",
         match_id_arg: str = "", no_elo: bool = False,
-        no_shorts: bool = False) -> list[Path]:
+        no_shorts: bool = True) -> list[Path]:
     """Full FACEIT flow: analyze demo -> one card per Recognised Pro
     (+ optional shorts extraction). Callable entry used by the unified
     create_backlog.py dispatcher."""
@@ -310,9 +310,9 @@ def main() -> None:
     ap.add_argument("--match-id", default="", help="FACEIT match id for run_id (defaults to demo stem)")
     ap.add_argument("--no-elo", action="store_true",
                     help="Skip FACEIT ELO fetch (title/thumbnail then omit the ELO line)")
-    ap.add_argument("--no-shorts", action="store_true",
-                    help="Skip short-timeline extraction (default: extracts shorts "
-                         "for Recognised Pros right after the backlog cards)")
+    ap.add_argument("--shorts", action="store_true",
+                     help="Enable short-timeline extraction for Recognised Pros "
+                          "(off by default while the FACEIT shorts system is reworked)")
     args = ap.parse_args()
 
     demo = Path(args.demo_path).resolve()
@@ -321,7 +321,7 @@ def main() -> None:
         sys.exit(1)
 
     run(demo, map_override=args.map, tournament=args.tournament,
-        match_id_arg=args.match_id, no_elo=args.no_elo, no_shorts=args.no_shorts)
+        match_id_arg=args.match_id, no_elo=args.no_elo, no_shorts=not args.shorts)
 
 
 if __name__ == "__main__":

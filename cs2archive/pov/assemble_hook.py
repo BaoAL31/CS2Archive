@@ -114,6 +114,9 @@ def build_hook_filter(vid_idx: list[int], aud_idx: list[int], end_fade: float,
             parts.append(score_blur_filter(f"{v}:v", f"sb{i}", sw, sh, tag=f"sb{i}"))
             vsrc = f"sb{i}"
         parts.append(f"[{vsrc}]fps={fps:g},format=yuv420p,settb=AVTB[v{i}]")
+        # The clip's own input index lives in `a`. `concat` does not overlap, so
+        # the join keeps the clip timeline; the single AAC encode's priming is
+        # gapless-tagged here (measured - see cs2archive/audio_sync.py).
         parts.append(f"[{a}:a]aformat=sample_fmts=fltp:sample_rates=48000:"
                      f"channel_layouts=stereo,asetpts=PTS-STARTPTS,volume=0.85[a{i}]")
 

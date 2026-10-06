@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import statistics
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -113,7 +114,7 @@ def fit_partial_stars(
     window_days: int = WINDOW_DAYS,
     recognised: set[str] | None = None,
 ) -> dict:
-    """Ridge on log(views). Source and Clip age are controls, not Candidate score."""
+    """Ridge on natural log(positive views), saving the complete predictor."""
     import numpy as np
 
     usable: list[dict] = []
@@ -122,7 +123,7 @@ def fit_partial_stars(
             views = float(row.get("views"))
         except (TypeError, ValueError):
             continue
-        if views <= 0:
+        if not math.isfinite(views) or views <= 0:
             continue
         usable.append(row)
     empty = {
@@ -131,6 +132,12 @@ def fit_partial_stars(
         "opponent": {},
         "stage": {},
         "kind": {},
+        "source": {},
+        "clip_age": 0.0,
+        "reference_age_days": 0.0,
+        "model_version": 2,
+        "training_rows": len(usable),
+        "target": "ln(positive_views)",
     }
     if len(usable) < 2:
         if usable:
@@ -199,6 +206,12 @@ def fit_partial_stars(
         "opponent": {o: float(beta[cols.index(f"opponent:{o}")]) for o in opponents},
         "stage": {s: float(beta[cols.index(f"stage:{s}")]) for s in stages},
         "kind": {k: float(beta[cols.index(f"kind:{k}")]) for k in kinds},
+        "source": {s: float(beta[cols.index(f"source:{s}")]) for s in sources},
+        "clip_age": float(beta[cols.index("clip_age")]),
+        "reference_age_days": statistics.median(float(r.get("age_days") or 0) for r in usable),
+        "model_version": 2,
+        "training_rows": len(usable),
+        "target": "ln(positive_views)",
     }
     return out
 
@@ -334,50 +347,13 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
 
 
 def observations_from_allstar_jsonl(path: Path | None = None) -> list[dict]:
-    from cs2archive.shorts.clip_observation import observations_from_match_row, parse_stage
-    from cs2archive.shorts.popular_events import is_popular_event
-
+    from cs2archive.shorts.allstar_data import load_allstar_dataset
     dest = path or ALLSTAR_JSONL
     if not dest.is_file():
         return []
-    out: list[dict] = []
-    corrupt = 0
-    unpopular = 0
-    for line in dest.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            corrupt += 1
-            continue
-        if not isinstance(row, dict):
-            continue
-        # F10: the archive backfill filters at event level only, so
-        # qualifier/academy/CCT rows leak into the store — re-apply the
-        # popularity gate at fit time instead of fitting them.
-        if not is_popular_event(str(row.get("slug") or ""),
-                                str(row.get("event_slug") or "")):
-            unpopular += 1
-            continue
-        clips = row.get("clips") or []
-        if clips and isinstance(clips[0], dict) and "kinds" in clips[0] and "source" in clips[0]:
-            stage = parse_stage(row.get("match_stage") or row.get("stage"))
-            for c in clips:
-                if not isinstance(c, dict):
-                    continue
-                out.append({**c, "stage": stage} if stage else c)
-            continue
-        out.extend(observations_from_match_row(row))
-    if corrupt:
-        print(f"[partial-stars] skipped {corrupt} corrupt line(s) in {dest}",
-              flush=True)
-    if unpopular:
-        print(f"[partial-stars] excluded {unpopular} non-popular row(s) "
-              f"from {dest}", flush=True)
-    if dest.resolve() == ALLSTAR_JSONL.resolve():
-        out = apply_demo_kind_stamps(out, load_demo_kind_stamps())
-    return out
+    rows, stats = load_allstar_dataset(dest)
+    print(f"[partial-stars] Allstar data: {json.dumps(stats, sort_keys=True)}", flush=True)
+    return rows
 
 
 def refresh_partial_stars(
@@ -387,9 +363,13 @@ def refresh_partial_stars(
     to_jsonl: Path | None = None,
     views_by_id: dict[str, int] | None = None,
     fetch_views: bool = False,
+    allstar_only: bool = True,
 ) -> dict:
     """Refit Partial stars from stored Clip Observations. Does not wipe the store."""
-    allstar = observations_from_allstar_jsonl(jsonl)
+    from cs2archive.shorts.allstar_data import deduplicate, load_allstar_dataset
+    data_path = jsonl or ALLSTAR_JSONL
+    allstar, data_stats = load_allstar_dataset(data_path) if data_path.is_file() else ([], {})
+    print(f"[partial-stars] Allstar data: {json.dumps(data_stats, sort_keys=True)}", flush=True)
     to_path = to_jsonl or TO_JSONL
     to_rows = observations_from_to_jsonl(to_path)
     rows = allstar + to_rows
@@ -403,17 +383,23 @@ def refresh_partial_stars(
         rows = refresh_youtube_views(rows, fetched)
         if to_rows:
             _write_jsonl(to_path, refresh_youtube_views(to_rows, fetched))
-    stars = fit_partial_stars(rows)
+    fit_rows, _ = deduplicate(allstar if allstar_only else rows)
+    stars = fit_partial_stars(fit_rows)
     # F6 provenance stamp: the fit previously carried no fitted_at, row
     # count or window, so its age was unknowable at read time.
     stars["fitted_at"] = datetime.now(timezone.utc).isoformat()
-    stars["rows"] = len(rows)
+    stars["rows"] = stars["training_rows"]
+    stars["sources_used"] = sorted({r.get("source") for r in fit_rows if r.get("source")})
+    stars["data_quality"] = data_stats
+    known_ages = sum(r.get("age_days") is not None or bool(r.get("published_at")) for r in fit_rows)
+    stars["age_signal"] = "available" if known_ages else "unavailable"
+    stars["stage_coverage"] = sum(bool(r.get("stage")) for r in fit_rows) / len(fit_rows) if fit_rows else 0.0
     stars["window_days"] = WINDOW_DAYS
     dest = out_path or STARS_PATH
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(json.dumps(stars, indent=2) + "\n", encoding="utf-8")
-    stars["_rows"] = len(rows)
-    print(f"[partial-stars] fit {len(rows)} rows -> {dest.name} "
+    from cs2archive.shorts.shorts_picker import atomic_json
+    atomic_json(dest, stars)
+    stars["_rows"] = stars["training_rows"]
+    print(f"[partial-stars] fit {stars['training_rows']} rows -> {dest.name} "
           f"(fitted_at={stars['fitted_at']})", flush=True)
     return stars
 
@@ -432,3 +418,15 @@ def harvest_allstar(*, max_matches: int = DAILY_NEW_MATCHES) -> int:
             str(max_matches),
         ]
     )
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Refit complete Allstar view predictor")
+    parser.add_argument("--allstar-only", action="store_true", help="Allstar only (the default)")
+    parser.add_argument("--include-to", action="store_true", help="Explicitly include TO observations")
+    parser.add_argument("--output", type=Path, default=STARS_PATH)
+    args = parser.parse_args()
+    if args.include_to and args.allstar_only:
+        parser.error("choose either --include-to or --allstar-only")
+    refresh_partial_stars(out_path=args.output, allstar_only=not args.include_to)

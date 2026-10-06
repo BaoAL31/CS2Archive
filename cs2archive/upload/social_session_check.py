@@ -18,6 +18,8 @@ def check_tiktok(profile_dir: Path, *, timeout_ms: int = 15000) -> tuple[bool, s
     """Return (logged_in, message). Logged_in True means TikTok Studio upload reachable."""
     try:
         from cloakbrowser import launch_persistent_context
+        from cs2archive.overlay._common import prefer_cs2util_scripts
+        prefer_cs2util_scripts()
         from tiktok_studio_navigator import UPLOAD_URL
     except Exception as e:
         return False, f"tiktok import failed: {e}"

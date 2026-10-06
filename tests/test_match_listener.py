@@ -6,7 +6,7 @@ from pathlib import Path
 
 from datetime import date, datetime, timedelta
 
-from cs2archive.hltv.match_listener import (
+from cs2archive.listener.daemon import (
     State,
     Match,
     ScheduledMatch,
@@ -177,6 +177,41 @@ def test_select_best_card_one_per_match():
     ]
 
 
+def test_candidate_cards_one_upload_slot_per_match(monkeypatch, tmp_path):
+    """A two-map series must not eat both daily upload slots.
+
+    9z vs NAVI queued b1t/Nuke *and* makazze/Cache on 2026-10-06, spending the
+    whole 2/day budget and deferring spirit vs mouz and vitality vs falcons.
+    """
+    import cs2archive.listener.daemon as daemon
+
+    slug = "2398735-9z-vs-natus-vincere-esl-pro-league-season-24"
+    # HLTV URLs carry the id separately from the team slug.
+    url = f"https://www.hltv.org/matches/2398735/{slug.removeprefix('2398735-')}"
+    folder = tmp_path / "backlog" / slug / "high"
+    folder.mkdir(parents=True)
+    for player, map_name, rating in (("b1t", "Nuke", 1.68),
+                                     ("makazze", "Cache", 1.77)):
+        (folder / f"{player}-{map_name.lower()}.json").write_text(
+            json.dumps({"player": player, "map": map_name, "rating": rating}),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(daemon, "ROOT", tmp_path)
+
+    match = Match(
+        match_id="2398735",
+        url=url,
+        slug=slug,
+        team1="9z",
+        team2="natus vincere",
+        event="ESL Pro League Season 24",
+    )
+
+    assert daemon._candidate_cards(match) == [
+        f"backlog/{slug}/high/makazze-cache.json",
+    ]
+
+
 def test_queue_sorts_by_rating_descending():
     cards = [
         ("backlog/donk.json", {"rating": 2.43}),
@@ -297,7 +332,7 @@ def test_upload_cmd_targets_this_meta_only(tmp_path: Path):
 
 def test_spawn_upload_dry_run_does_not_popen(monkeypatch):
     called = []
-    monkeypatch.setattr("cs2archive.hltv.match_listener.subprocess.Popen", lambda *a, **k: called.append((a, k)))
+    monkeypatch.setattr("cs2archive.listener.daemon.subprocess.Popen", lambda *a, **k: called.append((a, k)))
     _spawn_upload_terminal(["python", "upload_youtube.py"], dry_run=True)
     assert called == []
 
@@ -310,7 +345,7 @@ def test_spawn_upload_opens_new_console(monkeypatch):
         captured["kwargs"] = kwargs
         return None
 
-    monkeypatch.setattr("cs2archive.hltv.match_listener.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("cs2archive.listener.daemon.subprocess.Popen", fake_popen)
     cmd = ["python", "-u", "cs2archive/upload/upload_youtube.py", "video.mp4"]
     _spawn_upload_terminal(cmd, dry_run=False)
     assert captured["cmd"] == cmd
@@ -319,7 +354,7 @@ def test_spawn_upload_opens_new_console(monkeypatch):
 
 def test_start_upload_after_pipeline_dry_run_does_not_popen(monkeypatch):
     called = []
-    monkeypatch.setattr("cs2archive.hltv.match_listener.subprocess.Popen", lambda *a, **k: called.append((a, k)))
+    monkeypatch.setattr("cs2archive.listener.daemon.subprocess.Popen", lambda *a, **k: called.append((a, k)))
     _start_upload_after_pipeline("backlog/x.json", dry_run=True)
     assert called == []
 
@@ -329,7 +364,7 @@ def test_start_upload_spawns_upload_pending_for_this_meta(monkeypatch, tmp_path:
     video.write_bytes(b"x")
     meta_path = _write_pending_meta(tmp_path / "youtube" / "run_overlay", video)
     monkeypatch.setattr(
-        "cs2archive.hltv.match_listener._pending_upload_metas",
+        "cs2archive.listener.daemon._pending_upload_metas",
         lambda card, **k: [meta_path],
     )
     captured = {}
@@ -339,7 +374,7 @@ def test_start_upload_spawns_upload_pending_for_this_meta(monkeypatch, tmp_path:
         captured["kwargs"] = kwargs
         return None
 
-    monkeypatch.setattr("cs2archive.hltv.match_listener.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("cs2archive.listener.daemon.subprocess.Popen", fake_popen)
     _start_upload_after_pipeline("backlog/x.json", dry_run=False)
     joined = " ".join(captured["cmd"])
     assert "upload_pending.py" in joined
@@ -488,7 +523,7 @@ def test_faceit_window_stretches_over_render_blocked_gap():
 
 
 def test_prune_keeps_one_faceit_card_per_match(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr("cs2archive.hltv.match_listener.ROOT", tmp_path)
+    monkeypatch.setattr("cs2archive.listener.daemon.ROOT", tmp_path)
     cards = []
     for match_id, player, rating in (
         ("m1", "donk", 1.8),
@@ -521,6 +556,101 @@ def test_prune_keeps_one_faceit_card_per_match(tmp_path: Path, monkeypatch):
     assert players == {"donk", "ropz", "sh1ro"}
 
 
+def test_star_gate_keeps_only_proven_povs(tmp_path: Path, monkeypatch):
+    """Cherry-pick, do not queue every rating >= 1.0 POV (FACEIT rule)."""
+    import cs2archive.listener.daemon as daemon
+
+    monkeypatch.setattr(daemon, "ROOT", tmp_path)
+    verdicts = {
+        "donk": (True, False, 2.43, True, None),
+        "magixx": (False, False, 1.10, True, None),
+    }
+    monkeypatch.setattr(
+        "cs2archive.scoring.demand_eligibility",
+        lambda nick, **kw: verdicts[nick],
+    )
+    paths = []
+    for player in ("donk", "magixx"):
+        rel = f"backlog/slug/high/{player}-anubis.json"
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"player": player, "map": "Anubis"}),
+                        encoding="utf-8")
+        paths.append(rel)
+
+    match = Match(match_id="2398725", url="https://www.hltv.org/matches/1/x",
+                  slug="x", team1="spirit", team2="parivision", event="ESL")
+
+    assert daemon._star_gate_cards(paths, match) == [paths[0]]
+
+
+def test_star_gate_normalises_hltv_padded_nicks(monkeypatch):
+    """HLTV ratings cells are padded (' donk ') — the index key must still hit."""
+    import cs2archive.listener.daemon as daemon
+
+    seen: list[str] = []
+
+    def fake(nick, **kw):
+        seen.append(nick)
+        return (nick == "donk", False, 2.4 if nick == "donk" else None, True, None)
+
+    monkeypatch.setattr("cs2archive.scoring.demand_eligibility", fake)
+
+    assert daemon._star_eligible(" donk\u00a0") == (True, "")
+    assert seen == ["donk"]
+    assert daemon._star_eligible(" \u200bmagixx ")[0] is False
+
+
+def test_star_gate_fails_closed_without_demand_payload(tmp_path: Path, monkeypatch):
+    """A dead star refresh must narrow the gate, never widen it."""
+    import cs2archive.listener.daemon as daemon
+
+    monkeypatch.setattr(daemon, "ROOT", tmp_path)
+    monkeypatch.setattr(
+        "cs2archive.scoring.demand_eligibility",
+        lambda nick, **kw: (False, False, None, False, None),
+    )
+    rel = "backlog/slug/high/donk-anubis.json"
+    path = tmp_path / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"player": "donk", "map": "Anubis"}),
+                    encoding="utf-8")
+
+    match = Match(match_id="1", url="https://www.hltv.org/matches/1/x", slug="x",
+                  team1="spirit", team2="parivision", event="ESL")
+
+    assert daemon._star_gate_cards([rel], match) == []
+
+
+def test_indexed_team_tolerates_the_glued_event_suffix():
+    """HLTV slugs leave the event on team 2 ("tyloo esl pro league season 24")."""
+    import cs2archive.listener.daemon as daemon
+
+    index = {"Natus Vincere": 2.0, "9z": 1.05}
+
+    assert daemon._resolve_indexed_team("natus vincere esl pro league season 24",
+                                        index) == "Natus Vincere"
+    assert daemon._resolve_indexed_team("9z", index) == "9z"
+    assert daemon._resolve_indexed_team("unknown team", index) == "unknown team"
+
+
+def test_order_matches_by_demand_puts_the_biggest_fixture_first(monkeypatch):
+    import cs2archive.listener.daemon as daemon
+
+    monkeypatch.setattr(
+        daemon, "_match_demand_points",
+        lambda match, indexes=None: {"small": 10, "big": 500_000}[match.team1],
+    )
+    matches = [
+        Match(match_id="1", url="u1", slug="s1", team1="small", team2="b",
+              event="ESL"),
+        Match(match_id="2", url="u2", slug="s2", team1="big", team2="a",
+              event="ESL"),
+    ]
+
+    assert [m.match_id for m in daemon.order_matches_by_demand(matches, {})] == ["2", "1"]
+
+
 def _guard_args(dry_run: bool = False):
     from types import SimpleNamespace
     return SimpleNamespace(dry_run=dry_run)
@@ -533,38 +663,79 @@ def _mk_guard_card(tmp_path: Path, name: str) -> str:
     return name
 
 
-def test_day_guard_reenqueues_unrendered_pick_instead_of_scraping(
+def test_faceit_scrape_queues_whatever_quality_passes_up_to_room(
         monkeypatch, tmp_path: Path):
-    """Once today's pick is queued, a scrape must never queue another —
-    re-enqueue the SAME card instead (the n=room batching grew one day to
-    14 while zero uploads completed)."""
+    """No FACEIT-specific per-day cap: the quality gate decides how many
+    POVs queue (up to the remaining daily room). A second scrape with a
+    first card already queued must still scrape and may queue more."""
     import asyncio
 
-    import cs2archive.hltv.match_listener as ml
+    import cs2archive.listener.daemon as ml
     monkeypatch.setattr(ml, "ROOT", tmp_path)
-    card = _mk_guard_card(tmp_path, "backlog/faceit/2026-09-29/high/p.json")
     state = State(tmp_path / "listener.json")
     daily = _daily(state)
-    daily["faceit_queued"] = [card]
+    daily["faceit_queued"] = ["backlog/faceit/2026-09-29/high/old.json"]
+    picks = [
+        {"player": "donk", "match_id": "m1", "kills": 30, "deaths": 10,
+         "kd": 3.0, "adr": 130.0, "map": "Mirage"},
+        {"player": "m0NESY", "match_id": "m2", "kills": 28, "deaths": 12,
+         "kd": 2.3, "adr": 120.0, "map": "Dust2"},
+    ]
+    scraped: dict = {}
+
+    async def fake_discover(n=0, *, hours=0, count=25, skip_youtube_demand=True):
+        scraped["n"] = n
+        return (list(picks), [])
+
+    monkeypatch.setattr(ml, "discover_faceit_tracks", fake_discover)
+    monkeypatch.setattr(ml, "download_and_backlog", lambda picks: None)
+    monkeypatch.setattr(ml, "rel_card_for_pick",
+                        lambda pick: f"backlog/faceit/card-{pick['match_id']}.json")
+    monkeypatch.setattr(ml, "_completed_faceit_keys", lambda: set())
+    monkeypatch.setattr(ml, "remember_picks", lambda picks: None)
     enqueued: list[str] = []
-    spawned: list[str] = []
     monkeypatch.setattr(ml, "_enqueue",
                         lambda st, cards, idx: enqueued.extend(cards))
-    monkeypatch.setattr(ml, "_start_upload_after_pipeline",
-                        lambda c, dry: spawned.append(c))
     asyncio.run(ml._maybe_queue_faceit(_guard_args(), state, None))
-    assert enqueued == [card]
-    assert spawned == []
-    assert _daily(state)["faceit_queued"] == [card]
+    # room is 2 (nothing completed, queue empty) so both quality picks queue
+    assert scraped["n"] == 2
+    assert enqueued == ["backlog/faceit/card-m1.json",
+                        "backlog/faceit/card-m2.json"]
+    assert _daily(state)["faceit_queued"] == [
+        "backlog/faceit/2026-09-29/high/old.json",
+        "backlog/faceit/card-m1.json",
+        "backlog/faceit/card-m2.json",
+    ]
 
 
-def test_day_guard_never_respawns_fresh_upload_spawn(monkeypatch, tmp_path: Path):
-    """A live upload console (spawn <30 min old) must not get a second
-    spawn — upload_pending.py has no single-instance lock, so racing
-    consoles double-upload the same video. A dead one (>=30 min) respawns."""
+def test_faceit_scrape_respects_remaining_room(monkeypatch, tmp_path: Path):
+    """With one slot already completed, the scrape asks for at most the
+    one remaining slot."""
     import asyncio
 
-    import cs2archive.hltv.match_listener as ml
+    import cs2archive.listener.daemon as ml
+    monkeypatch.setattr(ml, "ROOT", tmp_path)
+    state = State(tmp_path / "listener.json")
+    _daily(state)["completed"] = ["backlog/faceit/2026-09-29/high/done.json"]
+    scraped: dict = {}
+
+    async def fake_discover(n=0, *, hours=0, count=25, skip_youtube_demand=True):
+        scraped["n"] = n
+        return ([], [])
+
+    monkeypatch.setattr(ml, "discover_faceit_tracks", fake_discover)
+    asyncio.run(ml._maybe_queue_faceit(_guard_args(), state, None))
+    assert scraped["n"] == 1
+
+
+def test_faceit_upload_respawn_dead_console_only(monkeypatch, tmp_path: Path):
+    """A live upload console (spawn <30 min old) must not get a second
+    spawn — upload_pending.py has no single-instance lock, so racing
+    consoles double-upload the same video. A dead one (>=30 min) respawns,
+    and the respawn runs alongside (not instead of) the scrape."""
+    import asyncio
+
+    import cs2archive.listener.daemon as ml
     monkeypatch.setattr(ml, "ROOT", tmp_path)
     card = _mk_guard_card(tmp_path, "backlog/faceit/2026-09-29/high/p.json")
     state = State(tmp_path / "listener.json")
@@ -576,9 +747,14 @@ def test_day_guard_never_respawns_fresh_upload_spawn(monkeypatch, tmp_path: Path
     spawned: list[str] = []
     monkeypatch.setattr(ml, "_start_upload_after_pipeline",
                         lambda c, dry: spawned.append(c))
+
+    async def fake_discover(n=0, *, hours=0, count=25, skip_youtube_demand=True):
+        return ([], [])
+
+    monkeypatch.setattr(ml, "discover_faceit_tracks", fake_discover)
     asyncio.run(ml._maybe_queue_faceit(_guard_args(), state, None))
     assert spawned == []
-    # the guard writes its ledger copy back to daily — re-read it live
+    # the ledger copy is written back to daily — re-read it live
     _daily(state)["faceit_upload_spawns"][card] = {
         "at": (datetime.now() - timedelta(minutes=45)).isoformat(),
         "count": 1,
@@ -588,10 +764,10 @@ def test_day_guard_never_respawns_fresh_upload_spawn(monkeypatch, tmp_path: Path
     assert _daily(state)["faceit_upload_spawns"][card]["count"] == 2
 
 
-def test_day_guard_respects_upload_spawn_cap(monkeypatch, tmp_path: Path):
+def test_faceit_upload_respawn_respects_spawn_cap(monkeypatch, tmp_path: Path):
     import asyncio
 
-    import cs2archive.hltv.match_listener as ml
+    import cs2archive.listener.daemon as ml
     monkeypatch.setattr(ml, "ROOT", tmp_path)
     card = _mk_guard_card(tmp_path, "backlog/faceit/2026-09-29/high/p.json")
     state = State(tmp_path / "listener.json")
@@ -604,37 +780,22 @@ def test_day_guard_respects_upload_spawn_cap(monkeypatch, tmp_path: Path):
         "count": ml.FACEIT_UPLOAD_SPAWN_CAP,
     }
     spawned: list[str] = []
+
+    async def fake_discover(n=0, *, hours=0, count=25, skip_youtube_demand=True):
+        return ([], [])
+
+    monkeypatch.setattr(ml, "discover_faceit_tracks", fake_discover)
     monkeypatch.setattr(ml, "_start_upload_after_pipeline",
                         lambda c, dry: spawned.append(c))
     asyncio.run(ml._maybe_queue_faceit(_guard_args(), state, None))
     assert spawned == []
 
 
-def test_day_guard_falls_through_when_queued_card_gone(monkeypatch, tmp_path: Path):
-    """A dup-cleaned/purged card must not kill the day: the scrape still
-    runs so a fresh pick can be found."""
+def test_faceit_dry_run_scrapes_nothing_and_keeps_cooldown(
+        monkeypatch, tmp_path: Path):
     import asyncio
 
-    import cs2archive.hltv.match_listener as ml
-    monkeypatch.setattr(ml, "ROOT", tmp_path)
-    state = State(tmp_path / "listener.json")
-    daily = _daily(state)
-    daily["faceit_queued"] = ["backlog/faceit/2026-09-29/high/gone.json"]
-    scraped: dict = {}
-
-    async def fake_discover(n=0, *, hours=0, count=25, skip_youtube_demand=True):
-        scraped["n"] = n
-        return ([], [])
-
-    monkeypatch.setattr(ml, "discover_faceit_tracks", fake_discover)
-    asyncio.run(ml._maybe_queue_faceit(_guard_args(), state, None))
-    assert scraped["n"] == 1
-
-
-def test_day_guard_dry_run_reports_guard_not_scrape(monkeypatch, tmp_path: Path):
-    import asyncio
-
-    import cs2archive.hltv.match_listener as ml
+    import cs2archive.listener.daemon as ml
     monkeypatch.setattr(ml, "ROOT", tmp_path)
     card = _mk_guard_card(tmp_path, "backlog/faceit/2026-09-29/high/p.json")
     state = State(tmp_path / "listener.json")
@@ -651,3 +812,36 @@ def test_day_guard_dry_run_reports_guard_not_scrape(monkeypatch, tmp_path: Path)
     assert "n" not in scraped
     # a dry run must not advance the 15-min FACEIT cooldown
     assert _daily(state).get("faceit_last_scrape") is None
+
+
+def test_teams_stale_covers_missing_and_expired(tmp_path: Path):
+    from cs2archive.listener.daemon import TEAMS_MAX_AGE, teams_stale
+
+    now = datetime(2026, 9, 30, 12, 0)
+    fresh = (now - timedelta(hours=1)).isoformat()
+    expired = (now - timedelta(hours=TEAMS_MAX_AGE.total_seconds() / 3600)).isoformat()
+
+    assert teams_stale(State(tmp_path / "a.json"), now=now) is True
+    for bad_ts in (None, "not-a-date"):
+        s = State(tmp_path / "b.json")
+        s.data["teams"] = ["Spirit"]
+        s.data["teams_updated_at"] = bad_ts
+        assert teams_stale(s, now=now) is True
+
+    s = State(tmp_path / "c.json")
+    s.data["teams"] = ["Spirit"]
+    s.data["teams_updated_at"] = fresh
+    assert teams_stale(s, now=now) is False
+
+    # exactly at the boundary counts as stale, so a 24h-old list does refresh
+    s.data["teams_updated_at"] = expired
+    assert teams_stale(s, now=now) is True
+
+
+def test_refresh_teams_defaults_on_with_opt_out():
+    from cs2archive.listener.daemon import build_parser
+
+    parser = build_parser()
+    assert parser.parse_args([]).refresh_teams is True
+    assert parser.parse_args(["--refresh-teams"]).refresh_teams is True
+    assert parser.parse_args(["--no-refresh-teams"]).refresh_teams is False

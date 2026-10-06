@@ -505,7 +505,10 @@ def _meets_tier_criterion(kills: list[dict]) -> bool:
     """At least two victims held a weapon of tier >= attacker's primary weapon tier.
 
     Primary weapon = most common weapon across all kills (tie → highest tier).
-    Tier 5 (inferno, nades, etc.) always passes.
+    Tier 5 (inferno, nades, etc.) always passes. Sub-rifle attackers (pistol /
+    shotgun / SMG, tier < 4) always pass: the gate targets rifle eco-farming,
+    and an SMG/pistol 4K is inherently notable (e.g. a 22k-view MP9 4K vs
+    pistol-heavy victims that this gate used to reject).
     """
     if not kills:
         return False
@@ -516,6 +519,8 @@ def _meets_tier_criterion(kills: list[dict]) -> bool:
     primary = counts.most_common(1)[0][0]
     attacker_tier = weapon_tier(primary)
     if attacker_tier >= 5:
+        return True
+    if 0 <= attacker_tier < 4:
         return True
     eligible = 0
     for k in kills:
@@ -847,8 +852,10 @@ def detect_shorts(
         for _, row in round_start.sort_values("tick").iterrows():
             t = int(row["tick"])
             rn = int(row.get("round", 0) or 0)
-            if t <= 1:
-                continue
+            if t <= 1 and rn <= 0:
+                continue  # warmup phantom (tick<=1 with no round number)
+            # CR-20: HLTV emits round 1 at tick 1 — keep numbered starts,
+            # otherwise the whole pistol round maps to round 0 (warmup).
             if rn <= 0:
                 rn = len(_rs_by_round) + 1
             _rs_by_round[rn] = (t, rn)
@@ -862,8 +869,14 @@ def detect_shorts(
         _ff = int(freeze_end["tick"].min())
     first_freeze = _ff
 
-    if first_freeze is not None:
+    if (first_freeze is not None and not any(rn <= 0 for _, rn in round_starts)
+            and all(t > first_freeze for t, _ in round_starts)):
+        # Genuine warmup before the first numbered round: ticks in
+        # [first_freeze, first start) are round 0. Skipped when round 1
+        # already starts at/before first_freeze (e.g. HLTV tick-1 starts),
+        # where a (first_freeze, 0) entry would shadow it.
         round_starts.insert(0, (first_freeze, 0))
+        round_starts.sort()
 
     # --- Round freeze ends ---
     if round_freeze_ends is None and freeze_end is not None and not freeze_end.empty:
@@ -977,6 +990,12 @@ def detect_shorts(
         kills_by_round = {}
 
     # --- Bomb/win events ---
+    # Final-round fallback: a round with kills but no end event (truncated
+    # demo tail) ends at its last kill + 10s, so its moments don't silently
+    # drop for want of an end tick.
+    for _rn, _rk in kills_by_round.items():
+        if _rn > 0 and _rn not in round_ends and _rk:
+            round_ends[_rn] = max(k["tick"] for k in _rk) + 640
     if round_win_events is not None:
         _rwe = round_win_events
     else:

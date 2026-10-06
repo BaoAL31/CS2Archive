@@ -1091,6 +1091,7 @@ def _bomb_action_site(label, rn, tick, sid, place_at, plant_sites) -> str:
 
 def build_action_timeline(demo_path: Path) -> dict:
     import demoparser2 as dp
+    from cs2archive.shorts.event_data import EVENT_DATA_VERSION, kill_event_details, raw_event_table
 
     parser = dp.DemoParser(str(demo_path))
 
@@ -1101,6 +1102,7 @@ def build_action_timeline(demo_path: Path) -> dict:
     round_end = parser.parse_event("round_officially_ended")
     round_end_winner = parser.parse_event("round_end")
     hurt = _as_df(parser.parse_event("player_hurt"))
+    weapon_fire = _as_df(parser.parse_event("weapon_fire"))
     blind = _as_df(parser.parse_event("player_blind"))
     throw_dfs = {}
     for ev_name, _util in UTIL_THROW_EVENTS:
@@ -1452,6 +1454,9 @@ def build_action_timeline(demo_path: Path) -> dict:
             "penetrated": _penetrated_count(row.get("penetrated")),
             "attacker_place": _place_at(tick, attacker_sid),
             "victim_place": _place_at(tick, victim_sid),
+            # Engine kill-feed evidence is distinct from the inferred
+            # blinded_by/duration fields above. Missing flags stay null.
+            "kill_event": kill_event_details(row),
         }
         kills_all.append(record)
         if attacker_is_pro or victim_is_pro:
@@ -1631,6 +1636,15 @@ def build_action_timeline(demo_path: Path) -> dict:
 
     return {
         "timeline_version": TIMELINE_VERSION,
+        "event_data_version": EVENT_DATA_VERSION,
+        # Preserve already-parsed source data before gameplay/pro filters.
+        # player_hurt includes gun damage too, not only util_damages.
+        "raw_events": {
+            "player_death": raw_event_table(deaths),
+            "player_hurt": raw_event_table(hurt),
+            "weapon_fire": raw_event_table(weapon_fire),
+        },
+        "raw_player_info": raw_event_table(info),
         "stakes_version": STAKES_VERSION,
         "place_source": place_source,
         "demo_path": demo_rel,
@@ -1674,16 +1688,19 @@ def ensure_action_timeline(demo_path: Path,
     multi-pros highlights pipeline). Pass ``output`` for a POV-local copy —
     the POV flow keeps its cache inside the pov folder and never creates
     hl-* dirs. Rebuilds when the cached ``timeline_version`` is older than
-    ``TIMELINE_VERSION``. Failures return None — callers must treat that as
+    ``TIMELINE_VERSION`` or it predates the raw engine-event schema. Failures
+    return None — callers must treat that as
     "no timeline", never as an error (backlog cards and hooks must still
     land).
     """
+    from cs2archive.shorts.event_data import EVENT_DATA_VERSION
     demo_path = Path(demo_path)
     out = Path(output) if output else highlights_run_dir(demo_path) / "action_timeline.json"
     if out.is_file():
         try:
             cached = json.loads(out.read_text(encoding="utf-8"))
-            if int(cached.get("timeline_version") or 0) >= TIMELINE_VERSION:
+            if (int(cached.get("timeline_version") or 0) >= TIMELINE_VERSION
+                    and int(cached.get("event_data_version") or 0) >= EVENT_DATA_VERSION):
                 return out
         except Exception:
             pass

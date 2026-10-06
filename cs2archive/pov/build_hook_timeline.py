@@ -1,8 +1,9 @@
 """Build a Hook Timeline: 2-4 impressive POV moments for a video cold open.
 
-The hook is a no-spoiler cold open prepended to a POV: rendered with
-``cl_draw_only_deathnotices 1`` (full HUD hidden, killfeed kept — the Shorts
-format), so no score/round/timer information leaks. Multiple moments are
+The hook is a no-spoiler cold open prepended to a POV: rendered with the
+full player HUD but the compact alive-count team bar (N vs N, not the avatar
+row) and the score digits blurred in post — the Shorts HUD policy — so no
+score information leaks. Multiple moments are
 allowed when several are impressive; the assembled hook is heavily edited
 (tight kill-anchored trims + crossfades, climax last).
 
@@ -237,7 +238,9 @@ def _map_mesh_available(map_name: str) -> bool:
 
 INSTA_PAIR_SECONDS = 3.0  # non-flick insta kills must pair within this to qualify
 INSTA_CLEAN_HP = 90.0  # ...and at least one victim at/above this (0 disables)
-INSTA_RULE_VERSION = 8  # bumped whenever the insta rule changes (stale caches rebuild)
+INSTA_RULE_VERSION = 9  # bumped whenever the insta rule changes (stale
+# caches rebuild). v9: hook quality is per-segment (best single window),
+# not per-moment — old hook_timeline.json picks re-rank under the new rule.
 
 # ── Peek-kill vs back-shot (council-reviewed taper) ─────────────────────
 # victim_hold_deg = angle between the victim's view and the direction to the
@@ -748,6 +751,46 @@ def _resolve_player_sid(player: str | None) -> str | None:
     return None
 
 
+def kill_credit_index(demo_path: Path, sid: str | None,
+                      candidates: list[dict],
+                      tickrate: int = 64) -> dict[int, dict]:
+    """Per-kill scoring credit fused across candidates.
+
+    Returns ``{kill_tick: {"hs": bool, "peek": float, "trade": bool}}``.
+    Sibling candidates hold per-kill data the merged moment may lack (e.g.
+    an insta candidate's headshot/peek for a kill the clutch candidate
+    also references), so hs/peek/trade fuse by tick across every
+    candidate. Pure candidate reads — no demo I/O, never raises.
+    """
+    credit: dict[int, dict] = {}
+    for cand in candidates:
+        hs_ticks = cand.get("hs_ticks") or {}
+        peek_ticks = cand.get("peek_ticks") or {}
+        trade_ticks = {int(k) for k in (cand.get("trade_ticks") or [])
+                       if str(k).lstrip("-").isdigit()}
+        for raw in cand.get("kill_ticks") or []:
+            try:
+                tick = int(raw)
+            except (TypeError, ValueError):
+                continue
+            entry = credit.setdefault(
+                tick, {"hs": False, "peek": 0.0, "trade": False})
+            try:
+                if float(hs_ticks.get(tick, hs_ticks.get(str(tick), 0)) or 0) > 0:
+                    entry["hs"] = True
+            except (TypeError, ValueError):
+                pass
+            try:
+                entry["peek"] = max(
+                    float(entry["peek"]),
+                    float(peek_ticks.get(tick, peek_ticks.get(str(tick), 0)) or 0))
+            except (TypeError, ValueError):
+                pass
+            if tick in trade_ticks:
+                entry["trade"] = True
+    return credit
+
+
 def _sort_key(m: dict):
     """Tier first, then kill count desc, then faster TTK, then tick."""
     return (m["tier_rank"], -len(m.get("kill_ticks") or []),
@@ -762,6 +805,72 @@ def _sort_key(m: dict):
 TRADE_DETER_POINTS = 100.0
 
 
+def _window_kills(window: dict, kill_ticks: list[int]) -> list[int]:
+    """Kill ticks enclosed by one planned window, in order."""
+    a, b = int(window["start_tick"]), int(window["end_tick"])
+    return sorted(k for k in kill_ticks if a <= k <= b)
+
+
+def segment_quality(window_kills: list[int], moment: dict,
+                    kill_credit: dict[int, dict]) -> float:
+    """Score one planned window (what the viewer experiences as one clip).
+
+    A window enclosing ALL the moment's kills keeps the full moment score
+    (tier base, flick/TTK included) — an unbroken chain is one continuous
+    piece of footage. A fragment window scores only what it encloses, with
+    no tier base: per kill +100, +50 headshot, +peek bonus, −100 traded.
+    Scattered multi-kill pieces therefore rank as the weak singles they
+    play as, instead of pooling tier + count at moment level. No smoke
+    concept: a smoke kill inside a fragment simply earns no reaction
+    credit, and an unbroken smoke-heavy chain keeps whatever its tier
+    and headshots pay.
+    """
+    kills = [int(k) for k in (moment.get("kill_ticks") or [])]
+    enclosed = sorted(set(window_kills) & set(kills))
+    if enclosed and enclosed == sorted(set(kills)):
+        return moment_quality(moment)
+    score = 0.0
+    for tick in enclosed:
+        credit = kill_credit.get(int(tick)) or {}
+        score += 100.0
+        try:
+            if float(credit.get("hs") or 0.0) > 0:
+                score += 50.0
+        except (TypeError, ValueError):
+            pass
+        try:
+            score += max(0.0, float(credit.get("peek") or 0.0))
+        except (TypeError, ValueError):
+            pass
+        if credit.get("trade"):
+            score -= TRADE_DETER_POINTS
+    return score
+
+
+def chain_segments(chain: dict, tickrate: int,
+                   kill_credit: dict[int, dict],
+                   all_kill_ticks: list[int] | None = None,
+                   ) -> tuple[float, list[tuple[dict, float]]]:
+    """Plan a chain's windows and score each: (best score, [(window, score)]).
+
+    The chain's quality IS its best single segment — the unit scored is
+    the unit watched. Fill/budget/assembly below consume chains in this
+    order with unchanged mechanics.
+    """
+    from cs2archive.pov.hook_plan import plan_hook
+    kills = sorted({int(k) for k in (chain.get("kill_ticks") or [])})
+    windows = []
+    for planned in plan_hook([{**chain, "kill_ticks": kills}], tickrate,
+                             all_kill_ticks=all_kill_ticks):
+        windows.extend(planned.get("windows") or [])
+    scored = []
+    for window in windows:
+        enclosed = _window_kills(window, kills)
+        scored.append((window, segment_quality(enclosed, chain, kill_credit)))
+    best = max((score for _, score in scored), default=0.0)
+    return best, scored
+
+
 def moment_quality(m: dict) -> float:
     """Impressiveness score for one picked moment (higher = better).
 
@@ -769,10 +878,12 @@ def moment_quality(m: dict) -> float:
     TTK); within a tier more kills win, then headshot bonuses stack flat
     (every headshot the same, counted once per kill tick no matter how many
     fused candidates reference it — chained kills add up, so 2 headshots
-    outscore 1), then faster reactions, then bigger clutch disadvantages.
-    Traded kills deter flat (see TRADE_DETER_POINTS) — a revenge kill never
-    earns reaction credit. Pure — drives the least-impressive-first assembly
-    order so the hook builds to its climax.
+    outscore 1), then faster reactions. Traded kills deter flat (see
+    TRADE_DETER_POINTS) — a revenge kill never earns reaction credit.
+    There is deliberately no clutch-disadvantage bonus: the tier base
+    already pays clutches top dollar, so an extra would double-count.
+    Pure — drives the least-impressive-first assembly order so the hook
+    builds to its climax.
     """
     rank = int(m.get("tier_rank", 99))
     score = (len(TIER_ORDER) - rank) * 1000.0
@@ -800,13 +911,6 @@ def moment_quality(m: dict) -> float:
         score -= len(m.get("trade_ticks") or []) * TRADE_DETER_POINTS
     except TypeError:
         pass
-    initial = str(m.get("clutch_initial_count") or "")
-    if "v" in initial:
-        try:
-            enemies = int(initial.split("v", 1)[1])
-            score += enemies * 25.0
-        except (TypeError, ValueError):
-            pass
     return score
 
 
@@ -1099,11 +1203,11 @@ def build_hook_timeline(
     candidates.sort(key=_sort_key)
     chains = pick_moments(candidates, tickrate, max_moments)
 
-    # Target fill: stamp quality levels, then accumulate best-first until
-    # the PLANNED footage reaches min_seconds — the minimum number of
-    # segments to reach the bar. Short of the bar: no hook (normal skip).
-    for m in chains:
-        m["quality"] = moment_quality(m)
+    # Target fill: stamp each chain with its best single segment, then
+    # accumulate best-first until the PLANNED footage reaches min_seconds.
+    # The unit scored is the unit watched: a chain ranks by its strongest
+    # continuous window, never by pooling tier + count across scattered
+    # pieces. Short of the bar: no hook (normal skip).
     # POV kills only (same input render_hook plans with — any player's
     # deaths would cap tails the render leaves alone).
     try:
@@ -1112,6 +1216,12 @@ def build_hook_timeline(
                             if str(k.get("attacker_steam_id") or "") == str(sid)})
     except (TypeError, ValueError):
         all_ticks = []
+    credit = kill_credit_index(demo_path, sid, candidates, tickrate)
+    for m in chains:
+        best, _windows = chain_segments(
+            m, tickrate, credit,
+            all_kill_ticks=all_ticks or None)
+        m["quality"] = best
     chains = enforce_footage_budget(chains, tickrate, max_seconds,
                                     all_kill_ticks=all_ticks or None)
     picked, planned_total = fill_to_target(chains, tickrate=tickrate,

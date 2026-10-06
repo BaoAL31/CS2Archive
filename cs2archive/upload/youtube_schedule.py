@@ -198,6 +198,11 @@ def resolve_publish_schedule(
     tz = timezone or meta.get("publish_timezone") or DEFAULT_PUBLISH_TZ
     if not local:
         return privacy, None, tz, None
+    # Explicit "publish now": no schedule, keep the caller's privacy (so
+    # `--privacy public --publish-at none` really does go public on finalize
+    # instead of being forced to a scheduled private video).
+    if str(local).strip().lower() in {"none", "now", "off", "instant", "-"}:
+        return privacy, None, tz, None
 
     if local == AUTO_PUBLISH_MODE:
         # Auto mode: always use local timezone detection

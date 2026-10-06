@@ -230,6 +230,8 @@ def _ffmpeg_encode(
         cmd.extend(["-i", str(raw_path)])
     if include_audio:
         audio_map_args = ["-map", "0:a?"]
+        # Single-pass path: volume + the AAC priming trim (untagged 1024 samples
+        # play back as audio-late; see cs2archive/audio_sync.py).
         audio_codec_args = ["-c:a", "aac", "-b:a", "256k",
                             "-af", "asetpts=PTS-STARTPTS,volume=0.85"]
     else:
@@ -298,7 +300,8 @@ def _ffmpeg_segment_copy(
 
 
 
-def _remux_source_audio(overlay_path: Path, source_path: Path) -> None:
+def _remux_source_audio(overlay_path: Path, source_path: Path,
+                        tempo: float | None = None) -> None:
     """Replace the overlay video's audio with the original source audio.
 
     Batch encodes run video-only (``-an``), so the concatenated overlay has
@@ -316,6 +319,12 @@ def _remux_source_audio(overlay_path: Path, source_path: Path) -> None:
     from cs2archive.overlay._common import _log
     tmp = overlay_path.with_name(overlay_path.name + ".resync.mp4")
     tmp.unlink(missing_ok=True)
+    af = "volume=0.85"
+    if tempo and abs(float(tempo) - 1.0) > 1e-6:
+        # Capture-side rate drift (measured ~-0.2 ms/s, present in combined.mp4
+        # before any overlay work): resample the audio onto the video timeline.
+        af = f"{af},atempo={float(tempo):.6f}"
+        _log(f"  [audio-sync] atempo {float(tempo):.6f} applied")
     cmd = [
         "ffmpeg", "-y",
         "-i", str(overlay_path),
@@ -323,7 +332,11 @@ def _remux_source_audio(overlay_path: Path, source_path: Path) -> None:
         "-map", "0:v", "-map", "1:a?",
         "-c:v", "copy",
         "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2",
-        "-af", "volume=0.85",
+        # Measured: plain `-af volume=0.85` keeps the delivered audio
+        # sample-locked to the copied video (+0.0 ms vs the CSDM capture); the
+        # AAC priming is gapless-tagged by this muxer, so it must NOT be trimmed
+        # (trimming measured +23.2 ms late). See cs2archive/audio_sync.py.
+        "-af", af,
         "-movflags", "+faststart",
         "-shortest",
         str(tmp),

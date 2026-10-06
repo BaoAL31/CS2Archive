@@ -1,4 +1,4 @@
-"""DEPRECATED (CR-01): this module moved to ``cs2archive.hltv.match_listener``.
+"""DEPRECATED (CR-01): this module moved to ``cs2archive.listener.daemon``.
 
 Kept as a one-release-window compatibility shim so documented command lines, stale docs and
 muscle memory keep working. Every invocation prints a deprecation notice on stderr.
@@ -11,10 +11,10 @@ from __future__ import annotations
 import sys
 
 sys.stderr.write(
-    "DEPRECATED scripts/hltv/match_listener.py -> python -m cs2archive.hltv.match_listener\n"
+    "DEPRECATED scripts/hltv/match_listener.py -> python -m cs2archive.listener.daemon\n"
 )
 
-_TARGET = "cs2archive.hltv.match_listener"
+_TARGET = "cs2archive.listener.daemon"
 
 if __name__ == "__main__":
     import runpy

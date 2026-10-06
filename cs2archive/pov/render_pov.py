@@ -396,6 +396,20 @@ def _cfg_without_comments() -> str:
     return "\n".join(lines) + "\n"
 
 
+def hud_sequence_cfg(hud_lines: list[str], player_cvars: list[str] | None = None,
+                     rename_map: dict[str, str] | None = None) -> str:
+    """Sequence cfg for every POV-based renderer (POV, hook, shorts, highlights).
+
+    ONE cfg system: the shared base (`assets/cs2_pov.cfg`, which carries
+    `cl_show_observer_crosshair 0`) + the player's cvars inlined last so they win.
+    A renderer may only prepend its own HUD delta. Hand-rolled cfgs (hook, shorts,
+    highlights) skipped the base, so CS2 drew the observer crosshair during demo
+    playback and those renders showed a crosshair the POV render did not.
+    """
+    pov_cfg = _sequence_cfg(player_cvars, rename_map).rstrip("\n")
+    return "\n".join([*hud_lines, pov_cfg]) + "\n"
+
+
 def _sequence_cfg(player_cvars: list[str] | None = None,
                   rename_map: dict[str, str] | None = None) -> str:
     """POV base cfg + inlined player crosshair/viewmodel (last wins).
@@ -916,7 +930,11 @@ def _write_render_autoexec(cvars: list[str], rename_map: dict[str, str] | None =
     # 64-slot bitmask all-set) enables hearing every recorded player.
     # It does not repair the native speaker HUD; Swift handles that separately.
     from cs2archive.chat_hide import CHAT_HIDE_CFG
-    lines = ["crosshair 1", *CHAT_HIDE_CFG, "snd_mvp_volume 0",
+    # `cl_show_observer_crosshair 0` belongs to BOTH renderers' launch cfg: with
+    # it on during demo playback CS2 draws the observer crosshair, not the
+    # player's cvars (the hook shipped without it and showed the wrong crosshair).
+    lines = ["crosshair 1", "cl_show_observer_crosshair 0",
+              *CHAT_HIDE_CFG, "snd_mvp_volume 0",
               "snd_mute_losefocus 0", "voice_enable 1", "voice_modenable 1",
               "tv_listen_voice_indices -1",
               "tv_listen_voice_indices_h -1",

@@ -99,9 +99,16 @@ def opponent_of_cut(short: dict, orgs: list[str] | None = None) -> str | None:
         return None
     t1 = canonical_ranking_name(names[0])
     t2 = canonical_ranking_name(names[1])
-    if not t1 or not t2 or t1 == t2:
+    if t1 and t2 and t1 == t2:
         return None
     pov = short.get("pov_team")
+    # One fixture side may be outside the ranking vocabulary. If the POV
+    # explicitly matches that raw side, the other known side is still usable.
+    if isinstance(pov, str):
+        if _norm_team(pov) == _norm_team(names[0]):
+            return t2
+        if _norm_team(pov) == _norm_team(names[1]):
+            return t1
     pov_canon = canonical_ranking_name(pov if isinstance(pov, str) else None)
     if pov_canon == t1:
         return t2
@@ -193,6 +200,11 @@ def kinds_from_cut(short: dict) -> tuple[str, ...]:
         kinds.append("ace")
     elif nkill == 4:
         kinds.append("4k")
+    elif nkill == 3 and not clutch_kind:
+        # Allstar's observed clutch labels almost never include a 3K tag.
+        # Keep explicitly labelled compound kinds, but don't invent that bonus
+        # for every three-kill detector clutch (a feature-distribution mismatch).
+        kinds.append("3k")
     for stack in ("flick", "perfect_shots", "wallbang", "knife", "defuse"):
         if st == stack:
             kinds.append(stack)
@@ -280,6 +292,8 @@ def observation_from_allstar(clip: dict, match: dict | None = None) -> dict | No
         return None
     label = str(clip.get("label") or clip.get("title") or "")
     match_id = str(clip.get("match_id") or "") or None
+    if match and match_id and match.get("match_id") and match_id != str(match["match_id"]):
+        return None  # Never inherit opponent/stage from a different fixture.
     if match and not match_id:
         match_id = str(match.get("match_id") or "") or None
     hint = clip.get("opponent_team")
@@ -310,7 +324,8 @@ def observation_from_allstar(clip: dict, match: dict | None = None) -> dict | No
         "views": clip.get("views"),
         "title": str(clip.get("title") or ""),
         "round": clip.get("round"),
-        "published_at": (match or {}).get("scraped_at") or (match or {}).get("published_at"),
+        "published_at": clip.get("published_at"),
+        "observed_at": (match or {}).get("scraped_at"),
     }
 
 

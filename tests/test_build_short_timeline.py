@@ -509,7 +509,7 @@ def test_4k_with_two_high_tier_victims_detected():
     """Two victims held weapons of tier >= attacker's AK -> detected."""
     kill_events = [
         {"tick": 1000, "round": 1, "attacker_sid": "X", "victim_sid": "a", "weapon": "ak47", "victim_weapon": "ak47"},
-        {"tick": 2000, "round": 1, "attacker_sid": "X", "victim_sid": "b", "weapon": "ak47", "victim_weapon": "m4a1"},
+        {"tick": 2000, "round": 1, "attacker_sid": "X", "victim_sid": "b", "weapon": "ak47", "victim_weapon": "ak47"},
         {"tick": 3000, "round": 1, "attacker_sid": "X", "victim_sid": "c", "weapon": "ak47", "victim_weapon": "glock"},
         {"tick": 4000, "round": 1, "attacker_sid": "X", "victim_sid": "d", "weapon": "ak47", "victim_weapon": "glock"},
     ]
@@ -521,6 +521,72 @@ def test_4k_with_two_high_tier_victims_detected():
     fourk = [s for s in result["shorts"] if s["short_type"] == "4k"]
     assert len(fourk) == 1
     assert len(fourk[0]["kill_ticks"]) == 4
+
+
+def test_4k_with_smg_attacker_passes_tier_gate():
+    """SMG 4K vs pistol-heavy victims is not eco-farming (real 22k-view MP9 4K)."""
+    kill_events = [
+        {"tick": 1000, "round": 2, "attacker_sid": "X", "victim_sid": "a", "weapon": "mp9", "victim_weapon": "glock"},
+        {"tick": 1100, "round": 2, "attacker_sid": "X", "victim_sid": "b", "weapon": "mp9", "victim_weapon": "glock"},
+        {"tick": 1200, "round": 2, "attacker_sid": "X", "victim_sid": "c", "weapon": "mp9", "victim_weapon": "ak47"},
+        {"tick": 1300, "round": 2, "attacker_sid": "X", "victim_sid": "d", "weapon": "mp9", "victim_weapon": "glock"},
+    ]
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=kill_events,
+        round_starts=[(500, 2)],
+    )
+    fourk = [s for s in result["shorts"] if s["short_type"] == "4k"]
+    assert len(fourk) == 1
+
+
+def test_round_1_start_at_tick_1_is_not_warmup():
+    """HLTV emits round 1 at tick 1 — its kills must not map to round 0."""
+    import pandas as pd
+
+    round_start = pd.DataFrame([
+        {"tick": 1, "round": 1},
+        {"tick": 5902, "round": 2},
+    ])
+    kill_events = [
+        {"tick": 3850, "attacker_sid": "X", "victim_sid": "a", "weapon": "glock", "victim_weapon": "usp-s"},
+        {"tick": 5337, "attacker_sid": "X", "victim_sid": "b", "weapon": "glock", "victim_weapon": "glock"},
+        {"tick": 5372, "attacker_sid": "X", "victim_sid": "c", "weapon": "glock", "victim_weapon": "glock"},
+        {"tick": 5582, "attacker_sid": "X", "victim_sid": "d", "weapon": "glock", "victim_weapon": "glock"},
+    ]
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=kill_events,
+        round_start=round_start,
+        first_freeze=1272,
+    )
+    fourk = [s for s in result["shorts"] if s["short_type"] in ("4k", "punch_up")]
+    assert len(fourk) == 1
+    assert fourk[0]["kill_ticks"] == [3850, 5337, 5372, 5582]
+
+
+def test_final_round_without_end_event_keeps_clutch():
+    """A won clutch in a round with no end event uses last-kill fallback."""
+    kill_events = [
+        {"tick": 100, "round": 5, "attacker_sid": "e1", "victim_sid": "A2", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 200, "round": 5, "attacker_sid": "e1", "victim_sid": "A3", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 300, "round": 5, "attacker_sid": "e1", "victim_sid": "A4", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 1000, "round": 5, "attacker_sid": "A", "victim_sid": "b", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 2000, "round": 5, "attacker_sid": "A", "victim_sid": "c", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 3000, "round": 5, "attacker_sid": "A", "victim_sid": "d", "weapon": "ak47", "victim_weapon": "ak47"},
+        {"tick": 3500, "round": 5, "attacker_sid": "A", "victim_sid": "e2", "weapon": "ak47", "victim_weapon": "ak47"},
+    ]
+    team_by_sid = {"A": 2, "A2": 2, "A3": 2, "A4": 2, "A5": 2,
+                   "b": 3, "c": 3, "d": 3, "e1": 3, "e2": 3}
+    result = detect_shorts(
+        demo_path="test.dem",
+        kill_events=kill_events,
+        team_by_sid=team_by_sid,
+        winner_by_round={5: 2},
+        round_starts=[(500, 5)],
+    )
+    clutches = [s for s in result["shorts"] if s["short_type"] == "clutch"]
+    assert len(clutches) == 1
 
 
 # ------------------ Action Timeline conversion ------------------

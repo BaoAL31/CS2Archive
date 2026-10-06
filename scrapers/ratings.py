@@ -17,7 +17,12 @@ from cs2archive.config import settings
 console = Console(force_terminal=True)
 
 _HLTV_PLAYER_PATH = re.compile(r"/player/\d+/[^/?#]+", re.IGNORECASE)
-_STAGE_STAR = re.compile(r"\*\s*([^*]{3,120}?)\.")
+# The stage blob is ``* Swiss round 2 (teams with a 1-0 record) 1. Spirit removed
+# Ancient 2. ...`` — stage and map-veto list share one node. Terminating on a bare
+# ``\.`` stops at the veto item's ``1.`` and leaks the item number into the stage
+# ("Swiss round 2 (teams with a 1-0 record) 1"), because the dot the downstream
+# veto-split looks for is already consumed. Stop before the veto marker too.
+_STAGE_STAR = re.compile(r"\*\s*([^*]{3,120}?)(?=\s*\d+\.\s|\s*\.\s|\s*$)", re.S)
 _STAGE_HINT = re.compile(
     r"grand final|quarter|semi|playoff|final|swiss|opening|group|"
     r"round of|stage \d|3rd place|decider",
@@ -52,7 +57,12 @@ def _clean_stage_text(text: str) -> str:
     text = re.sub(r"[<>]+", " ", text)
     text = re.sub(r"&[a-zA-Z0-9#]+;", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
-    text = re.split(r"\s+\d+\.\s", text, maxsplit=1)[0].strip()
+    # The "* Stage" bullet marker is markup, not part of the stage name.
+    text = text.lstrip("*").strip()
+    # Drop the map-veto block. The leading \s* matters: get_text(strip=True) glues
+    # nodes together ("Round of 161. Aurora removed ..."), so the item number has
+    # no whitespace before it and ``\s+\d+\.\s`` would miss it.
+    text = re.split(r"\s*\d+\.\s", text, maxsplit=1)[0].strip()
     if ". " in text:
         text = text.split(". ", 1)[0].strip()
     return text

@@ -60,18 +60,42 @@ CSDM = settings.csdm_cmd
 # Full-HUD policy: the compact alive-count team bar (N vs N numbers, not the
 # wide avatar row) stays visible; CSDM's showOnlyDeathNotices stays OFF and
 # the score digits are blurred in post (assemble_hook.py) instead.
-HOOK_CFG_LINES = [
+#
+# HUD DELTA ONLY. The crosshair is NOT decided here: the hook's sequence cfg is
+# built from the POV's own cfg (`_sequence_cfg`), because this list used to be
+# the whole cfg and it never loaded `assets/cs2_pov.cfg` — so the hook went out
+# without `cl_show_observer_crosshair 0` and CS2 drew the *observer* crosshair
+# during demo playback while the POV (which does load the base) drew the
+# player's. One list, two crosshairs, ten bug reports.
+HOOK_HUD_LINES = [
     "cl_draw_only_deathnotices 0",
     "cl_drawhud 1",
     *COMPACT_PLAYERCOUNT_CFG,
-    "crosshair 1",
     *CHAT_HIDE_CFG,
     "snd_mvp_volume 0",
     "cl_showfps 0",
     "net_graph 0",
 ]
 
+
+# Back-compat alias (older callers/tests reference the old name).
+HOOK_CFG_LINES = HOOK_HUD_LINES
+
+
+def hook_cfg_lines(player_cvars: list[str] | None = None,
+                   rename_map: dict[str, str] | None = None) -> str:
+    """The hook's sequence cfg — the POV's cfg plus the hook's HUD delta."""
+    from cs2archive.pov.render_pov import hud_sequence_cfg
+
+    return hud_sequence_cfg(HOOK_HUD_LINES, player_cvars, rename_map)
+
 MIN_SEGMENT_BYTES = 1_048_576
+
+# Bump when the way CS2 receives the crosshair/HUD changes, so cached hook
+# segments (and any prepend made from them) are invalidated. 1 = crosshair only
+# in the per-sequence `cfg` string (CSDM ignored it → default crosshair);
+# 2 = also passed as `--cfg <file>`, the mechanism render_pov uses.
+HOOK_RENDER_VERSION = 2
 
 
 def _pov_kill_ticks(demo_path: Path, sid: str) -> list[int]:
@@ -136,19 +160,18 @@ def build_config(plan: list[dict], demo_path: Path, out_dir: Path,
             else:
                 cvars, _info = _player_cvars(sid, demo_path, nick, height)
                 crosshair_cache[sid] = cvars
-        # HUD policy first, player cvars last (last wins — same as the POV).
-        cfg_lines = list(HOOK_CFG_LINES) + crosshair_cache[sid]
-        if rename_map:
-            from cs2archive.pov.render_pov import rename_cfg_lines
-            cfg_lines += rename_cfg_lines(rename_map)
+        # Same crosshair system as the POV render: one cfg builder for both
+        # (`hook_cfg_lines` wraps render_pov._sequence_cfg), so the hook cannot
+        # drift onto a different crosshair/viewmodel again.
+        cfg_lines = hook_cfg_lines(crosshair_cache[sid], rename_map)
         nick = canonical_nick(sid, (moment.get("pov_nick") or "").strip()
                               or (player_nick or "").strip())
         if nick and nick.lower() != "unknown":
-            cfg_lines.append(f'mirv_replace_name byXuid add x{sid} "{nick}"')
+            cfg_lines += f'mirv_replace_name byXuid add x{sid} "{nick}"\n'
         for w in moment["windows"]:
             sequences.append(sequence(
                 n, int(w["start_tick"]), int(w["end_tick"]), sid,
-                "\n".join(cfg_lines) + "\n",
+                cfg_lines,
                 show_only_death_notices=False,
                 player_voices=False,
             ))
@@ -300,13 +323,22 @@ def render_hook(timeline_path: Path, width: int | None = None,
                                hide_avatars=bool(hide_avatars))
         _write_spec_lock_cfg(demo_name)
         _swap_autoexec(AUTOEXEC_RENDER)
+        # CS2 needs the crosshair/viewmodel handed over the SAME way the POV
+        # render does it: `--cfg <file>`. The per-sequence `cfg` string inside
+        # `--config-file` is NOT applied by CSDM here (measured: the hook's
+        # central 400x400 holds 6 cyan pixels vs 408 in the POV body for
+        # flameZ's cyan crosshair), so the hook rendered the game's default
+        # teaching crosshair while the POV rendered the player's.
+        seq_cfg = out_dir / "hook_sequence.cfg"
+        seq_cfg.write_text(hook_cfg_lines(cvars, rename_map), encoding="utf-8")
         try:
             # Hardened detector (hook_aware): AfxHook query + ffmpeg delta +
             # fast fail with a named stage. The legacy shorts poller only
             # counted sequence files and burned the full timeout blind.
             # hook_retries counts TOTAL attempts here; the wrapper counts
             # EXTRA attempts after the first.
-            cmd = [CSDM, "video", "--config-file", str(cfg_path.resolve())]
+            cmd = [CSDM, "video", "--config-file", str(cfg_path.resolve()),
+                   "--cfg", str(seq_cfg.resolve())]
             video = run_csdm_hook_aware(
                 cmd, "hook", segments_dir,
                 hook_timeout=hook_timeout,

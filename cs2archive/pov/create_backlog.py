@@ -410,61 +410,49 @@ def _ingest_corpus(demos: list[Path]) -> None:
 
 
 def _extract_shorts(demos: list[Path]) -> None:
-    """Extract short timelines (Recognised Pros only) for each demo.
+    """Nominate each demo's top Allstar clip as its short.
 
-    Mirrors the FACEIT flow in cs2archive/faceit/create_faceit_match_backlog.py:
-    one short_timeline.json per detected short, each under its own POV
-    folder (``renders/pov-{stem}_{nick}/shorts/shorts-{slug}/``).
+    One nomination per demo (the demo map's top verified clip by views),
+    replacing the old heuristic detector. Each nomination is kill-count
+    verified and foundation-staged; persist under its own POV folder
+    (``renders/pov-{stem}_{nick}/shorts/shorts-{slug}/``).
     """
-    from cs2archive.shorts.build_short_timeline import build_short_timeline
     from cs2archive._backlog_common import card_nicks_for_demo, persist_shorts_grouped
+    from cs2archive.shorts.extract_top_allstar import extract_top_allstar_short
 
     total = 0
     for demo in demos:
         demo = Path(demo)
         try:
-            timeline = build_short_timeline(demo, pros_only=True)
+            top = extract_top_allstar_short(demo)
         except Exception as e:
-            print(f"  [WARN] Shorts extraction failed for {demo.name}: "
+            print(f"  [WARN] Allstar nominate failed for {demo.name}: "
                   f"{type(e).__name__}: {e}", file=sys.stderr)
             continue
-        dropped_randos = timeline.get("_dropped_randos", 0)
-        from cs2archive.shorts.demand_gate import (
-            filter_publishable_shorts, folder_orgs, filter_suffix,
-        )
-        shorts = list(timeline.get("shorts") or [])
-        opp_cache: dict[str, tuple[str | None, str | None]] = {}
+        if not top:
+            print(f"  [SHORTS] {demo.name}: no verified Allstar clip")
+            continue
         try:
             from cs2archive.shorts.detect_team import detect_pov_opponent
+            try:
+                pov, opp = detect_pov_opponent(demo, top["pov_steam_id"])
+                if pov:
+                    top["pov_team"] = pov
+                if opp:
+                    top["opponent"] = opp
+            except Exception:
+                pass
         except Exception:
-            detect_pov_opponent = None  # type: ignore
-        if detect_pov_opponent:
-            for short in shorts:
-                sid = str(short.get("pov_steam_id") or "")
-                if not sid:
-                    continue
-                if sid not in opp_cache:
-                    try:
-                        opp_cache[sid] = detect_pov_opponent(demo, sid)
-                    except Exception:
-                        opp_cache[sid] = (None, None)
-                pov, opp = opp_cache[sid]
-                if pov and not short.get("pov_team"):
-                    short["pov_team"] = pov
-                if opp and not short.get("opponent"):
-                    short["opponent"] = opp
-        shorts_list, dropped_demand = filter_publishable_shorts(
-            shorts, orgs=folder_orgs(demo),
-        )
-        suffix = filter_suffix(dropped_randos, dropped_demand)
-        if not shorts_list:
-            print(f"  [SHORTS] {demo.name}: 0 shorts{suffix}")
-            continue
+            pass
+        timeline = {"demo_path": str(demo), "map": top.get("map"),
+                    "shorts": [], "source": "allstar_top"}
+        print(f"  [SHORTS] {demo.name}: top Allstar = {top.get('pov_nick')} "
+              f"{top.get('short_type')} R{top.get('round')} "
+              f"{(top.get('allstar') or {}).get('views')} views "
+              f"({(top.get('allstar') or {}).get('confidence')})")
         written = persist_shorts_grouped(
-            demo, timeline, shorts_list, card_nicks_for_demo(demo))
+            demo, timeline, [top], card_nicks_for_demo(demo))
         total += written
-        print(f"  [SHORTS] {demo.name}: {len(shorts_list)} shorts -> "
-              f"{written} files{suffix}")
     print(f"[SHORTS] {total} short timeline(s) extracted")
 
 
@@ -488,11 +476,11 @@ async def main() -> None:
         ns = _ap.ArgumentParser()
         ns.add_argument("--map", default=""); ns.add_argument("--tournament", default="")
         ns.add_argument("--match-id", default=""); ns.add_argument("--no-elo", action="store_true")
-        ns.add_argument("--no-shorts", action="store_true")
+        ns.add_argument("--shorts", action="store_true")
         opts, _unknown = ns.parse_known_args(extra)
         run_faceit(demo, map_override=opts.map, tournament=opts.tournament,
                    match_id_arg=opts.match_id, no_elo=opts.no_elo,
-                   no_shorts=opts.no_shorts)
+                   no_shorts=not opts.shorts)
         return
     if source == "hltv":
         print("[ERR] HLTV .dem path given but the HLTV flow needs the match URL "

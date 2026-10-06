@@ -165,6 +165,8 @@ def main() -> None:
             # One Short per player per calendar day: if this POV already has a
             # Short booked that date, occupy the daily 18:00 slot so the next
             # clip of theirs lands on a later day.
+            from cs2archive.overlay._common import prefer_cs2util_scripts
+            prefer_cs2util_scripts()
             from publish_schedule import SLOT_TIMES, find_next_upload_slot
             nick = pov_nick_from_meta_path(meta_path)
             if nick:
@@ -256,6 +258,8 @@ def main() -> None:
     if publish_local:
         try:
             pdate, ptime = publish_local.split(" ")
+            from cs2archive.overlay._common import prefer_cs2util_scripts
+            prefer_cs2util_scripts()
             from publish_schedule import wall_clock_to_local_schedule
             browser_date, browser_time = wall_clock_to_local_schedule(pdate, ptime, publish_tz)
         except Exception as exc:
@@ -326,6 +330,8 @@ def _run_tiktok(
         print("  [tiktok] no schedule slot; skipping", flush=True)
         return
 
+    from cs2archive.overlay._common import prefer_cs2util_scripts
+    prefer_cs2util_scripts()
     from tiktok_studio_navigator import (
         DEFAULT_PROFILE_DIR as DEFAULT_TIKTOK_PROFILE_DIR,
         run_schedule_flow as run_tiktok_schedule_flow,

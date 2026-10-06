@@ -42,6 +42,21 @@ from cs2archive.csdm_segments import sequence, tick_range_config  # noqa: E402
 from cs2archive import encode
 
 CSDM = settings.csdm_cmd
+
+# HUD delta ONLY — the crosshair, viewmodel and base HUD come from
+# `render_pov.hud_sequence_cfg` (the same cfg the POV render uses), which loads
+# `assets/cs2_pov.cfg` including `cl_show_observer_crosshair 0` and inlines the
+# player's cvars last. A hand-rolled list here meant shorts rendered the observer
+# crosshair instead of the player's.
+SHORTS_HUD_LINES = [
+    "cl_draw_only_deathnotices 0",
+    "cl_drawhud 1",
+    *COMPACT_PLAYERCOUNT_CFG,
+    *CHAT_HIDE_CFG,
+    "snd_mvp_volume 0",
+    "cl_showfps 0",
+    "net_graph 0",
+]
 FFMPEG = settings.ffmpeg_exe
 FFPROBE = settings.ffprobe_exe
 CFG_PATH = (_PROJECT_ROOT / "assets" / "cs2_pov.cfg").resolve()
@@ -53,6 +68,7 @@ SRC_WIDTH = _DEFAULT_SRC_WIDTH
 SRC_HEIGHT = _DEFAULT_SRC_HEIGHT
 OUT_WIDTH = 1080
 OUT_HEIGHT = 1920
+EDGE_FADE_DUR = 0.6  # fade in from / out to black on the finished short (s)
 CSDM_RECORD_FRAMERATE = 60
 
 KILLFEED_CROP_W = 300
@@ -369,16 +385,13 @@ def _build_csdm_config(
         pov_sid = s["pov_steam_id"]
         cvars = crosshair_cache.get(pov_sid, [])
 
-        cfg_lines = [
-            "cl_draw_only_deathnotices 0",
-            "cl_drawhud 1",
-            *COMPACT_PLAYERCOUNT_CFG,
-            "crosshair 1",
-            *CHAT_HIDE_CFG,
-            "snd_mvp_volume 0",
-            "cl_showfps 0",
-            "net_graph 0",
-        ] + cvars
+        # ONE cfg system: the shared POV base + this product's HUD delta, built by
+        # render_pov.hud_sequence_cfg. The old hand-rolled list skipped
+        # `assets/cs2_pov.cfg`, so shorts went out without
+        # `cl_show_observer_crosshair 0` and CS2 drew the observer crosshair.
+        from cs2archive.pov.render_pov import hud_sequence_cfg
+
+        cfg_lines = hud_sequence_cfg(SHORTS_HUD_LINES, cvars).splitlines()
 
         # Automatically rename the POV player's in-HUD name to their canonical
         # nickname (HLAE mirv_replace_name, 2.184+). The demo records the
@@ -572,6 +585,7 @@ def _composite_9x16(
     avatar_bottom_margin: int = AVATAR_BOTTOM_MARGIN,
     use_cpu: bool = False,
     score_blur: bool = True,
+    src_duration: float | None = None,
 ) -> None:
     """Composite a source clip into 1080x1920 via ffmpeg filter chain.
 
@@ -606,7 +620,7 @@ def _composite_9x16(
     libx264 for CPU when *use_cpu* is True (allows parallel ffmpeg
     sessions when GPU already occupied).
     Decode: cuda hwaccel for GPU path; CPU path uses no hwaccel.
-    Audio: passthrough copy from the source.
+    Audio: re-encoded AAC (fades baked in — see EDGE_FADE_DUR).
     """
     gblur_sigma = max(1, blur_radius // 2)
 
@@ -772,6 +786,26 @@ def _composite_9x16(
             )
             cmd[cmd.index("-filter_complex") + 1] = vf
 
+    # Fade in from black / out to black on the finished canvas (video +
+    # audio). Trim only cuts middle gaps, never head/tail, so baking the
+    # edge fades here is safe. Duration comes from the caller: probing here
+    # would add a subprocess call that breaks the mocked-subprocess tests.
+    _dur = src_duration if src_duration is not None else 0.0
+    if _dur > 2 * EDGE_FADE_DUR:
+        _out_st = max(0.0, _dur - EDGE_FADE_DUR)
+        _fi = cmd.index("-filter_complex")
+        cmd[_fi + 1] += (f";[out]fade=t=in:st=0:d={EDGE_FADE_DUR},"
+                         f"fade=t=out:st={_out_st:.3f}:d={EDGE_FADE_DUR}[outf]")
+        cmd[cmd.index("[out]")] = "[outf]"
+        _ai = cmd.index("-c:a")
+        cmd[_ai + 1] = "aac"
+        cmd[_ai + 2:_ai + 2] = [
+            "-af",
+            f"afade=t=in:st=0:d={EDGE_FADE_DUR},"
+            f"afade=t=out:st={_out_st:.3f}:d={EDGE_FADE_DUR}",
+            "-b:a", "160k",
+        ]
+
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if r.returncode != 0:
         raise RuntimeError(
@@ -783,25 +817,8 @@ def _composite_9x16(
 
 
 def _short_output_path(out_dir: Path, short: dict, name: str | None = None) -> Path:
-    """Compute the final 9:16 output path for a short (or ``name`` override)."""
-    if name:
-        base = name
-    else:
-        st = short["short_type"]
-        nick = short.get("pov_nick", "unknown")
-        tick = short.get("start_tick", 0)
-        if st in ("4k", "punch_up"):
-            kills = len(short.get("kill_ticks", []))
-            base = f"{kills}k_multikill-{nick}-t{tick}"
-        elif st == "clutch":
-            cnt = short.get("clutch_initial_count", "XvX")
-            base = f"{cnt}_clutch-{nick}-t{tick}"
-        else:
-            base = f"{st}-{nick}-t{tick}"
-        tags = short.get("punch_up_tags") or []
-        if tags:
-            base = f"{base}_{'_'.join(tags)}"
-    return out_dir / f"{base}.mp4"
+    from cs2archive.shorts.output_paths import short_output_path
+    return short_output_path(out_dir, short, name)
 
 
 def render_shorts(
@@ -1015,6 +1032,7 @@ def render_shorts(
             scaling_mode=scaling_mode, avatar_path=avatar_path,
             avatar_height=avatar_height, avatar_bottom_margin=avatar_bottom_margin,
             use_cpu=use_cpu, score_blur=score_blur,
+            src_duration=_probe_duration(seg_file),
         )
         w, h = _probe_resolution(dst)
         dur = _probe_duration(dst)

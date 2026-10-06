@@ -185,37 +185,71 @@ def _discover_util_cams(util_cams_root: Path) -> list[Path]:
     return out
 
 
-def _find_demo_for_id(util_cams_root: Path, demo_id: str) -> Path:
-    """Find the .dem file for a demo_id.  Walks known locations.
+# Set once in main(): the exact demo this run renders (all jobs in one run share
+# a match/map) and the demos root to search when no exact path was passed.
+_DEMO_PATH_OVERRIDE: Path | None = None
+_DEMOS_DIR: Path | None = None
 
-    Accepts both full slug ("2395002-furia-vs-falcons-m3-inferno") and short
-    slug ("furia-vs-falcons-m3-inferno"). Tries both, with the full slug
-    first since it's more specific.
+
+def _find_demo_for_id(util_cams_root: Path, demo_id: str) -> Path:
+    """Resolve ``<match_id>-<demo_stem>`` to its .dem — by id, never by name.
+
+    Every match has its own id, and the id is in the folder name, so resolution
+    is a direct ``<demos>/{match_id}-*/` lookup. The old version fell back to
+    scanning *every* match folder for a matching file name, which returned
+    ``2393236-vitality-vs-falcons-iem-rio/vitality-vs-falcons-m2-dust2.dem`` for
+    ``2398739-vitality-vs-falcons-m2-dust2`` — an old-build demo CS2 refused as a
+    version mismatch while the POV render (exact card path) worked fine.
+
+    Without a match-id prefix nothing is searched: only an exact flat
+    ``<demos>/<demo_id>.dem`` (FACEIT stores demos flat) counts. Callers should
+    pass the card's own path via ``--demo-path``; this is the fallback.
     """
     import re
+    roots: list[Path] = []
+    if _DEMOS_DIR is not None:
+        roots.append(_DEMOS_DIR)
     project_root = util_cams_root
     for _ in range(5):
         if (project_root / "demos").is_dir():
             break
         project_root = project_root.parent
-    hltv_root = project_root / "demos" / "hltv"
-    if hltv_root.is_dir():
-        # Try the full demo_id first, then strip a leading "<digits>-" match_id prefix
-        candidates = [demo_id]
-        m = re.match(r"^\d+-(.+)$", demo_id)
-        if m:
-            candidates.append(m.group(1))
-        for cand_id in candidates:
-            for sub in hltv_root.iterdir():
-                cand = sub / f"{cand_id}.dem"
+    roots += [project_root / "demos" / "hltv", project_root / "demos" / "faceit"]
+
+    m = re.match(r"^(\d+)-(.+)$", demo_id)
+    if not m:
+        for root in roots:
+            flat = root / f"{demo_id}.dem"
+            if flat.is_file():
+                return flat.resolve()
+        return Path(demo_id + ".dem")
+
+    match_prefix, stem = m.group(1), m.group(2)
+    candidates: list[Path] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        # FACEIT ids start with a digit too ("1-8082f80e-…") but are stored flat.
+        flat = root / f"{demo_id}.dem"
+        if flat.is_file():
+            candidates.append(flat.resolve())
+        for sub in sorted(root.glob(f"{match_prefix}-*")):
+            if not sub.is_dir():
+                continue
+            for name in (demo_id, stem):
+                cand = sub / f"{name}.dem"
                 if cand.is_file():
-                    return cand.resolve()
-    # FACEIT demos are stored flat (no match_id prefix): demos/faceit/<demo_id>.dem
-    faceit_root = project_root / "demos" / "faceit"
-    if faceit_root.is_dir():
-        cand = faceit_root / f"{demo_id}.dem"
-        if cand.is_file():
-            return cand.resolve()
+                    candidates.append(cand.resolve())
+    # The demos store is reachable twice (junction), so the same file can match
+    # under two roots.
+    unique = list(dict.fromkeys(candidates))
+    if len(unique) == 1:
+        return unique[0]
+    if len(unique) > 1:
+        raise ValueError(
+            f"ambiguous demo for {demo_id!r} — pass --demo-path; candidates: "
+            + ", ".join(str(path) for path in unique)
+        )
     return Path(demo_id + ".dem")
 
 
@@ -308,7 +342,10 @@ def _build_job(util_dir: Path, throw_id: str, throws_df: pd.DataFrame, util_cams
     util_id = _util_id_for_row(row)
     cameras = row.get("cameras") or cameras_for_util_type(row.get("util_type", ""))
 
-    demo_path = str(_find_demo_for_id(util_cams_root, demo_id))
+    if _DEMO_PATH_OVERRIDE is not None:
+        demo_path = str(_DEMO_PATH_OVERRIDE)
+    else:
+        demo_path = str(_find_demo_for_id(util_cams_root, demo_id))
     if not Path(demo_path).is_file():
         return None, throw_id
 
@@ -658,14 +695,22 @@ def _render_util_cams(
                 f"({per_spot:.0f}s per spot)",
                 flush=True,
             )
-            if len(chunk) > 1 and per_spot > 50.0:
-                msg = (
-                    f"  [FAIL] per-spot time {per_spot:.0f}s in chunk of {len(chunk)} "
-                    f"looks like sequential CS2 launches, not batching. "
-                    f"Debug: check {work_dir / label}/"
+            if len(chunk) > 1 and len(outputs) == len(chunk) and per_spot > MAX_PER_SPOT_SECONDS:
+                # Warning, not a failure: render_spot_batch() is ONE CS2 session
+                # per chunk, and a real sequential-launch regression already trips
+                # the deterministic n_chunks == len(spots) check above. Wall time
+                # cannot tell the two apart — a hook+seek+encode spot costs ~50s
+                # here either way (b1t/Nuke: 51s/spot batched, this run: 54s/spot),
+                # so failing on it threw away 54 correctly rendered clips and
+                # failed the overlay with "0 flight clips for 54 throws".
+                print(
+                    f"  [WARN] per-spot time {per_spot:.0f}s in chunk of {len(chunk)} "
+                    f"exceeds {MAX_PER_SPOT_SECONDS:.0f}s — if that is unexpected, "
+                    f"check {work_dir / label}/ for per-spot CS2 launches. "
+                    f"Keeping {len(outputs)} clip(s).",
+                    file=sys.stderr,
+                    flush=True,
                 )
-                print(msg, file=sys.stderr, flush=True)
-                return 3
             for out_path in outputs:
                 for entry in chunk:
                     if entry.util_dir.resolve() == out_path.parent.resolve():
@@ -686,6 +731,12 @@ def _render_util_cams(
 # Main
 # ---------------------------------------------------------------------------
 
+# A chunk is ONE CS2 session (``render_spot_batch``), so per-spot wall time is a
+# diagnostic, not a correctness signal: hook + seek + encode costs ~50s/spot on
+# this machine whether batched or not. Only used for the warning below.
+MAX_PER_SPOT_SECONDS = 50.0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Prepare util_cam dirs via CS2UtilArchive canonical manifest + render.",
@@ -698,6 +749,10 @@ def main() -> int:
                     help="Filter throws.parquet by thrower_steamid")
     ap.add_argument("--demo-id", required=True,
                     help="Full demo slug like '2395002-furia-vs-falcons-m2-anubis'")
+    ap.add_argument("--demo-path", default=None,
+                    help="Exact .dem for this run. Wins over --demo-id resolution, which "
+                         "is how the pipeline passes the card's own demo (same-named "
+                         "demos exist in other matches).")
     ap.add_argument("--demos-dir", required=True,
                     help="Parent dir of extracted .dem folders")
     ap.add_argument("--chunk-size", type=int, default=0,
@@ -723,6 +778,14 @@ def main() -> int:
                     help="Supersample multiplier on displayed inner size (default 1.0 = 1:1, 1.2 = 20%% oversample for Lanczos).")
     args = ap.parse_args()
 
+    global _DEMO_PATH_OVERRIDE, _DEMOS_DIR
+    if args.demo_path:
+        override = Path(args.demo_path).resolve()
+        if not override.is_file():
+            print(f"[ERROR] --demo-path not found: {override}", file=sys.stderr)
+            return 2
+        _DEMO_PATH_OVERRIDE = override
+
     if args.prepare_only and args.render_only:
         print("[FAIL] --prepare-only and --render-only are mutually exclusive", file=sys.stderr)
         return 1
@@ -730,6 +793,15 @@ def main() -> int:
     util_cams_root = Path(args.util_cams_root).resolve()
     data_dir = Path(args.data_dir).resolve()
     demos_dir = Path(args.demos_dir).resolve()
+    _DEMOS_DIR = demos_dir
+    try:
+        resolved_demo = _DEMO_PATH_OVERRIDE or _find_demo_for_id(util_cams_root, args.demo_id)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 2
+    print(f"[prep] demo file: {resolved_demo} "
+          f"({'--demo-path' if _DEMO_PATH_OVERRIDE else 'resolved from --demo-id'})",
+          flush=True)
 
     # Phase 1: PREP — use canonical manifest builder
     if not args.render_only:

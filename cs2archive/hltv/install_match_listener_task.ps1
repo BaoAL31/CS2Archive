@@ -1,19 +1,19 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+  DEPRECATED forwarder -> cs2archive\listener\install_listener_task.ps1
+.DESCRIPTION
+  The listener moved out of hltv/ (it polls FACEIT too), and the task was renamed
+  from "CS2Archive HLTV Match Listener" to "CS2Archive Match Listener". Running
+  this forwarder installs the NEW name; delete the stale old-name task with
+  schtasks.exe /Delete /TN "CS2Archive HLTV Match Listener" /F
+#>
 param(
-    [string]$TaskName = "CS2Archive HLTV Match Listener",
-    [int]$IntervalMinutes = 5
+    [switch]$KeepLegacyTaskName
 )
 
-$ErrorActionPreference = "Stop"
-$Root = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
-$Launcher = Join-Path $Root "cs2archive\hltv\run_match_listener.ps1"
-$TaskCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$Launcher`""
+Write-Warning "DEPRECATED cs2archive\hltv\install_match_listener_task.ps1 -> cs2archive\listener\install_listener_task.ps1"
 
-# The listener itself remains alive and polls.  The scheduled task is configured
-# to restart it if Windows terminates it or the machine reboots.
-schtasks.exe /Delete /TN $TaskName /F 2>$null | Out-Null
-schtasks.exe /Create /TN $TaskName /SC ONLOGON /RL HIGHEST `
-    /TR $TaskCommand /F | Out-Host
-
-Write-Host "Installed: $TaskName"
-Write-Host "Start now: schtasks.exe /Run /TN `"$TaskName`""
-Write-Host "Stop:      schtasks.exe /End /TN `"$TaskName`""
+$taskName = if ($KeepLegacyTaskName) { "CS2Archive HLTV Match Listener" } else { "CS2Archive Match Listener" }
+& (Join-Path $PSScriptRoot "..\listener\install_listener_task.ps1") -TaskName $taskName
+exit $LASTEXITCODE

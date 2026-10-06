@@ -114,9 +114,33 @@ Test gaps before scoring integration (report §3): `_economy_by_round` untested;
 encodes a value the producer never emits; no "v2/unknown buys change nothing" regression test; no pro
 deaths from teamkill/suicide/world; no version-pinning assertions.
 
+### 2026-10-05 — pipeline performance TODO list
+
+Backlog: [`2026-10-05-pipeline-performance-todo.md`](2026-10-05-pipeline-performance-todo.md) · commit `8453f1c`
+
+All items **open**; no implementation or controlled A/B benchmarks performed. Savings and council claims are corrected/qualified in the backlog. Encoder quality and product selection remain unchanged.
+
+| Id | TODO | Status |
+|---|---|---|
+| PERF-01 | Benchmark native concat + upscale inside final overlay encode; preserve geometry/resume/raw-only | open |
+| PERF-02 | Measure concat/audit/remux/copy separately; optimise without weakening validation | open |
+| PERF-03 | Benchmark duration-aware batching and interrupted-run recovery; choose policy | open |
+| PERF-04 | Shared action-timeline/stat-strip caches outside purgeable POV folders | open |
+| PERF-05 | Profile and deduplicate hook/event parsing with versioned equivalent outputs | open |
+| PERF-06 | Memoise voice eligibility/team metadata | open |
+| PERF-07 | Parse team roster once per demo during backlog creation | open |
+| PERF-08 | Cache prosettings; reuse embedded crosshair code from valid analysis | open |
+| PERF-09 | Reduce output copying and repeated assembly rewrites safely | open |
+| PERF-10 | Reuse unchanged hook render windows | open |
+| PERF-11 | Hoist keyboard-mapper invariant allocations | open |
+| PERF-12 | Measure listener discovery latency/idle scraping; preserve single renderer | open |
+| PERF-13 | Diagnose listener restart warnings from correlated evidence | open |
+| PERF-14 | Owner decisions: PiP volume and any separate mezzanine quality experiment | open |
+
 ## Other reviews in this folder
 
 | Report | Scope |
 |---|---|
 | `2026-09-27-thermo-nuclear-code-review.md` | Whole-repo maintainability review (CR-01…CR-18). Has a **RESUME HERE** status block at the top. |
 | `2026-09-28-timeline-v3-review.md` | Timeline v3 (`detect_shorts` / edit-timeline) review from the overlay/PiP session. |
+| `2026-10-05-pipeline-performance-todo.md` | Pipeline performance TODOs, benchmark/parity plan, council corrections and deferred proposals (PERF-01…PERF-14). |

@@ -299,6 +299,11 @@ def _run_batch_util_cams_subprocess(
         cmd += ["--pip-supersample", str(float(pip_supersample))]
     if demo_id:
         cmd += ["--demo-id", demo_id]
+    # The card's own demo path: same-named demos exist in other matches, and
+    # stem-only resolution picked a stale one (2398739 vitality-vs-falcons-m2-dust2
+    # resolved to the old IEM Rio demo) that CS2 refused as a version mismatch.
+    if demo_path is not None:
+        cmd += ["--demo-path", str(Path(demo_path).resolve())]
     # Derive demos_dir from CS2UtilArchive project root
     demos_dir = _CS2UTIL_ROOT / "demos" / "extracted"
     cmd += ["--demos-dir", str(demos_dir.resolve())]

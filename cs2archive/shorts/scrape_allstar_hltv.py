@@ -352,6 +352,11 @@ def _listener_unseen(done: set[str], path: Path | None = None) -> list[dict]:
             continue
         slug = str(match.get("slug") or "")
         event = str(match.get("event") or match.get("event_slug") or "")
+        # Only popular fixtures are worth backfilling: the listener state keeps
+        # every event it has ever seen (CCT, challengers, qualifiers), and the
+        # import above exists for exactly this call. `event` was read but never
+        # used here — the filter had been lost, so the backfill queued CCT and
+        # friends (test_listener_skips_non_popular_events).
         if not is_popular_event(slug, event):
             continue
         out.append({
@@ -808,16 +813,16 @@ def main() -> int:
             encoding="utf-8",
         )
         print(f"[probe] archive events={len(events)} popular={len(popular)}")
-        for e in popular:
+        for e in events:
             print(f"  keep {e['event_id']} {e['slug']}")
-        if not popular:
-            print("[probe] no popular events parsed from archive; stopping")
+        if not events:
+            print("[probe] no events parsed from archive; stopping")
             print(json.dumps(stats))
             return 1
 
         matches: list[dict] = []
         seen_m: set[str] = set()
-        for ev in popular:
+        for ev in events:
             batch, mcf = _collect_event_matches(page, ev, base, args.sleep)
             stats["cloudflare"] += mcf
             if mcf:

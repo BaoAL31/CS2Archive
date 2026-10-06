@@ -28,9 +28,11 @@ the listener spawns `scripts/upload/upload_pending.py --dir <overlay> --limit 1`
 for **that** overlay folder in a new console, then immediately starts the next
 render. `--dir` keeps the scan inside the POV's youtube folder so leftover
 pending metas are not picked up.
-Shorts timelines are extracted inside `create_backlog.py` (Recognised Pros
-only, skip with `--no-shorts`; low-demand POVs without a NAVI / Spirit /
-Vitality hook are dropped). Output is written only when at least one
+Shorts candidate timelines are extracted inside `create_backlog.py` (Recognised
+Pros only, skip with `--no-shorts`; no HLTV demand veto or extraction-time claims).
+`render_pending_shorts` ranks the entire pending pool by predicted Allstar views
+and caps successful renders at two per Sydney day. See `shorts-picker.md`.
+Output is written only when at least one
 short is detected: `renders/pov-<demo-stem>_<nick>/shorts/shorts-<slug>/`.
 
 ## FACEIT notables (two tracks)
@@ -76,8 +78,7 @@ are not used to pad the day to 2. There is no separate Windows 09:00 task.
 ## Weighting
 
 `score_cards.py` scores HLTV backlog cards on the same chip scale as
-FACEIT notable scoring (manual CLI: `score_cards backlog/<match_slug>`
-— nothing in the listener calls it). Stars come from YouTube, not from
+FACEIT notable scoring. Stars come from YouTube, not from
 HLTV ranking alone:
 
 | Chip | Source | Cap |
@@ -88,9 +89,29 @@ HLTV ranking alone:
 | `demand` | max(POV-channel player index, highlight-named player index) | 200k |
 | `rating` | HLTV Rating 3.0 above 1.00 | 160k |
 
-Queue order is rating, then path — weight-vs-rating is an explicitly
-open operator decision (F1 DOCFIX), not a wired policy. Flip to weight
-only on a rating-blind wave-4 ordering replay with pre-registered bars
+Two of these are now wired into the HLTV queue (the CLI
+`score_cards backlog/<match_slug>` still prints the full chip table for
+inspection):
+
+- **Gate** — before queueing, `_star_gate_cards` drops every card whose POV
+  player fails the FACEIT rule (`_star_eligible` → `scoring.demand_eligibility`
+  at `FACEIT_STAR_FLOOR` 1.40: demand star **with sample evidence**, or a
+  breakout). Fail-closed: a missing/stale payload drops the match rather than
+  widening to rating alone, and the drop is logged per match. `--no-star-gate`
+  queues on HLTV rating only.
+- **Order** — actionable matches are actioned by `_match_demand_points`
+  (both teams' demand via `_resolve_indexed_team`, which tolerates the event
+  words HLTV glues onto team 2, plus `match_highlight` views), highest first, so
+  the day's scarce slots go to the biggest fixture instead of /results page
+  order. `--results-order` restores page order.
+
+Selection is **one card per match** (`select_best_card`): a two-map series used
+rating-per-map selection before, and a single series spent both daily slots
+(9z vs NAVI on 2026-10-06) while spirit vs mouz and vitality vs falcons waited.
+
+Ordering *within* a match, and any move beyond demand chipping, stays an open
+operator decision (F1 DOCFIX). Flip to a pure weight order only on a
+rating-blind wave-4 ordering replay with pre-registered bars
 (win-rate and margin over rating-ordered picks on held-out performance,
 plus renders holding the forward kill metric) — a yardstick that embeds
 the graded variable does not count. Refresh:

@@ -1,6 +1,9 @@
 """Single source of truth for the renders/ layout.
 
+
+
 ::
+
 
     renders/
       pov-{demo_stem}_{nick}/   per-POV home (pipeline render dir)
@@ -8,19 +11,24 @@
                                 segments/, hook.mp4
         intro/                  intro.png, intro_details.json, footage/
         shorts/                 shorts-{slug}/short_timeline.json (+ meta, mp4)
+        stat-strips/            repeek pane cache for this match (copied
+                                from a sibling POV when present)
         action_timeline.json    per-demo cache, pov-local copy (hook needs
                                 victim weapons + duel/opener/trade moments;
                                 thumbnail needs kills + round stakes)
         combined.mp4, round clips, sidecars, utility_cams/, .overlay_work/
       hl-{demo_stem}/           MULTI-PROS highlights pipeline only — the POV
                                 flow never creates this (no auto-generation).
-      stat-strips/ voice-review/ hlae-diagnostic-*/
+      voice-review/ hlae-diagnostic-*/
                                 shared/miscellany, out of scope.
 
 Shorts live under the SHORT'S POV folder (``pov-{stem}_{nick}/shorts/``),
 resolved from backlog cards (exact pipeline nick strings — never the demo's
 raw name). Anything that scans shorts must glob; nothing may hardcode
 ``renders/shorts/`` anymore (kept as a legacy fallback read path only).
+The legacy ``renders/stat-strips/`` tree is read-only fallback + staging
+only; once a match's panes exist in a POV folder it is removed (see
+drop_legacy_match_strips).
 """
 
 from __future__ import annotations
@@ -34,7 +42,7 @@ RENDERS_DIR = PROJECT_ROOT / "renders"
 
 # Subdirs of a pov dir that are deliverables or cross-step caches: the
 # post-upload purge and the queue-clean sweep must spare these.
-POV_KEEP_DIRS = ("shorts",)
+POV_KEEP_DIRS = ("shorts", "stat-strips")
 
 
 def run_id_from_name(name: str) -> str:
@@ -116,6 +124,39 @@ def find_match_strips(match_id: str) -> list[Path]:
             and legacy not in out):
         out.append(legacy)
     return out
+
+
+def drop_legacy_match_strips(match_id: str) -> bool:
+    """Remove renders/stat-strips/<match_id> when its panes already
+    exist POV-locally, so the shared legacy tree never persists.
+    Also rmdir renders/stat-strips/ once empty."""
+    legacy = RENDERS_DIR / "stat-strips" / match_id
+    if not legacy.is_dir():
+        return False
+    hits = [
+        p for p in find_match_strips(match_id)
+        if p != legacy
+        and p.parent.name == "stat-strips"
+        and p.parent.parent.name.startswith("pov-")
+    ]
+    if not hits:
+        return False
+    for name in ("repeek_left.png", "repeek_right.png"):
+        src = legacy / name
+        if src.is_file() and not any((p / name).is_file() for p in hits):
+            # Panes not duplicated POV-locally — do not drop.
+            return False
+    try:
+        shutil.rmtree(legacy)
+    except OSError:
+        return False
+    try:
+        root = RENDERS_DIR / "stat-strips"
+        if root.is_dir() and not any(root.iterdir()):
+            root.rmdir()
+    except OSError:
+        pass
+    return True
 
 
 def find_short_timelines(dem_stem: str) -> list[Path]:

@@ -15,11 +15,14 @@ from cs2archive.pov.build_hook_timeline import (  # noqa: E402
     DEFAULT_TIERS,
     MIN_ROUND_DEFAULT,
     TIER_ORDER,
+    chain_segments,
     flick_speed_bonus,
+    kill_credit_index,
     moment_quality,
     peek_kill_bonus,
     punch_up_singles,
     round_allowed,
+    segment_quality,
     timeline_matches,
     timeline_moment_candidates,
     tier_of,
@@ -444,7 +447,7 @@ def test_footage_budget_drops_weakest_first():
 
 def test_rule_version_bumps_cache():
     from cs2archive.pov.build_hook_timeline import INSTA_RULE_VERSION, timeline_matches
-    assert INSTA_RULE_VERSION == 8
+    assert INSTA_RULE_VERSION == 9
     assert timeline_matches({"params": {"tiers": [], "min_round": 2,
                                         "max_moments": 3, "max_seconds": 30.0,
                                         "rule_version": 7}},
@@ -959,10 +962,77 @@ def test_quality_more_kills_then_faster_ttk():
     assert moment_quality(fast) > moment_quality(slow)
 
 
-def test_quality_bigger_clutch_disadvantage():
-    v5 = _q("clutch_1v5", kills=3, clutch="1v5")
-    v3 = _q("clutch_1v3", kills=3, clutch="1v3")
-    assert moment_quality(v5) > moment_quality(v3)
+def test_quality_no_clutch_disadvantage_bonus():
+    # The tier base already pays clutches top dollar; the count string
+    # itself must not add anything (1v5 and 1v3 are different tiers, so
+    # compare within one tier).
+    counted = _q("clutch_1v4", kills=3, clutch="1v4")
+    uncounted = _q("clutch_1v4", kills=3, clutch="")
+    assert moment_quality(counted) == moment_quality(uncounted)
+
+
+# ── segment scoring (the unit watched, not the unit detected) ──────
+
+def _seg_moment(tier, kills, start=1000, **kw):
+    m = {"tier": tier, "tier_rank": TIER_ORDER.index(tier),
+         "kill_ticks": list(kills), "start_tick": start,
+         "end_tick": start + 5000, "hs_ticks": {}, "peek_ticks": {},
+         "trade_ticks": [], "flick_speed": None, "ttk": None,
+         "clutch_initial_count": ""}
+    m.update(kw)
+    return m
+
+
+def _win(a, b):
+    return {"start_tick": a, "end_tick": b}
+
+
+def test_segment_whole_window_keeps_moment_score():
+    m = _seg_moment("punch_up_single", [1000, 1100, 1200],
+                    hs_ticks={1000: 50.0})
+    credit = kill_credit_index(None, None, [m])
+    assert (segment_quality([1000, 1100, 1200], m, credit)
+            == moment_quality(m))
+
+
+def test_segment_fragment_scores_enclosed_kills_only():
+    m = _seg_moment("clutch_1v4", [1000, 2000, 3000, 4000])
+    credit = {1000: {"hs": True, "peek": 100.0, "trade": False},
+              2000: {"hs": False, "peek": 0.0, "trade": True},
+              3000: {"hs": True, "peek": 0.0, "trade": False},
+              4000: {"hs": False, "peek": 0.0, "trade": False}}
+    # headshot + peek reaction, no tier base
+    assert segment_quality([1000], m, credit) == 250.0
+    # traded kill: kill points minus the deter, still no tier base
+    assert segment_quality([2000], m, credit) == 0.0
+    # plain kill
+    assert segment_quality([4000], m, credit) == 100.0
+
+
+def test_segment_fuses_sibling_candidate_credits():
+    # The clutch candidate carries no per-kill data; the insta/duel
+    # siblings do. Fusion by tick must find it.
+    clutch = _seg_moment("clutch_1v4", [1000, 2000])
+    insta = {"tier": "insta_kill", "tier_rank": 7, "kill_ticks": [1000],
+             "hs_ticks": {1000: 50.0}, "peek_ticks": {1000: 100.0},
+             "trade_ticks": []}
+    credit = kill_credit_index(None, None, [clutch, insta])
+    assert segment_quality([1000], clutch, credit) == 250.0
+
+
+def test_chain_best_segment_ranks_unbroken_triple_first():
+    triple = _seg_moment("punch_up_single", [1000, 1100, 1200],
+                         hs_ticks={1000: 50.0, 1100: 50.0, 1200: 50.0})
+    scattered = _seg_moment("clutch_1v4", [1000, 5000, 9000, 13000],
+                            end_tick=20000)
+    credit = kill_credit_index(None, None, [triple, scattered])
+    triple_best, _ = chain_segments(
+        {**triple, "chained": True, "kill_ticks": [1000, 1100, 1200]}, 64,
+        credit)
+    scattered_best, segs = chain_segments(
+        {**scattered, "kill_ticks": [1000, 5000, 9000, 13000]}, 64, credit)
+    assert len(segs) == 4  # one window per scattered kill
+    assert triple_best > scattered_best
 
 
 def test_quality_missing_fields_never_crash():
