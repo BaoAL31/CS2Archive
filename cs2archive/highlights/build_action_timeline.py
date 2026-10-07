@@ -1063,15 +1063,38 @@ def _round_starts_from_events(rows) -> dict[int, int]:
     deletes the first round — CR-20) and dropped only as warmup phantoms
     (tick <= 1 with no round number). Rows without a round number are
     numbered sequentially in tick order.
+
+    Out-of-order repair: some demos emit a SPURIOUS round_start long after
+    its round (recorder hiccup — e.g. falcons-vs-natus-vincere-m3-mirage-p1
+    replays a "round 1" start at tick 116713 after round 13). Last-seen-wins
+    alone turns that into a round-1 start beyond round 13's, and the broken
+    ordering makes every kill resolve to round 0 — kills_all/moments come
+    out empty. So choose backward (last round first): each round takes the
+    LATEST candidate that still sits before the next round's chosen start.
+    FACEIT's repeated round-1 starts (all before round 2) keep last-wins;
+    a straggler far beyond round 13 falls back to the real early tick.
     """
-    by_round: dict[int, tuple[int, int]] = {}
+    by_round: dict[int, list[int]] = {}
+    seq = 0
     for t, rn in sorted(rows):
         if t <= 1 and rn <= 0:
             continue  # warmup phantom
         if rn <= 0:
-            rn = len(by_round) + 1
-        by_round[rn] = (t, rn)
-    return {rn: t for rn, (t, _rn) in sorted(by_round.items())}
+            seq += 1
+            rn = seq
+        by_round.setdefault(rn, []).append(t)
+    out: dict[int, int] = {}
+    next_start: int | None = None
+    for rn in sorted(by_round, reverse=True):
+        cands = sorted(set(by_round[rn]))
+        if next_start is None:
+            chosen = cands[-1]
+        else:
+            chosen = next((c for c in reversed(cands) if c < next_start),
+                          cands[-1])
+        out[rn] = chosen
+        next_start = chosen
+    return dict(sorted(out.items()))
 
 
 def _bomb_action_site(label, rn, tick, sid, place_at, plant_sites) -> str:

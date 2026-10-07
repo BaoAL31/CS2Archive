@@ -306,6 +306,14 @@ def test_round_starts_sequential_fallback_without_round_numbers():
     assert _round_starts_from_events([(100, 0), (9000, 0)]) == {1: 100, 2: 9000}
 
 
+def test_round_starts_spurious_late_repeat_does_not_scramble_rounds():
+    # Recorder hiccup: a "round 1" start replays long after round 13. The
+    # real round-1 tick must win over the straggler, or every kill lands
+    # in "round 0" and kills_all/moments come out empty.
+    rows = [(1, 1), (5710, 2), (12863, 3), (116713, 1)]
+    assert _round_starts_from_events(rows) == {1: 1, 2: 5710, 3: 12863}
+
+
 def test_pro_ledger_best_round_none_without_kills():
     ks = [_mkill(2000, 1, E1, MATE)]
     deaths = {1: [(2000, MATE)]}

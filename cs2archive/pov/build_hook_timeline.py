@@ -12,7 +12,10 @@ this module only ranks and selects. Tiers are an ordered, configurable list so
 the qualification threshold can be tuned without a code change.
 
 NOTE: the shorts extractor only emits multikills at >= 4 kills — there is no
-3k/2k short, so a "first multikill" fallback tier cannot be filled today.
+3k/2k short. Irrelevant now: EVERY kill of the POV player becomes a hook
+candidate (the ``kill`` tier below), so nothing depends on the extractor's
+multikill floor. Kills that land close together merge into one continuous
+moment and each enclosed kill adds its score to the segment.
 
 Usage:
     python cs2archive/pov/build_hook_timeline.py <demo.dem> --player <steam64|nick>
@@ -55,7 +58,7 @@ from thumbnail.utils import KILLFEED_POV_SECONDS  # noqa: E402
 # first-contact detector (cs2archive/overlay/victim_rewind.py) — victim visible
 # for <= 0.35s before dying, no prior peek, not a trade. Kills with measured
 # first contact inside 0.5s but over the insta cap surface as ``peek`` rows:
-# no insta moment, but proof enough for the ``punch_up_single`` tier, which
+# no insta moment, but proof enough for the punch-up quality bonus, which
 # reads victim weapons from the action timeline. The ammo-efficiency tier is
 # gone; a >=4-kill perfect_shots short is folded back into ``4k`` so those 4Ks
 # do not silently disappear (see tier_of).
@@ -66,12 +69,12 @@ TIER_ORDER = (
     "5k",
     "punch_up",
     "4k",
-    "punch_up_single",
     "insta_kill",
     "duel",
     "clutch_attempt",
     "opener",
     "trade",
+    "kill",
 )
 
 TIER_LABELS = {
@@ -81,12 +84,12 @@ TIER_LABELS = {
     "5k": "5K ACE",
     "punch_up": "PUNCH-UP 4K",
     "4k": "4K",
-    "punch_up_single": "PUNCH-UP",
     "insta_kill": "INSTA KILL",
     "duel": "DUEL",
     "clutch_attempt": "1vX CLUTCH ATTEMPT",
     "opener": "OPENER",
     "trade": "TRADE",
+    "kill": "KILL",
 }
 
 DEFAULT_TIERS = ",".join(TIER_ORDER)
@@ -148,7 +151,7 @@ def tier_of(short: dict, tickrate: int = 64) -> str | None:
     script's rule). A 4k spread across the round reads as four solos to a
     viewer; it must not headline a cold open. Dropped multikills vanish as
     a tier but their kills still flow through the separate single
-    detectors (insta / punch_up_single), so nothing fast is lost.
+    detectors (insta / the every-kill floor), so nothing fast is lost.
     """
     st = short.get("short_type")
     kills = _kills(short)
@@ -238,9 +241,10 @@ def _map_mesh_available(map_name: str) -> bool:
 
 INSTA_PAIR_SECONDS = 3.0  # non-flick insta kills must pair within this to qualify
 INSTA_CLEAN_HP = 90.0  # ...and at least one victim at/above this (0 disables)
-INSTA_RULE_VERSION = 9  # bumped whenever the insta rule changes (stale
-# caches rebuild). v9: hook quality is per-segment (best single window),
-# not per-moment — old hook_timeline.json picks re-rank under the new rule.
+INSTA_RULE_VERSION = 12  # bumped whenever the insta rule changes (stale
+# caches rebuild). v12: flick quality only when the real flick detector
+# tagged the kill (victim_rewind no longer surfaces raw peak deg/s).
+# v11: through-smoke kills deter -25. v10: INSTA_QUALITY_BONUS.
 
 # ── Peek-kill vs back-shot (council-reviewed taper) ─────────────────────
 # victim_hold_deg = angle between the victim's view and the direction to the
@@ -252,12 +256,22 @@ PEEK_HOLD_FULL_DEG = 15.0
 PEEK_HOLD_ZERO_DEG = 45.0
 PEEK_BONUS_MAX = 100.0
 
-# ── Flick speed (crosshair deg/s before the kill) ────────────────────────
-# Ordinary tracking reads 30-70 deg/s; a real flick 150-400+. Score only
-# above the floor, capped so one flick can't dominate a moment.
+# ── Flick speed (crosshair deg/s before a DETECTED flick) ────────────────
+# Only kills the real flick detector tagged (peak + yaw-travel gates in
+# shorts/flick.py) carry a flick_speed from victim_rewind. Raw peak deg/s
+# on a non-flick is a micro-adjust and must not score. Curve starts above
+# ordinary tracking, capped so one flick can't dominate a moment.
 FLICK_DPS_FLOOR = 100.0
 FLICK_SCALE = 0.75
 FLICK_BONUS_CAP = 150.0
+
+# ── Insta quality bonus ──────────────────────────────────────────────────
+# A verified insta kill (measured LOS-TTK inside the cap) pays a flat
+# per-kill bonus on top of the tier base and the (0.5 - ttk) * 200 speed
+# term: reaction kills are the scarcest content in a POV. Fused by tick
+# across merged candidates like the headshot bonus (an insta kill inside a
+# 3k keeps earning it exactly once).
+INSTA_QUALITY_BONUS = 250.0
 
 
 def peek_kill_bonus(hold_deg) -> float:
@@ -377,6 +391,7 @@ def pair_insta_rows(rows: list[dict], player_sid: str,
                            "kill_ticks": [tick],
                            "hs_ticks": {tick: tick_bonus} if tick_bonus else {},
                            "hs_bonus": tick_bonus,
+                           "insta_ticks": {tick: INSTA_QUALITY_BONUS},
                            "peek_ticks": {tick: peek_kill_bonus(r.get("victim_hold_deg"))},
                            "flick_speed": r.get("flick_speed"),
                            "rank_reason": (
@@ -455,6 +470,7 @@ def _solo_moment(m: dict, enabled: list[str], tickrate: int) -> dict:
         "ttk": ttk,
         "hs_ticks": {tick: tick_bonus} if tick_bonus else {},
         "hs_bonus": tick_bonus,
+        "insta_ticks": {tick: INSTA_QUALITY_BONUS},
         "peek_ticks": {tick: peek_kill_bonus(m.get("hold"))},
         "flick_speed": m.get("flick"),
     }
@@ -506,89 +522,49 @@ def _pair_moment(run: list[dict], enabled: list[str], tickrate: int) -> dict:
         "ttk": fastest,
         "hs_ticks": hs_ticks,
         "hs_bonus": hs_bonus,
+        "insta_ticks": {t: INSTA_QUALITY_BONUS for t in ticks},
         "peek_ticks": peek_ticks,
         "flick_speed": flick,
     }
 
 
-def punch_up_singles(rows: list[dict], timeline_kills: list[dict],
-                     player_sid: str, enabled: list[str],
-                     tickrate: int = 64) -> list[dict]:
-    """Pistol-vs-rifle headshot singles (pure; no demo access).
+# ── Kill quality bonuses (never gates) ──────────────────────────────────
+# Every kill of the POV player is a candidate ("kill" tier floor). These
+# are SCORE bonuses layered on top — punch-up, wallbang, noscope,
+# through-smoke — read from the action-timeline kill record. A kill with
+# none of them still counts; a kill with all of them just outranks.
+PUNCH_UP_BONUS = 200.0     # pistol (tier 1) headshot beats a rifle (tier >= 4)
+WALLBANG_BONUS = 150.0     # penetrated >= 1
+NOSCOPE_BONUS = 150.0      # engine noscope flag
+THRU_SMOKE_DETER = -25.0   # smoked kill: mild deter (spam-averse), not a bonus
 
-    Eligibility is the punch-up itself: attacker pistol (tier 1) beats a
-    rifle (victim tier >= 4), headshot — from the action timeline. LOS
-    first-contact is NOT a gate (a Deagle headshot onto an AK holder is a
-    punch-up even when the POV already knew he was there); it is quality
-    scoring input instead. Rewind rows therefore only enrich: when a row
-    with a measured LOS opening exists for the tick, its TTK rides along
-    for the label and the stacked quality score (``insta_kill`` rows stack
-    full insta points, ``peek`` rows stack less). Lone kills qualify —
-    that is the point.    """
-    out: list[dict] = []
-    by_tick: dict[int, dict] = {}
-    for k in timeline_kills or []:
-        try:
-            by_tick.setdefault(int(k.get("tick", 0)), k)
-        except (TypeError, ValueError):
-            continue
-    los_by_tick: dict[int, int] = {}
-    hold_by_tick: dict[int, object] = {}
-    flick_by_tick: dict[int, object] = {}
-    for r in rows or []:
-        try:
-            tick = int(r["kill_tick"])
-            los = r.get("los_open_tick")
-        except (TypeError, ValueError):
-            continue
-        if los is not None and tick not in los_by_tick:
-            try:
-                los_by_tick[tick] = int(los)
-            except (TypeError, ValueError):
-                continue
-        hold_by_tick.setdefault(tick, r.get("victim_hold_deg"))
-        flick_by_tick.setdefault(tick, r.get("flick_speed"))
-    for tick, k in sorted(by_tick.items()):
-        if str(k.get("attacker_steam_id") or "") != str(player_sid):
-            continue
-        if not k.get("headshot"):
-            continue
-        if weapon_tier(str(k.get("weapon") or "")) != 1:
-            continue
-        if weapon_tier(str(k.get("victim_weapon") or "")) < 4:
-            continue
-        los = los_by_tick.get(tick)
-        ttk = (tick - los) / tickrate if los is not None else None
-        gun = str(k.get("weapon") or "pistol").upper()
-        label = f"{gun} PUNCH-UP"
-        if ttk is not None:
-            label += f" {ttk:.2f}s"
-        tick_bonus = headshot_bonus(gun)
-        out.append({
-            "tier": "punch_up_single",
-            "tier_rank": enabled.index("punch_up_single"),
-            "label": label,
-            "short_type": "punch_up_single",
-            "round": int(k.get("round") or 0),
-            "pov_steam_id": str(player_sid),
-            "pov_nick": None,
-            "start_tick": tick - int(2.5 * tickrate),
-            "end_tick": tick + int(2.0 * tickrate),
-            "kill_ticks": [tick],
-            "round_win_tick": None,
-            "clutch_initial_count": "",
-            "rank_reason": (f"punch-up single: {gun} headshot vs "
-                            f"{k.get('victim_weapon') or '?'}"
-                            + (f" ({ttk:.2f}s)" if ttk is not None else "")),
-            "ttk": ttk,
-            "hs_ticks": {tick: tick_bonus},
-            "hs_bonus": tick_bonus,
-            "peek_ticks": {tick: peek_kill_bonus(hold_by_tick.get(tick))},
-            "flick_speed": flick_by_tick.get(tick),
-        })
-    out.sort(key=lambda m: (m["ttk"] if m["ttk"] is not None else 99.0,
-                            m["start_tick"]))
-    return out
+
+def kill_flag_bonus(k: dict) -> float:
+    """Quality bonus points for ONE action-timeline kill (pure).
+
+    Bonuses, never gates: the kill qualifies for the hook by existing;
+    these only rank it. ``k`` is a ``kills_all`` record from the action
+    timeline (carries ``headshot``, ``penetrated`` and the engine
+    ``kill_event`` noscope flag). A through-smoke kill deters slightly —
+    the engine flag is noisy and smoke-spam shouldn't outscore aim.
+    """
+    bonus = 0.0
+    if (k.get("headshot")
+            and weapon_tier(str(k.get("weapon") or "")) == 1
+            and weapon_tier(str(k.get("victim_weapon") or "")) >= 4):
+        bonus += PUNCH_UP_BONUS
+    try:
+        if int(k.get("penetrated") or 0) >= 1:
+            bonus += WALLBANG_BONUS
+    except (TypeError, ValueError):
+        pass
+    ev = k.get("kill_event") or {}
+    if isinstance(ev, dict):
+        if ev.get("noscope"):
+            bonus += NOSCOPE_BONUS
+        if ev.get("thrusmoke"):
+            bonus += THRU_SMOKE_DETER
+    return bonus
 
 
 _MOMENT_TIER_TYPES = ("duel", "opener", "trade")
@@ -691,6 +667,67 @@ def timeline_moment_candidates(moments: list[dict], player_sid: str,
     return out
 
 
+def every_kill_candidates(kills: list[dict], player_sid: str | None,
+                          enabled: list[str],
+                          tickrate: int = 64) -> list[dict]:
+    """One hook moment per kill the POV player lands (pure).
+
+    Every single kill counts — no qualification gate. ``kills`` are
+    action-timeline kill records when available (they carry headshot /
+    penetrated / engine noscope-thrusmoke flags), falling back to the
+    shorts-timeline kill list (weapon + penetrated only). The stronger
+    detectors (4k/5k, insta, duels) rank ON TOP of this floor: they carry
+    a higher tier base, and their per-kill detail fuses into any merged
+    moment by tick. Kills within CHAIN_GAP_SECONDS merge into one
+    continuous moment in pick_moments, so a burst of close kills pools
+    its per-kill score into one segment instead of three flash cuts.
+    """
+    if not player_sid or "kill" not in enabled:
+        return []
+    out: list[dict] = []
+    for k in kills or []:
+        if str(k.get("attacker_steam_id") or "") != str(player_sid):
+            continue
+        try:
+            tick = int(k["tick"])
+        except (TypeError, ValueError):
+            continue
+        try:
+            rnd = int(k.get("round") or 0)
+        except (TypeError, ValueError):
+            rnd = 0
+        weapon = str(k.get("weapon") or "")
+        hs_ticks: dict[int, float] = {}
+        if k.get("headshot"):
+            b = headshot_bonus(weapon)
+            if b:
+                hs_ticks[tick] = b
+        flag = kill_flag_bonus(k)
+        out.append({
+            "tier": "kill",
+            "tier_rank": enabled.index("kill"),
+            "label": TIER_LABELS.get("kill", "KILL"),
+            "short_type": "kill",
+            "round": rnd,
+            "pov_steam_id": str(player_sid),
+            "pov_nick": None,
+            "start_tick": tick - int(2.5 * tickrate),
+            "end_tick": tick + int(2.0 * tickrate),
+            "kill_ticks": [tick],
+            "round_win_tick": None,
+            "clutch_initial_count": "",
+            "rank_reason": f"kill: {tick} ({weapon or '?'})",
+            "ttk": None,
+            "hs_ticks": hs_ticks,
+            "hs_bonus": sum(hs_ticks.values()),
+            "insta_ticks": {},
+            "flag_ticks": {tick: flag} if flag else {},
+            "peek_ticks": {},
+            "flick_speed": None,
+        })
+    return out
+
+
 def _round_for_tick(kills: list[dict], tick: int) -> int | None:
     """Round of the kill nearest ``tick`` (the timeline's kill list carries it)."""
     best, best_d = None, None
@@ -756,16 +793,18 @@ def kill_credit_index(demo_path: Path, sid: str | None,
                       tickrate: int = 64) -> dict[int, dict]:
     """Per-kill scoring credit fused across candidates.
 
-    Returns ``{kill_tick: {"hs": bool, "peek": float, "trade": bool}}``.
+    Returns ``{kill_tick: {"hs": bool, "peek": float, "trade": bool,
+    "insta": bool}}``.
     Sibling candidates hold per-kill data the merged moment may lack (e.g.
     an insta candidate's headshot/peek for a kill the clutch candidate
-    also references), so hs/peek/trade fuse by tick across every
+    also references), so hs/peek/trade/insta fuse by tick across every
     candidate. Pure candidate reads — no demo I/O, never raises.
     """
     credit: dict[int, dict] = {}
     for cand in candidates:
         hs_ticks = cand.get("hs_ticks") or {}
         peek_ticks = cand.get("peek_ticks") or {}
+        insta_ticks = cand.get("insta_ticks") or {}
         trade_ticks = {int(k) for k in (cand.get("trade_ticks") or [])
                        if str(k).lstrip("-").isdigit()}
         for raw in cand.get("kill_ticks") or []:
@@ -774,7 +813,8 @@ def kill_credit_index(demo_path: Path, sid: str | None,
             except (TypeError, ValueError):
                 continue
             entry = credit.setdefault(
-                tick, {"hs": False, "peek": 0.0, "trade": False})
+                tick, {"hs": False, "peek": 0.0, "trade": False, "insta": False,
+                       "flag": 0.0})
             try:
                 if float(hs_ticks.get(tick, hs_ticks.get(str(tick), 0)) or 0) > 0:
                     entry["hs"] = True
@@ -784,6 +824,14 @@ def kill_credit_index(demo_path: Path, sid: str | None,
                 entry["peek"] = max(
                     float(entry["peek"]),
                     float(peek_ticks.get(tick, peek_ticks.get(str(tick), 0)) or 0))
+            except (TypeError, ValueError):
+                pass
+            if str(tick) in insta_ticks or tick in insta_ticks:
+                entry["insta"] = True
+            try:
+                entry["flag"] = max(
+                    float(entry["flag"]),
+                    float((cand.get("flag_ticks") or {}).get(tick, 0) or 0))
             except (TypeError, ValueError):
                 pass
             if tick in trade_ticks:
@@ -840,6 +888,12 @@ def segment_quality(window_kills: list[int], moment: dict,
             pass
         try:
             score += max(0.0, float(credit.get("peek") or 0.0))
+        except (TypeError, ValueError):
+            pass
+        if credit.get("insta"):
+            score += INSTA_QUALITY_BONUS
+        try:
+            score += float(credit.get("flag") or 0.0)  # may deter (negative)
         except (TypeError, ValueError):
             pass
         if credit.get("trade"):
@@ -899,6 +953,22 @@ def moment_quality(m: dict) -> float:
             score += sum(float(v) for v in peek.values())
         except (TypeError, ValueError):
             pass
+    # Verified insta kills pay a flat per-kill bonus (deduped per tick on
+    # merges — an insta kill folded into a 3k earns it exactly once).
+    insta = m.get("insta_ticks")
+    if isinstance(insta, dict):
+        try:
+            score += len(insta) * INSTA_QUALITY_BONUS
+        except (TypeError, ValueError):
+            pass
+    # Flag bonuses (punch-up / wallbang / noscope / through-smoke) stack
+    # per kill — sum across merged candidates.
+    flag = m.get("flag_ticks")
+    if isinstance(flag, dict):
+        try:
+            score += sum(float(v) for v in flag.values())
+        except (TypeError, ValueError):
+            pass
     # Flick speed: the faster the crosshair was moving, the more quality.
     score += flick_speed_bonus(m.get("flick_speed"))
     ttk = m.get("ttk")
@@ -951,6 +1021,24 @@ def _merge_moments(target: dict, src: dict) -> None:
                     continue
     target["hs_ticks"] = merged_hs
     target["hs_bonus"] = sum(merged_hs.values())
+    merged_insta: dict[int, float] = {}
+    for src_map in (src.get("insta_ticks") or {}, target.get("insta_ticks") or {}):
+        if isinstance(src_map, dict):
+            for k, v in src_map.items():
+                try:
+                    merged_insta[int(k)] = float(v)
+                except (TypeError, ValueError):
+                    continue
+    target["insta_ticks"] = merged_insta
+    merged_flag: dict[int, float] = {}
+    for src_map in (src.get("flag_ticks") or {}, target.get("flag_ticks") or {}):
+        if isinstance(src_map, dict):
+            for k, v in src_map.items():
+                try:
+                    merged_flag[int(k)] = merged_flag.get(int(k), 0.0) + float(v)
+                except (TypeError, ValueError):
+                    continue
+    target["flag_ticks"] = merged_flag
     merged_peek: dict[int, float] = {}
     for src_map in (src.get("peek_ticks") or {}, target.get("peek_ticks") or {}):
         if isinstance(src_map, dict):
@@ -1014,6 +1102,7 @@ def pick_moments(candidates: list[dict], tickrate: int,
 
     chains: list[dict] = []
     appends = 0
+    overflow: list[dict] = []  # quota-blocked; re-scanned as chains grow
     for c in candidates:
         merged = False
         for ch in chains:
@@ -1027,22 +1116,38 @@ def pick_moments(candidates: list[dict], tickrate: int,
         if any(_overlaps(c, ch) for ch in chains):
             continue
         if appends >= max_moments:
+            # Not dropped: a chain that grows later (absorbing a neighbour)
+            # can pull this candidate inside its merge gap — the fixpoint
+            # re-scan below gives it a second chance WITHOUT a new slot.
+            overflow.append({"kill_ticks": list(c.get("kill_ticks") or []), **c})
             continue
         chains.append({"kill_ticks": list(c.get("kill_ticks") or []), **c})
         appends += 1
-    # Fixpoint: a merge can bring two chains within chaining distance.
+    # Fixpoint: a merge can bring two chains within chaining distance, and
+    # a grown chain can pull in an overflow candidate. Re-scan until stable.
     while True:
         merged_any = False
-        for i, a in enumerate(chains):
-            for b in chains[i + 1:]:
-                if _kill_gap(a, b) >= chain_gap or _span(a, b) > chain_span:
+        for o in overflow[:]:
+            for ch in chains:
+                if _kill_gap(o, ch) >= chain_gap or _span(o, ch) > chain_span:
                     continue
-                _merge_moments(a, b)
-                chains.remove(b)
+                _merge_moments(ch, o)
+                overflow.remove(o)
                 merged_any = True
                 break
             if merged_any:
                 break
+        if not merged_any:
+            for i, a in enumerate(chains):
+                for b in chains[i + 1:]:
+                    if _kill_gap(a, b) >= chain_gap or _span(a, b) > chain_span:
+                        continue
+                    _merge_moments(a, b)
+                    chains.remove(b)
+                    merged_any = True
+                    break
+                if merged_any:
+                    break
         if not merged_any:
             break
     return chains
@@ -1154,24 +1259,20 @@ def build_hook_timeline(
     # LOS-TTK insta kills: single-kill moments the multikill-based
     # Shorts extractor cannot see (e.g. a 0.19s pistol headshot). Only the
     # POV player's own kills. One shared rewind parse feeds both the insta
-    # pairs and the punch-up singles below.
+    # pairs and the duel/opener/trade enrichment below.
     sid = _resolve_player_sid(player)
     map_name = str(timeline.get("map") or "")
     rows: list[dict] = []
-    if bool({"insta_kill", "punch_up_single"} & set(enabled)) and sid:
+    if bool({"insta_kill", "duel", "opener", "trade"} & set(enabled)) and sid:
         rows = _load_insta_rows(demo_path, sid, map_name, tickrate)
-    if "insta_kill" in enabled and rows:
-        insta = pair_insta_rows(rows, sid, enabled, tickrate)
-        for m in insta:
-            m["pov_nick"] = m.get("pov_nick") or (player or "Unknown")
-        candidates.extend(insta)
 
-    # Action-timeline tiers (POV-local cache via --pov-dir, self-healed on
-    # demand). punch_up_single intersects timeline victim weapons with
-    # rewind TTK enrichment; duel/opener/trade come from the POV slice.
+    # Action-timeline data (POV-local cache via --pov-dir, self-healed on
+    # demand). duel/opener/trade come from the POV slice; its kill records
+    # (headshot/penetrated/noscope/thrusmoke flags) also power the
+    # every-kill floor's quality bonuses.
     atl_kills: list[dict] = []
     atl_moments: list[dict] = []
-    if bool({"punch_up_single", "duel", "opener", "trade"} & set(enabled)) and sid:
+    if bool({"kill", "duel", "opener", "trade"} & set(enabled)) and sid:
         atl_path = _action_timeline_for(demo_path, pov_dir)
         if atl_path is not None:
             try:
@@ -1181,10 +1282,20 @@ def build_hook_timeline(
                 atl_moments = sl["moments"]
             except Exception as e:  # noqa: BLE001
                 print(f"  [WARN] action timeline slice failed ({e})")
-    if "punch_up_single" in enabled and atl_kills:
-        for m in punch_up_singles(rows, atl_kills, sid, enabled, tickrate):
+
+    # Every kill counts: one candidate per POV kill (action-timeline
+    # records preferred — they carry the quality flags). Stronger moments
+    # rank on top; plain kills only surface alone when nothing better
+    # covers them.
+    candidates.extend(every_kill_candidates(atl_kills or timeline.get("kills"),
+                                            sid, enabled, tickrate=tickrate))
+
+    if "insta_kill" in enabled and rows:
+        insta = pair_insta_rows(rows, sid, enabled, tickrate)
+        for m in insta:
             m["pov_nick"] = m.get("pov_nick") or (player or "Unknown")
-            candidates.append(m)
+        candidates.extend(insta)
+
     if atl_moments:
         for m in timeline_moment_candidates(atl_moments, sid, enabled,
                                             timeline_kills=atl_kills,

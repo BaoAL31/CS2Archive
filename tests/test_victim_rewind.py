@@ -596,7 +596,6 @@ def test_victim_hold_fails_closed():
 
 
 def test_rows_carry_flick_and_hold_fields():
-    ticks = list(range(KILL - LOS_LOOKBACK_TICKS, KILL + 1, LOS_STRIDE))
     open_at = _peek_open_at()
     got = detect_rewinds(
         [_kill()],
@@ -605,3 +604,27 @@ def test_rows_carry_flick_and_hold_fields():
     )
     assert got, "insta row expected"
     assert "flick_speed" in got[0] and "victim_hold_deg" in got[0]
+    # Insta-only (no flick detector hit): raw peak deg/s must not surface —
+    # hook quality would treat it as a flick bonus.
+    assert "flick" not in got[0]["reasons"] and "awp_flick" not in got[0]["reasons"]
+    assert got[0]["flick_speed"] is None
+
+
+def test_flick_speed_only_on_detected_flick():
+    # Same kill + dense snapshots that measure a real sweep: only when the
+    # flick detector tagged the kill does flick_speed ride along.
+    open_at = _peek_open_at()
+    snaps = _snaps_lookback()
+    for t in range(KILL - 24, KILL + 1):
+        snaps.setdefault((t, AID), {"x": 0.0, "y": 0.0, "z": 64.0,
+                                    "yaw": 0.0, "pitch": 0.0,
+                                    "duck_amount": 0.0, "health": 100.0})
+        snaps[(t, AID)]["yaw"] = (t - (KILL - 24)) * 5.0  # 320 deg/s peak
+    plain = detect_rewinds(
+        [_kill()], snaps=snaps, mesh_open_fn=_open_at_fn(open_at))
+    assert plain and plain[0]["flick_speed"] is None
+    tagged = detect_rewinds(
+        [_kill()], snaps=snaps, mesh_open_fn=_open_at_fn(open_at),
+        flick_kills={(AID, KILL)})
+    assert "flick" in tagged[0]["reasons"] or "awp_flick" in tagged[0]["reasons"]
+    assert tagged[0]["flick_speed"] == pytest.approx(320.0, rel=0.02)

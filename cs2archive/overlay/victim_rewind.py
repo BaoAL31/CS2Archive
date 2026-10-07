@@ -551,9 +551,15 @@ def detect_rewinds(
         # "at least one un-damaged victim"); already computed, not re-derived.
         row["victim_hp"] = victim_hp_before_kill(
             str(k.get("victim_sid") or ""), int(k["tick"]), snaps)
-        # Hook quality inputs: crosshair speed before the kill, and whether
-        # the victim was already holding the angle (peek-kill proof).
-        row["flick_speed"] = flick_speed(k, snaps)
+        # Hook quality inputs: whether the victim was already holding the
+        # angle (peek-kill proof). Flick speed is ONLY surfaced when the
+        # real flick detector tagged this kill (peak + yaw-travel gates in
+        # shorts/flick.py) — raw peak deg/s alone is a micro-adjust, not a
+        # flick, and must not feed the quality bonus.
+        row["flick_speed"] = (
+            flick_speed(k, snaps)
+            if any(x in ("flick", "awp_flick") for x in reasons)
+            else None)
         row["victim_hold_deg"] = victim_hold_deg(k, los_tick, snaps)
         out.append(row)
     return out
