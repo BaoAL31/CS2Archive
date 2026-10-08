@@ -79,7 +79,8 @@ def test_csdm_subprocess_called(tmp_path):
     demo.parent.mkdir(parents=True, exist_ok=True)
     demo.write_text("")
 
-    timeline_path = tmp_path / "short_timeline.json"
+    timeline_path = tmp_path / "shorts-test" / "short_timeline.json"
+    timeline_path.parent.mkdir(parents=True, exist_ok=True)
     timeline = {
         "short_type": "short_timeline",
         "demo_path": str(demo),

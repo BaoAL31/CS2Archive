@@ -16,7 +16,8 @@ Usage:
     python cs2archive/faceit/build_stat_strips.py --from-json renders/stat-strips/<id>/strips.json
     python cs2archive/faceit/build_stat_strips.py --match-id <id> --out renders/stat-strips/<stem> --no-cache
 
-Outputs (default renders/stat-strips/<match_id>/):
+Outputs (default: the match's first per-POV ``stat-strips/<match_id>/`` resolved
+from backlog cards; --out overrides):
     left.png / right.png   720x1440 RGBA strips (one 5-card column each)
     strips.json            all numbers behind the render (reuse in pipeline)
     avatars/               cached player headshots
@@ -676,7 +677,8 @@ def main() -> None:
     ap.add_argument("--from-json", default=None,
                     help="re-render PNGs from an existing strips.json (no API)")
     ap.add_argument("--out", default=None,
-                    help="output dir (default renders/stat-strips/<match_id>)")
+                    help="output dir (default: first per-POV stat-strips/<match_id> "
+                         "resolved from backlog cards)")
     ap.add_argument("--window", type=int, default=WINDOW_DEFAULT,
                     help="last-N matches per player (default 30)")
     ap.add_argument("--no-cache", action="store_true",
@@ -690,8 +692,15 @@ def main() -> None:
     else:
         if not args.match_id:
             ap.error("--match-id is required unless --from-json is set")
-        out = Path(args.out) if args.out else (
-            PROJECT_ROOT / "renders" / "stat-strips" / args.match_id)
+        if args.out:
+            out = Path(args.out)
+        else:
+            from scrapers.repeek_snapshot import resolve_pov_strips_dirs
+            dirs = resolve_pov_strips_dirs(args.match_id)
+            if not dirs:
+                ap.error(f"--match-id {args.match_id}: no POV folder resolvable "
+                         "(no backlog card) — pass --out explicitly")
+            out = dirs[0]
         payload = asyncio.run(build_strips(
             args.match_id, out, window=args.window, use_cache=not args.no_cache))
     for side in ("left", "right"):

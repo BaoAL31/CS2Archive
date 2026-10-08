@@ -562,14 +562,14 @@ def hold_browser_until_both(*, download_ok: bool, repeek_ok: bool) -> None:
         )
 
 
-def _capture_repeek_roster(page: Any, match_id: str) -> Path:
+def _capture_repeek_roster(page: Any, match_id: str, dem_stem: str | None = None) -> Path:
     from scrapers.repeek_snapshot import capture_from_page, RepeekCaptureError
     try:
         page.set_viewport_size({"width": 1920, "height": 1440})
     except Exception as e:
         raise RepeekCaptureError("REPEEK_VIEWPORT", str(e)) from e
     console.print("[cyan]   [REPEEK] waiting for last-30 cards, then snapping left/right...[/cyan]")
-    out = capture_from_page(page, match_id)
+    out = capture_from_page(page, match_id, dem_stem=dem_stem)
     console.print(f"[green]   [REPEEK] {out / 'repeek_left.png'}[/green]")
     return out
 
@@ -579,6 +579,7 @@ def run_download_then_repeek(
     match_id: str,
     download_fn: Callable[[Any], Optional[Path]],
     close_fn: Callable[[], None],
+    dem_stem: str | None = None,
 ) -> Path:
     """Download the demo, then capture Repeek. ``close_fn`` runs only afterwards."""
     saved: Optional[Path] = None
@@ -588,7 +589,7 @@ def run_download_then_repeek(
         saved = download_fn(page)
         download_ok = saved is not None
         if download_ok:
-            _capture_repeek_roster(page, match_id)
+            _capture_repeek_roster(page, match_id, dem_stem)
             repeek_ok = True
         hold_browser_until_both(download_ok=download_ok, repeek_ok=repeek_ok)
         return saved  # type: ignore[return-value]
@@ -596,20 +597,25 @@ def run_download_then_repeek(
         close_fn()
 
 
-def _repeek_strips_ready(match_id: str) -> bool:
-    from scrapers.repeek_snapshot import RepeekCaptureError, assert_column_pngs, strips_dir
-    d = strips_dir(match_id)
-    try:
-        assert_column_pngs(d / "repeek_left.png", d / "repeek_right.png")
-        return True
-    except RepeekCaptureError:
-        return False
+def _repeek_strips_ready(match_id: str, dem_stem: str | None = None) -> bool:
+    from scrapers.repeek_snapshot import (
+        RepeekCaptureError,
+        assert_column_pngs,
+        resolve_pov_strips_dirs,
+    )
+    for d in resolve_pov_strips_dirs(match_id, dem_stem):
+        try:
+            assert_column_pngs(d / "repeek_left.png", d / "repeek_right.png")
+            return True
+        except RepeekCaptureError:
+            continue
+    return False
 
 
-def _ensure_repeek_roster(match_id: str) -> None:
+def _ensure_repeek_roster(match_id: str, dem_stem: str | None = None) -> None:
     """Open the room only to capture left/right (demo already on disk)."""
     from scrapers.repeek_snapshot import RepeekCaptureError
-    if _repeek_strips_ready(match_id):
+    if _repeek_strips_ready(match_id, dem_stem):
         console.print("[yellow]   [REPEEK] left/right strips already valid — skip[/yellow]")
         return
     room_url = f"https://www.faceit.com/en/cs2/room/{match_id}"
@@ -620,7 +626,7 @@ def _ensure_repeek_roster(match_id: str) -> None:
         page = _auth_page(browser)
         page.goto(room_url, wait_until="domcontentloaded")
         console.print("[cyan]   [REPEEK] room open (demo already downloaded); waiting for stats...[/cyan]")
-        _capture_repeek_roster(page, match_id)
+        _capture_repeek_roster(page, match_id, dem_stem)
         repeek_ok = True
         hold_browser_until_both(download_ok=True, repeek_ok=repeek_ok)
     finally:
@@ -1261,7 +1267,7 @@ def download_demo(match_id: str) -> DownloadResult:
     if existing:
         console.print(f"[yellow]   [SKIP] Already downloaded: {existing}[/yellow]")
         try:
-            _ensure_repeek_roster(match_id)
+            _ensure_repeek_roster(match_id, Path(str(existing)).stem)
         except Exception as e:
             # Demo is usable without strips; strips retry next run.
             console.print(f"[yellow]   [WARN] Repeek failed, demo kept: {e}[/yellow]")
@@ -1281,7 +1287,7 @@ def download_demo(match_id: str) -> DownloadResult:
         if saved:
             result = _finalize_download(match_info, saved, started)
             try:
-                _ensure_repeek_roster(match_id)
+                _ensure_repeek_roster(match_id, Path(str(result.demo_path)).stem)
             except Exception as e:
                 console.print(f"[yellow]   [WARN] Repeek failed, demo kept: {e}[/yellow]")
             return result
@@ -1336,7 +1342,7 @@ def _download_demo_browser(match_id: str, match_info: MatchInfo, started) -> Dow
         console.print(f"[yellow]   [SKIP] Archive already on disk: {leftover}[/yellow]")
         result = _finalize_download(match_info, leftover, started)
         try:
-            _ensure_repeek_roster(match_id)
+            _ensure_repeek_roster(match_id, Path(str(result.demo_path)).stem)
         except Exception as e:
             console.print(f"[yellow]   [WARN] Repeek failed, demo kept: {e}[/yellow]")
         return result
@@ -1347,7 +1353,7 @@ def _download_demo_browser(match_id: str, match_info: MatchInfo, started) -> Dow
         if done:
             result = _finalize_download(match_info, done, started)
             try:
-                _ensure_repeek_roster(match_id)
+                _ensure_repeek_roster(match_id, Path(str(result.demo_path)).stem)
             except Exception as e:
                 console.print(f"[yellow]   [WARN] Repeek failed, demo kept: {e}[/yellow]")
             return result
@@ -1475,7 +1481,7 @@ def _download_demo_browser(match_id: str, match_info: MatchInfo, started) -> Dow
             # Same tab: Repeek has been loading during the transfer. Best-effort —
             # strips retry via _ensure_repeek_roster on the next run.
             try:
-                _capture_repeek_roster(page, match_id)
+                _capture_repeek_roster(page, match_id, dem_path.stem)
                 hold_browser_until_both(download_ok=True, repeek_ok=True)
             except Exception as e:
                 console.print(f"[yellow]   [WARN] Repeek failed, demo kept: {e}[/yellow]")

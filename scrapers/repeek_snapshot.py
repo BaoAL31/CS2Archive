@@ -17,10 +17,12 @@ REPEEK_ID = "mokknliiomknodkdmpcellamkopbdmao"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FACEIT_SESSION = PROJECT_ROOT / ".sessions" / "faceit"
 DEBUG_PROFILE = Path.home() / ".chrome-debug"
-# Staging for fresh standalone captures. The POV pipeline copies the
-# panes into its own ``{pov}/stat-strips/`` (create_repeek_intro +
-# paths.drop_legacy_match_strips), so this legacy tree should be empty
-# between a capture and the POV copy — never a permanent home.
+# Per-POV home for captured panes: ``renders/pov-{stem}_{nick}/stat-strips/
+# <match_id>/`` (see cs2archive.paths). Captures resolve their destinations
+# via resolve_pov_strips_dirs() and fan out to every Recognised-Pro POV —
+# nothing is ever written to a shared tree. STRIPS_ROOT survives only as an
+# explicit-override anchor and the read-only fallback in
+# cs2archive.paths.find_match_strips (straggler cleanup).
 STRIPS_ROOT = PROJECT_ROOT / "renders" / "stat-strips"
 
 NEED_PLAYERS = 10
@@ -408,7 +410,154 @@ def _screenshot_clip(page: Any, box: dict, dest: Path, vw: dict, **pad: float) -
 
 
 def strips_dir(match_id: str, root: Path | None = None) -> Path:
-    return (root or STRIPS_ROOT) / match_id
+    """Pane dir for a match. Explicit root wins; otherwise the first
+    per-POV dir (raises NO_POV_DIRS when unresolvable — never legacy)."""
+    if root is not None:
+        return root / match_id
+    dirs = resolve_pov_strips_dirs(match_id)
+    if not dirs:
+        raise RepeekCaptureError(
+            "NO_POV_DIRS",
+            f"no POV folder resolvable for {match_id} "
+            "(no backlog card, API roster lookup failed) — pass an explicit out dir",
+        )
+    return dirs[0]
+
+
+def pov_dirs_from_backlog(match_id: str, project_root: Path | None = None) -> list[Path]:
+    """Per-POV strips dirs from backlog cards carrying this faceit_match_id.
+
+    Each card contributes ``pov-{demo_stem}_{player}/stat-strips/<match_id>``
+    — the exact render dir the pipeline derives (pov_render_dir), so a
+    capture here is found by find_match_strips without any copy step.
+    """
+    from cs2archive.paths import pov_dir
+
+    root = Path(project_root) if project_root else PROJECT_ROOT
+    out: list[Path] = []
+    for card_path in sorted((root / "backlog" / "faceit").rglob("*.json")):
+        try:
+            meta = json.loads(card_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(meta, dict):
+            continue
+        if str(meta.get("faceit_match_id") or "").strip() != match_id:
+            continue
+        player = str(meta.get("player") or "").strip()
+        stem = Path(str(meta.get("demo_path") or "")).stem
+        if not player or not stem:
+            continue
+        cand = pov_dir(stem, player) / "stat-strips" / match_id
+        # pov_dir() anchors at the real repo root; re-anchor under the
+        # caller's root so tests can point this at a tmp tree.
+        if root != PROJECT_ROOT:
+            cand = root / cand.relative_to(PROJECT_ROOT)
+        if cand not in out:
+            out.append(cand)
+    return out
+
+
+def _fetch_faceit_rosters(match_id: str) -> list[tuple[str, str]]:
+    """FACEIT Data API rosters: [(faceit_player_id, nickname)] for both sides."""
+    import httpx
+
+    from cs2archive.config import settings
+
+    if not settings.faceit_api_key:
+        return []
+    try:
+        resp = httpx.get(
+            f"{settings.faceit_data_api_base}/matches/{match_id}",
+            headers={"Authorization": f"Bearer {settings.faceit_api_key}"},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        teams = resp.json().get("teams") or {}
+    except Exception:
+        return []
+    out: list[tuple[str, str]] = []
+    for faction in teams.values():
+        if not isinstance(faction, dict):
+            continue
+        for member in faction.get("roster") or []:
+            if not isinstance(member, dict):
+                continue
+            pid = str(member.get("player_id") or "").strip()
+            nick = str(member.get("nickname") or "").strip()
+            if pid and nick:
+                out.append((pid, nick))
+    return out
+
+
+def resolve_pov_strips_dirs(
+    match_id: str,
+    dem_stem: str | None = None,
+    project_root: Path | None = None,
+) -> list[Path]:
+    """Every per-POV ``stat-strips/<match_id>`` dir for a FACEIT match.
+
+    Backlog cards first (exact pipeline nick + demo stem). Without cards,
+    the FACEIT API roster is matched against player_accounts (faceit_id,
+    then nickname) and combined with ``dem_stem`` — the download flow's
+    path, where cards don't exist yet. Returns [] when nothing resolves;
+    callers skip the capture (the pipeline intro captures per-POV on
+    demand) instead of writing a shared folder.
+    """
+    dirs = pov_dirs_from_backlog(match_id, project_root)
+    if dirs:
+        return dirs
+    stem = str(dem_stem or "").strip()
+    if not stem:
+        return []
+    try:
+        import cs2archive._backlog_common as _bc
+
+        accounts = list(_bc.load_accounts_by_steam().values())
+    except Exception:
+        return []
+    by_fid = {str(a.get("faceit_id") or "").strip(): a for a in accounts}
+    by_nick = {}
+    for a in accounts:
+        for key in ("nickname", "faceit_nickname"):
+            nick = str(a.get(key) or "").strip().lower()
+            if nick:
+                by_nick.setdefault(nick, a)
+    try:
+        from cs2archive.paths import pov_dir as _pov_dir
+
+        root = Path(project_root) if project_root else PROJECT_ROOT
+        out: list[Path] = []
+        for pid, nick in _fetch_faceit_rosters(match_id):
+            acct = by_fid.get(pid) or by_nick.get(nick.lower())
+            if not acct:
+                continue
+            canon = str(acct.get("nickname") or "").strip()
+            if not canon:
+                continue
+            cand = _pov_dir(stem, canon) / "stat-strips" / match_id
+            if root != PROJECT_ROOT:
+                cand = root / cand.relative_to(PROJECT_ROOT)
+            if cand not in out:
+                out.append(cand)
+        return out
+    except Exception:
+        return []
+
+
+def fanout_panes(src: Path, dests: list[Path]) -> None:
+    """Copy a captured pane set into every other POV dir (best-effort)."""
+    for dest in dests:
+        if dest == src:
+            continue
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+            for name in ("repeek_left.png", "repeek_right.png", "repeek_meta.json"):
+                s = src / name
+                if s.is_file() and not (dest / name).is_file():
+                    shutil.copy2(s, dest / name)
+        except OSError:
+            continue
 
 
 def _read_json(path: Path) -> dict | None:
@@ -558,9 +707,22 @@ def _settled_boxes(page: Any, timeout_ms: int = SETTLE_TIMEOUT_MS) -> tuple:
     raise last_err
 
 
-def capture_from_page(page: Any, match_id: str, out_dir: Path | None = None) -> Path:
-    """Screenshot left/right roster columns. Raises on any layout/PNG mismatch."""
-    out_dir = out_dir or strips_dir(match_id)
+def capture_from_page(page: Any, match_id: str, out_dir: Path | None = None,
+                     dem_stem: str | None = None) -> Path:
+    """Screenshot left/right roster columns. Raises on any layout/PNG mismatch.
+
+    Without an explicit out_dir the panes land in every resolved per-POV
+    ``stat-strips/<match_id>/`` (first dir captured, rest fanned out).
+    Unresolvable matches raise NO_POV_DIRS — the caller skips; the pipeline
+    intro captures per-POV on demand.
+    """
+    dests = [Path(out_dir)] if out_dir else resolve_pov_strips_dirs(match_id, dem_stem)
+    if not dests:
+        raise RepeekCaptureError(
+            "NO_POV_DIRS",
+            f"no POV folder resolvable for {match_id} — capture skipped",
+        )
+    out_dir = dests[0]
     out_dir.mkdir(parents=True, exist_ok=True)
     wait_repeek_ready(page)
     boxes, cols = _settled_boxes(page)
@@ -586,11 +748,16 @@ def capture_from_page(page: Any, match_id: str, out_dir: Path | None = None) -> 
         "boxes": [{k: v for k, v in b.items() if k in ("x", "y", "w", "h", "bid")}
                   for b in boxes],
     }, indent=2), encoding="utf-8")
+    fanout_panes(out_dir, dests)
     return out_dir
 
 
-def run_standalone(match_id: str, out_dir: Path | None = None) -> Path:
-    """Headed Chrome on ``.sessions/faceit`` (Repeek is installed there)."""
+def run_standalone(match_id: str, out_dir: Path | None = None,
+                   dem_stem: str | None = None) -> Path:
+    """Headed Chrome on ``.sessions/faceit`` (Repeek is installed there).
+
+    Without an explicit out_dir the panes land in every resolved per-POV
+    dir (backlog cards, else API roster + dem_stem)."""
     from playwright.sync_api import sync_playwright
 
     if not repeek_installed(FACEIT_SESSION):
@@ -599,7 +766,6 @@ def run_standalone(match_id: str, out_dir: Path | None = None) -> Path:
             f"Repeek missing in {FACEIT_SESSION}",
         )
     room = f"https://www.faceit.com/en/cs2/room/{match_id}"
-    out_dir = out_dir or strips_dir(match_id)
     print(f"[repeek] profile={FACEIT_SESSION}", flush=True)
     print(f"[repeek] room={room}", flush=True)
     with sync_playwright() as p:
@@ -621,7 +787,7 @@ def run_standalone(match_id: str, out_dir: Path | None = None) -> Path:
                     "no service workers — Repeek did not load",
                 )
             print(f"[repeek] service_workers={n_sw}", flush=True)
-            captured = capture_from_page(page, match_id, out_dir)
+            captured = capture_from_page(page, match_id, out_dir, dem_stem)
             print(f"[repeek] out={captured}", flush=True)
             return captured
         finally:

@@ -129,7 +129,18 @@ def pane_layers(left: Image.Image, right: Image.Image,
 def ensure_capture(match_id: str, *, force: bool,
                    strips_root: Path | None = None) -> Path:
     from cs2archive.paths import find_match_strips
+    from scrapers.repeek_snapshot import resolve_pov_strips_dirs
 
+    if strips_root is None:
+        auto = resolve_pov_strips_dirs(match_id)
+        if not auto:
+            from scrapers.repeek_snapshot import RepeekCaptureError as _RCE
+            raise _RCE(
+                "NO_POV_DIRS",
+                f"no POV folder resolvable for {match_id} "
+                "(no backlog card) — pass --strips-dir <pov>/stat-strips",
+            )
+        strips_root = auto[0].parent
     d = strips_dir(match_id, root=strips_root)
     left, right = d / "repeek_left.png", d / "repeek_right.png"
     if left.is_file() and right.is_file() and not force:
@@ -229,9 +240,10 @@ def main() -> None:
     ap.add_argument("--output", type=Path, default=None,
                     help="output dir (default renders/intro-<match_id>)")
     ap.add_argument("--strips-dir", type=Path, default=None,
-                    help="stat-strips root for the repeek pane cache "
-                         "(default renders/stat-strips; the pipeline passes "
-                         "its POV folder so captures land per-POV)")
+                     help="stat-strips root for the repeek pane cache "
+                          "(default: resolved from backlog cards into the "
+                          "match's per-POV stat-strips/; the pipeline passes "
+                          "its POV folder explicitly)")
     ap.add_argument("--force", action="store_true",
                     help="re-capture even if left/right panes exist")
     args = ap.parse_args()

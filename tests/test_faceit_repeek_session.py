@@ -36,7 +36,7 @@ def test_download_then_repeek_runs_capture_before_close(monkeypatch: pytest.Monk
         order.append("download")
         return Path("demo.zst")
 
-    def capture(_page, _match_id):
+    def capture(_page, _match_id, _dem_stem=None):
         order.append("repeek")
         return Path("strips")
 
@@ -61,7 +61,7 @@ def test_close_not_called_early_if_repeek_fails(monkeypatch: pytest.MonkeyPatch)
         order.append("download")
         return Path("demo.zst")
 
-    def capture(_page, _match_id):
+    def capture(_page, _match_id, _dem_stem=None):
         order.append("repeek")
         raise RepeekCaptureError("REPEEK_CARD_COUNT", "got 9")
 
@@ -88,7 +88,7 @@ def test_close_not_called_if_download_fails_before_repeek(monkeypatch: pytest.Mo
         order.append("download")
         return None
 
-    def capture(_page, _match_id):
+    def capture(_page, _match_id, _dem_stem=None):
         order.append("repeek")
         return Path("strips")
 
