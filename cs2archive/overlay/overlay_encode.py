@@ -301,7 +301,7 @@ def _ffmpeg_segment_copy(
 
 
 def _remux_source_audio(overlay_path: Path, source_path: Path,
-                        tempo: float | None = None) -> None:
+                        tempo: float | None = None, offset: float = 0.0) -> None:
     """Replace the overlay video's audio with the original source audio.
 
     Batch encodes run video-only (``-an``), so the concatenated overlay has
@@ -315,16 +315,39 @@ def _remux_source_audio(overlay_path: Path, source_path: Path,
     joined file declares one audio config while the packets after the join
     use another, so nothing past the join decodes (silence after the hook).
     Video is still stream-copied (no re-encode).
+
+    ``offset`` is measured audio time minus picture time in source seconds.
+    Trim late audio, or pad early audio, BEFORE rate resampling so an event at
+    ``offset + tempo * t`` lands at picture time ``t`` (within sample-rate
+    rounding). Explicit tiny rate corrections use asetrate/aresample, not
+    atempo: the latter added +314 ms over 1658 s on retained capture audio
+    despite a requested speedup. Rate resampling changes pitch by the same
+    tiny factor. This is never an AAC priming trim.
     """
     from cs2archive.overlay._common import _log
     tmp = overlay_path.with_name(overlay_path.name + ".resync.mp4")
     tmp.unlink(missing_ok=True)
-    af = "volume=0.85"
+    filters = ["asetpts=PTS-STARTPTS"]
+    if offset > 0:
+        filters.extend([f"atrim=start={offset:.6f}", "asetpts=PTS-STARTPTS"])
+    elif offset < 0:
+        filters.append(f"adelay={-offset * 1000:.6f}:all=1")
+    if offset:
+        _log(f"  [audio-sync] offset {offset:+.6f}s applied")
+    filters.append("volume=0.85")
     if tempo and abs(float(tempo) - 1.0) > 1e-6:
-        # Capture-side rate drift (measured ~-0.2 ms/s, present in combined.mp4
-        # before any overlay work): resample the audio onto the video timeline.
-        af = f"{af},atempo={float(tempo):.6f}"
-        _log(f"  [audio-sync] atempo {float(tempo):.6f} applied")
+        # Normalize first: source captures can have a different sample rate.
+        # Changing the declared rate then resampling gives deterministic timing,
+        # unlike WSOLA's content-dependent alignment at near-unity tempos.
+        correction_rate = round(48000 * float(tempo))
+        filters.extend(["aresample=48000", f"asetrate={correction_rate}",
+                        "aresample=48000"])
+        _log(f"  [audio-sync] rate {correction_rate}/48000 applied "
+             f"(requested {float(tempo):.6f})")
+    # Corrections can shorten audio. Keep every video packet and fill the
+    # audio tail with silence; -shortest stops the padding at video EOF.
+    filters.append("apad")
+    af = ",".join(filters)
     cmd = [
         "ffmpeg", "-y",
         "-i", str(overlay_path),

@@ -1626,28 +1626,14 @@ def run_overlay(
                 # The overlay adds no audio, so the source audio is the
                 # correct sync reference.
                 #
-                # Measure the capture's audio rate drift first (kill landmarks
-                # across the file; ~-0.2 ms/s on a 25 min POV — that is the
-                # "audio drifts as time goes on" report, and it is inherited
-                # from combined.mp4, not caused by any filter here).
-                tempo = None
-                try:
-                    from cs2archive.audio_sync import (
-                        atempo_for_slope, measure_audio_drift)
-                    _off = {int(k): float(v)
-                            for k, v in (round_offsets or {}).items()}
-                    _ticks = {int(k): tuple(v) for k, v in
-                              (off_data.get("per_round_ticks") or {}).items()}
-                    _intercept, _slope, _n = measure_audio_drift(
-                        video_path, demo_path, steam_id, _off, _ticks)
-                    if _n >= 2:
-                        _log(f"  [audio-sync] drift {_slope * 1000:+.3f} ms/s "
-                             f"({_n} kill marks) — "
-                             f"{'compensating' if abs(_slope) > 5e-5 else 'within noise'}")
-                        tempo = atempo_for_slope(_slope)
-                except Exception as e:  # noqa: BLE001 - diagnostics must not kill the overlay
-                    _log(f"  [audio-sync] drift measurement skipped ({e})")
-                _remux_source_audio(output_path, video_path, tempo=tempo)
+                # Kill-tick/first-threshold fits are not verified A/V landmarks:
+                # they can pad already-late audio or slow it further. Preserve
+                # capture timing until visible-shot measurements validate a fit.
+                # The former atempo correction itself added growing delay on
+                # retained ZywOo audio. See docs/bugs/audio-sync-atempo-drift.md.
+                _log("  [audio-sync] preserving source timing; automatic "
+                     "kill-onset corrections disabled (unvalidated landmarks)")
+                _remux_source_audio(output_path, video_path)
                 mb = output_path.stat().st_size / 1024 / 1024
                 _log(f"Overlay: {output_path.name} ({mb:.0f} MB) in {time.time()-t4:.1f}s")
                 return

@@ -1,6 +1,12 @@
-"""Delivered-audio sync: measured facts, drift measurement, and compensation.
+"""Audio-sync diagnostics and historical capture measurements.
 
-What was measured on real renders (flameZ / Dust2, 25 min POV):
+WARNING: kill-tick/first-amplitude-crossing fits are not validated picture/shot
+landmarks. Automatic overlay corrections are disabled: near-unity atempo added
++314 ms over 1658 s on retained ZywOo audio, while plain AAC encoding added none.
+The signed fits below must not drive production correction without independent
+visible-shot validation. See docs/bugs/audio-sync-atempo-drift.md.
+
+Historical observations on renders (flameZ / Dust2, 25 min POV):
 
 1. **The volume change is innocent.** ``-af volume=0.85 -c:a aac`` keeps the
    delivered audio sample-locked to the CSDM capture (**+0.0 ms**, 120 s window

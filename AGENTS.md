@@ -23,6 +23,7 @@ Long-running **bugs** (open, not a how-to) live in `docs/bugs/`:
 | Doc | Contents |
 |---|---|
 | `docs/bugs/hlae-steam-online-hook.md` | Steam-online HLAE inject/record flake (vanilla demo viewer, no ffmpeg) — not solved |
+| `docs/bugs/audio-sync-atempo-drift.md` | Recurring late POV audio: automatic fitter / near-unity `atempo` added drift; safety fix, real-capture regression, recovery and re-enable gates |
 
 ## Scripts layout
 
