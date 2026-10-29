@@ -111,6 +111,7 @@ from cs2archive.overlay.lineup_freeze import (
 )
 from cs2archive.overlay.overlay_encode import (
     _overlay_output_valid,
+    _resume_overlay_output,
     _batch_stamp,
     _batch_stamp_matches,
     _ffmpeg_encode,
@@ -1444,8 +1445,10 @@ def run_overlay(
 
         if batches > 0 and round_offsets:
             _log(f"Batched overlay: {batches} round(s) per batch")
-            if _overlay_output_valid(output_path):
-                _log(f"  [skip] Overlay output already exists: {output_path.name}")
+            if _resume_overlay_output(output_path, video_path):
+                # Concat writes video-only output before audio remuxing. A
+                # failed remux must be resumed, never accepted by file size.
+                _log(f"  [skip] Overlay video exists; source audio restored: {output_path.name}")
                 return
 
             boundaries = _compute_batch_boundaries(round_offsets, fps, frame_count, batches)

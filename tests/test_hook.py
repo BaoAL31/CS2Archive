@@ -450,7 +450,7 @@ def test_footage_budget_drops_weakest_first():
 
 def test_rule_version_bumps_cache():
     from cs2archive.pov.build_hook_timeline import INSTA_RULE_VERSION, timeline_matches
-    assert INSTA_RULE_VERSION == 12
+    assert INSTA_RULE_VERSION == 13
     assert timeline_matches({"params": {"tiers": [], "min_round": 2,
                                         "max_moments": 3, "max_seconds": 30.0,
                                         "rule_version": 7}},
@@ -1071,6 +1071,17 @@ def test_chain_best_segment_ranks_unbroken_triple_first():
         {**scattered, "kill_ticks": [1000, 5000, 9000, 13000]}, 64, credit)
     assert len(segs) == 4  # one window per scattered kill
     assert triple_best > scattered_best
+
+
+def test_zywoo_inferno_fast_4k_keeps_continuous_window_and_tier():
+    # Real round-six 4K: 7s on the feed, but two gaps exceed 2s.
+    burst = _seg_moment("4k", [51113, 51228, 51368, 51561],
+                        start=50409, end_tick=51689)
+    best, windows = chain_segments(burst, 64, {})
+    assert len(windows) == 1
+    assert windows[0][0] == _win(51049, 51625)
+    assert best == moment_quality(burst)
+    assert best > moment_quality(_seg_moment("kill", [57258], start=57000))
 
 
 def test_quality_missing_fields_never_crash():

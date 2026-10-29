@@ -1298,6 +1298,14 @@ class Pipeline:
         if self.skip_overlay:
             print("  [skip] raw-only: no overlay youtube dir")
             return
+        if not overlay.exists():
+            fail(4, "OVERLAY_OUTPUT_MISSING",
+                 f"overlay result not found: {overlay}")
+        from cs2archive.overlay.overlay_encode import _require_overlay_audio
+        try:
+            _require_overlay_audio(overlay)
+        except (RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+            fail(4, "OVERLAY_AUDIO_MISSING", str(exc))
         target = self.youtube_dir / "video.mp4"
         if (
             target.exists()
@@ -1309,9 +1317,6 @@ class Pipeline:
             print(f"  [skip] overlay video.mp4 already present "
                   f"({target.stat().st_size / 1e9:.1f} GB, up to date)")
             return
-        if not overlay.exists():
-            fail(4, "OVERLAY_OUTPUT_MISSING",
-                 f"overlay result not found: {overlay}")
         self.youtube_dir.mkdir(parents=True, exist_ok=True)
         if target.exists():
             print(f"  [replace] outdated youtube overlay "
@@ -1429,6 +1434,12 @@ class Pipeline:
                 src = self.render_dir / "combined.mp4"
                 re_baked = src.is_file() and src.stat().st_mtime > dst.stat().st_mtime
                 if not re_baked:
+                    from cs2archive.overlay.overlay_encode import _require_overlay_audio
+                    body = self.youtube_dir / "video.nohook.mp4"
+                    try:
+                        _require_overlay_audio(body if body.is_file() else dst)
+                    except (RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+                        fail(4, "OVERLAY_AUDIO_MISSING", str(exc))
                     print(f"  [skip] Overlay video already exists in "
                           f"{self.youtube_dir.name}/video.mp4")
                     return

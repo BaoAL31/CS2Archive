@@ -241,8 +241,8 @@ def _map_mesh_available(map_name: str) -> bool:
 
 INSTA_PAIR_SECONDS = 3.0  # non-flick insta kills must pair within this to qualify
 INSTA_CLEAN_HP = 90.0  # ...and at least one victim at/above this (0 disables)
-INSTA_RULE_VERSION = 12  # bumped whenever the insta rule changes (stale
-# caches rebuild). v12: flick quality only when the real flick detector
+INSTA_RULE_VERSION = 13  # fast multikills remain continuous; stale caches rebuild
+# v12: flick quality only when the real flick detector
 # tagged the kill (victim_rewind no longer surfaces raw peak deg/s).
 # v11: through-smoke kills deter -25. v10: INSTA_QUALITY_BONUS.
 

@@ -9,6 +9,40 @@ import pytest
 from cs2archive.overlay.overlay_encode import _remux_source_audio
 
 
+def test_resume_retries_failed_audio_before_accepting_overlay(tmp_path, monkeypatch):
+    import cs2archive.overlay.overlay_encode as encode
+    overlay = tmp_path / "overlay.mp4"
+    overlay.write_bytes(b"v" * 100_001)
+    source = tmp_path / "source.mp4"
+    calls = []
+
+    def remux(path, original):
+        calls.append((path, original))
+        if len(calls) == 1:
+            raise SystemExit(1)
+
+    monkeypatch.setattr(encode, "_remux_source_audio", remux)
+    with pytest.raises(SystemExit):
+        encode._resume_overlay_output(overlay, source)
+    assert encode._resume_overlay_output(overlay, source)
+    assert calls == [(overlay, source), (overlay, source)]
+
+
+def test_remux_missing_source_audio_fails_without_replacing_video(tmp_path):
+    video = tmp_path / "silent.mp4"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+        "color=size=64x64:rate=30:duration=1", "-c:v", "mpeg4", str(video),
+    ], check=True, capture_output=True)
+    original = video.read_bytes()
+    from cs2archive.overlay.overlay_encode import _require_overlay_audio
+    with pytest.raises(RuntimeError, match="no audio track"):
+        _require_overlay_audio(video)
+    with pytest.raises(SystemExit):
+        _remux_source_audio(video, video)
+    assert video.read_bytes() == original
+
+
 @pytest.mark.parametrize("offset", [0.3, -0.3, 0.0])
 def test_remux_aligns_audio_landmarks_and_preserves_video(tmp_path, offset):
     tempo = 1.001

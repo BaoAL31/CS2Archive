@@ -45,8 +45,16 @@ def _windows_for_moment(moment: dict, tickrate: int,
     # Chained moments (several candidates merged in the builder) play as one
     # continuous clip: spans merge across gaps below the chain threshold
     # instead of splitting into jump-cut windows.
-    merge_gap = (CHAIN_MERGE_SECONDS * tickrate
-                 if moment.get("chained") else 0.0)
+    # A feed-sized multikill is already one burst. Splitting it at the
+    # two-second trim boundary strips its tier during segment scoring.
+    from thumbnail.utils import KILLFEED_POV_SECONDS
+    fast_multikill = (
+        moment.get("tier") in {"4k", "5k", "punch_up"}
+        and len(kills) >= 4
+        and kills[-1] - kills[0] <= KILLFEED_POV_SECONDS * tickrate
+    )
+    merge_gap = (KILLFEED_POV_SECONDS * tickrate if fast_multikill else
+                 CHAIN_MERGE_SECONDS * tickrate if moment.get("chained") else 0.0)
     spans: list[list[int]] = []
     for i, k in enumerate(kills):
         if i == 0:

@@ -16,6 +16,28 @@ def _overlay_output_valid(path: Path) -> bool:
     return path.is_file() and path.stat().st_size > 100_000
 
 
+def _resume_overlay_output(path: Path, source: Path) -> bool:
+    """Finish audio even when a previous run already concatenated video."""
+    if not _overlay_output_valid(path):
+        return False
+    _remux_source_audio(path, source)
+    return True
+
+
+def _require_overlay_audio(path: Path) -> None:
+    """Reject video-only intermediates before they become publishable output."""
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,duration",
+         "-of", "json", str(path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    if probe.returncode:
+        raise RuntimeError(f"Cannot inspect overlay audio in {path}: {probe.stderr[-1000:]}")
+    streams = json.loads(probe.stdout).get("streams", [])
+    if not any(s.get("codec_type") == "audio" for s in streams):
+        raise RuntimeError(f"Overlay has no audio track: {path}; resume audio remux before publishing")
+
+
 BATCH_STAMP_VERSION = 1  # bump when batch encode params change (forces re-encode)
 
 
@@ -352,7 +374,7 @@ def _remux_source_audio(overlay_path: Path, source_path: Path,
         "ffmpeg", "-y",
         "-i", str(overlay_path),
         "-i", str(source_path),
-        "-map", "0:v", "-map", "1:a?",
+        "-map", "0:v", "-map", "1:a",
         "-c:v", "copy",
         "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2",
         # Measured: plain `-af volume=0.85` keeps the delivered audio
@@ -366,9 +388,15 @@ def _remux_source_audio(overlay_path: Path, source_path: Path,
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
     if r.returncode != 0 or not tmp.is_file():
-        _log(f"[ERROR] audio resync failed: {r.stderr[-500:]}")
+        log_path = overlay_path.with_name(overlay_path.name + ".audio-remux.log")
+        log_path.write_text(
+            f"returncode={r.returncode}\ncommand={json.dumps(cmd)}\n{r.stderr or ''}",
+            encoding="utf-8",
+        )
+        _log(f"[ERROR] audio resync failed (rc={r.returncode}; full log: {log_path}): {r.stderr[-1000:]}")
         tmp.unlink(missing_ok=True)
         sys.exit(1)
+    _require_overlay_audio(tmp)
     os.replace(tmp, overlay_path)
 
 

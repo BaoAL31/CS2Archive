@@ -95,7 +95,9 @@ MIN_SEGMENT_BYTES = 1_048_576
 # segments (and any prepend made from them) are invalidated. 1 = crosshair only
 # in the per-sequence `cfg` string (CSDM ignored it → default crosshair);
 # 2 = also passed as `--cfg <file>`, the mechanism render_pov uses.
-HOOK_RENDER_VERSION = 2
+# 3 = preserve fast multikills; invalidate already-prepended fragmented hooks
+# even when the new selection has the same number of identical player cfgs.
+HOOK_RENDER_VERSION = 3
 
 
 def _pov_kill_ticks(demo_path: Path, sid: str) -> list[int]:
