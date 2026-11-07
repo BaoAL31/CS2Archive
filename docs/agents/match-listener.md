@@ -5,17 +5,48 @@ notables, and queues POV renders for either source. It lives in
 `cs2archive/listener/` (not `cs2archive/hltv/`) because HLTV is only half of
 it; the old `cs2archive/hltv/match_listener.py` path is a deprecated shim.
 
-On the HLTV side it queues matches from the configured event when at least one
+On the HLTV side it queues matches from the tracked event when at least one
 team is in the top-20 ranking snapshot.
 
-The default event is BLAST Open Porto 2026. The default poll interval is five
-minutes. One card per map/demo is queued from `backlog/<match>/{high,medium}/`
-(rating >= 1.0), picked by **raw HLTV rating — by decision, not by
-omission** (F1 DOCFIX: the weight machinery in `score_cards.py` exists and
-is inspected manually, but the live queue is rating-ordered; wiring weight
-in is recorded as an explicit open decision — flip only on a wave-4
-ordering replay showing weight-ordered picks beating rating-ordered picks.
-See Weighting below). HLTV's
+**The tracked event is auto-followed by default.** With no `--event-url`, each
+poll reads `/results` first and follows whichever event today/yesterday's
+*notable* results are actually in — the event with the most notable matches
+wins, ties go to the newest, and an event HLTV currently marks `Live` in the
+cached events scrape (`.data/allstar_hltv_events.json`, written by
+`cs2archive/shorts/scrape_allstar_hltv.py`; slug-matched) wins outright. Its
+cached URL also enriches the poll so `hltv_next_12h` still works. Pass
+`--event-url <url>` to pin one event explicitly; `[event] auto-tracking: …` /
+`[event] pinned: …` prints which mode is active every cycle. This exists
+because a hardcoded `DEFAULT_EVENT_URL` (BLAST Open Porto 2026) silently kept
+being tracked for five weeks after that event ended, so a live ESL Pro League
+season was invisible and the daemon fell through to the FACEIT track. The old
+constant survives only as the fallback when no notable result is visible.
+
+The demand gate filters the **candidate pool before** `select_best_card`
+picks the one card per match. Gating after the pick discarded the whole match
+whenever its top-rated card was unproven — tN1R Mirage (r=2.06, index 1.45 but
+20 videos / 0 recent, so `supported=False`) took the eligible m0NESY Mirage
+(r=1.46) down with it. A match whose every candidate fails the gate is a
+completed no-op with `skip_reason: star gate`.
+
+Team names for the gate are read from the result block's team cells
+(`td.team-cell .line-align .team`), **not** by splitting the match slug: real
+HLTV slugs carry the event suffix (`/matches/2398753/falcons-vs-spirit-esl-
+pro-league-season-24`), so slug-splitting left the event name glued to team2
+and every match whose notable team sat in slot 2 was silently dropped.
+
+The default poll interval is five minutes. One card per series is queued from
+`backlog/<match>/{high,medium}/` (rating >= 1.0), picked by raw HLTV rating
+after demand eligibility. The queue puts currently trending players first,
+then sorts by rating within the trending and other groups. It re-sorts every
+poll so newly arrived or expired evidence affects existing queued cards.
+Ready local HLTV cards with available daily slots drain **before** discovery
+or acquisition. A new match's corpus/keyboard ingest must not block a ready
+POV for minutes. FACEIT-only queues still need the live HLTV-window check
+before rendering. The day bucket and queue order are saved at cycle start,
+so disk state reflects the current day even during a long subprocess.
+The full fitted weights in `score_cards.py` remain diagnostic; enabling those
+still requires the held-out ordering replay described below. HLTV's
 `/results?date=` query is a no-op (the SPA always returns the latest-results
 dump), so the listener reads on-page date headlines and keeps **Featured
 results** plus **today and yesterday**. Older dated groups on that dump
@@ -37,7 +68,18 @@ short is detected: `renders/pov-<demo-stem>_<nick>/shorts/shorts-<slug>/`.
 
 ## FACEIT notables (two tracks)
 
-The listener polls FACEIT every cycle (`discover_faceit_tracks`, one scrape,
+**An HLTV window outranks FACEIT.** While a tracked-event match is live or
+starts within `FACEIT_HORIZON` (12h) the FACEIT track neither polls
+(`should_poll_faceit(state, hltv_busy=True) -> False`) nor renders: the
+queue drain takes the next **HLTV** card and leaves FACEIT cards queued
+(`_next_card`). Both tracks spend the same 2 uploads/day, and before this
+rule a FACEIT card already in the queue could preempt a same-day HLTV
+fixture — on 2026-10-11 the second slot went to a FACEIT POV at 03:56
+while the ESL Pro League semifinals were still to be played. Acquisition
+still continues (demoscards queue up); only the render/poll is held.
+
+Outside that window the listener polls FACEIT every cycle
+(`discover_faceit_tracks`, one scrape,
 15-minute cooldown, lookback stretches 1h→24h to cover time blocked inside
 renders). Each scrape splits into:
 
@@ -133,6 +175,49 @@ freshness loudly (`scoring.log_demand_payload_status`, called from
 the star arm instead of silently widening it to the research table.
 `--dry-run` does not scrape YouTube.
 
+The POV sources include **ravie** (`UCJO6WnoHNOk3ZaFzqvhtsjw`), added and
+backfilled on 2026-10-28. Edited POVs count even when their titles omit `POV`,
+K/D, map or a fixture: `ZywOo MASTERCLASS vs The MongolZ`, `AFTER LOSING
+ROUND 1, donk CAME BACK ANGRY...`, and `HE IS THE REASON MOUZ LOST THE GRAND
+FINALS` are examples. Editorial title leads can resolve a named pro later in
+the title. Otherwise an explicit description `player:` label can resolve the
+primary player; arbitrary description/tag mentions are never used as a guess.
+`primary_player_source` records title versus description attribution. Videos
+younger than two days remain outside the durable demand fit, but can qualify
+through the early-trend arm below.
+
+### Early POV trends (2026-10-28)
+
+The live gate now accepts supported stars **or** legacy breakouts **or** an
+early trend. `cs2archive/faceit/pov_trends.py` detects a recognised player's
+6-hour–7-day-old POV with at least 5,000 views and at least 2x the median total
+views of five or more older observed uploads on the same channel, from the
+last 30 days. Peers must have been captured at least two days after publication
+and at least as old as the candidate observation. This is a conservative
+total-view hurdle, not a projection from views/hour. It excludes our channel,
+Shorts, future observations and unknown players. Candidate captures must be
+no older than four hours; early-trend eligibility expires after four hours
+without a new capture. Thresholds are initial operating settings, not a proven
+view-lift claim.
+
+`early_trends` is independently versioned as `method.early_trend_version: 1`;
+the durable star/breakout payload keeps its existing rule version. Both HLTV
+and FACEIT read the same early-trend predicate. The gate ledger distinguishes
+`early_trend(ratio=...)` from legacy breakout PI and saves the source video.
+
+Windows task **CS2ArchivePOVTrendRefresh** runs every two hours at `xx:30` via
+`scripts/hltv/run_pov_trends.ps1`, writing `.listener/pov_trends.log`. It refreshes
+player demand from public YouTube data without invoking HLTV harvesting,
+Shorts fitting, renders or Analytics OAuth. The daily comprehensive refresh
+remains in place. The task was manually run and verified with exit code 0.
+
+Recent matches rejected by the star gate are reconsidered once per new demand
+payload when they reappear in the existing today/yesterday result window.
+This reuses cached backlog cards; it does not re-download demos. Successfully
+queued/completed matches are not requeued. The strongest eligible rating still
+chooses the POV within each series. Queue priority puts fresh trending players
+first, then rating; one POV per series and the two-upload daily cap remain.
+
 ## Grading the gate (replay_gate + ledger + forward metrics)
 
 `cs2archive/faceit/replay_gate.py` replays gate configs over past days:
@@ -159,6 +244,28 @@ python -m cs2archive.faceit.replay_gate --from 2026-09-15 --to 2026-10-01
   1.0–2.0 hold / < 1.0 tighten or revert. Unaliased rows never score.
   Forward window opened 2026-10-02 (`.data/gate_forward.json`, baseline
   median own_pi 0.89 over 141 videos); decision due 2026-10-23.
+- **Measurement repair (2026-10-28):** forward metrics now read newest own-channel
+  seed captures instead of always falling back to the old own-history CSV. The
+  own baseline and table both use recognised-player long-form rows aged 7–180
+  days. Daily player refresh updates our full 180-day video window; competitor
+  discovery remains incremental. Deleted/private playlist placeholders are
+  logged and skipped rather than crashing the refresh.
+  Lifetime views/day still is **not** a fixed-age outcome and must not be used
+  alone to decide whether the selector improved. For seven complete Pacific
+  calendar days after the publication day, excluding a three-day reporting
+  buffer, use:
+
+  ```powershell
+  python -m cs2archive.upload.auth_youtube_analytics
+  python -m cs2archive.upload.export_pov_analytics --days 60 --diagnostics
+  ```
+
+  The exporter is read-only, checks channel identity, and writes
+  `exports/pov_market/pov_analytics.json` (views, watch minutes, average view
+  duration/percentage, subscribers, plus optional traffic sources and retention
+  curves). Missing rows are labelled unavailable. Thumbnail impressions/CTR
+  still require Studio. It exits with a login-renewal instruction if OAuth has
+  expired; it never starts an interactive login automatically.
 - Demand payload note: `update_player_demand.refresh()` writes a
   `breakouts` section (`{nick: max 30d PI}`: long-form, age ≥ 2d,
   velocity floored at 7d, leave-one-out channel baseline, absolute

@@ -45,7 +45,21 @@ fn main() {
     let mmap = unsafe { MmapOptions::new().map(&f).unwrap() };
     let d = ds.parse_demo(&mmap).unwrap();
     use parser::second_pass::variants::VarVec;
-    let cols = &d.df_per_player[&steamid];
+    // A Steam64 that is not a player in this demo must be a readable error, not
+    // a panic: the callers treat this as a hard failure (no keyboard overlay),
+    // and "no entry found for key" hid a wrong-account mapping behind a Rust
+    // backtrace (2026-10-23: card 2399635 resolved the wrong Senzu account and
+    // only this lookup noticed, after a 32 GB render).
+    let cols = match d.df_per_player.get(&steamid) {
+        Some(cols) => cols,
+        None => {
+            eprintln!(
+                "button_extract: steamid {steamid} is not a player in {demo} - \
+                 check the card's steam_id against the demo roster"
+            );
+            std::process::exit(2);
+        }
+    };
     let t  = match cols.get(&100000013).and_then(|c|c.data.as_ref()) { Some(VarVec::I32(v))=>v, _=>&vec![] };
     let b1 = match cols.get(&100000029).and_then(|c|c.data.as_ref()) { Some(VarVec::U64(v))=>v, _=>&vec![] };
     let fw = match cols.get(&100000025).and_then(|c|c.data.as_ref()) { Some(VarVec::F32(v))=>v, _=>&vec![] };

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -593,6 +594,41 @@ def _build_nickname_map(info) -> dict[str, str]:
     return nid
 
 
+def _player_info_with_split_fallback(demo_path: Path, parser, info):
+    """Roster for split demos: a part (e.g. Cache p1) can parse kills fine
+    while its own player_info table comes back empty, which silently
+    disables all clutch/defuse detection for that part (no team data).
+    Borrow the roster from the first sibling part that has one.
+    """
+    try:
+        empty = info is None or getattr(info, "empty", True)
+    except Exception:
+        empty = True
+    if not empty:
+        return info
+    demo_path = Path(demo_path)
+    m = re.search(r"(.*)-p(\d+)(\.dem)$", demo_path.name, re.IGNORECASE)
+    if not m:
+        return info
+    import demoparser2 as dp
+
+    for sib in sorted(demo_path.parent.glob(f"{m.group(1)}-p*{m.group(3)}")):
+        if sib.name == demo_path.name:
+            continue
+        try:
+            alt = dp.DemoParser(str(sib)).parse_player_info()
+        except Exception:
+            continue
+        try:
+            if alt is not None and not alt.empty:
+                print(f"  [shorts] player_info empty in {demo_path.name}; "
+                      f"borrowed roster from {sib.name}", flush=True)
+                return alt
+        except Exception:
+            continue
+    return info
+
+
 def build_short_timeline(demo_path: Path, player: str | None = None,
                          pros_only: bool = True) -> dict:
     """Parse demo via demoparser2 and extract 4K/Clutch Shorts."""
@@ -605,7 +641,8 @@ def build_short_timeline(demo_path: Path, player: str | None = None,
     freeze_end = _as_event_df(parser.parse_event("round_freeze_end"))
     round_end = _as_event_df(parser.parse_event("round_officially_ended"))
     round_end_winner = _as_event_df(parser.parse_event("round_end"))
-    info = parser.parse_player_info()
+    info = _player_info_with_split_fallback(
+        Path(demo_path), parser, parser.parse_player_info())
     bomb_plant = _as_event_df(parser.parse_event("bomb_planted"))
     bomb_defuse = _as_event_df(parser.parse_event("bomb_defused"))
     bomb_explode = _as_event_df(parser.parse_event("bomb_exploded"))
@@ -836,6 +873,9 @@ def detect_shorts(
             if name:
                 _nid[sid] = name
     team_by_sid = _tid
+    if not team_by_sid:
+        print("[WARN] no team assignments for this demo — "
+              "clutch/defuse/1v3 detection is disabled", file=sys.stderr)
     if nickname_by_sid is None:
         nickname_by_sid = _nid
     else:

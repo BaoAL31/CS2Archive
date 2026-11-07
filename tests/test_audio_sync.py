@@ -1,106 +1,83 @@
-"""Delivered-audio sync: what was measured, and what must not regress.
+"""Audio drift measurement: the fit must not be steerable by one bad mark.
 
-Measured on a real 120 s window of a flameZ POV (``combined.mp4`` = the CSDM
-capture, used as the sync reference):
-
-* ``-af volume=0.85 -c:a aac``  -> **+0.0 ms**  (the AAC priming is gapless-tagged
-  by this muxer, so the volume filter costs nothing — commit 20f99bf is innocent)
-* same + ``atrim=start_sample=1024`` -> **+23.2 ms LATE** (so never trim it here)
-* ``faceit/intro_prepend`` on the delivered render -> **-20.6 ms EARLY** because
-  ``acrossfade=d=0.02`` overlaps 20 ms of audio at a joint the video cuts hard.
+The delivered-audio delay went unreported-as-fixed for weeks because the slope
+came from 6 latched onsets fitted with least squares, which produced
+random-signed corrections (+0.637 … -0.574 ms/s across nine renders) against a
+real drift that is consistently positive (audio progressively late). A
+wrong-signed correction makes the delay grow, so "no correction when unsure" is
+the safer failure mode.
 """
-
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
-import numpy as np
-import pytest
-
-from cs2archive.audio_sync import crossfade_pad_filter, crossfade_pad_ms
-from cs2archive.pov.assemble_hook import build_hook_filter
-
-SR = 8000
+from cs2archive import audio_sync as a
 
 
-def _lag(a: np.ndarray, b: np.ndarray) -> float:
-    a = a - a.mean()
-    b = b - b.mean()
-    n = min(len(a), len(b))
-    a, b = a[:n], b[:n]
-    corr = np.correlate(a, b, mode="full")
-    return (int(np.argmax(np.abs(corr))) - (len(b) - 1)) / SR
+def test_theil_sen_recovers_slope_with_an_outlier() -> None:
+    true_slope = 0.0008  # 0.8 ms/s, the order measured on real POVs
+    marks = [(t, 0.05 + true_slope * t) for t in range(0, 400, 50)]
+    polluted = [*marks, (200.0, 3.0)]  # one onset that latched onto a louder sound
+    slope = a.theil_sen_slope(polluted)
+    assert abs(slope - true_slope) < 1e-4, slope
+    # Least squares on the same 9 marks is dragged off by the outlier (the
+    # 6-mark era's failure mode); Theil-Sen is far closer to the truth.
+    _intercept, ls_slope = a.fit_drift(polluted)
+    assert abs(ls_slope - true_slope) > 10 * abs(slope - true_slope), (
+        slope, ls_slope)
 
 
-def _pcm(path: Path, start: float, dur: float) -> np.ndarray:
-    out = subprocess.run(
-        ["ffmpeg", "-v", "error", "-ss", f"{start:.3f}", "-t", f"{dur:.3f}",
-         "-i", str(path), "-vn", "-ac", "1", "-ar", str(SR), "-f", "s16le", "-"],
-        capture_output=True, check=True).stdout
-    return np.frombuffer(out, dtype="<i2").astype(np.float64)
+def test_theil_sen_needs_enough_marks() -> None:
+    few = [(float(t), 0.001 * t) for t in range(0, 5)]
+    assert len(few) < a.MIN_SLOPE_MARKS
+    assert a.theil_sen_slope(few) == 0.0
 
 
-def test_crossfade_pad_math() -> None:
-    assert crossfade_pad_ms(0.02) == 20
-    assert crossfade_pad_filter(0.02) == "adelay=20:all=1"
+def test_robust_intercept_is_the_median_residual() -> None:
+    marks = [(t, 0.2 - 0.5 * t) for t in range(0, 400, 20)]
+    marks.append((400.0, 9.9))
+    intercept = a.robust_intercept(marks, -0.5)
+    assert abs(intercept - 0.2) < 0.05, intercept
 
 
-def test_remux_keeps_audio_sample_locked(monkeypatch, tmp_path) -> None:
-    """The overlay remux must NOT carry a priming trim (measured +23 ms late)."""
-    from cs2archive.overlay import overlay_encode
-
-    seen: dict = {}
-
-    def fake_run(cmd, **kwargs):
-        seen["cmd"] = cmd
-        (tmp_path / "v.mp4.resync.mp4").write_bytes(b"x")
-
-        class _Done:
-            returncode = 0
-            stdout = ""
-            stderr = ""
-
-        return _Done()
-
-    monkeypatch.setattr(overlay_encode.subprocess, "run", fake_run)
-    video = tmp_path / "v.mp4"
-    video.write_bytes(b"x")
-    overlay_encode._remux_source_audio(video, video)
-
-    af = seen["cmd"][seen["cmd"].index("-af") + 1]
-    assert af == "volume=0.85"
-    assert "atrim" not in af
+def test_tempo_direction_and_cap() -> None:
+    # Audio progressively late -> speed it up (tempo > 1) to pull it back.
+    assert a.atempo_for_slope(0.0008) > 1.0
+    # Audio creeping ahead -> slow it down.
+    assert a.atempo_for_slope(-0.0008) < 1.0
+    # Beyond the sanity cap: refuse to "fix" it.
+    assert a.atempo_for_slope(2.0) == 1.0
+    assert a.atempo_for_slope(0.0) == 1.0
+    assert a.MAX_TEMPO_DEVIATION <= 0.005
 
 
-def test_hook_join_does_not_trim_priming() -> None:
-    """`concat` does not overlap, so the hook join needs no compensation."""
-    graph = build_hook_filter([0, 1], [2, 3], end_fade=0.5, total=20.0,
-                              width=2560, height=1440, fps=60)
-
-    assert "atrim" not in graph
-    assert "volume=0.85" in graph
+def _fake_marks(monkeypatch, ticks: list[int], onset) -> None:
+    monkeypatch.setattr(a, "_pov_kills", lambda demo, steam: ticks)
+    monkeypatch.setattr(a, "_audio_onset_offset",
+                        lambda video, expected, window: onset(expected))
 
 
-@pytest.mark.skipif(subprocess.run(["ffmpeg", "-version"], capture_output=True).returncode != 0,
-                    reason="ffmpeg required")
-def test_prepend_keeps_the_pov_audio_aligned(tmp_path: Path) -> None:
-    """Real integration check of the prepend join (video hard cut + acrossfade)."""
-    from cs2archive.faceit.intro_prepend import prepend
+def test_measure_audio_drift_ignores_a_wild_mark(monkeypatch) -> None:
+    rounds = {r: (r * 1000, r * 1000 + 900) for r in range(1, 25)}
+    offsets = {r: (r - 1) * 55.0 for r in range(1, 25)}
+    ticks = [r * 1000 + 100 for r in range(1, 25)]  # one kill inside each round
+    true_slope = 0.0007
 
-    hook = tmp_path / "hook.mp4"
-    pov = tmp_path / "pov.mp4"
-    for path, seconds, seed in ((hook, 2.0, 11), (pov, 4.0, 29)):
-        subprocess.run([
-            "ffmpeg", "-y", "-v", "error",
-            "-f", "lavfi", "-i", f"color=c=black:s=320x240:r=30:d={seconds}",
-            "-f", "lavfi", "-i", f"anoisesrc=color=white:seed={seed}:duration={seconds}:amplitude=0.5",
-            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-ar", "48000", "-ac", "2", "-shortest", str(path),
-        ], check=True)
-    out = prepend(hook, pov, tmp_path / "joined.mp4")
+    def onset(expected: float) -> float:
+        if abs(expected - 660.0) < 1.0:  # one mark latched onto the wrong sound
+            return 2.5
+        return 0.05 + true_slope * expected
 
-    # The POV body starts where the hook's picture ends; audio there must still
-    # line up with the POV's own audio (before the pad it ran one fade early).
-    lag = _lag(_pcm(pov, 0.5, 2.0), _pcm(out, 2.5, 2.0))
-    assert abs(lag) <= 0.03, f"prepend shifted the POV audio by {lag * 1000:+.1f} ms"
+    _fake_marks(monkeypatch, ticks, onset)
+    _intercept, slope, n = a.measure_audio_drift(
+        Path("v.mp4"), Path("d.dem"), "1", offsets, rounds)
+    assert n >= a.MIN_SLOPE_MARKS
+    assert abs(slope - true_slope) < 2e-4, slope
+
+
+def test_measure_audio_drift_without_marks_makes_no_correction(monkeypatch) -> None:
+    _fake_marks(monkeypatch, [], lambda expected: None)
+    _intercept, slope, n = a.measure_audio_drift(
+        Path("v.mp4"), Path("d.dem"), "1", {1: 0.0}, {1: (0, 100)})
+    assert slope == 0.0 and n == 0
+    assert a.atempo_for_slope(slope) == 1.0

@@ -244,7 +244,7 @@ def test_skipped_meta_is_not_pending() -> None:
         "tiktok_status": "skipped",
         "instagram_status": "skipped",
     }
-    assert not ups._needs_upload(meta, skip_tiktok=False, skip_instagram=False)
+    assert not ups._needs_upload(meta)
     pending = ups._platform_pending(meta)
     assert pending == {
         "youtube": False, "tiktok": False, "instagram": False, "facebook": False,
@@ -298,7 +298,7 @@ def test_hltv_upload_does_not_reapply_retired_intercept_veto(tmp_path: Path) -> 
     ups._mark_skipped(meta_path, meta, "slot_floor")
     saved = json.loads(meta_path.read_text(encoding="utf-8"))
     assert saved["skip_reason"] == "slot_floor"
-    assert not ups._needs_upload(saved, skip_tiktok=False, skip_instagram=False)
+    assert not ups._needs_upload(saved)
 
 
 def test_hltv_upload_above_intercept_passes(tmp_path: Path) -> None:
@@ -329,4 +329,4 @@ def test_mark_skipped_stops_future_pending(tmp_path: Path) -> None:
     saved = json.loads(meta_path.read_text(encoding="utf-8"))
     assert saved["upload_status"] == "skipped"
     assert saved["skip_reason"] == "low_demand"
-    assert not ups._needs_upload(saved, skip_tiktok=False, skip_instagram=False)
+    assert not ups._needs_upload(saved)

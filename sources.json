@@ -1,0 +1,99 @@
+{
+  "database": "data/social-sweep/shorts_evidence.sqlite3",
+  "raw_root": "data/social-sweep/raw",
+  "window": {
+    "start": "2026-08-01T00:00:00Z",
+    "max_days": 120
+  },
+  "rate_limit": {
+    "min_interval_seconds": 1.5,
+    "max_requests_per_run": 1200,
+    "youtube_daily_quota": 5000
+  },
+  "retry": {
+    "max_attempts": 3
+  },
+  "defaults": {
+    "max_pages": 2,
+    "max_posts": 60
+  },
+  "platforms": {
+    "youtube": {
+      "enabled": true,
+      "mode": "api",
+      "creators": [
+        "@cs2povarchive"
+      ],
+      "video_ids": [
+        "j41039mYjEI"
+      ],
+      "max_posts": 900,
+      "search_queries": [],
+      "max_pages": 2,
+      "per_creator_max": 60,
+      "min_interval_seconds": 0.35,
+      "max_requests_per_run": 1200,
+      "own_channel_id": "UCh8PPTy8KFPhxvVZOCE519Q",
+      "own_channel_handle": "@cs2povarchive",
+      "discovery": {
+        "enabled": true,
+        "queries": [
+          "cs2 shorts highlights",
+          "counter strike 2 pro highlights shorts",
+          "cs2 clutch shorts daily",
+          "cs2 ace shorts"
+        ],
+        "max_creators": 16,
+        "min_relevance": 0.5,
+        "require_recent_activity": true
+      },
+      "max_creators": 20,
+      "own_max_pages": 10
+    },
+    "instagram": {
+      "enabled": true,
+      "mode": "graph_business_discovery",
+      "creators": [
+        "cs2povarchive",
+        "eslcs"
+      ],
+      "max_pages": 8,
+      "max_posts": 220,
+      "per_page": 25,
+      "min_interval_seconds": 1.0
+    },
+    "tiktok": {
+      "enabled": true,
+      "mode": "oembed",
+      "video_urls": [],
+      "max_posts": 20
+    },
+    "reddit": {
+      "enabled": true,
+      "mode": "rss",
+      "communities": [
+        "GlobalOffensive",
+        "cs2",
+        "csgoclips"
+      ],
+      "max_pages": 1,
+      "max_posts": 40,
+      "min_interval_seconds": 8.0
+    },
+    "allstar": {
+      "enabled": true,
+      "mode": "local_store_import",
+      "store": ".data/allstar_hltv_probe.jsonl",
+      "max_posts": 1200
+    }
+  },
+  "imports": [],
+  "foundation": {
+    "dir": "data/shorts-foundation",
+    "allstar_store": ".data/allstar_hltv_probe.jsonl"
+  },
+  "training": {
+    "min_rows_per_platform": 25,
+    "output": "data/social-sweep/train_report.json"
+  }
+}

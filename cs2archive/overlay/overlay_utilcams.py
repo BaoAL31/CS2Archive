@@ -519,7 +519,14 @@ def _render_throw_flight_clips(
         first_round_tick = rs
         last_round_tick = re
 
-    throws = _load_player_throws(demo_path, steam_id, first_round_tick, last_round_tick)
+    # NOTE: do NOT pre-filter this demo's throws by the (first, last) tick
+    # bound above. For split demos (p1/p2) round_tick_ranges mixes ticks from
+    # BOTH parts (p1 spans 1148-107342 here while round 21 ends at 70216), so
+    # the bound silently amputates this demo's late throws (15 of NiKo's 34
+    # p1 throws dropped, 2026-10-07: renderer produced 19 clips while the
+    # validator — which uses the full span — expected 34). Load unfiltered;
+    # select_window_throws below does the real per-round windowing.
+    throws = _load_player_throws(demo_path, steam_id, 0, 0)
     if throws is None:
         _log("[extract] CS2UtilArchive data missing — auto-extracting...")
         _ensure_cs2util_data(demo_path)

@@ -144,6 +144,105 @@ def test_results_event_label_matches_when_event_page_ids_are_stale():
     assert [m.match_id for m in selected] == ["100"]
 
 
+# Real HLTV match slugs carry the event suffix, so splitting the slug on
+# "-vs-" glued the event name onto team2 ("spirit esl pro league season
+# 24"). That value never matched the notable-team gate, which silently
+# dropped every match whose notable team sat in slot 2.
+EVENT_SUFFIXED_RESULT = """
+<div class="results-holder">
+  <div class="result-con">
+    <a class="a-reset" href="/matches/2398753/falcons-vs-spirit-esl-pro-league-season-24">
+      <table><tbody><tr>
+        <td class="team-cell"><div class="line-align team1"><div class="team">Falcons</div></div></td>
+        <td class="result-score"><span class="score-lost">0</span>-<span class="score-won">2</span></td>
+        <td class="team-cell"><div class="line-align team2"><div class="team team-won">Spirit</div></div></td>
+      </tr></tbody></table>
+    </a>
+    <td class="event"><span class="event-name">ESL Pro League Season 24</span></td>
+  </div>
+</div>
+"""
+
+
+def test_team_names_come_from_dom_not_the_event_suffixed_slug():
+    matches = parse_match_links(EVENT_SUFFIXED_RESULT)
+    assert len(matches) == 1
+    assert matches[0].team1 == "Falcons"
+    assert matches[0].team2 == "Spirit"  # not "Spirit ESL Pro League Season 24"
+
+
+def test_notable_team_in_slot_two_still_selects_the_match():
+    matches = parse_match_links(EVENT_SUFFIXED_RESULT)
+    selected = select_matches(
+        matches, set(), ["Spirit"], "esl pro league season 24"
+    )
+    assert [m.match_id for m in selected] == ["2398753"]
+
+
+def test_auto_event_follows_the_populated_notable_event(monkeypatch, tmp_path: Path):
+    import cs2archive.listener.daemon as daemon
+
+    cache = tmp_path / "events.json"
+    cache.write_text(json.dumps({"events": [{
+        "event_id": "8244", "slug": "esl-pro-league-season-24",
+        "name": "Live EPL S24",
+        "url": "https://www.hltv.org/events/8244/esl-pro-league-season-24",
+    }]}), encoding="utf-8")
+    monkeypatch.setattr(daemon, "ALLSTAR_EVENTS_PATH", cache)
+
+    notable = [
+        Match("1", "u1", "s1", "Falcons", "Spirit", "ESL Pro League Season 24"),
+        Match("2", "u2", "s2", "FURIA", "MOUZ", "ESL Pro League Season 24"),
+        Match("3", "u3", "s3", "small", "tiny", "Some Minor Cup"),
+        Match("4", "u4", "s4", "dead", "event", "BLAST Open Porto 2026"),
+    ]
+    name, url = daemon.auto_event(notable)
+    assert name == "ESL Pro League Season 24"
+    assert url == "https://www.hltv.org/events/8244/esl-pro-league-season-24"
+
+
+def test_auto_event_without_notable_results_yields_nothing(monkeypatch, tmp_path: Path):
+    import cs2archive.listener.daemon as daemon
+
+    monkeypatch.setattr(daemon, "ALLSTAR_EVENTS_PATH", tmp_path / "missing.json")
+    assert daemon.auto_event([]) == ("", None)
+
+
+def test_gate_the_pool_before_the_per_match_pick(monkeypatch, tmp_path: Path):
+    """An unproven top-rated card must lose to an eligible card, not the match.
+
+    Regression: the demand gate used to run AFTER select_best_card, so
+    dropping the best card (tN1R Mirage r=2.06, no sample evidence) also
+    threw away the eligible runner-up (m0NESY Mirage r=1.46).
+    """
+    import cs2archive.listener.daemon as daemon
+
+    slug = "2398753-falcons-vs-spirit-esl-pro-league-season-24"
+    folder = tmp_path / "backlog" / slug / "high"
+    folder.mkdir(parents=True)
+    (folder / "best.json").write_text(
+        json.dumps({"player": "unproven", "map": "Mirage", "rating": 2.06}),
+        encoding="utf-8")
+    (folder / "runner-up.json").write_text(
+        json.dumps({"player": "eligible", "map": "Anubis", "rating": 1.46}),
+        encoding="utf-8")
+    monkeypatch.setattr(daemon, "ROOT", tmp_path)
+    monkeypatch.setattr(
+        daemon, "_star_eligible",
+        lambda nick: (True, "") if nick == "eligible" else (False, "no sample evidence"),
+    )
+
+    match = Match("2398753",
+                  f"https://www.hltv.org/matches/2398753/{slug.removeprefix('2398753-')}",
+                  slug, "Falcons", "Spirit", "ESL Pro League Season 24")
+    pool = daemon._match_card_pool(match)
+    assert len(pool) == 2
+    keep = set(daemon._star_gate_cards([p for p, _ in pool], match))
+    gated = [(p, m) for p, m in pool if p in keep]
+    picked = daemon._candidate_cards(match, pool=gated)
+    assert picked == ["backlog/%s/high/runner-up.json" % slug]
+
+
 def test_parse_top_twenty_teams():
     html = """
     <div class="ranking-item"><div class="ranking-item-team-name">Spirit</div></div>
@@ -610,6 +709,12 @@ def test_star_gate_fails_closed_without_demand_payload(tmp_path: Path, monkeypat
         "cs2archive.scoring.demand_eligibility",
         lambda nick, **kw: (False, False, None, False, None),
     )
+    # fail-closed means NO evidence at all: the live early-trend feed must not
+    # leak real state into the test (donk's genuine trend passed 2026-11-04).
+    monkeypatch.setattr(
+        "cs2archive.scoring.early_pov_trend",
+        lambda nick, **kw: None,
+    )
     rel = "backlog/slug/high/donk-anubis.json"
     path = tmp_path / rel
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -845,3 +950,229 @@ def test_refresh_teams_defaults_on_with_opt_out():
     assert parser.parse_args([]).refresh_teams is True
     assert parser.parse_args(["--refresh-teams"]).refresh_teams is True
     assert parser.parse_args(["--no-refresh-teams"]).refresh_teams is False
+
+
+# HLTV and FACEIT share the 2/day budget, so a queued FACEIT card used to
+# preempt a same-day HLTV fixture: on 2026-10-11 the second slot went to a
+# FACEIT POV at 03:56 while the ESL Pro League semifinals were still to be
+# played, and both semifinal cards then sat behind a spent budget.
+
+QUEUED_FACEIT = "backlog/faceit/2026-10-11/high/donk-dust2-team-a-vs-team-b-dust2.json"
+QUEUED_HLTV = "backlog/2398755-mouz-vs-spirit-esl-pro-league-season-24/high/donk-mirage-2398755.json"
+
+
+def test_faceit_card_never_preempts_an_hltv_window(monkeypatch):
+    import cs2archive.listener.daemon as daemon
+
+    # FACEIT sorts first in the queue; during the HLTV window the HLTV card runs.
+    assert daemon._next_card([QUEUED_FACEIT, QUEUED_HLTV], hltv_busy=True) == QUEUED_HLTV
+    # Outside the window FACEIT is first-class again.
+    assert daemon._next_card([QUEUED_FACEIT, QUEUED_HLTV], hltv_busy=False) == QUEUED_FACEIT
+
+
+def test_faceit_only_queue_is_held_during_the_hltv_window():
+    import cs2archive.listener.daemon as daemon
+
+    assert daemon._next_card([QUEUED_FACEIT], hltv_busy=True) is None
+    assert daemon._next_card([], hltv_busy=False) is None
+
+
+def test_no_hltv_window_means_no_faceit_polling(tmp_path: Path):
+    state = State(tmp_path / "listener.json")
+    assert should_poll_faceit(state)                      # slots free, outside a window
+    assert not should_poll_faceit(state, hltv_busy=True)  # a match is live/within 12h
+
+
+def test_listener_exits_after_three_consecutive_poll_failures(monkeypatch, tmp_path: Path):
+    """An unbroken failure loop must terminate so it can be alerted.
+
+    This loop used to swallow every exception and poll forever: a listener with
+    a dead scrape or a locked browser profile looked healthy, queued nothing and
+    reported nothing — the same silent shape as the two unexplained deaths on
+    2026-10-10 and 2026-10-11.
+    """
+    import argparse
+    import asyncio
+
+    import pytest
+    import cs2archive.listener.daemon as daemon
+
+    async def boom(*_args, **_kwargs):
+        raise RuntimeError("scrape profile locked")
+
+    monkeypatch.setattr(daemon, "poll_once", boom)
+    monkeypatch.setattr(daemon, "_clean_queue_on_start", lambda state: None)
+
+    args = argparse.Namespace(
+        state=tmp_path / "listener.json",
+        status=False,
+        no_rebaseline=True,
+        once=False,
+        interval=0,
+    )
+    with pytest.raises(SystemExit) as exc:
+        asyncio.run(daemon.main(args))
+    assert f"failed {daemon.MAX_CONSECUTIVE_POLL_FAILURES} times in a row" in str(exc.value)
+    assert daemon.MAX_CONSECUTIVE_POLL_FAILURES == 3
+
+
+def test_pipeline_lock_is_detected_not_treated_as_free(tmp_path, monkeypatch):
+    """A held pipeline lock must read as busy.
+
+    A restarted listener spawned a second pipeline while the first was still
+    rendering (an orphaned child survives a killed daemon), got
+    PIPELINE_ALREADY_RUNNING, counted it as a HARD FAIL, and after the wrapper's
+    3 strikes the listener stopped dead while a healthy render held the lock
+    (2026-10-13 00:53). Busy is not broken.
+    """
+    import msvcrt
+    import os
+
+    import cs2archive.listener.daemon as daemon
+
+    root = tmp_path
+    (root / ".pipeline").mkdir()
+    monkeypatch.setattr(daemon, "ROOT", root)
+
+    assert daemon._pipeline_lock_held() is False      # free
+
+    fd = (root / ".pipeline" / "pipeline.lock").open("r+b")
+    lock = os.open(str(root / ".pipeline" / "pipeline.lock"), os.O_RDWR)
+    msvcrt.locking(lock, msvcrt.LK_NBLCK, 1)
+    try:
+        assert daemon._pipeline_lock_held() is True   # someone is rendering
+    finally:
+        msvcrt.locking(lock, msvcrt.LK_UNLCK, 1)
+        os.close(lock)
+        fd.close()
+
+    assert daemon._pipeline_lock_held() is False      # released
+
+
+# ── Per-card completion bookkeeping vs --dry-run ────────────────────────────
+#
+# A --dry-run cycle used to print "[upload] would spawn ..." and then run the
+# completion bookkeeping anyway: it removed the card from `queue`, appended it
+# to `daily.completed` and marked the match completed. Two never-rendered POVs
+# were silently lost that way on 2026-10-20 (kyousuke Anubis, molodoy Cache),
+# and the day's 2 upload slots were spent on them.
+
+def _card() -> str:
+    return ("backlog/2399416-aurora-vs-falcons-thunderpick-world-championship/"
+            "medium/kyousuke-anubis-2399416-aurora-vs-falcons-"
+            "thunderpick-world-championship.json")
+
+
+def test_finish_card_dry_run_consumes_nothing(tmp_path: Path):
+    from cs2archive.listener.daemon import _finish_card
+
+    state = State(tmp_path / "listener.json")
+    card = _card()
+    state.data["queue"] = [card]
+    state.data["matches"] = {"2399416": {"cards": [card], "status": "queued"}}
+    before_slots = _slots_left(state)
+
+    _finish_card(state, card, dry_run=True)
+
+    assert state.data["queue"] == [card], "dry run must leave the queue alone"
+    assert (_daily(state).get("completed") or []) == [], "dry run must not spend a slot"
+    assert _slots_left(state) == before_slots
+    record = state.data["matches"]["2399416"]
+    assert record["status"] == "queued"
+    assert not (record.get("completed_cards") or [])
+
+
+def test_finish_card_real_run_consumes_the_card(tmp_path: Path):
+    from cs2archive.listener.daemon import _finish_card
+
+    state = State(tmp_path / "listener.json")
+    card = _card()
+    state.data["queue"] = [card]
+    state.data["matches"] = {"2399416": {"cards": [card], "status": "queued"}}
+
+    _finish_card(state, card, dry_run=False)
+
+    assert state.data["queue"] == []
+    assert card in (_daily(state).get("completed") or [])
+    assert _slots_left(state) == DAILY_UPLOAD_LIMIT - 1
+    record = state.data["matches"]["2399416"]
+    assert record["status"] == "completed"
+    assert card in record["completed_cards"]
+
+
+# ── Render-attempt knobs are reachable from the listener ────────────────────
+#
+# The POV pipeline has always accepted --batches / --hook-timeout /
+# --hook-retries and forwarded them to render_pov.py, but the listener spawned
+# it with a bare command line, so the defaults (2 hook attempts) were the only
+# option. The vanilla-viewer flake regularly eats the FIRST launch ("Game
+# error"), and on 2026-10-25 it ate both attempts on two cards in a row, so the
+# listener hard-failed three times and gave up on a machine where a retry
+# renders fine.
+
+def test_run_pipeline_forwards_render_knobs(monkeypatch, tmp_path: Path):
+    import cs2archive.listener.daemon as daemon
+
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr(daemon.subprocess, "run", fake_run)
+    monkeypatch.setattr(daemon, "ROOT", tmp_path)
+
+    daemon._run_pipeline("backlog/x.json", False,
+                         ["--hook-retries", "4", "--batches", "3"])
+
+    cmd = seen["cmd"]
+    assert "--no-upload" in cmd
+    assert cmd[-4:] == ["--hook-retries", "4", "--batches", "3"]
+
+
+def test_run_pipeline_without_knobs_keeps_the_bare_command(monkeypatch, tmp_path: Path):
+    import cs2archive.listener.daemon as daemon
+
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr(daemon.subprocess, "run", fake_run)
+    monkeypatch.setattr(daemon, "ROOT", tmp_path)
+
+    daemon._run_pipeline("backlog/x.json", False)
+
+    assert seen["cmd"][-1] == "--no-upload"
+
+
+# ── Render stall guard ──────────────────────────────────────────────────────
+#
+# CS2 that has been parked behind the operator's windows can stop presenting
+# entirely on some machines (the reporter's words: "when it's unfocus it just
+# stops entirely"), which silently freezes a POV render. The guard watches the
+# render directory and refocuses CS2 when nothing has been written for a while.
+
+def test_stall_guard_flags_a_flat_write_counter():
+    from cs2archive.cs2_minimizer import render_is_stalled
+
+    # still writing frames: not stalled
+    assert render_is_stalled(1_000_000, 9_000_000) is False
+    # counter frozen between samples: the game stopped producing frames
+    assert render_is_stalled(9_000_000, 9_000_000) is True
+    # counter went backwards (process restarted): treat as stalled, not as growth
+    assert render_is_stalled(9_000_000, 1_000) is True
+    # no game / not armed yet is startup, not a stall
+    assert render_is_stalled(None, 9_000_000) is False
+    assert render_is_stalled(9_000_000, None) is False
+
+
+def test_stall_guard_records_refocuses_and_gives_up():
+    from cs2archive.cs2_minimizer import StallAction, stall_action
+
+    assert stall_action(consecutive=0) is StallAction.REFOCUS
+    assert stall_action(consecutive=1) is StallAction.REFOCUS
+    assert stall_action(consecutive=2) is StallAction.REFOCUS
+    # After repeated stalls the park attempt is the problem: stop parking.
+    assert stall_action(consecutive=3) is StallAction.STOP_PARKING

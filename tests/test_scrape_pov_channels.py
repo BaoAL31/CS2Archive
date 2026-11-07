@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import asyncio
 import json
 import sys
 from datetime import datetime, timezone
@@ -84,6 +85,53 @@ def test_player_features_keep_unlisted_primary_ahead_of_known_pros():
     assert features["primary_player"] == "mzinho"
     assert json.loads(features["secondary_players"]) == ["s1mple", "Senzu"]
     assert features["party_type"] == "trio"
+
+
+def test_editorial_title_still_identifies_the_pov_player():
+    features = scraper._player_features(
+        "AFTER LOSING ROUND 1, donk CAME BACK ANGRY...", {"donk": "donk"})
+    assert features["primary_player"] == "donk"
+
+
+def test_description_player_label_resolves_anonymous_pov_title():
+    features = scraper._video_features(
+        "HE IS THE REASON MOUZ LOST THE GRAND FINALS",
+        "Watch an incredible series.\n\n📌 player: ZywOo\n📌 match: vs MOUZ",
+        aliases={"zywoo": "ZywOo"})
+    assert features["primary_player"] == "ZywOo"
+    assert features["primary_player_source"] == "description:player"
+    assert json.loads(features["all_pro_players"]) == ["ZywOo"]
+
+
+def test_description_does_not_assign_random_player_mentions_or_replace_clear_title():
+    aliases = {"donk": "donk", "zywoo": "ZywOo"}
+    ambiguous = scraper._video_features(
+        "HE CARRIED THE FINAL", "donk and ZywOo were both in this game", aliases=aliases)
+    assert ambiguous["primary_player"] not in {"donk", "ZywOo"}
+    clear = scraper._video_features("donk vs ZywOo", "player: ZywOo", aliases=aliases)
+    assert clear["primary_player"] == "donk"
+
+
+def test_metric_row_uses_description_attribution_for_editorial_pov():
+    row = scraper._metric_row({
+        "id": "s4bYIGg-mtA",
+        "snippet": {
+            "title": "HE IS THE REASON MOUZ LOST THE GRAND FINALS",
+            "publishedAt": "2026-10-11T00:00:00Z",
+            "description": "📌 player: ZywOo\n📌 match: vs MOUZ",
+            "tags": ["donk", "ropz"],
+        },
+        "statistics": {"viewCount": "98832"},
+        "contentDetails": {"duration": "PT16M6S"},
+    }, {"channel_id": "ravie", "channel": "ravie", "subscribers": 1000},
+        datetime(2026, 10, 28, tzinfo=timezone.utc))
+    assert row["primary_player"] == "ZywOo"
+    assert row["primary_player_source"] == "description:player"
+    assert row["duration_seconds"] == 966
+
+
+def test_ravie_is_a_daily_pov_source():
+    assert "UCJO6WnoHNOk3ZaFzqvhtsjw" in scraper.DEFAULT_CHANNELS
 
 
 def test_real_channel_title_samples_use_recognised_pro_roster():
@@ -246,3 +294,23 @@ def test_stale_video_ids_skip_old_history():
         {"video_id": "fresh", "published_at": "2026-08-27T00:00:00+00:00"},
     ]
     assert scraper.stale_video_ids(rows, now, 7) == {"old"}
+
+
+def test_recent_video_ids_survives_unavailable_playlist_entries(monkeypatch):
+    pages = iter([
+        {"items": [
+            {"contentDetails": {"videoId": "deleted"}},
+            {"contentDetails": {"videoId": "new", "videoPublishedAt": "2026-10-27T00:00:00Z"}},
+        ], "nextPageToken": "next"},
+        {"items": [
+            {"contentDetails": {}},
+            {"contentDetails": {"videoId": "newer", "videoPublishedAt": "2026-10-26T00:00:00Z"}},
+            {"contentDetails": {"videoId": "old", "videoPublishedAt": "2026-09-01T00:00:00Z"}},
+        ]},
+    ])
+    async def get(*args, **kwargs):
+        return next(pages)
+    monkeypatch.setattr(scraper, "_get", get)
+    got = asyncio.run(scraper._recent_video_ids(
+        None, "test-key", "uploads", datetime(2026, 10, 1, tzinfo=timezone.utc), 50))
+    assert got == ["new", "newer"]

@@ -533,7 +533,15 @@ def _demo_player_names(demo_path: str) -> dict[str, str]:
                 if sid and nm:
                     out[sid] = nm
         except Exception as e:
-            print(f"  [WARN] demo name lookup failed: {e}")
+            # Rename map drives the in-HUD name AND the hooks' crosshair/nick
+            # canon: an empty map renders the raw demo nick (or nothing) and the
+            # video silently ships with a wrong name. Fail instead.
+            print(f"[PIPELINE_ERROR] {{\"error\": true, \"step\": 2, "
+                  f"\"step_name\": \"render\", \"code\": "
+                  f"\"RENDER_DEMO_NAMES_UNAVAILABLE\", \"message\": "
+                  f"\"demo name lookup failed ({str(e).replace(chr(34), chr(39))}); "
+                  "the POV would render without a verified player name\"}")
+            sys.exit(1)
         _DEMO_NAMES_CACHE[key] = out
     return _DEMO_NAMES_CACHE[key]
 
@@ -878,7 +886,15 @@ def _write_spec_lock_cfg(player_name: str | None) -> None:
     try:
         (GAME_CFG / "spec_lock.cfg").write_text(content, encoding="utf-8")
     except OSError as e:
-        print(f"  [WARN] could not write spec_lock.cfg: {e}")
+        # A missing spec_lock means CS2's camera is free to cut away from the POV
+        # (the director takes over on POV death), so the delivered video is not a
+        # POV any more. Not a warning.
+        print(f"[PIPELINE_ERROR] {{\"error\": true, \"step\": 2, "
+              f"\"step_name\": \"render\", \"code\": "
+              f"\"RENDER_SPEC_LOCK_WRITE_FAILED\", \"message\": "
+              f"\"could not write spec_lock.cfg ({str(e).replace(chr(34), chr(39))}); "
+              "the spectator camera would follow the director, not the POV\"}")
+        sys.exit(1)
 
 
 def _demo_player_name(steam_id: str, demo_parts: list[str]) -> str | None:
@@ -919,13 +935,11 @@ def rename_cfg_lines(rename_map: dict[str, str] | None) -> list[str]:
 def _write_render_autoexec(cvars: list[str], rename_map: dict[str, str] | None = None,
                            player_name: str | None = None,
                            hide_avatars: bool = False) -> None:
-    # Chat/console text: cs2archive.chat_hide owns the cvar list. The relayed
-    # "Console: ..." server lines that used to bleed into every full-HUD render
-    # are TextMsg prints — killed by cl_showtextmsg 0 (plus hidehud 128 for the
-    # chat panel). cl_chatfilters/tv_relaytextchat do NOT exist in CS2 and were
-    # no-ops. These MUST be in the game's autoexec.cfg (runs at launch, BEFORE
-    # the demo loads) — a sequence cfg alone loses the race against a print
-    # issued while CSDM is seeking.
+    # Chat/console text: cs2archive.chat_hide owns the cvar list (best-effort
+    # only — VERDICT 2026-10-07: the panel is ungovernable by cvar on the CSDM
+    # path, and the launch autoexec provably never reaches the render session;
+    # per explicit user decision there is no pixel cover-up — cfg or nothing).
+    # cl_chatfilters/tv_relaytextchat do NOT exist in CS2 and were no-ops.
     # Voice stays fully ON during render. tv_listen_voice_indices -1 (both halves =
     # 64-slot bitmask all-set) enables hearing every recorded player.
     # It does not repair the native speaker HUD; Swift handles that separately.
@@ -935,6 +949,8 @@ def _write_render_autoexec(cvars: list[str], rename_map: dict[str, str] | None =
     # player's cvars (the hook shipped without it and showed the wrong crosshair).
     lines = ["crosshair 1", "cl_show_observer_crosshair 0",
               *CHAT_HIDE_CFG, "snd_mvp_volume 0",
+              "engine_no_focus_sleep 0", "fps_max 0",
+              "fps_max_tools 0", "fps_max_ui 0",
               "snd_mute_losefocus 0", "voice_enable 1", "voice_modenable 1",
               "tv_listen_voice_indices -1",
               "tv_listen_voice_indices_h -1",
@@ -944,10 +960,23 @@ def _write_render_autoexec(cvars: list[str], rename_map: dict[str, str] | None =
     # missing-texture checkers. Hide them there; keep them for real rosters.
     if hide_avatars:
         lines += ["cl_hide_avatar_images 1",
-                  "cl_teamcounter_playercount_instead_of_avatars true"]
+                  "cl_teamcounter_playercount_instead_of_avatars 1"]
     else:
+        # Reset the compact-bar cvars here, in the LAUNCH cfg. CS2 latches
+        # them in the client config, and a hook/shorts render sets them to 1
+        # (`cs2archive.hud_score_blur.COMPACT_PLAYERCOUNT_CFG`); nothing reset
+        # them for a normal POV, so the next POV render inherited the hook's
+        # compact N-vs-N bar with no avatar row (caught 2026-10-10 on the
+        # flameZ EPL POV, right after the kyousuke hook render).
+        #
+        # Do NOT move this into the sequence cfg: `cs2_pov.cfg` runs
+        # `exec autoexec` mid-sequence, so a 0 there stomps the compact bar
+        # that hook/shorts sequence cfgs set for their own product (caught on
+        # the flameZ 4K short: avatars + overlapping score blur). Order is
+        # safe here — `lines += cvars` below lets a hook render re-assert 1.
         lines += ["cl_hide_avatar_images 0",
-                  "cl_teamcounter_playercount_instead_of_avatars false"]
+                  "cl_teamcounter_playercount_instead_of_avatars 0",
+                  "cl_hud_playercount_showcount 0"]
     lines += cvars
     lines.extend(rename_cfg_lines(rename_map))
 
@@ -970,7 +999,7 @@ def _write_render_autoexec(cvars: list[str], rename_map: dict[str, str] | None =
 
 def _viewmodel_cvars_from_args(args: argparse.Namespace) -> list[str]:
     """Build viewmodel convars from CLI flags or prosettings nickname lookup."""
-    from scrapers.prosettings import resolve_video_settings, viewmodel_convars
+    from scrapers.prosettings import VideoSettingsUnresolved, resolve_video_settings, viewmodel_convars
 
     settings: dict = {}
     if getattr(args, "viewmodel_fov", None) is not None:
@@ -987,10 +1016,61 @@ def _viewmodel_cvars_from_args(args: argparse.Namespace) -> list[str]:
     if not settings and getattr(args, "player", None):
         try:
             settings = resolve_video_settings(args.player, refresh_if_missing=True)
-        except Exception as e:
-            print(f"  [WARN] viewmodel lookup failed: {e}")
-            settings = {}
+        except VideoSettingsUnresolved as e:
+            # No silent empty cfg: viewmodel_convars({}) falls back to the GAME
+            # default viewmodel, so a lookup failure shipped a POV with the wrong
+            # viewmodel/FOV and nothing said so.
+            print(f"[PIPELINE_ERROR] {{\"error\": true, \"step\": 2, "
+                  f"\"step_name\": \"render\", \"code\": "
+                  f"\"RENDER_VIDEO_SETTINGS_UNRESOLVED\", "
+                  f"\"message\": \"{str(e).replace(chr(34), chr(39))}\"}}")
+            sys.exit(1)
     return viewmodel_convars(settings)
+
+
+def _resolve_player_nick(cli_nick: str, steam_id: str) -> str:
+    """Player nickname for prosettings lookups, with a steam_id fallback.
+
+    Manual ``render_pov`` runs often omit ``--player``; feeding the blank
+    nick to the crosshair lookup skips prosettings and drops the render onto
+    the demo share-code fallback — which is undecodable for current 46-char
+    codes (checksum mismatch on every code in the NiKo Mirage demo,
+    2026-10-07), so the render silently ships the game-default crosshair.
+    Resolve the canonical (prosettings) nickname from player_accounts.json by
+    steam_id instead.
+    """
+    from cs2archive.crosshair_resolve import canonical_nick
+
+    nick = (cli_nick or "").strip()
+    if nick:
+        return nick
+    canon = canonical_nick(steam_id, fallback="")
+    if canon:
+        print(f"  [crosshair] --player empty, resolved '{canon}' by steam_id")
+    return canon
+
+
+def _ensure_pro_crosshair(cvars: list[str], steam_id: str, player_nick: str) -> None:
+    """Abort loudly when a Recognised Pro ends up with no crosshair cvars.
+
+    A transient prosettings failure combined with the undecodable demo
+    share-code fallback used to burn a multi-hour render on the game-default
+    crosshair with only a WARN (NiKo Mirage 2026-10-07). Refuse instead;
+    unknown players keep the old warn-and-proceed behaviour.
+    """
+    if any(c.startswith("cl_crosshair") for c in cvars):
+        return
+    from cs2archive.crosshair_resolve import canonical_nick
+
+    if canonical_nick(steam_id, fallback=""):
+        sys.exit(
+            "[ERROR] No crosshair cvars resolved for recognised pro "
+            f"'{player_nick or steam_id}' (prosettings miss + demo "
+            "share-code fallback failed). Refusing to render with the "
+            "game-default crosshair — retry (transient lookup failure) or fix "
+            "the lookup, then re-run."
+        )
+    print("  [WARN] No crosshair cvars resolved — using game-default crosshair")
 
 
 def _swap_autoexec(src: Path) -> None:
@@ -1099,10 +1179,14 @@ def main() -> None:
     # Capture resolution: ignore the pro's own in-game resolution (CR-17).
     # Render at the tallest resolution this machine supports AT THE POV'S
     # ASPECT RATIO; concat_rounds then stretches that native frame to the 16:9
-    # export target (no letterboxing, ever). Falls back to the 16:9 machine max.
+    # export target (no letterboxing, ever). The aspect MUST be known: this used
+    # to fall back to the 16:9 machine max, which silently rendered a 4:3 player
+    # (dem0n, 2026-11-07) into a 16:9 frame — wrong FOV, wrong framing, hours
+    # wasted. Unknown aspect is now a hard fail.
     from cs2archive.capture_res import capture_size_for_aspect, capture_size_for_player
 
     _acct = None
+    _acct_error = ""
     if args.width is None or args.height is None:
         try:
             _accounts_path = _PROJECT_ROOT / ".data" / "player_accounts.json"
@@ -1112,9 +1196,27 @@ def main() -> None:
                     (a for a in _accounts if a.get("steam_id") == args.steam_id),
                     None,
                 )
-        except Exception:
-            pass
-    _cap_w, _cap_h = capture_size_for_player(_acct) or capture_size_for_aspect("")
+        except (OSError, json.JSONDecodeError) as exc:
+            _acct_error = f"player_accounts.json unreadable: {exc}"
+
+    if args.width is not None and args.height is not None:
+        _cap_w, _cap_h = args.width, args.height
+    else:
+        _size = capture_size_for_player(_acct)
+        if _size is None:
+            reason = _acct_error or (
+                "no account record for steam_id " + str(args.steam_id)
+                if not _acct else
+                "account has no usable aspect_ratio/resolution"
+            )
+            print("[PIPELINE_ERROR] {\"error\": true, \"step\": 2, "
+                  "\"step_name\": \"render\", \"code\": "
+                  "\"RENDER_CAPTURE_ASPECT_UNKNOWN\", \"message\": "
+                  f"\"cannot determine the POV aspect ratio ({reason}); refusing to "
+                  "guess 16:9. Set resolution/aspect_ratio on the player account or "
+                  "pass --width/--height\"}")
+            sys.exit(1)
+        _cap_w, _cap_h = _size
 
     if args.width is None:
         args.width = _cap_w
@@ -1126,8 +1228,21 @@ def main() -> None:
 
     demo_path = _ensure_demo(args.demo, args.hf_root, args.hf_repo, args.match_slug, args.match_id)
 
-    from cs2archive.pov.render_version_check import RenderVersionError, assert_render_versions
+    from cs2archive.pov.render_version_check import (
+        RenderVersionError,
+        assert_render_versions,
+        ensure_hlae_for_cs2,
+    )
 
+    # HLAE adapts to the running CS2: pick the right installed HLAE and repoint
+    # CSDM before the version gate reads it (Steam updates AND rollbacks both
+    # used to invalidate the one hard-coded path).
+    if ensure_hlae_for_cs2() is None:
+        print("[PIPELINE_ERROR] {\"error\": true, \"step\": 2, \"step_name\": \"render\", "
+              "\"code\": \"RENDER_NO_HLAE_INSTALLED\", \"message\": \"No HLAE found under "
+              "~/.csdm/hlae-versions — install one from "
+              "https://github.com/advancedfx/advancedfx/releases\"}")
+        sys.exit(1)
     try:
         vers = assert_render_versions(demo_path)
         print(
@@ -1158,7 +1273,8 @@ def main() -> None:
 
     from cs2archive.crosshair_code import effective_crosshair_height
     from cs2archive.crosshair_resolve import resolve_crosshair_cvars
-    player_nick = (getattr(args, "player", "") or "").strip()
+    player_nick = _resolve_player_nick(
+        (getattr(args, "player", "") or "").strip(), args.steam_id)
     xhair_h = effective_crosshair_height(args.height)
     if xhair_h != args.height:
         print(f"  [crosshair] pixel convert at {xhair_h}p "
@@ -1167,6 +1283,7 @@ def main() -> None:
         player_nick, args.steam_id, parts[0],
         csdm_cmd=CSDM, screen_height=xhair_h, demo_paths=parts,
     )
+    _ensure_pro_crosshair(cvars, args.steam_id, player_nick)
     xhair_info = {**xhair_info, "screen_height": xhair_h}
     try:
         (output_dir / "crosshair_used.json").write_text(
@@ -1251,11 +1368,11 @@ def main() -> None:
         if not args.no_minimize_cs2:
             # Park-behind: bring CS2 to the foreground for a beat on launch (so it
             # renders at full speed instead of being throttled while unactivated),
-            # then drop it restored *behind* your other windows (not minimized).
-            # fps_max 0 in the render cfg removes any FPS cap.
+            # then keep it restored behind other windows. The sequence cfg
+            # disables engine background sleep and separate FPS limiters.
             minimizer = CS2Park()
             minimizer.start()
-            print("CS2 park-behind enabled (briefly focuses on launch, then parks behind)")
+            print("CS2 park-behind enabled (restored; background sleep disabled by cfg)")
 
         global_round = 0
         total_rendered = 0

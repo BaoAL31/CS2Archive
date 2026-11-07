@@ -450,7 +450,9 @@ def test_footage_budget_drops_weakest_first():
 
 def test_rule_version_bumps_cache():
     from cs2archive.pov.build_hook_timeline import INSTA_RULE_VERSION, timeline_matches
-    assert INSTA_RULE_VERSION == 13
+    # v14 = content-only hook scoring; the literal matters because a stale
+    # timeline is only rebuilt when the stored version differs from this one.
+    assert INSTA_RULE_VERSION == 14
     assert timeline_matches({"params": {"tiers": [], "min_round": 2,
                                         "max_moments": 3, "max_seconds": 30.0,
                                         "rule_version": 7}},
@@ -759,23 +761,26 @@ def test_hs_bonus_never_breaks_tier_order():
     assert moment_quality(plain_insta) > moment_quality(rich_kill)
 
 
-def test_trade_deters_insta_scale_points():
-    from cs2archive.pov.build_hook_timeline import TRADE_DETER_POINTS
-    assert TRADE_DETER_POINTS == 100.0  # ceiling of the (0.5 - ttk) * 200 scale
+def test_trade_flag_costs_nothing():
+    """A revenge kill looks identical on screen to any other kill.
+
+    Trade used to subtract 100 points, which let round-context ranking leak
+    into clip quality. Category data must not move the score at all.
+    """
     clean = _cand(68435, tier_rank=8)
     traded = _cand(68435, tier_rank=8, trade_ticks=[68435])
-    assert moment_quality(clean) - moment_quality(traded) == 100.0
+    assert moment_quality(clean) == moment_quality(traded)
 
 
-def test_trade_deter_survives_chain_merge():
+def test_chain_merge_keeps_content_score_flat():
+    """Merging a same-kill sibling must not change what the clip is worth."""
     from cs2archive.pov.build_hook_timeline import _merge_moments
     target = _cand(68435, tier_rank=8, start=67776, end=68563)
-    src = _cand(68435, tier_rank=11, start=68115, end=68563,
-                trade_ticks=[68435])
-    _merge_moments(target, src)
-    assert target["trade_ticks"] == [68435]
-    assert target["tier_rank"] == 8  # best tier still wins
-    assert moment_quality(_cand(68435, tier_rank=8)) - moment_quality(target) == 100.0
+    src_m = _cand(68435, tier_rank=11, start=68115, end=68563,
+                  trade_ticks=[68435])
+    before = moment_quality(target)
+    _merge_moments(target, src_m)
+    assert moment_quality(target) == before
 
 
 def test_moment_candidates_score_heads_up():
@@ -877,8 +882,9 @@ def test_insta_bonus_rides_fragment_scoring():
     insta = {"tier": "insta_kill", "tier_rank": 8, "kill_ticks": [1000],
              "insta_ticks": {1000: INSTA_QUALITY_BONUS}}
     credit = kill_credit_index(None, None, [m, insta])
-    # fragment: 100 kill + 250 insta, no tier base
-    assert segment_quality([1000], m, credit) == 100.0 + INSTA_QUALITY_BONUS
+    # fragment: kill points + 250 insta, no category base
+    from cs2archive.pov.build_hook_timeline import KILL_POINTS
+    assert segment_quality([1000], m, credit) == KILL_POINTS + INSTA_QUALITY_BONUS
 
 
 def test_punch_chain_counts_each_head_once():
@@ -984,11 +990,19 @@ def _q(tier, kills=1, ttk=None, clutch="", start=1000):
             "start_tick": start}
 
 
-def test_quality_tier_dominates_kills_and_ttk():
-    assert moment_quality(_q("4k", kills=4)) > moment_quality(
+def test_quality_is_content_only_category_never_scores():
+    """The viewer sees the clip, not the round: category buys no points.
+
+    A 2-kill clip must beat a 1-kill clip whatever tier either was found by,
+    and two clips with identical content must score identically even when one
+    is a "clutch_1v5" and the other a plain "kill".
+    """
+    # more kills on screen wins, regardless of category
+    assert moment_quality(_q("kill", kills=2)) > moment_quality(
         _q("insta_kill", kills=1, ttk=0.06))
-    assert moment_quality(_q("insta_kill", kills=1)) > moment_quality(
-        _q("kill", kills=3))
+    # identical content, wildly different categories: identical score
+    assert moment_quality(_q("clutch_1v5", kills=2)) == moment_quality(
+        _q("trade", kills=2))
 
 
 def test_quality_more_kills_then_faster_ttk():
@@ -1039,12 +1053,13 @@ def test_segment_fragment_scores_enclosed_kills_only():
               2000: {"hs": False, "peek": 0.0, "trade": True},
               3000: {"hs": True, "peek": 0.0, "trade": False},
               4000: {"hs": False, "peek": 0.0, "trade": False}}
-    # headshot + peek reaction, no tier base
-    assert segment_quality([1000], m, credit) == 250.0
-    # traded kill: kill points minus the deter, still no tier base
-    assert segment_quality([2000], m, credit) == 0.0
+    # content only: kill points + headshot credit + peek reaction
+    from cs2archive.pov.build_hook_timeline import KILL_HS_FLAT, KILL_POINTS
+    assert segment_quality([1000], m, credit) == KILL_POINTS + KILL_HS_FLAT + 100.0
+    # a traded kill is worth exactly what any other plain kill is worth
+    assert segment_quality([2000], m, credit) == KILL_POINTS
     # plain kill
-    assert segment_quality([4000], m, credit) == 100.0
+    assert segment_quality([4000], m, credit) == KILL_POINTS
 
 
 def test_segment_fuses_sibling_candidate_credits():
@@ -1055,7 +1070,9 @@ def test_segment_fuses_sibling_candidate_credits():
              "hs_ticks": {1000: 50.0}, "peek_ticks": {1000: 100.0},
              "trade_ticks": []}
     credit = kill_credit_index(None, None, [clutch, insta])
-    assert segment_quality([1000], clutch, credit) == 250.0
+    from cs2archive.pov.build_hook_timeline import KILL_HS_FLAT, KILL_POINTS
+    # kill points + the fused headshot credit + the fused peek bonus
+    assert segment_quality([1000], clutch, credit) == KILL_POINTS + KILL_HS_FLAT + 100.0
 
 
 def test_chain_best_segment_ranks_unbroken_triple_first():

@@ -4,9 +4,9 @@ Reads ``short_timeline.json``, renders tick-range source clips at the player's
 native capture resolution (from player_accounts.json, e.g. 1280×960 for donk),
 then composites each into 1080×1920 with edge mirror blur header/footer.
 
-HUD policy: full player HUD with the compact alive-count team bar (N vs N
-numbers, not the avatar row — the row does not survive the 9:16 centre crop);
-the two score digits are blurred in the composite so a short leaks no score
+HUD policy: killfeed only (``cl_draw_only_deathnotices 1``) — no score row,
+no team bar. Because the HUD is off there is nothing to hide, so the score
+blur is OFF by default; ``--score-blur`` re-enables it for a full-HUD render
 (``cs2archive/hud_score_blur.py``).
 
 Usage:
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -32,7 +33,6 @@ from cs2archive.shorts import resolve_output_dir  # noqa: E402
 from cs2archive.shorts.dead_gap_trim import apply_dead_gap_trim  # noqa: E402
 from cs2archive.shorts.make_short_meta import make_meta  # noqa: E402
 from cs2archive.hud_score_blur import (  # noqa: E402
-    COMPACT_PLAYERCOUNT_CFG,
     HUD_POLICY,
     score_blur_filter,
 )
@@ -51,7 +51,12 @@ CSDM = settings.csdm_cmd
 SHORTS_HUD_LINES = [
     "cl_draw_only_deathnotices 0",
     "cl_drawhud 1",
-    *COMPACT_PLAYERCOUNT_CFG,
+    # Full avatar bar, FORCED explicitly (plain + mirv force-apply): the bar
+    # rendered compact or full nondeterministically across identical cfgs
+    # (saved-config/build-default flip-flop, caught 2026-10-09) — never leave
+    # this to defaults again.
+    "cl_teamcounter_playercount_instead_of_avatars 0",
+    "mirv_cvar_hack cl_teamcounter_playercount_instead_of_avatars 0",
     *CHAT_HIDE_CFG,
     "snd_mvp_volume 0",
     "cl_showfps 0",
@@ -68,7 +73,6 @@ SRC_WIDTH = _DEFAULT_SRC_WIDTH
 SRC_HEIGHT = _DEFAULT_SRC_HEIGHT
 OUT_WIDTH = 1080
 OUT_HEIGHT = 1920
-EDGE_FADE_DUR = 0.6  # fade in from / out to black on the finished short (s)
 CSDM_RECORD_FRAMERATE = 60
 
 KILLFEED_CROP_W = 300
@@ -189,6 +193,18 @@ def _probe_resolution(path: Path) -> tuple[int, int]:
     return (int(parts[0]), int(parts[1]))
 
 
+# Does this product's HUD draw the score row? The killfeed-only HUD does not,
+# so the digit blur has nothing to cover — applying it anyway smudges live
+# gameplay in the top-centre of every short. Tie the blur to the HUD policy so
+# the two can never disagree again.
+HUD_SHOWS_SCORE = False
+
+# v2: killfeed-only HUD (no score row) + score blur gated on HUD_SHOWS_SCORE.
+# Stale v1 artifacts carry a blur smudge over clear gameplay and must be
+# re-composited, not reused.
+SHORTS_HUD_POLICY = "deathnotices-only-spec-lock-v2"
+
+
 def _hud_stamp_path(out_dir: Path) -> Path:
     return out_dir / "hud_policy.json"
 
@@ -201,13 +217,13 @@ def _hud_stamp_ok(out_dir: Path) -> bool:
     silently keep the old pixels.
     """
     try:
-        return json.loads(_hud_stamp_path(out_dir).read_text(encoding="utf-8")).get("hud") == HUD_POLICY
+        return json.loads(_hud_stamp_path(out_dir).read_text(encoding="utf-8")).get("hud") == SHORTS_HUD_POLICY
     except Exception:
         return False
 
 
 def _write_hud_stamp(out_dir: Path) -> None:
-    _hud_stamp_path(out_dir).write_text(json.dumps({"hud": HUD_POLICY}, indent=2), encoding="utf-8")
+    _hud_stamp_path(out_dir).write_text(json.dumps({"hud": SHORTS_HUD_POLICY}, indent=2), encoding="utf-8")
 
 
 def _ffmpeg_settings(use_cpu: bool = False) -> dict:
@@ -291,6 +307,11 @@ def _prepare_avatar_overlay(
     from PIL import Image, ImageFilter
 
     img = Image.open(avatar_path).convert("RGBA")
+    # Autocrop transparent padding: cutouts carry empty rows below the body
+    # that read as floating above the bottom edge once overlaid at y=bottom.
+    bbox = img.getbbox()
+    if bbox:
+        img = img.crop(bbox)
     w, h = img.size
     ratio = target_height / h
     img = img.resize((max(1, round(w * ratio)), target_height), Image.LANCZOS)
@@ -363,10 +384,30 @@ def _build_csdm_config(
     use_cpu: bool = False,
 ) -> dict:
     pov_sids = {s["pov_steam_id"] for s in shorts} | {s["pov_switch_to"] for s in shorts if "pov_switch_to" in s}
-    nicks = {s["pov_steam_id"]: (s.get("pov_nick") or "") for s in shorts}
+    # Canonical nick per POV, steam_id-first like render_pov: a blank/"Unknown"
+    # timeline nick skips prosettings and drops onto the (often undecodable)
+    # demo share-code fallback. Resolve from player_accounts.json instead.
+    from cs2archive.crosshair_resolve import canonical_nick
+
+    nicks = {}
+    for s in shorts:
+        sid = s["pov_steam_id"]
+        nick = (s.get("pov_nick") or "").strip()
+        if not nick or nick.lower() == "unknown":
+            nick = canonical_nick(sid, fallback="")
+        nicks[sid] = nick
+    for sid in pov_sids:
+        if sid not in nicks:
+            nicks[sid] = canonical_nick(sid, fallback="")
+    # Same refusal as render_pov._ensure_pro_crosshair: a Recognised Pro with
+    # no crosshair cvars (prosettings miss + undecodable demo share code)
+    # must abort here, not silently ship the game-default crosshair.
+    from cs2archive.pov.render_pov import _ensure_pro_crosshair
+
     crosshair_cache = {}
     for sid in pov_sids:
         cvars = _get_player_crosshair_cvars(sid, demo_path, nicks.get(sid, ""))
+        _ensure_pro_crosshair(cvars, sid, nicks.get(sid, ""))
         if cvars:
             crosshair_cache[sid] = cvars
             _dbg("xhair", f"crosshair for {sid}: {len(cvars)} cvars")
@@ -392,6 +433,34 @@ def _build_csdm_config(
         from cs2archive.pov.render_pov import hud_sequence_cfg
 
         cfg_lines = hud_sequence_cfg(SHORTS_HUD_LINES, cvars).splitlines()
+        # Apply after the shared base/autoexec, which restores full HUD.
+        # Death notices remain available for the dedicated kill-feed crop.
+        cfg_lines.extend([
+            "cl_draw_only_deathnotices 1",
+            "mirv_cvar_hack cl_draw_only_deathnotices 1",
+            "crosshair 1",
+        ])
+
+        # CSDM's initial playerCamera can fail to stick after seeking. Lock
+        # single-POV cuts explicitly, after the shared cfg's exec spec_lock
+        # (which may contain off or a previous product's target).
+        if "pov_switch_to" not in s:
+            import demoparser2 as dp
+            from cs2archive.pov.render_pov import SPEC_LOCK_SNIPPET, _ensure_spec_lock_snippet
+
+            roster = dp.DemoParser(str(demo_path)).parse_player_info()
+            names = {str(row["steamid"]): str(row["name"]).strip()
+                     for row in roster.to_dict(orient="records")}
+            demo_name = names.get(str(pov_sid), "")
+            if not demo_name:
+                raise RuntimeError(f"Cannot lock Shorts POV: no demo name for {pov_sid}")
+            _ensure_spec_lock_snippet()
+            safe_name = demo_name.replace('"', '').replace('\n', '').replace('\r', '')
+            cfg_lines.extend([
+                f'mirv_script_load "{SPEC_LOCK_SNIPPET}"',
+                f'mirv_script_spec_lock_name "{safe_name}"',
+                'spec_mode 1',
+            ])
 
         # Automatically rename the POV player's in-HUD name to their canonical
         # nickname (HLAE mirv_replace_name, 2.184+). The demo records the
@@ -584,7 +653,7 @@ def _composite_9x16(
     avatar_height: int = AVATAR_DEFAULT_HEIGHT,
     avatar_bottom_margin: int = AVATAR_BOTTOM_MARGIN,
     use_cpu: bool = False,
-    score_blur: bool = True,
+    score_blur: bool = HUD_SHOWS_SCORE,
     src_duration: float | None = None,
 ) -> None:
     """Composite a source clip into 1080x1920 via ffmpeg filter chain.
@@ -620,7 +689,8 @@ def _composite_9x16(
     libx264 for CPU when *use_cpu* is True (allows parallel ffmpeg
     sessions when GPU already occupied).
     Decode: cuda hwaccel for GPU path; CPU path uses no hwaccel.
-    Audio: re-encoded AAC (fades baked in — see EDGE_FADE_DUR).
+    Picture and audio start/end directly, without automatic edge fades.
+    Audio is copied from the source.
     """
     gblur_sigma = max(1, blur_radius // 2)
 
@@ -647,14 +717,17 @@ def _composite_9x16(
         _dbg("9x16", f"{src.name}: 1080x1920 canvas, src={src_width}x{src_height} ({scaling_mode}), scale={scale}x, blur_sigma={gblur_sigma}")
 
     # Optional stretch pre-filter applied to [0:v], then the score-digit blur
-    # (full-HUD policy: alive counts stay sharp). Both stages are
-    # resolution-independent; bg/fg/pip all split from [sbase] afterwards.
+    # (full avatar bar: two gutter boxes over the digits only, portraits and
+    # timer stay sharp). Both stages are resolution-independent; bg/fg/pip
+    # all split from [sbase] afterwards.
     if stretch:
         pre = f"[0:v]scale={stretched_w}:{stretched_h}:flags=spline,setsar=1[base];"
-        pre += (score_blur_filter("base", "sbase", stretched_w, stretched_h, tag="ssb")
+        pre += (score_blur_filter("base", "sbase", stretched_w, stretched_h, tag="ssb",
+                                  compact=False)
                 if score_blur else "[base]null[sbase]") + ";"
     elif score_blur:
-        pre = score_blur_filter("0:v", "sbase", src_width, src_height, tag="ssb") + ";"
+        pre = score_blur_filter("0:v", "sbase", src_width, src_height, tag="ssb",
+                                compact=False) + ";"
     else:
         pre = ""
     split_src = "[sbase]" if (stretch or score_blur) else "[0:v]"
@@ -786,26 +859,6 @@ def _composite_9x16(
             )
             cmd[cmd.index("-filter_complex") + 1] = vf
 
-    # Fade in from black / out to black on the finished canvas (video +
-    # audio). Trim only cuts middle gaps, never head/tail, so baking the
-    # edge fades here is safe. Duration comes from the caller: probing here
-    # would add a subprocess call that breaks the mocked-subprocess tests.
-    _dur = src_duration if src_duration is not None else 0.0
-    if _dur > 2 * EDGE_FADE_DUR:
-        _out_st = max(0.0, _dur - EDGE_FADE_DUR)
-        _fi = cmd.index("-filter_complex")
-        cmd[_fi + 1] += (f";[out]fade=t=in:st=0:d={EDGE_FADE_DUR},"
-                         f"fade=t=out:st={_out_st:.3f}:d={EDGE_FADE_DUR}[outf]")
-        cmd[cmd.index("[out]")] = "[outf]"
-        _ai = cmd.index("-c:a")
-        cmd[_ai + 1] = "aac"
-        cmd[_ai + 2:_ai + 2] = [
-            "-af",
-            f"afade=t=in:st=0:d={EDGE_FADE_DUR},"
-            f"afade=t=out:st={_out_st:.3f}:d={EDGE_FADE_DUR}",
-            "-b:a", "160k",
-        ]
-
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if r.returncode != 0:
         raise RuntimeError(
@@ -840,7 +893,7 @@ def render_shorts(
     hook_timeout: float = 150.0,
     hook_retries: int = 2,
     use_cpu: bool = False,
-    score_blur: bool = True,
+    score_blur: bool = HUD_SHOWS_SCORE,
 ) -> Path:
     """Render all shorts from a timeline JSON.
     
@@ -1049,8 +1102,39 @@ def render_shorts(
         except Exception as e:
             _dbg("meta", f"[WARN] meta generation failed: {e}")
 
+    # Durable short -> demo provenance. Instrumentation only: it never changes
+    # the rendered bytes and never alters selection. A failure is loud but
+    # non-fatal, and it is the only record that survives the render purge.
+    _record_linkage(out_dir, timeline_path)
+
     print(f"\nDone. Shorts in {out_dir}")
     return out_dir
+
+
+def _record_linkage(out_dir: Path, timeline_path: Path) -> None:
+    """Best-effort linkage staging; never raises into the render."""
+    if os.environ.get("CS2ARCHIVE_NO_LINKAGE"):
+        return
+    try:
+        from cs2archive.shorts.social.linkage import record_render_linkage
+    except Exception as e:  # noqa: BLE001 - optional instrumentation
+        print(f"[linkage][WARN] import failed: {e}", flush=True)
+        return
+    try:
+        candidates = sorted(Path(out_dir).glob("*.mp4"),
+                            key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        candidates = []
+    record = record_render_linkage(
+        timeline_path,
+        video_path=candidates[0] if candidates else None,
+        out_dir=Path(out_dir),
+        selection={"entry": "render_shorts"},
+        log=lambda msg: print(msg, flush=True))
+    if record is not None:
+        _dbg("linkage", f"staged short_id={record['short_id']} "
+                        f"round={record.get('round')} "
+                        f"demo={record.get('demo_path')}")
 
 
 def main() -> int:
@@ -1086,10 +1170,14 @@ def main() -> int:
     ap.add_argument("--no-rename", action="store_true",
                     help="Disable automatic HUD player-name rename to canonical nickname "
                          "(mirv_replace_name). Default: on.")
+    ap.add_argument("--score-blur", action="store_true",
+                    help="Blur the top-bar score digits. OFF by default: the "
+                         "shorts HUD is killfeed-only and draws no score row, "
+                         "so the boxes would smudge clear gameplay. Only "
+                         "meaningful for a full-HUD render "
+                         "(boxes: cs2archive/hud_score_blur.py)")
     ap.add_argument("--no-score-blur", action="store_true",
-                    help="Skip blurring the top-bar score digits (debug / "
-                         "geometry tuning — the blur boxes live in "
-                         "cs2archive/hud_score_blur.py)")
+                    help="Deprecated no-op: score blur is already off by default")
     ap.add_argument("--hook-timeout", type=float, default=150.0,
                    help="Seconds to wait for HLAE to hook CS2 and emit a sequence file "
                         "before treating it as a hook failure (default: 150). "
@@ -1128,7 +1216,7 @@ def main() -> int:
                         rename=not args.no_rename, make_meta_on=not args.no_meta,
                         tournament=args.tournament, year=args.year,
                         hook_timeout=args.hook_timeout, hook_retries=args.hook_retries,
-                        use_cpu=use_cpu, score_blur=not args.no_score_blur)
+                        use_cpu=use_cpu, score_blur=args.score_blur)
         return 0
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)

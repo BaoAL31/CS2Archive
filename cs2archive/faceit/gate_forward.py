@@ -64,7 +64,7 @@ def own_channel_rows(own_rows: list[dict] | None = None) -> list[dict]:
     """Fresh own-channel rows: main seed union first, own CSV as fallback."""
     if own_rows is not None:
         return [r for r in own_rows if (r.get("channel") or "") == OWN_CHANNEL]
-    fresh = [r for r in _deduped_seed_rows()
+    fresh = [r for r in _deduped_seed_rows(include_own=True)
              if (r.get("channel") or "") == OWN_CHANNEL]
     if fresh:
         return fresh
@@ -77,8 +77,11 @@ def own_channel_median_vpd(*, now: datetime | None = None,
                            own_rows: list[dict] | None = None) -> dict:
     """Median views/day of our own long-form channel (the kill denominator)."""
     now = now or datetime.now(timezone.utc)
+    aliases = recognised_aliases()
     velocities = []
     for row in own_channel_rows(own_rows):
+        if not aliases.get(str(row.get("primary_player") or "").strip().casefold()):
+            continue
         try:
             if float(row.get("duration_seconds") or 0) < 300:
                 continue
@@ -88,7 +91,7 @@ def own_channel_median_vpd(*, now: datetime | None = None,
         if parsed is None:
             continue
         _vpd_raw, age = parsed
-        if age < min_age_days:
+        if age < min_age_days or age > WINDOW_DAYS:
             continue
         try:
             views = float(row.get("views") or 0)
@@ -108,17 +111,17 @@ def _read_csv(path: Path) -> list[dict]:
         return list(csv.DictReader(handle))
 
 
-def _deduped_seed_rows() -> list[dict]:
-    """Seed union deduped by video_id (newest capture wins), own channel out.
+def _deduped_seed_rows(*, include_own: bool = False) -> list[dict]:
+    """Seed union deduped by video_id (newest capture wins).
 
     Raw seed CSVs overlap heavily (re-exports across folders); without
-    dedupe the median is a weighted multiset. Own uploads are excluded:
-    they are the numerator, never the baseline.
+    dedupe the median is a weighted multiset. Competitor callers exclude own
+    uploads by default; the own-channel numerator explicitly includes them.
     """
     latest: dict[str, dict] = {}
     for row in sorted(load_seed_rows(),
                       key=lambda r: str(r.get("captured_at") or "")):
-        if (row.get("channel") or "") == OWN_CHANNEL:
+        if not include_own and (row.get("channel") or "") == OWN_CHANNEL:
             continue
         video_id = str(row.get("video_id") or "").strip()
         if video_id:
@@ -226,6 +229,7 @@ def own_table(*, now: datetime | None = None,
     own_med = own_channel_median_vpd(now=now, own_rows=own_rows)
     own_median = own_med["median_vpd"]
     out = []
+    aliases = recognised_aliases()
     for row in own_channel_rows(own_rows):
         try:
             if float(row.get("duration_seconds") or 0) < 300:
@@ -236,9 +240,8 @@ def own_table(*, now: datetime | None = None,
         if parsed is None:
             continue
         _vpd_raw, age = parsed
-        if age < VELOCITY_FLOOR_DAYS:
+        if age < VELOCITY_FLOOR_DAYS or age > WINDOW_DAYS:
             continue
-        aliases = recognised_aliases()
         raw = (row.get("primary_player") or "").strip()
         player = aliases.get(raw.casefold()) if raw else None
         if not player:

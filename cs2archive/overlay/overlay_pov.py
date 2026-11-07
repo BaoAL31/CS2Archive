@@ -608,24 +608,30 @@ def _extract_keyboard_states(
             tick_range = re - rs
             # Use video round duration (NOT game-time duration) for tick scaling
             vid_dur = (round_video_duration or {}).get(rn)
-            if vid_dur and vid_dur > 0 and tick_range > 0:
-                tick = rs + int((offset_sec / vid_dur) * tick_range)
-            else:
-                # Fallback: offset_sec * TICKRATE (wrong for compressed video, but used only as last resort)
-                tick = rs + int(offset_sec * TICKRATE)
+            if not (vid_dur and vid_dur > 0 and tick_range > 0):
+                # Hard fail: the old `offset_sec * TICKRATE` guess is wrong for
+                # compressed video (frames are not uniformly tick-spaced), so key
+                # states land on the wrong frames and the overlay lies about what
+                # the player pressed, at the moment they pressed it.
+                _log("[ERROR] no per-round video duration for round "
+                     f"{rn} — cannot map video frames to demo ticks without "
+                     "guessing. Re-run the concat step so "
+                     "combined.round_offsets.json carries per_round_durations.")
+                sys.exit(1)
+            tick = rs + int((offset_sec / vid_dur) * tick_range)
             tick = max(rs, min(re, tick))
             states = tick_states.get(tick, zero)
             for sig in _OVERLAY_SIGNALS:
                 per_sig[sig].append(int(states.get(sig, 0)))
     else:
-        # Fallback: linear tick mapping from base_tick
-        base_tick = all_ticks[0] if all_ticks else 0
-        _log(f"  [mapping] Linear tick mapping from tick {base_tick}")
-        for f_idx in range(frame_count):
-            t = base_tick + int(f_idx * TICKRATE / fps)
-            states = tick_states.get(t, zero)
-            for sig in _OVERLAY_SIGNALS:
-                per_sig[sig].append(int(states.get(sig, 0)))
+        # No per-round frame mapping at all: a linear tick guess puts EVERY key
+        # press at the wrong time. Refuse instead of shipping a misleading
+        # input overlay.
+        _log("[ERROR] no per-round frame mapping available (round_offsets / "
+             "per_round_durations missing) — refusing to guess the tick timeline. "
+             "Re-run the concat step, or pass --no-keyboard to ship without an "
+             "input overlay.")
+        sys.exit(1)
 
     total_pressed = sum(sum(v) for v in per_sig.values())
     _log(f"  [keyboard] {total_pressed} non-idle across {len(per_sig)} signals")

@@ -26,6 +26,7 @@
 # script reports SKIPPED instead of comparing.
 
 # --- measured 2026-09-28: 14 entries, 12 remaining after F1 DOCFIX ---
+# --- now 12 entries (render_version_check entry removed 2026-10-17) ---
 # (2026-10-04: test_queue_sorts_by_weight_then_rating and
 # test_select_prefers_weight_over_rating were inverted to the shipped
 # rating-ordered policy and removed from the baseline.)
@@ -45,8 +46,8 @@ FAILED tests/test_render_shorts.py::test_scale_scales_foreground_wider
 # The next entry was the concurrent agent's in-flight HP-gate change; it landed
 # (their test expectation caught up) and the test now passes — removed 2026-09-29.
 #
-# The next entry is the concurrent agent's in-flight render_version_check drift:
-# their source added an upper bound for CS2 1.41.8.5 but their test expectation
-# has not caught up (CR-13, expires 2026-11-15). Remove when their change lands.
-FAILED tests/test_render_version_check.py::test_hlae_bounds_for_cs2_table
+# The next entry was the concurrent agent's in-flight render_version_check drift:
+# their source added the CS2 1.41.8.5/1.41.9.x pin rows while their test expectation
+# stayed hardcoded. Their expectation is now derived from the pin table (so the next
+# game update cannot rot it) and the test passes — removed 2026-10-17.
 

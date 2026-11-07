@@ -24,6 +24,10 @@ param(
     [switch]$RefreshTeams,
     [switch]$NoRefreshTeams,
     [switch]$FaceitHighlights,
+    # HLAE hook attempts per render, forwarded to the pipeline/render_pov.
+    # The vanilla-viewer flake ("Game error") eats the first launch often
+    # enough that the default of 2 is thin; 4 rides it out.
+    [int]$HookRetries = 0,
     # Keep the on-disk result baseline AND the on-disk queue. Without this every
     # launch clears state.data["queue"] (fresh edge), which would wipe a
     # manually re-queued POV before it can render.
@@ -43,6 +47,7 @@ if ($DryRun) { $Args += "--dry-run" }
 if ($RefreshTeams) { $Args += "--refresh-teams" }
 if ($NoRefreshTeams) { $Args += "--no-refresh-teams" }
 if ($FaceitHighlights) { $Args += "--faceit-highlights" }
+if ($HookRetries -gt 0) { $Args += @("--hook-retries", $HookRetries) }
 if ($NoRebaseline) { $Args += "--no-rebaseline" }
 
 Set-Location $Root
@@ -78,15 +83,27 @@ try {
     $par = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $me.ParentProcessId) -ErrorAction SilentlyContinue | Select-Object -First 1
     Write-Host ("[wrapper-parent] pid={0} parent={1} ({2}) cmd={3}" -f $MyPid, $par.Name, $me.ParentProcessId, $par.CommandLine)
 } catch { Write-Host ("[wrapper-parent] lookup failed: {0}" -f $_) }
+$ConsecutiveFailures = 0
+# A restart loop that never terminates converts loud failures into silence:
+# the ZywOo grand-final render hard-failed 713 times over 6 hours while the
+# wrapper absorbed every one, so no task notification ever fired (the channel
+# only reports terminal state) and the failures sat unseen in a growing output
+# file. Cap the restarts so the failure reaches a terminal state and is alertable.
+$MaxRestarts = 3
 try {
     do {
         & $Python @Args
         $Code = $LASTEXITCODE
+        if ($Code -ne 0) { $ConsecutiveFailures++ } else { $ConsecutiveFailures = 0 }
         if (-not $Once) {
-            Write-Warning "Listener exited with code $Code; restarting in 30 seconds."
-            Start-Sleep -Seconds 30
+            if ($ConsecutiveFailures -lt $MaxRestarts) {
+                Write-Warning ("Listener exited with code {0}; restart {1}/{2} in 30 seconds." -f $Code, $ConsecutiveFailures, $MaxRestarts)
+                Start-Sleep -Seconds 30
+            } else {
+                Write-Warning ("Listener exited with code {0} and failed {1} times in a row - giving up so the failure is visible (a silent restart loop is worse than a stopped listener)." -f $Code, $ConsecutiveFailures)
+            }
         }
-    } while (-not $Once)
+    } while (-not $Once -and $ConsecutiveFailures -lt $MaxRestarts)
 } finally {
     Stop-Transcript | Out-Null
 }

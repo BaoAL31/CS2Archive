@@ -6,52 +6,72 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
 import cs2archive.crosshair_resolve as crosshair_resolve  # noqa: E402
 
 
-def test_unknown_nick_skips_prosettings():
+def test_unknown_nick_uses_demo_share_code(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(crosshair_resolve, "CACHE_PATH", tmp_path / "cache.json")
+    rows = [{"steamId": "123",
+             "crosshairShareCode": "CSGO-dGik3-tOynV-MWMqb-KMiLO-K7XXC"}]
     calls = []
 
     def fake_resolve(nick, fallback=None, **kwargs):
         calls.append(nick)
-        return (fallback(), {"source": "demo"}) if fallback else ([], {"source": "none"})
+        return [], {"source": "none"}
 
     with patch.object(crosshair_resolve, "resolve_crosshair", side_effect=fake_resolve):
-        with patch.object(crosshair_resolve, "demo_crosshair_cvars", return_value=["demo"]) as demo:
+        with patch.object(crosshair_resolve, "_demo_json_players", return_value=rows):
             cvars, info = crosshair_resolve.resolve_crosshair_cvars(
                 "Unknown", "123", Path("x.dem"), csdm_cmd="csdm")
 
-    assert cvars == ["demo"] and info["source"] == "demo"
-    assert calls == [""]
-    assert demo.call_args[0][:2] == ("123", Path("x.dem"))
+    assert info["source"] == "demo"
+    assert any(c.startswith("cl_crosshair") for c in cvars)
+    assert calls == []
 
 
-def test_blank_nick_skips_prosettings():
+def test_blank_nick_total_miss_raises(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(crosshair_resolve, "CACHE_PATH", tmp_path / "cache.json")
     with patch.object(crosshair_resolve, "resolve_crosshair",
-                       return_value=([], {"source": "none"})) as resolve:
-        with patch.object(crosshair_resolve, "demo_crosshair_cvars", return_value=[]):
-            cvars, info = crosshair_resolve.resolve_crosshair_cvars(
-                "", "123", Path("x.dem"), csdm_cmd="csdm")
-
-    assert cvars == [] and info["source"] == "none"
-    assert resolve.call_args[0][0] == ""
+                       return_value=([], {"source": "none"})):
+        with patch.object(crosshair_resolve, "_demo_json_players", return_value=[]):
+            with pytest.raises(RuntimeError, match="refusing game-default"):
+                crosshair_resolve.resolve_crosshair_cvars(
+                    "", "123", Path("x.dem"), csdm_cmd="csdm")
 
 
-def test_nick_goes_to_prosettings_first():
+def test_nick_goes_to_prosettings_first(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(crosshair_resolve, "CACHE_PATH", tmp_path / "cache.json")
     with patch.object(
         crosshair_resolve, "resolve_crosshair",
-        return_value=(["pro"], {"source": "prosettings"}),
+        return_value=(["cl_crosshairsize 2"],
+                      {"source": "prosettings", "settings": {"s": 1}}),
     ) as resolve:
-        with patch.object(crosshair_resolve, "demo_crosshair_cvars") as demo:
+        with patch.object(crosshair_resolve, "_demo_json_players") as demo_json:
             cvars, info = crosshair_resolve.resolve_crosshair_cvars(
                 "donk", "123", Path("x.dem"), csdm_cmd="csdm")
 
-    assert cvars == ["pro"] and info["source"] == "prosettings"
+    assert cvars == ["cl_crosshairsize 2"] and info["source"] == "prosettings"
     assert resolve.call_args[0][0] == "donk"
-    assert demo.call_count == 0
+    assert demo_json.call_count == 0
+    assert (tmp_path / "cache.json").is_file()
+
+
+def test_listed_pro_miss_skips_demo_and_raises(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(crosshair_resolve, "CACHE_PATH", tmp_path / "cache.json")
+    with patch.object(crosshair_resolve, "canonical_nick", return_value="flameZ"):
+        with patch.object(crosshair_resolve, "resolve_crosshair",
+                           return_value=([], {"source": "none"})):
+            with patch.object(crosshair_resolve, "_demo_json_players") as demo_json:
+                with pytest.raises(RuntimeError, match="listed players"):
+                    crosshair_resolve.resolve_crosshair_cvars(
+                        "flameZ", "999", Path("x.dem"), csdm_cmd="csdm")
+
+    assert demo_json.call_count == 0
 
 
 def test_demo_lookup_decodes_share_code(tmp_path: Path):
@@ -93,6 +113,28 @@ def test_demo_lookup_miss_returns_empty(tmp_path: Path):
 
     with patch.object(crosshair_resolve.subprocess, "run", side_effect=fake_run):
         assert demo_crosshair_cvars("999", tmp_path / "x.dem", csdm_cmd="csdm") == []
+
+
+def test_demo_lookup_matches_int_steam_id(tmp_path: Path):
+    # csdm may emit steamId as int; the lookup must not miss on type.
+    from cs2archive.crosshair_resolve import demo_crosshair_cvars
+
+    payload = {"players": [
+        {"steamId": 123, "crosshairShareCode": "CSGO-dGik3-tOynV-MWMqb-KMiLO-K7XXC"},
+    ]}
+
+    class _R:
+        returncode = 0
+
+    def fake_run(cmd, **kwargs):
+        out = Path(cmd[cmd.index("--output-folder") + 1])
+        (out / "a.json").write_text(json.dumps(payload), encoding="utf-8")
+        return _R()
+
+    with patch.object(crosshair_resolve.subprocess, "run", side_effect=fake_run):
+        cvars = demo_crosshair_cvars("123", tmp_path / "x.dem", csdm_cmd="csdm")
+
+    assert "cl_crosshairstyle 4" in cvars
 
 
 def test_shorts_wrapper_passes_nick():

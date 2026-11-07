@@ -76,7 +76,14 @@ def test_render_png_size():
     )
     im = Image.open(dest)
     try:
-        assert im.size == (WIDTH, HEIGHT)
+        # Message kept lazy (only built on failure) and diagnostic: this test has
+        # flaked once in a full-suite run with the file present, so the observed
+        # size and byte count are the evidence needed to tell a bad render from a
+        # bad read.
+        assert im.size == (WIDTH, HEIGHT), (
+            f"proof_01 render is {im.size}, expected {(WIDTH, HEIGHT)} "
+            f"({dest.name}: {dest.stat().st_size} bytes)"
+        )
     finally:
         im.close()
     dest.unlink(missing_ok=True)

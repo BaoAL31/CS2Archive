@@ -17,6 +17,7 @@ from pathlib import Path
 
 from cs2archive import scoring as _scoring
 from cs2archive.faceit.scrape_notable import FACEIT_STAR_FLOOR
+from cs2archive.faceit.pov_trends import TREND_VERSION
 
 RULE_VERSION = _scoring.DEMAND_RULE_VERSION
 
@@ -37,11 +38,14 @@ def gate_verdict(candidate: dict) -> dict:
     nick = str(candidate.get("player") or "")
     star, spike, index, supported, pi = _scoring.demand_eligibility(
         nick, None, star_floor=FACEIT_STAR_FLOOR)
-    passed = bool(star or spike)
+    trend = _scoring.early_pov_trend(nick)
+    passed = bool(star or spike or trend)
     if star:
         reason = f"star(ix={index})"
     elif spike:
         reason = f"breakout(pi={pi})"
+    elif trend:
+        reason = f"early_trend(ratio={trend['ratio']})"
     else:
         reason = "reject"
     return {
@@ -49,13 +53,15 @@ def gate_verdict(candidate: dict) -> dict:
         "match_id": candidate.get("match_id"),
         "stream": candidate.get("stream"),
         "date": str(candidate.get("date") or "")[:10],
-        "rule": f"star-or-breakout@{RULE_VERSION}",
+        "rule": f"star-or-breakout@{RULE_VERSION}+early-trend@{TREND_VERSION}",
         "verdict": "pass" if passed else "reject",
         "reason": reason,
         "index": index,
         "supported": supported,
         "breakout_or": bool(spike),
         "breakout_pi": pi,
+        "early_trend": trend,
+        "early_trend_version": TREND_VERSION,
     }
 
 
@@ -80,7 +86,7 @@ def record_gate_scrape(source: str, candidates: list[dict],
                 "ts": stamp,
                 "source": source,
                 "kind": "scrape",
-                "rule": f"demand-only@{RULE_VERSION}",
+                "rule": f"star-or-breakout@{RULE_VERSION}+early-trend@{TREND_VERSION}",
                 "candidates": len(candidates),
                 "qualified": len(qualified),
                 "qualified_players": [

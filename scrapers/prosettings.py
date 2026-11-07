@@ -183,6 +183,11 @@ _CROSSHAIR_STYLE_CVARS = {
     "static cross": 4,
     "legacy": 5,
     "hybrid": 5,
+    # Prosettings' display label for the legacy dynamic style (flameZ,
+    # Oct 2026; independently confirmed by a style-5 share-code command
+    # for the same player). Without this the style line is silently
+    # dropped and renders fall back to whatever style was already set.
+    "dynamic cross (legacy/shot feedback)": 5,
     # "Dot Only" has no dedicated style value (CS2 styles 0-5 all draw
     # lines; a lone dot is Classic Static + center dot + ~zero length).
     # Map it to 4 and let the converter zero the length below, so the
@@ -558,13 +563,141 @@ def _ensure_viewmodel(entry: dict, nickname: str, *, force: bool = False) -> dic
     return entry
 
 
+class VideoSettingsUnresolved(RuntimeError):
+    """prosettings has no usable video settings for this player.
+
+    Raised instead of silently returning 1920x1080 Native. That fallback shipped
+    a whole render at the wrong aspect on 2026-11-07: dem0n's card claimed
+    1920x1080 / 16:9 Native (the default) while he actually plays 1280x960 /
+    4:3 Stretched, so the capture was started at the wrong aspect and had to be
+    killed. A wrong-aspect POV is worse than no POV, and the failure is silent
+    until someone eyeballs the video.
+    """
+
+    def __init__(self, nickname: str, reason: str = "not found on prosettings"):
+        self.nickname = nickname
+        self.reason = reason
+        super().__init__(
+            f"no video settings for {nickname!r} ({reason}). "
+            f"Rendering at the fallback aspect would ship a wrong-looking POV; "
+            f"set the resolution/aspect/scaling on the player account "
+            f"('python main.py player add') or add the player to "
+            f"{CACHE_PATH.name}, then re-run."
+        )
+
+
+def _ordered_label_values(soup: BeautifulSoup) -> list[tuple[str, str]]:
+    """All label/value pairs in document order (first occurrence matters).
+
+    prosettings repeats labels: a player page carries the player's own
+    Resolution/Aspect Ratio *and* the monitor's. ``_label_value_map`` keeps the
+    LAST value, which silently selected 1920x1080 16:9 (the monitor) instead of
+    dem0n's real 1280x960 4:3 Stretched.
+    """
+    pairs: list[tuple[str, str]] = []
+    for tr in soup.find_all("tr"):
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+        if len(cells) >= 2 and cells[0] and cells[1]:
+            pairs.append((cells[0].lower(), cells[1]))
+    for dl in soup.find_all("dl"):
+        dts, dds = dl.find_all("dt"), dl.find_all("dd")
+        for dt, dd in zip(dts, dds):
+            k, v = dt.get_text(" ", strip=True), dd.get_text(" ", strip=True)
+            if k and v:
+                pairs.append((k.lower(), v))
+    return pairs
+
+
+def _video_section_pairs(soup: BeautifulSoup) -> list[tuple[str, str]]:
+    """Label/value pairs inside the page's "Video Settings" section, if any."""
+    for h in soup.find_all(["h2", "h3", "h4"]):
+        if "video" in h.get_text(" ", strip=True).lower():
+            table = h.find_next("table")
+            if table is None:
+                continue
+            pairs: list[tuple[str, str]] = []
+            for tr in table.find_all("tr"):
+                cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+                if len(cells) >= 2 and cells[0] and cells[1]:
+                    pairs.append((cells[0].lower(), cells[1]))
+            if pairs:
+                return pairs
+    return []
+
+
+def scrape_player_video_settings(
+    nickname: str,
+    session: requests.Session | None = None,
+) -> dict | None:
+    """Fetch resolution/aspect/scaling from a player's own prosettings page.
+
+    The LIST cache only holds the players prosettings features; a player who is
+    missing from the list can still have a page (dem0n does). The Video Settings
+    section wins over page-wide labels, and the FIRST value wins within a scope,
+    because pages repeat the labels for the monitor's native mode. Returns None
+    when the page is missing or carries no resolution.
+    """
+    nick = (nickname or "").strip()
+    if not nick:
+        return None
+    slug = nick.lower().replace(" ", "-")
+    sess = session or requests.Session()
+    try:
+        resp = sess.get(_PLAYER_URL.format(slug=slug), headers=_UA, timeout=60)
+        if resp.status_code != 200:
+            return None
+        soup = BeautifulSoup(resp.text, "lxml")
+    except Exception:
+        return None
+
+    pairs = _video_section_pairs(soup) or _ordered_label_values(soup)
+
+    def first(label: str) -> str | None:
+        return next((v for k, v in pairs if k == label), None)
+
+    raw_res = first("resolution")
+    if not raw_res:
+        return None
+    parsed = _parse_resolution(raw_res)
+    if not parsed:
+        return None
+    width, height = parsed
+    res = f"{width}x{height}"
+    return {
+        "resolution": res,
+        "width": width,
+        "height": height,
+        "aspect_ratio": first("aspect ratio") or _aspect_for(width, height),
+        "scaling_mode": _normalize_scaling(first("scaling mode") or "Native"),
+        "hud_scaling": _parse_num(first("hud scaling") or ""),
+        "source": "prosettings",
+    }
+
+
+def _aspect_for(width: int, height: int) -> str:
+    """Canonical aspect label for a pixel size (16:9, 4:3, 5:4, 16:10)."""
+    if not width or not height:
+        return ""
+    ratio = width / height
+    for label, target in (("16:9", 16 / 9), ("16:10", 16 / 10),
+                          ("4:3", 4 / 3), ("5:4", 5 / 4)):
+        if abs(ratio - target) < 0.02:
+            return label
+    return f"{width}:{height}"
+
+
 def resolve_video_settings(
     nickname: str,
     *,
     refresh_if_missing: bool = True,
     fetch_viewmodel: bool = True,
 ) -> dict:
-    """Return video settings for a player. Falls back to 1920x1080 Native."""
+    """Return video settings for a player, or raise VideoSettingsUnresolved.
+
+    Lookup order: scraped LIST cache -> the player's own prosettings page.
+    There is deliberately no default fallback: an unverified aspect ratio used
+    to render whole POVs at the wrong shape (see VideoSettingsUnresolved).
+    """
     nick = (nickname or "").strip()
     key = nick.lower()
     players = load_cache()
@@ -577,13 +710,17 @@ def resolve_video_settings(
 
     entries = players.get(key) or []
     if not entries:
-        out = dict(DEFAULT_SETTINGS)
-        out["nickname"] = nick
-        out["team"] = ""
-        out["source"] = "default"
+        direct = scrape_player_video_settings(nick)
+        if direct is None:
+            raise VideoSettingsUnresolved(nick)
+        print(f"  [prosettings] {nick}: not in the list cache, used the player "
+              f"page ({direct['resolution']} {direct['aspect_ratio']} "
+              f"{direct['scaling_mode']})")
         if fetch_viewmodel:
-            out.update(scrape_player_viewmodel(nick))
-        return out
+            direct.update(scrape_player_viewmodel(nick))
+        direct["nickname"] = nick
+        direct.setdefault("team", "")
+        return direct
 
     hit = dict(_pick_entry(nick, entries))
     if fetch_viewmodel:

@@ -1,8 +1,9 @@
-"""Publish queued Instagram Reels when their YouTube slot arrives.
+"""Publish queued Instagram Reels and TikTok direct posts when their slot arrives.
 
 Instagram Graph has no native ``scheduled_publish_time``. The shorts uploader
 registers a one-shot Windows Scheduled Task that runs this script at the same
-wall-clock as YouTube/TikTok/Facebook.
+wall-clock as YouTube/TikTok/Facebook. TikTok Content Posting API direct posts
+use the same queue pattern (drafts don't queue — they land in the app inbox).
 
 Usage:
     python cs2archive/upload/publish_due_social.py --meta renders/.../upload_meta_shorts.json
@@ -114,6 +115,45 @@ def publish_queued_instagram(meta_path: Path, *, now: datetime | None = None) ->
     return f"published:{ig_id}"
 
 
+def _queued_video(meta_path: Path, status_key: str) -> Path:
+    meta = _read_meta(meta_path)
+    video = Path(meta.get("video_path") or "")
+    if not video.is_file():
+        fallback = meta_path.parent / "short.mp4"
+        video = fallback if fallback.is_file() else video
+    if not video.is_file():
+        raise FileNotFoundError(f"queued {status_key} video missing: {video}")
+    return video
+
+
+def publish_queued_tiktok(meta_path: Path, *, now: datetime | None = None) -> str:
+    """Direct-post a queued TikTok video if the slot has arrived."""
+    meta = _read_meta(meta_path)
+    status = meta.get("tiktok_status")
+    if status == PUBLISHED:
+        return "already_published"
+    if status != QUEUED:
+        return f"skip_status_{status or 'missing'}"
+
+    slot = parse_utc(meta.get("publish_at_utc"))
+    now = now or datetime.now(timezone.utc)
+    if slot is not None and now + timedelta(seconds=15) < slot:
+        return "not_due"
+
+    video = _queued_video(meta_path, "TikTok")
+
+    from cs2archive.overlay._common import prefer_cs2util_scripts
+
+    prefer_cs2util_scripts()
+    from tiktok_api import upload_video_file
+
+    caption = meta.get("title") or ""
+    result = upload_video_file(video, caption=caption, direct_post=True)
+    publish_id = result.get("publish_id") or ""
+    _write_meta(meta_path, tiktok_status=PUBLISHED, tiktok_publish_id=publish_id)
+    return f"published:{publish_id}"
+
+
 def _iter_metas(root: Path) -> list[Path]:
     return sorted(root.rglob(SHORTS_META_NAME))
 
@@ -135,18 +175,22 @@ def main(argv: list[str] | None = None) -> int:
     n_skip = 0
     n_fail = 0
     for path in paths:
-        try:
-            result = publish_queued_instagram(path)
-        except Exception as exc:
-            print(f"  [FAIL] {path}: {type(exc).__name__}: {exc}", flush=True)
-            n_fail += 1
-            continue
-        if result.startswith("published:"):
-            print(f"  [OK] {path.parent.name} {result}", flush=True)
-            n_ok += 1
-        else:
-            print(f"  [skip] {path.parent.name} {result}", flush=True)
-            n_skip += 1
+        for platform, publish_fn in (
+            ("instagram", publish_queued_instagram),
+            ("tiktok", publish_queued_tiktok),
+        ):
+            try:
+                result = publish_fn(path)
+            except Exception as exc:
+                print(f"  [FAIL] {path} [{platform}]: {type(exc).__name__}: {exc}", flush=True)
+                n_fail += 1
+                continue
+            if result.startswith("published:"):
+                print(f"  [OK] {path.parent.name} [{platform}] {result}", flush=True)
+                n_ok += 1
+            else:
+                print(f"  [skip] {path.parent.name} [{platform}] {result}", flush=True)
+                n_skip += 1
     print(f"due_social published={n_ok} skipped={n_skip} failed={n_fail}", flush=True)
     return 1 if n_fail else 0
 

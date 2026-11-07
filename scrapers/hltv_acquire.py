@@ -28,7 +28,7 @@ def _navigate_with_retry(
     *,
     wait_selector: str | None,
     timeout_ms: int,
-    max_retries: int = 10,
+    max_retries: int = 3,
 ) -> str:
     """Navigate to URL, retry on network errors (ERR_CONNECTION_RESET etc)."""
     import time
@@ -169,7 +169,7 @@ def _download_with_browser(
     profile_dir: Path,
     *,
     headless: bool,
-    max_retries: int = 10,
+    max_retries: int = 3,
 ) -> Path:
     """Download demo via CloakBrowser. Retry with random delay if error page appears."""
     from cloakbrowser import launch_persistent_context

@@ -92,3 +92,41 @@ def rank_candidates_by_allstar(candidates, rows: list[dict] | None = None):
         new = replace(cand, log_views=math.log(max(clip.get("views") or 1, 1)))
         out.append((new, clip))
     return out, report
+
+
+def order_by_pick(ranked, pick: dict | None):
+    """Reorder ``(candidate, clip)`` pairs by the picker agent's ranking.
+
+    The agent's order wins for the clips it ranked; anything it did not rank
+    keeps its view order after them, so a pick that covers only part of the
+    pool still leaves a usable queue. A pick naming a clip that is not in
+    ``ranked`` is ignored — the agent cannot conjure a candidate.
+
+    Returns ``(ordered, report)``.
+    """
+    if not pick:
+        return list(ranked), {"applied": False, "reason": "no pick"}
+    order = {str(clip_id): i for i, clip_id in enumerate(pick.get("ranking") or [])}
+    headline = str(pick.get("pick") or "")
+    if headline and headline not in order:
+        order[headline] = -1
+    if not order:
+        return list(ranked), {"applied": False, "reason": "empty ranking"}
+
+    def sort_key(item):
+        _cand, clip = item
+        clip_id = str(clip.get("clip_id") or "")
+        # Ranked clips first in the agent's order, then everything else by views.
+        if clip_id in order:
+            return (0, order[clip_id], 0)
+        return (1, 0, -(clip.get("views") or 0))
+
+    ordered = sorted(ranked, key=sort_key)
+    matched = sum(1 for _c, clip in ranked if str(clip.get("clip_id") or "") in order)
+    return ordered, {
+        "applied": True,
+        "ranked_ids": len(order),
+        "matched": matched,
+        "unmatched": len(ranked) - matched,
+        "headline": headline or None,
+    }

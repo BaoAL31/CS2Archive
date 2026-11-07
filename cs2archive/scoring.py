@@ -81,6 +81,12 @@ def has_recent_breakout(nick: str, path: Path | None = None) -> bool:
     return spike
 
 
+def early_pov_trend(nick: str, path: Path | None = None) -> dict | None:
+    """Fresh early outperformance, separately versioned from durable stars."""
+    from cs2archive.faceit.pov_trends import read_early_trend
+    return read_early_trend(load_demand_payload(path), nick, datetime.now(timezone.utc))
+
+
 def demand_eligibility(nick: str, path: Path | None = None,
                        *, star_floor: float = 1.40,
                        enforce_freshness: bool = True) -> tuple:

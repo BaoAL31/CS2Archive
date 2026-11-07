@@ -186,6 +186,14 @@ def clip_from_allstar(raw: dict) -> dict | None:
         round_n = int(round_n) if round_n is not None else None
     except (TypeError, ValueError):
         round_n = None
+    # `createdDate` is Allstar's publication timestamp for the clip. It is the
+    # only publication time we ever get, and it makes a view *rate* computable
+    # from a single snapshot — without it, views are an un-ageable number.
+    published_at = _iso_stamp(raw.get("createdDate"))
+    try:
+        clip_length = round(float(raw.get("clipLength")), 2)
+    except (TypeError, ValueError):
+        clip_length = None
     return {
         "clip_id": str(raw.get("_id") or raw.get("internalId") or ""),
         "steamid": steamid or None,
@@ -196,7 +204,25 @@ def clip_from_allstar(raw: dict) -> dict | None:
         "views": views_n,
         "round": round_n,
         "opponent_team": opponent_team,
+        "published_at": published_at,
+        "publication_time_known": published_at is not None,
+        "clip_length": clip_length,
+        "score_line": (meta.get("PARTNER_scoreLine") or "").strip() or None,
+        "series_game_label": (meta.get("PARTNER_seriesGameLabel") or "").strip() or None,
     }
+
+
+def _iso_stamp(value) -> str | None:
+    """Normalise an Allstar timestamp to ISO-8601 UTC, or None."""
+    if not value:
+        return None
+    try:
+        stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.astimezone(timezone.utc).isoformat()
 
 
 def clips_from_playlist_payload(payload) -> list[dict]:

@@ -2,11 +2,11 @@
 
 HLTV cards are gated like FACEIT POVs: the fixture must have a top-20 team,
 and the POV player must clear the demand gate (star >= 1.40 with sample
-evidence, or a breakout — ``scoring.demand_eligibility`` at
-``FACEIT_STAR_FLOOR``). Selection is one card per match (the highest rating
+evidence, a breakout, or a fresh early trend). Selection is one card per match (the highest rating
 across the series' maps), so a two-map series cannot spend both daily slots
 on itself. Actionable matches are actioned best-fixture-first by demand chips
-rather than in /results page order.
+rather than in /results page order. Render priority puts currently trending
+players first, then raw rating, and updates each poll as evidence changes.
 
 FACEIT is polled every cycle via ``daily_notable.discover_faceit_tracks``,
 which splits one scrape into two tracks. Solo POVs (demand-index star
@@ -91,6 +91,11 @@ from cs2archive.hltv.score_cards import (  # noqa: E402
 )
 
 DEFAULT_EVENT_URL = "https://www.hltv.org/events/8249/blast-open-porto-2026"
+ALLSTAR_EVENTS_PATH = ROOT / ".data" / "allstar_hltv_events.json"
+# Retry policy: 3 attempts, then fail loudly. Nothing in this repo retries
+# forever — an unbounded retry (or restart) loop turns a loud failure into a
+# silent one, because the only alert channel reports terminal state.
+MAX_CONSECUTIVE_POLL_FAILURES = 3
 DEFAULT_STATE = ROOT / ".listener" / "hltv.json"
 DEFAULT_RANKINGS_URL = "https://www.hltv.org/ranking/teams"
 MIN_RATING = 1.5
@@ -158,6 +163,25 @@ def parse_results_headline_date(text: str) -> date | None:
         return None
 
 
+def _team_names_from_con(node) -> tuple[str, str] | None:
+    """Team display names straight off the result block's team cells.
+
+    The match slug carries the event suffix — ``/matches/2398753/
+    falcons-vs-spirit-esl-pro-league-season-24`` — so splitting it on
+    ``-vs-`` glues the event name onto team2 ("spirit esl pro league
+    season 24"). That value can never match the notable-team gate, so every
+    match whose notable team sits in slot 2 was silently dropped.
+    """
+    cells = node.select("td.team-cell .line-align .team")
+    if len(cells) < 2:
+        return None
+    team1 = cells[0].get_text(" ", strip=True)
+    team2 = cells[1].get_text(" ", strip=True)
+    if not team1 or not team2:
+        return None
+    return team1, team2
+
+
 def _match_from_result_con(node, base_url: str) -> Match | None:
     link = node.select_one('a[href*="/matches/"]')
     if link is None:
@@ -167,7 +191,7 @@ def _match_from_result_con(node, base_url: str) -> Match | None:
         return None
     match_id, slug = parsed
     event_node = node.select_one(".event-name")
-    team1, team2 = _slug_teams(slug)
+    team1, team2 = _team_names_from_con(node) or _slug_teams(slug)
     return Match(
         match_id=match_id,
         url=urljoin(base_url, link["href"]),
@@ -293,6 +317,59 @@ def event_matches_url(event_url: str, base_url: str = settings.hltv_base_url) ->
     if not match:
         return event_url
     return f"{base_url.rstrip('/')}/events/{match.group(1)}/matches"
+
+
+def _event_slug(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.casefold()).strip("-")
+
+
+def _cached_event_index() -> dict[str, dict]:
+    """{event slug: cached HLTV events-entry} from the events scrape.
+
+    The scraper caches HLTV's events list with each event's canonical URL and
+    HLTV's own "Live" marker in the name. A missing or stale file only costs
+    URL enrichment (and the live preference) — never a hard failure.
+    """
+    try:
+        data = json.loads(ALLSTAR_EVENTS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    index: dict[str, dict] = {}
+    for event in data.get("events") or []:
+        slug = (event.get("slug") or "").casefold()
+        if slug:
+            index[slug] = event
+    return index
+
+
+def auto_event(notable: list[Match]) -> tuple[str, str | None]:
+    """Pick the event to follow from today/yesterday's notable results.
+
+    Returns ``(display name, event url | None)``, or ``("", None)`` when no
+    notable result carries an event label. Ties go to the event appearing
+    first (HLTV lists newest first); an event HLTV currently marks live wins
+    outright. This exists because a pinned ``DEFAULT_EVENT_URL`` once stayed
+    in place for five weeks after its event ended, which made a live season
+    invisible while the daemon quietly fell through to the FACEIT track.
+    """
+    counts: dict[str, int] = {}
+    order: dict[str, int] = {}
+    display: dict[str, str] = {}
+    for i, match in enumerate(notable):
+        name = (match.event or "").strip()
+        slug = _event_slug(name)
+        if not slug:
+            continue
+        counts[slug] = counts.get(slug, 0) + 1
+        order.setdefault(slug, i)
+        display.setdefault(slug, name)
+    if not counts:
+        return "", None
+    cached = _cached_event_index()
+    live = {slug for slug, entry in cached.items()
+            if "live" in (entry.get("name") or "").casefold()}
+    best = min(counts, key=lambda s: (s not in live, -counts[s], order[s]))
+    return display[best], (cached.get(best) or {}).get("url")
 
 
 def _as_unix_ms(raw: int) -> int:
@@ -551,14 +628,8 @@ def _map_group(meta: dict, path: str) -> str:
     return str(meta.get("map") or path).strip().lower()
 
 
-def _candidate_cards(match: Match, indexes: dict | None = None) -> list[str]:
-    """The single best card for a match — one upload slot per series.
-
-    One card per *map* let a two-map series eat the whole 2/day upload
-    budget (9z vs NAVI took both slots on 2026-10-06 while spirit vs mouz and
-    vitality vs falcons waited), so the cap is per match: the highest-rated
-    POV of the series across its maps wins the slot.
-    """
+def _match_card_pool(match: Match) -> list[tuple[str, dict]]:
+    """Every high/medium card on disk for a match — the selection pool."""
     match_slug = match_slug_from_url(match.url)
     root = ROOT / "backlog" / match_slug
     cards: list[tuple[str, dict]] = []
@@ -572,6 +643,24 @@ def _candidate_cards(match: Match, indexes: dict | None = None) -> list[str]:
             except (OSError, json.JSONDecodeError):
                 continue
             cards.append((str(path.relative_to(ROOT)).replace("\\", "/"), meta))
+    return cards
+
+
+def _candidate_cards(match: Match, indexes: dict | None = None,
+                     pool: list[tuple[str, dict]] | None = None) -> list[str]:
+    """The single best card for a match — one upload slot per series.
+
+    One card per *map* let a two-map series eat the whole 2/day upload
+    budget (9z vs NAVI took both slots on 2026-10-06 while spirit vs mouz and
+    vitality vs falcons waited), so the cap is per match: the highest-rated
+    POV of the series across its maps wins the slot.
+
+    ``pool`` lets the caller gate the candidates BEFORE this pick. Selecting
+    first and gating after discarded the whole match whenever its top-rated
+    card was unproven, even with an eligible card sitting right behind it
+    (tN1R Mirage r=2.06 unsupported -> m0NESY Mirage r=1.46 lost as well).
+    """
+    cards = _match_card_pool(match) if pool is None else pool
     selected = select_best_card(cards)
     for path, meta in selected:
         print(
@@ -629,7 +718,8 @@ def _star_eligible(nick: str) -> tuple[bool, str]:
     """FACEIT-style POV gate: demand star >= 1.40 with sample evidence.
 
     Same rule as the FACEIT notable picker (``is_good_faceit_pov``): star OR
-    breakout. Fail-closed — an absent/stale demand payload is no evidence, so a
+    breakout OR a fresh early POV trend. Fail-closed — absent/stale evidence
+    does not qualify, so a
     dead star refresh narrows the gate instead of letting every rating >= 1.0
     POV through.
     """
@@ -641,7 +731,7 @@ def _star_eligible(nick: str) -> tuple[bool, str]:
     nick = str(nick or "").strip(" \t\r\n\u00a0\u200b")
     star, spike, index, supported, _pi = scoring.demand_eligibility(
         nick, star_floor=FACEIT_STAR_FLOOR)
-    if star or spike:
+    if star or spike or scoring.early_pov_trend(nick):
         return True, ""
     if index is None:
         return False, "no demand index"
@@ -762,16 +852,23 @@ def _prune_queue(cards: list[str], indexes: dict | None = None) -> list[str]:
     return passthrough + selected
 
 
-def sort_card_records(cards: list[tuple[str, dict]]) -> list[str]:
-    """Order queued cards by rating desc, then path."""
+def sort_card_records(cards: list[tuple[str, dict]], *,
+                      trending_players: set[str] | None = None) -> list[str]:
+    """Fresh trending players first, then rating desc and deterministic path."""
+    trending_players = trending_players or set()
     def key(record: tuple[str, dict]) -> tuple:
         path, meta = record
-        return (-_rating(meta), path)
+        return (str(meta.get("player") or "").strip().casefold() not in trending_players,
+                -_rating(meta), path)
 
     return [path for path, _ in sorted(cards, key=key)]
 
 
 def _sort_queue(cards: list[str], indexes: dict | None = None) -> list[str]:
+    from cs2archive import scoring
+    from cs2archive.faceit.pov_trends import read_early_trend
+    payload = scoring.load_demand_payload()
+    now = datetime.now(timezone.utc)
     records: list[tuple[str, dict]] = []
     passthrough: list[str] = []
     for path in cards:
@@ -781,7 +878,9 @@ def _sort_queue(cards: list[str], indexes: dict | None = None) -> list[str]:
             passthrough.append(path)
             continue
         records.append((path, meta))
-    return sort_card_records(records) + passthrough
+    trending = {str(meta.get("player") or "").strip().casefold() for _, meta in records
+                if read_early_trend(payload, str(meta.get("player") or ""), now)}
+    return sort_card_records(records, trending_players=trending) + passthrough
 
 
 def _child_env() -> dict[str, str]:
@@ -838,8 +937,58 @@ def _is_faceit_card(path: str, meta: dict | None = None) -> bool:
     return norm.startswith("backlog/faceit/") or norm.startswith("faceit/")
 
 
-def should_poll_faceit(state: State, now: datetime | None = None) -> bool:
-    """FACEIT is a first-class source: poll whenever slots + interval allow."""
+def _pipeline_lock_held() -> bool:
+    """True while another pipeline holds ``.pipeline/pipeline.lock``.
+
+    A restarted listener used to spawn a second pipeline while the first was
+    still rendering — an orphaned pipeline child outlives a killed daemon —
+    and got back ``PIPELINE_ALREADY_RUNNING``. The drain loop treated that as a
+    HARD FAIL, so three restarts later the wrapper's retry cap gave up and the
+    listener stopped dead while a perfectly healthy render held the lock
+    (2026-10-13 00:53: a MaiL09 FACEIT render was in step 4). A held lock is
+    "another render is in flight", not a bug to fix: hold the queue and wait.
+    """
+    path = ROOT / ".pipeline" / "pipeline.lock"
+    try:
+        fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        return False
+    try:
+        import msvcrt
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return True
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        return False
+    except (ImportError, OSError):
+        return False
+    finally:
+        os.close(fd)
+
+
+def _next_card(queue: list[str], hltv_busy: bool) -> str | None:
+    """Next card to render; during an HLTV window only HLTV cards are eligible.
+
+    FACEIT and HLTV share the 2/day upload budget, so an already-queued FACEIT
+    card used to preempt a same-day HLTV fixture: on 2026-10-11 the second slot
+    went to a FACEIT POV at 03:56 while the ESL Pro League semifinals were still
+    to be played, and both semifinal cards then sat unrendered behind a spent
+    budget. While a match is live or starts within ``FACEIT_HORIZON`` the FACEIT
+    track neither polls nor renders — its cards are held, not dropped.
+    """
+    if not queue:
+        return None
+    if not hltv_busy:
+        return queue[0]
+    return next((card for card in queue if not _is_faceit_card(card)), None)
+
+
+def should_poll_faceit(state: State, now: datetime | None = None,
+                       *, hltv_busy: bool = False) -> bool:
+    """FACEIT polls only outside an HLTV window (live, or a match within 12h)."""
+    if hltv_busy:
+        return False
     if _slots_left(state) <= 0:
         return False
     now = now or datetime.now()
@@ -1025,16 +1174,73 @@ def _run_backlog(match: Match, dry_run: bool, retries: int = 3) -> bool:
     return False
 
 
-def _run_pipeline(card: str, dry_run: bool) -> bool:
+def _run_pipeline(card: str, dry_run: bool, tune: list[str] | None = None) -> bool:
+    """Run one card's pipeline. *tune* is extra CLI for it (render knobs).
+
+    The pipeline has always accepted --batches / --hook-timeout / --hook-retries
+    and forwarded them to render_pov.py, but the listener used to spawn it bare,
+    leaving the 2-attempt default as the only option. The vanilla-viewer flake
+    ("Game error") regularly eats the first launch, and on 2026-10-25 it ate
+    both attempts on two cards in a row: the listener hard-failed three times
+    and gave up on a machine where the very next retry rendered fine.
+    """
     cmd = [sys.executable, str(ROOT / "cs2archive/pov/pipeline.py"),
            "--backlog", str(ROOT / card),
            # The listener owns the upload spawn (daily-slot ledger + spawn
            # bookkeeping), so the pipeline must not spawn its own.
            "--no-upload"]
+    cmd += list(tune or [])
     print(f"[pipeline] {' '.join(cmd)}", flush=True)
     if dry_run:
         return True
     return subprocess.run(cmd, cwd=ROOT, env=_child_env()).returncode == 0
+
+
+def _finish_card(state: State, card: str, *, dry_run: bool) -> None:
+    """Report the upload spawn and, unless *dry_run*, consume the card.
+
+    A dry run must change NOTHING. This bookkeeping used to run regardless of
+    ``dry_run``: a ``--dry-run`` cycle printed ``[upload] would spawn …`` and
+    then drained the queue, marked never-rendered POVs completed and spent the
+    day's upload slots — two POVs were silently lost that way on 2026-10-20
+    (kyousuke Anubis, molodoy Cache, neither of which had been rendered).
+    """
+    _start_upload_after_pipeline(card, dry_run)
+    if dry_run:
+        return
+    state.data["queue"].remove(card)
+    daily = _daily(state)
+    daily.setdefault("completed", []).append(card)
+    if _is_faceit_card(card):
+        # Record the spawn so the upload-respawn ledger knows the first spawn
+        # time (a live console racing a respawn would double-upload the same
+        # video).
+        spawns = daily.setdefault("faceit_upload_spawns", {})
+        prev = spawns.get(card) or {}
+        spawns[card] = {
+            "at": datetime.now().isoformat(),
+            "count": int(prev.get("count") or 0) + 1,
+        }
+    for record in state.data["matches"].values():
+        if card in record.get("cards", []):
+            record.setdefault("completed_cards", []).append(card)
+            record["status"] = "completed"
+    state.save()
+
+
+def _render_tune(args) -> list[str]:
+    """Render knobs the operator set on the listener, as pipeline CLI.
+
+    Only non-None flags are forwarded, so an unconfigured listener keeps the
+    pipeline's own defaults (this is how --hook-retries 4 gets through).
+    """
+    tune: list[str] = []
+    for flag, value in (("--batches", getattr(args, "batches", None)),
+                        ("--hook-timeout", getattr(args, "hook_timeout", None)),
+                        ("--hook-retries", getattr(args, "hook_retries", None))):
+        if value is not None:
+            tune += [flag, str(value)]
+    return tune
 
 
 def _run_id_from_name(name: str) -> str:
@@ -1310,18 +1516,92 @@ def initialize_result_baseline(state: State, matches: list[Match]) -> None:
 def _actionable_matches(state: State, matches: list[Match]) -> list[Match]:
     """Return only newly appeared results or records that need retrying."""
     known = set(state.data.get("result_baseline_ids", []))
+    demand_stamp = _demand_refresh_stamp()
     return [
         match for match in matches
         if match.match_id not in known
         or state.data["matches"].get(match.match_id, {}).get("status")
         in {"retry", "discovered"}
+        or (demand_stamp and state.data["matches"].get(match.match_id, {}).get("status") == "completed"
+            and state.data["matches"].get(match.match_id, {}).get("skip_reason") == "star gate"
+            and state.data["matches"].get(match.match_id, {}).get("demand_checked_at") != demand_stamp)
     ]
+
+
+def _demand_refresh_stamp() -> str:
+    from cs2archive import scoring
+    return str(scoring.load_demand_payload().get("updated_at") or "")
+
+
+def _recheck_star_gated_match(state: State, match: Match, record: dict,
+                             indexes: dict | None, *, star_gate: bool = True) -> None:
+    """New audience evidence can revive a recent rejected match from cached cards."""
+    stamp = _demand_refresh_stamp()
+    pool = _match_card_pool(match)
+    if star_gate:
+        keep = set(_star_gate_cards([path for path, _ in pool], match))
+        pool = [(path, meta) for path, meta in pool if path in keep]
+    cards = _candidate_cards(match, indexes, pool=pool)
+    record["demand_checked_at"] = stamp
+    if cards:
+        _enqueue(state, cards, indexes)
+        record.update(status="queued", cards=cards, last_error=None)
+        record.pop("skip_reason", None)
+        print(f"[demand-recheck] {match.match_id}: queued from new demand evidence", flush=True)
+
+
+def _drain_queue(args, state: State, *, hltv_busy: bool) -> None:
+    """Run the existing single-worker queue, with the same slot and lock guards."""
+    while state.data["queue"] and _slots_left(state) > 0:
+        if not args.dry_run and _pipeline_lock_held():
+            print("[queue] another pipeline is rendering (lock held) — "
+                  f"holding {len(state.data['queue'])} card(s) until it finishes",
+                  flush=True)
+            break
+        card = _next_card(state.data["queue"], hltv_busy)
+        if card is None:
+            held = sum(1 for c in state.data["queue"] if _is_faceit_card(c))
+            print(f"[hltv] match live or starting within "
+                  f"{int(FACEIT_HORIZON.total_seconds() // 3600)}h — holding "
+                  f"{held} FACEIT card(s)", flush=True)
+            break
+        if not args.dry_run and not (ROOT / card).exists():
+            print(f"[queue] missing card, dropping: {card}", flush=True)
+            state.data["queue"].remove(card)
+            state.save()
+            continue
+        ok = _run_pipeline(card, args.dry_run, _render_tune(args))
+        if not ok:
+            for record in state.data["matches"].values():
+                if card in record.get("cards", []):
+                    record["status"] = "failed"
+                    record["last_error"] = f"pipeline hard-failed for {card}"
+            state.save()
+            print(f"[queue] HARD FAIL pipeline for {card} — fix underlying bug, not skipping", flush=True)
+            raise SystemExit(f"hard fail: pipeline failed for {card}")
+        _finish_card(state, card, dry_run=args.dry_run)
+        if args.dry_run:
+            break
+    if state.data["queue"] and _slots_left(state) <= 0:
+        print(f"[daily] {DAILY_UPLOAD_LIMIT} uploads used for {_local_day()}, "
+              f"holding {len(state.data['queue'])} queued card(s)", flush=True)
 
 
 async def poll_once(args, state: State) -> None:
     event_url = args.event_url
-    state.data["event_url"] = event_url
     _daily(state)
+    # Demand refreshes independently of match discovery. Reorder even when no
+    # newly discovered card caused _enqueue, and let expired boosts fall away.
+    state.data["queue"] = _sort_queue(state.data.get("queue") or [])
+    # Persist rollover immediately: the on-disk ledger must not appear stuck
+    # on yesterday while discovery or an ingest subprocess takes minutes.
+    state.save()
+    # Cached HLTV POVs need no network discovery to establish source precedence.
+    # FACEIT-only queues still go through the live HLTV-window check below.
+    if _slots_left(state) > 0 and _next_card(state.data["queue"], hltv_busy=True):
+        print("[queue] ready HLTV POVs take priority over new acquisition", flush=True)
+        _drain_queue(args, state, hltv_busy=True)
+        return
     indexes = None if getattr(args, "results_order", False) \
         and not getattr(args, "star_gate", True) else _load_score_indexes()
     # Refresh on first use and whenever the cached copy went stale, so a
@@ -1337,24 +1617,11 @@ async def poll_once(args, state: State) -> None:
         state.data["teams_updated_at"] = _now()
         print(f"[teams] tracking: {', '.join(teams)}")
 
-    event_html = await asyncio.to_thread(fetch_hltv_page_html, event_url,
-                                         headless=True, wait_selector=None)
-    event_ids = parse_event_match_ids(event_html)
-    scheduled = parse_scheduled_matches(event_html)
-    if not any(item.live or item.unix_ms for item in scheduled):
-        tab = event_matches_url(event_url)
-        if tab != event_url:
-            tab_html = await asyncio.to_thread(
-                fetch_hltv_page_html, tab, headless=True, wait_selector=None)
-            extra = parse_scheduled_matches(tab_html)
-            if extra:
-                scheduled = extra
-            event_ids |= parse_event_match_ids(tab_html)
     now = datetime.now()
     today = now.date()
-    event_slug = event_url.rstrip("/").rsplit("/", 1)[-1]
-    event_name = re.sub(r"[-_]+", " ", event_slug).casefold()
     # ``?date=`` is ignored by HLTV; one /results dump, filter by headline date.
+    # Results are read BEFORE the event page: with no pinned --event-url the
+    # tracked event is whatever these results are actually in.
     results_html = await asyncio.to_thread(
         fetch_hltv_page_html,
         f"{settings.hltv_base_url}/results",
@@ -1363,6 +1630,69 @@ async def poll_once(args, state: State) -> None:
     )
     result_links = parse_match_links(
         results_html, on_dates={today, today - timedelta(days=1)})
+
+    if event_url:
+        # Pinned: the notable-team gate is scoped to this one event.
+        event_html = await asyncio.to_thread(fetch_hltv_page_html, event_url,
+                                             headless=True, wait_selector=None)
+        event_ids = parse_event_match_ids(event_html)
+        scheduled = parse_scheduled_matches(event_html)
+        if not any(item.live or item.unix_ms for item in scheduled):
+            tab = event_matches_url(event_url)
+            if tab != event_url:
+                tab_html = await asyncio.to_thread(
+                    fetch_hltv_page_html, tab, headless=True, wait_selector=None)
+                extra = parse_scheduled_matches(tab_html)
+                if extra:
+                    scheduled = extra
+                event_ids |= parse_event_match_ids(tab_html)
+        event_name = re.sub(
+            r"[-_]+", " ",
+            event_url.rstrip("/").rsplit("/", 1)[-1]).casefold()
+        print(f"[event] pinned: {event_name}", flush=True)
+    else:
+        teams_lower = {team.casefold() for team in state.data["teams"]}
+        notable_results = [
+            match for match in result_links
+            if match.team1.casefold() in teams_lower
+            or match.team2.casefold() in teams_lower
+        ]
+        picked_name, resolved_url = auto_event(notable_results)
+        if not picked_name:
+            # Nothing notable to follow — keep the historical default rather
+            # than tracking nothing at all, and say so loudly.
+            event_url = DEFAULT_EVENT_URL
+            event_html = await asyncio.to_thread(
+                fetch_hltv_page_html, event_url, headless=True,
+                wait_selector=None)
+            event_ids = parse_event_match_ids(event_html)
+            scheduled = parse_scheduled_matches(event_html)
+            event_name = re.sub(
+                r"[-_]+", " ",
+                event_url.rstrip("/").rsplit("/", 1)[-1]).casefold()
+            print("[event] auto: no notable result to follow; falling back "
+                  f"to {event_name}", flush=True)
+        else:
+            event_url = resolved_url
+            event_name = picked_name.casefold()
+            event_ids: set[str] = set()
+            scheduled = []
+            if resolved_url:
+                # Enrich with the event page's scheduled/live list so
+                # hltv_next_12h still works in auto mode.
+                event_html = await asyncio.to_thread(
+                    fetch_hltv_page_html, resolved_url, headless=True,
+                    wait_selector=None)
+                event_ids = parse_event_match_ids(event_html)
+                scheduled = parse_scheduled_matches(event_html)
+            print(
+                f"[event] auto-tracking: {picked_name} "
+                f"({len(notable_results)} notable result(s) in "
+                f"{today}/{today - timedelta(days=1)}"
+                f"{'' if resolved_url else '; event page unresolved'})",
+                flush=True,
+            )
+    state.data["event_url"] = event_url or f"auto:{event_name}"
     matches = select_matches(result_links, event_ids, state.data["teams"],
                              event_name)
     matches = list({match.match_id: match for match in matches}.values())
@@ -1399,6 +1729,11 @@ async def poll_once(args, state: State) -> None:
                 continue
             if not _retry_ready(record):
                 continue
+            if record.get("skip_reason") == "star gate" and not args.dry_run:
+                _recheck_star_gated_match(state, match, record, indexes,
+                                         star_gate=getattr(args, "star_gate", True))
+                state.save()
+                continue
             if _queue_room(state) <= 0:
                 # The daily upload slots are spent — but acquisition must not
                 # stop: keep downloading the demo, extracting it and building
@@ -1424,88 +1759,51 @@ async def poll_once(args, state: State) -> None:
                 _schedule_retry(record, "create_backlog failed")
                 state.save()
                 continue
-            cards = _candidate_cards(match, indexes)
+            # Gate the candidate POOL before the per-match pick: the demand
+            # gate is a filter on who is worth rendering, so an unproven
+            # top-rated card must lose to an eligible card, not take the match
+            # down with it.
+            pool = _match_card_pool(match)
+            gated_out = False
+            if getattr(args, "star_gate", True) and not args.dry_run:
+                record["demand_checked_at"] = _demand_refresh_stamp()
+                keep = set(_star_gate_cards([path for path, _ in pool], match))
+                if pool and not keep:
+                    gated_out = True
+                pool = [(path, meta) for path, meta in pool if path in keep]
+            cards = _candidate_cards(match, indexes, pool=pool)
             if args.dry_run:
                 cards = [f"backlog/{match_slug_from_url(match.url)}/high/<generated>.json"]
             if not cards:
-                # A successful backlog run can legitimately produce no high/medium
-                # performer (all ratings below 1.0). This is a completed no-op.
+                # No high/medium performer at all (all ratings below 1.0), or
+                # every candidate failed the demand gate. Either way: a
+                # completed no-op, not a retry.
                 record["status"] = "completed"
                 record["cards"] = []
-                record["no_candidate_cards"] = True
+                if gated_out:
+                    record["skip_reason"] = "star gate"
+                else:
+                    record["no_candidate_cards"] = True
                 record["last_error"] = None
                 state.save()
                 continue
-            if getattr(args, "star_gate", True) and not args.dry_run:
-                # Cherry-pick, do not queue every positive POV: FACEIT's demand
-                # gate (star >= 1.40 with sample evidence, or a breakout).
-                kept = _star_gate_cards(cards, match)
-                if not kept:
-                    record["status"] = "completed"
-                    record["cards"] = []
-                    record["skip_reason"] = "star gate"
-                    record["last_error"] = None
-                    state.save()
-                    continue
-                cards = kept
             _enqueue(state, cards, indexes)
             record["status"] = "queued"
             record["cards"] = cards
             record["last_error"] = None
             state.save()
 
-    if should_poll_faceit(state):
+    if should_poll_faceit(state, hltv_busy=hltv_busy):
         await _maybe_queue_faceit(args, state, indexes)
 
-    while state.data["queue"] and _slots_left(state) > 0:
-        card = state.data["queue"][0]
-        if not args.dry_run and not (ROOT / card).exists():
-            print(f"[queue] missing card, dropping: {card}", flush=True)
-            state.data["queue"].pop(0)
-            state.save()
-            continue
-        ok = _run_pipeline(card, args.dry_run)
-        if not ok:
-            # HARD FAIL: never silently skip or retain for retry.
-            # Surface the pipeline's [PIPELINE_ERROR] immediately so the
-            # underlying bug (e.g. zero-length victim seq 186388->186388)
-            # gets fixed instead of looping every poll.
-            for record in state.data["matches"].values():
-                if card in record.get("cards", []):
-                    record["status"] = "failed"
-                    record["last_error"] = f"pipeline hard-failed for {card}"
-            state.save()
-            # SystemExit is BaseException, not caught by main's `except Exception`,
-            # so the listener dies and the failure is visible (no silent skip/loop).
-            print(f"[queue] HARD FAIL pipeline for {card} — fix underlying bug, not skipping", flush=True)
-            raise SystemExit(f"hard fail: pipeline failed for {card}")
-        _start_upload_after_pipeline(card, args.dry_run)
-        state.data["queue"].pop(0)
-        daily = _daily(state)
-        daily.setdefault("completed", []).append(card)
-        if _is_faceit_card(card):
-            # Record the spawn so the upload-respawn ledger knows
-            # the first spawn time (a live console racing a respawn would
-            # double-upload the same video).
-            spawns = daily.setdefault("faceit_upload_spawns", {})
-            prev = spawns.get(card) or {}
-            spawns[card] = {
-                "at": datetime.now().isoformat(),
-                "count": int(prev.get("count") or 0) + 1,
-            }
-        for record in state.data["matches"].values():
-            if card in record.get("cards", []):
-                record.setdefault("completed_cards", []).append(card)
-                record["status"] = "completed"
-        state.save()
-    if state.data["queue"] and _slots_left(state) <= 0:
-        print(f"[daily] {DAILY_UPLOAD_LIMIT} uploads used for {_local_day()}, "
-              f"holding {len(state.data['queue'])} queued card(s)", flush=True)
+    _drain_queue(args, state, hltv_busy=hltv_busy)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--event-url", default=DEFAULT_EVENT_URL)
+    parser.add_argument("--event-url", default=None,
+                        help="pin the tracked HLTV event; omit to auto-follow "
+                             "the event today's notable results are in")
     parser.add_argument("--rankings-url", default=DEFAULT_RANKINGS_URL)
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--interval", type=int, default=300,
@@ -1514,6 +1812,18 @@ def build_parser() -> argparse.ArgumentParser:
                         help="attempt each failed backlog acquisition this many times")
     parser.add_argument("--pipeline-retries", type=int, default=3,
                         help="retry a failed pipeline this many times before skipping it")
+    parser.add_argument("--batches", type=int, default=None,
+                        help="forwarded to the pipeline: CSDM launches per render "
+                             "(default: the pipeline's own 1)")
+    parser.add_argument("--hook-timeout", type=float, default=None,
+                        help="forwarded to the pipeline: seconds to wait for the "
+                             "first >=1 MB sequence before calling the HLAE hook "
+                             "failed (default: the pipeline's own 150)")
+    parser.add_argument("--hook-retries", type=int, default=None,
+                        help="forwarded to the pipeline: HLAE hook attempts per "
+                             "render. The vanilla-viewer flake eats the first "
+                             "launch often enough that 2 is thin — use 3-4 "
+                             "(default: the pipeline's own 2)")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
@@ -1589,15 +1899,30 @@ async def main(args) -> None:
         # Every launch: drop missing cards + dups of completed uploads so a
         # restart never re-renders an already-uploaded POV.
         _clean_queue_on_start(state)
+        # Cap consecutive poll failures. This loop used to swallow every
+        # exception and keep polling forever, so an environment-level breakage
+        # (dead scrape, locked profile, missing tool) produced a listener that
+        # looked alive, never queued anything, and reported nothing — the same
+        # shape as the wrapper's unbounded restart loop. Three in a row is
+        # already ~15 minutes of a poll that retries internally, so fail loudly.
+        consecutive_failures = 0
         while True:
             try:
                 await poll_once(args, state)
                 state.save()
+                consecutive_failures = 0
             except Exception as exc:
+                consecutive_failures += 1
                 print(f"[listener-error] {type(exc).__name__}: {exc}",
                       file=sys.stderr, flush=True)
                 state.data["last_error"] = str(exc)
+                state.data["consecutive_poll_failures"] = consecutive_failures
                 state.save()
+                if consecutive_failures >= MAX_CONSECUTIVE_POLL_FAILURES:
+                    raise SystemExit(
+                        f"listener poll failed {consecutive_failures} times in a "
+                        f"row ({type(exc).__name__}: {exc}) — exiting so the "
+                        f"failure is visible instead of polling forever")
             if args.once:
                 return
             await asyncio.sleep(args.interval)

@@ -186,3 +186,39 @@ def test_forward_perf_ratio():
         own_rows=[_row("v2", "Some Random", "CS2 Archive",
                        "2026-09-20T00:00:00+00:00", 999_999)],
         comp_rows=comp)["error"] == "unaliased player"
+
+
+def test_forward_default_uses_newest_own_capture_without_polluting_competitors(monkeypatch):
+    """Default CLI must see fresh own uploads, not just the legacy own CSV."""
+    old = _row("own", "donk", "CS2 Archive", "2026-09-20T00:00:00+00:00", 1)
+    old["captured_at"] = "2026-09-21T00:00:00+00:00"
+    fresh = dict(old, views="220", captured_at="2026-10-01T00:00:00+00:00")
+    comp = _row("comp", "donk", "Competitor", "2026-09-20T00:00:00+00:00", 2200)
+    monkeypatch.setattr(gate_forward, "load_seed_rows", lambda: [fresh, comp, old])
+    monkeypatch.setattr(gate_forward, "_read_csv", lambda path: [old])
+    monkeypatch.setattr(gate_forward, "recognised_aliases", lambda: {"donk": "donk"})
+
+    assert gate_forward.own_channel_rows() == [fresh]
+    assert gate_forward._deduped_seed_rows() == [comp]
+    got = gate_forward.own_video_pi("own", now=datetime(2026, 10, 1, tzinfo=timezone.utc))
+    assert got["views"] == "220"
+    assert got["perf_ratio"] == 0.1
+
+
+def test_forward_uses_legacy_own_history_when_seed_has_no_own_rows(monkeypatch):
+    own = _row("own", "donk", "", "2026-09-20T00:00:00+00:00", 220)
+    monkeypatch.setattr(gate_forward, "load_seed_rows", lambda: [])
+    monkeypatch.setattr(gate_forward, "_read_csv", lambda path: [own])
+    assert gate_forward.own_channel_rows() == [own]
+
+
+def test_forward_baseline_matches_recognised_pov_window(monkeypatch):
+    monkeypatch.setattr(gate_forward, "recognised_aliases", lambda: {"donk": "donk"})
+    rows = [_row("pov", "donk", "CS2 Archive", "2026-09-20T00:00:00Z", 220),
+            _row("tutorial", "Top", "CS2 Archive", "2026-09-20T00:00:00Z", 22000),
+            _row("old", "donk", "CS2 Archive", "2025-09-20T00:00:00Z", 1)]
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    assert gate_forward.own_channel_median_vpd(now=now, own_rows=rows) == {
+        "videos": 1, "median_vpd": 20.0}
+    monkeypatch.setattr(gate_forward, "_deduped_seed_rows", lambda **kwargs: [])
+    assert [r["video_id"] for r in gate_forward.own_table(now=now, own_rows=rows)] == ["pov"]

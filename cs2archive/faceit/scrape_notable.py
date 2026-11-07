@@ -85,7 +85,7 @@ HIGHLIGHT_LOBBY_RAW_FLOOR = 800_000
 
 
 def is_good_faceit_pov(c: dict) -> bool:
-    """Watchable solo POV: demand-index star OR recent breakout, any line.
+    """Watchable solo POV: demand star, recent breakout or fresh early trend.
 
     Single shared predicate (F3): delegates to
     scoring.demand_eligibility at FACEIT_STAR_FLOOR — star means index
@@ -93,7 +93,9 @@ def is_good_faceit_pov(c: dict) -> bool:
     videos or a deep track record; stale long-window-only thin samples
     must not auto-pass) — losses count — or a recent breakout video
     (30d, 30x channel median with absolute reach; the median-based
-    index buries one-off spikes, so the max is read instead). There is
+    index buries one-off spikes, so the max is read instead). A separate
+    early_pov_trend arm admits strong 6h–7d videos before the two-day fit
+    floor, with same-channel older-peer total views and fresh evidence. There is
     deliberately no org-rank fallback: a top-10-org starter with no
     measurable audience demand does not earn a solo render on lobby
     context (that lobby belongs to the highlight feed, see
@@ -104,7 +106,7 @@ def is_good_faceit_pov(c: dict) -> bool:
         return False
     star, spike, _, _, _ = _scoring.demand_eligibility(
         nick, star_floor=FACEIT_STAR_FLOOR)
-    return bool(star or spike)
+    return bool(star or spike or _scoring.early_pov_trend(nick))
 
 
 def is_highlight_lobby(rec: dict) -> bool:

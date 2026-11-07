@@ -36,18 +36,36 @@ UPLOAD_SHORTS = PROJECT_ROOT / "cs2archive" / "upload" / "upload_youtube_shorts.
 SHORTS_META_NAME = "upload_meta_shorts.json"
 DEFAULT_ROOT = PROJECT_ROOT / "renders"
 
+# The partial-upload gate lives with the uploader so both entry points agree on
+# the flag names and the authorization rule.
+from cs2archive.upload.upload_youtube_shorts import (  # noqa: E402
+    PLATFORM_FLAGS,
+    refuse_unauthorized_partial_upload,
+)
+
 
 def _platform_pending(meta: dict) -> dict[str, bool]:
-    """Which platforms still need work, keyed by name."""
+    """Which platforms still need work, keyed by name.
+
+    A platform listed in ``skipped_platforms`` was dropped by an authorized
+    operator (``CS2ARCHIVE_ALLOW_PARTIAL_UPLOAD=1``) and counts as settled, so
+    the runner does not retry it forever.
+    """
     skipped = meta.get("upload_status") == "skipped"
+    dropped = set(meta.get("skipped_platforms") or ())
     yt_done = skipped or bool(
         meta.get("upload_status") == "completed" and meta.get("youtube_id")
     )
-    tt_done = skipped or meta.get("tiktok_status") == "scheduled"
-    ig_done = skipped or meta.get("instagram_status") in {
+    tt_done = skipped or "tiktok" in dropped or meta.get("tiktok_status") in {
+        # "scheduled" = legacy browser-UI flow; the API writes these:
+        "scheduled", "uploaded_draft", "queued", "published",
+    }
+    ig_done = skipped or "instagram" in dropped or meta.get("instagram_status") in {
         "scheduled", "published", "queued",
     }
-    fb_done = skipped or meta.get("facebook_status") in {"scheduled", "published"}
+    fb_done = skipped or "facebook" in dropped or meta.get("facebook_status") in {
+        "scheduled", "published",
+    }
     return {
         "youtube": not yt_done,
         "tiktok": not tt_done,
@@ -105,32 +123,11 @@ def _mark_skipped_low_demand(meta_path: Path, meta: dict) -> None:
     _mark_skipped(meta_path, meta, "low_demand")
 
 
-def _needs_upload(
-    meta: dict,
-    *,
-    skip_tiktok: bool,
-    skip_instagram: bool,
-    skip_facebook: bool = False,
-) -> bool:
-    pending = _platform_pending(meta)
-    if pending["youtube"]:
-        return True
-    if not skip_tiktok and pending["tiktok"]:
-        return True
-    if not skip_instagram and pending["instagram"]:
-        return True
-    if not skip_facebook and pending["facebook"]:
-        return True
-    return False
+def _needs_upload(meta: dict) -> bool:
+    return any(_platform_pending(meta).values())
 
 
-def find_pending(
-    root: Path,
-    *,
-    skip_tiktok: bool,
-    skip_instagram: bool,
-    skip_facebook: bool = False,
-) -> list[Path]:
+def find_pending(root: Path) -> list[Path]:
     """Return paths of upload_meta_shorts.json files that still need work."""
     pending: list[Path] = []
     for meta_path in sorted(root.rglob(SHORTS_META_NAME)):
@@ -139,12 +136,7 @@ def find_pending(
         except Exception as e:
             print(f"  [skip] could not parse {meta_path}: {e}")
             continue
-        if not _needs_upload(
-            meta,
-            skip_tiktok=skip_tiktok,
-            skip_instagram=skip_instagram,
-            skip_facebook=skip_facebook,
-        ):
+        if not _needs_upload(meta):
             continue
         video = meta.get("video_path")
         if not video or not Path(video).exists():
@@ -161,18 +153,12 @@ def upload_one(
     meta: dict,
     dry_run: bool,
     *,
-    skip_tiktok: bool,
-    skip_instagram: bool,
+    skip_tiktok: bool = False,
+    skip_instagram: bool = False,
     skip_facebook: bool = False,
 ) -> bool:
     video = Path(meta["video_path"])
     pending = _platform_pending(meta)
-    if skip_tiktok:
-        pending["tiktok"] = False
-    if skip_instagram:
-        pending["instagram"] = False
-    if skip_facebook:
-        pending["facebook"] = False
 
     if dry_run:
         parts = [name for name, p in pending.items() if p]
@@ -203,12 +189,6 @@ def upload_one(
         updated = {}
 
     remaining = _platform_pending(updated)
-    if skip_tiktok:
-        remaining["tiktok"] = False
-    if skip_instagram:
-        remaining["instagram"] = False
-    if skip_facebook:
-        remaining["facebook"] = False
     still = [name for name, p in remaining.items() if p]
     if still:
         print(f"  [WARN] still pending after upload ({', '.join(still)}): {video}")
@@ -229,28 +209,22 @@ def main() -> None:
     parser.add_argument(
         "--limit", type=int, default=0,
         help="Upload at most N pending metas (default: 0 = all)")
-    parser.add_argument(
-        "--skip-tiktok", action="store_true",
-        help="Treat TikTok as done / don't require it (passes --skip-tiktok to uploader)")
-    parser.add_argument(
-        "--skip-instagram", action="store_true",
-        help="Treat Instagram as done / don't require it (passes --skip-instagram to uploader)")
-    parser.add_argument(
-        "--skip-facebook", action="store_true",
-        help="Treat Facebook as done / don't require it (passes --skip-facebook to uploader)")
+    # Hidden on purpose: dropping a platform needs operator authorization
+    # (CS2ARCHIVE_ALLOW_PARTIAL_UPLOAD), so these must not read as ordinary options.
+    for _name, _flag in PLATFORM_FLAGS.items():
+        parser.add_argument(
+            _flag, action="store_true", help=argparse.SUPPRESS, dest=f"skip_{_name}")
     args = parser.parse_args()
+
+    skipped_platforms = [name for name in PLATFORM_FLAGS if getattr(args, f"skip_{name}")]
+    refuse_unauthorized_partial_upload(skipped_platforms)
 
     root = Path(args.dir)
     if not root.exists():
         print(f"[ERROR] directory not found: {root}")
         sys.exit(1)
 
-    pending = find_pending(
-        root,
-        skip_tiktok=args.skip_tiktok,
-        skip_instagram=args.skip_instagram,
-        skip_facebook=args.skip_facebook,
-    )
+    pending = find_pending(root)
     print(f"Found {len(pending)} pending short upload(s) under {root}")
     if args.limit > 0:
         pending = pending[:args.limit]
@@ -259,18 +233,25 @@ def main() -> None:
         print("Nothing to upload.")
         return
 
-    # preflight: TikTok still uses the browser session. Instagram/Facebook use Graph.
+    # preflight: TikTok uses the Content Posting API token. Instagram/Facebook use Graph.
     if pending and not args.dry_run:
-        need_tt = any(json.loads(p.read_text(encoding="utf-8-sig")).get("tiktok_status") != "scheduled" for p in pending) and not args.skip_tiktok
+        _TT_DONE = {"scheduled", "uploaded_draft", "queued", "published"}
+        need_tt = any(
+            json.loads(p.read_text(encoding="utf-8-sig")).get("tiktok_status") not in _TT_DONE
+            for p in pending
+        )
         if need_tt:
             try:
-                from pathlib import Path as _P
                 from cs2archive.upload.social_session_check import check_tiktok
-                tt_dir = _P(r"D:\Projects\CS2UtilArchive") / ".cloak-tiktok-profile"
-                ok, msg = check_tiktok(tt_dir)
+                ok, msg = check_tiktok()
                 print(f"[preflight tiktok] {msg}", flush=True)
                 if not ok:
-                    print("  -> TikTok not logged in. Fix then re-run, or use --skip-tiktok", flush=True)
+                    print(
+                        "  -> TikTok API token missing/expired. Run: "
+                        "python scripts/tiktok_api.py login (in CS2UtilArchive). "
+                        "The upload will still run and fail loudly on TikTok.",
+                        flush=True,
+                    )
             except Exception as e:
                 print(f"[preflight warn] {e}", flush=True)
 

@@ -10,6 +10,54 @@ This identifies overlay-added delay, not yet all capture-side A/V delay reported
 - Real-capture regression (opt-in via `CS2ARCHIVE_AUDIO_DRIFT_FIXTURE`) failed old code: +24.750 ms measured vs -3.284 ms requested at 84.2 s. The synthetic pulse test passed old code and is not evidence of reproducing the capture defect.
 - Review-only pre-hook video built and verified at `.pi/audio-drift-probe/zywoo.source-timing.nohook.mp4`; original video and upload are unchanged. Machine-readable verification: `.pi/audio-drift-probe/review-verification.json`.
 
+## 2026-11-01: the concat join was adding ~26 ms of audio lag per round
+
+A fourth, independent mechanism — and the one that explains the repeat reports
+on long POVs. `concat_rounds._concat_many` joined the per-round CSDM clips with
+the **concat demuxer + `-c copy`**, i.e. it copied each clip's AAC packets onto
+the next clip's timeline. That re-inserts, at every join, one primed AAC frame
+(1024 samples: 21.3 ms at 48 kHz) plus whatever audio tail overhang the clip
+carried over its frame-quantised picture length.
+
+Measured on the delivered YEKINDAR Dust2 POV (2026-11-01, 18 rounds):
+
+- `combined.mp4`: picture 1341.167 s (80470 frames), audio 1341.611 s —
+  **0.444 s of audio with no picture**, i.e. +26 ms per round boundary.
+- Overlay and hook prepend add **0.000 ms** at 60/300/600/900/1200/1320 s
+  (cross-correlated against `combined.mp4`), and the hook join is a stream copy:
+  the drift is entirely upstream of them.
+- Controlled reproduction, four synthetic clips (picture flash and audio click
+  both at exactly 0.500 s), same `-f concat -c copy` join:
+  click−flash = 4.7 / 31.4 / 67.4 / 106.0 ms → **+29.3 ms per join**, with the
+  picture perfectly continuous. Equal-length clips drift too: the priming frame
+  alone is enough.
+- With video copied and audio rejoined (the fix below) the same clips measure a
+  constant −16.6 ms at every join — no growth.
+
+This is the mechanism behind "the audio drifts later the longer the video runs"
+on every multi-round POV, and it is *additive* with the older capture-side
+offset: a 20-round map ends ~0.5 s late before anything else is considered.
+It also explains why the drift looked like a rate mismatch across a whole file
+(the steps are small and frequent enough to fit a slope).
+
+**Fix (`cs2archive/pov/concat_rounds.py`):** video stays a stream copy (frame
+timestamps untouched), the joined audio is rebuilt — each part decoded on its
+own (a standalone decode honours that file's edit list, so its encoder delay is
+trimmed), trimmed/padded to that part's frame-exact picture length
+(`nb_frames / fps`), joined with the `concat` **filter** and encoded once to
+AAC 256k / 48 kHz stereo. One encode = one priming, on the picture clock.
+
+Regression: `tests/test_concat_rounds.py::test_concat_audio_does_not_drift_across_joins`
+builds flash+click clips, concatenates them through `concat_rounds`, and asserts
+the click−flash offset does not grow across joins and that the audio track does
+not outrun the picture. It fails on the old copy join (101 ms growth over 3
+joins).
+
+**Already-delivered files cannot be repaired in place:** the round clips are
+deleted once concatenated, so the per-round steps are not recoverable from
+`combined.mp4`. Re-render (the fix applies at step 3) or accept the shipped
+file.
+
 ## Recurrence and what must not be forgotten
 
 Late audio was reported across ZywOo, donk and earlier flameZ POVs. The symptom is recurring; the controlled filter reproduction below proves this mechanism for ZywOo only. Do not assume every future A/V failure has the same cause.

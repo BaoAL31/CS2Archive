@@ -19,6 +19,16 @@ token_youtube_thumb.json
 tmp_meta_token.json
 .tmp_meta_token*.json
 .cloak-instagram-profile/
+.cloak-tiktok-profile/
+
+# Runtime data stores (large binaries, regenerable)
+data/
+cs2archive/hf/.sync_foundation_state.json
+exports/pov_selection_*/
+
+# Agent scratch (dot-prefixed variants of the tmp_* rules below)
+.tmp_*
+grep.exe.stackdump
 
 # App data
 .data/

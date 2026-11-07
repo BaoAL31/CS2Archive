@@ -241,7 +241,10 @@ def _map_mesh_available(map_name: str) -> bool:
 
 INSTA_PAIR_SECONDS = 3.0  # non-flick insta kills must pair within this to qualify
 INSTA_CLEAN_HP = 90.0  # ...and at least one victim at/above this (0 disables)
-INSTA_RULE_VERSION = 13  # fast multikills remain continuous; stale caches rebuild
+INSTA_RULE_VERSION = 14  # v14: hook quality is CONTENT-only (kills on screen,
+# compression, headshot/reaction/hardness). Category tiers are detectors and
+# score nothing — caches from the tier-ranked era must rebuild.
+# v13: fast multikills remain continuous; stale caches rebuild
 # v12: flick quality only when the real flick detector
 # tagged the kill (victim_rewind no longer surfaces raw peak deg/s).
 # v11: through-smoke kills deter -25. v10: INSTA_QUALITY_BONUS.
@@ -840,10 +843,14 @@ def kill_credit_index(demo_path: Path, sid: str | None,
 
 
 def _sort_key(m: dict):
-    """Tier first, then kill count desc, then faster TTK, then tick."""
-    return (m["tier_rank"], -len(m.get("kill_ticks") or []),
-            m.get("ttk") if m.get("ttk") is not None else 99.0,
-            m["start_tick"])
+    """Content score first (best first), then kill count, then tick.
+
+    Category is deliberately absent: the clip is ranked by what a viewer sees in
+    it, so a 2-kill clip always outranks a 1-kill clip no matter which detector
+    found either one.
+    """
+    return (-moment_quality(m), -len(m.get("kill_ticks") or []),
+            m.get("start_tick") or 0)
 
 
 # A traded kill forfeits the maximum reaction credit an insta can earn: the
@@ -877,13 +884,42 @@ def segment_quality(window_kills: list[int], moment: dict,
     enclosed = sorted(set(window_kills) & set(kills))
     if enclosed and enclosed == sorted(set(kills)):
         return moment_quality(moment)
-    score = 0.0
-    for tick in enclosed:
-        credit = kill_credit.get(int(tick)) or {}
-        score += 100.0
+    per_tick = {int(t): (kill_credit.get(int(t)) or {}) for t in enclosed}
+    return _content_score([int(t) for t in enclosed], per_tick)
+
+
+# ── Hook quality = what the viewer sees inside the clip ─────────────────────
+#
+# The viewer never sees the round: a clip is judged only by what happens on
+# screen for those few seconds. So quality is CONTENT — how many kills, how
+# fast, how clean, how hard — never the detector category that found the clip.
+# A "1v5 clutch" clip showing two clean kills is a 2-kill clip; a lone fast kill
+# is a 1-kill clip. Category contributes zero points (it is a label only).
+KILL_POINTS = 900.0              # dominant term: more kills on screen wins
+KILL_HS_FLAT = 50.0              # a headshot reads as cleaner aim
+COMPRESSION_MAX = 400.0          # per adjacent kill pair, scaled by how tight
+DEAD_AIR_GRACE_S = 3.0           # gaps above this are dead time in the clip
+DEAD_AIR_PENALTY_PER_S = 60.0
+
+
+def _content_score(kill_ticks: list[int], per_tick: dict[int, dict],
+                   *, tickrate: int = 64, extra: float = 0.0) -> float:
+    """Score one clip from its on-screen content (pure).
+
+    ``per_tick`` maps kill tick -> {"hs": bool|0/1, "hs_points": float,
+    "peek": float, "insta": bool, "flag": float}. Adjacent kills earn a
+    compression bonus (a fast double reads better than two lone kills) and
+    long gaps inside the clip pay a dead-air penalty.
+    """
+    ticks = sorted({int(t) for t in kill_ticks})
+    if not ticks:
+        return 0.0
+    score = KILL_POINTS * len(ticks)
+    for t in ticks:
+        credit = per_tick.get(t) or {}
         try:
             if float(credit.get("hs") or 0.0) > 0:
-                score += 50.0
+                score += float(credit.get("hs_points") or KILL_HS_FLAT)
         except (TypeError, ValueError):
             pass
         try:
@@ -896,9 +932,12 @@ def segment_quality(window_kills: list[int], moment: dict,
             score += float(credit.get("flag") or 0.0)  # may deter (negative)
         except (TypeError, ValueError):
             pass
-        if credit.get("trade"):
-            score -= TRADE_DETER_POINTS
-    return score
+    for a, b in zip(ticks, ticks[1:]):
+        gap_s = abs(b - a) / float(tickrate or 64)
+        score += COMPRESSION_MAX * max(0.0, 1.0 - gap_s / CHAIN_GAP_SECONDS)
+        if gap_s > DEAD_AIR_GRACE_S:
+            score -= (gap_s - DEAD_AIR_GRACE_S) * DEAD_AIR_PENALTY_PER_S
+    return score + extra
 
 
 def chain_segments(chain: dict, tickrate: int,
@@ -926,62 +965,46 @@ def chain_segments(chain: dict, tickrate: int,
 
 
 def moment_quality(m: dict) -> float:
-    """Impressiveness score for one picked moment (higher = better).
+    """Impressiveness of ONE moment — its content only, never its category.
 
-    The tier ladder dominates (a 4K always outranks any single, whatever the
-    TTK); within a tier more kills win, then headshot bonuses stack flat
-    (every headshot the same, counted once per kill tick no matter how many
-    fused candidates reference it — chained kills add up, so 2 headshots
-    outscore 1), then faster reactions. Traded kills deter flat (see
-    TRADE_DETER_POINTS) — a revenge kill never earns reaction credit.
-    There is deliberately no clutch-disadvantage bonus: the tier base
-    already pays clutches top dollar, so an extra would double-count.
-    Pure — drives the least-impressive-first assembly order so the hook
+    The viewer sees the clip, not the round: they cannot tell a 1v5 from an eco
+    round, so the detector that found the clip (``tier``) must not add points.
+    What scores is what is on screen: kills (dominant), how tight they are,
+    headshots, reaction (insta / TTK), weapon disadvantage (punch-up, wallbang,
+    noscope), peek/flick difficulty, minus dead air and through-smoke noise.
+
+    Pure — drives pick order and the least-impressive-first assembly so the hook
     builds to its climax.
     """
-    rank = int(m.get("tier_rank", 99))
-    score = (len(TIER_ORDER) - rank) * 1000.0
-    score += len(m.get("kill_ticks") or []) * 100.0
-    try:
-        score += float(m.get("hs_bonus") or 0.0)
-    except (TypeError, ValueError):
-        pass
-    # Peek-kill bonuses stack per kill (deduped per tick on merges).
-    peek = m.get("peek_ticks")
-    if isinstance(peek, dict):
+    kills = [int(t) for t in (m.get("kill_ticks") or [])]
+    hs_ticks = m.get("hs_ticks") or {}
+    peek_ticks = m.get("peek_ticks") or {}
+    insta_ticks = m.get("insta_ticks") or {}
+    flag_ticks = m.get("flag_ticks") or {}
+    per_tick: dict[int, dict] = {}
+    for t in kills:
+        per_tick[t] = {
+            "hs": bool(float(hs_ticks.get(t, hs_ticks.get(str(t), 0)) or 0) > 0),
+            "hs_points": float(hs_ticks.get(t, hs_ticks.get(str(t), KILL_HS_FLAT)) or 0),
+            "peek": float(peek_ticks.get(t, peek_ticks.get(str(t), 0)) or 0),
+            "insta": str(t) in insta_ticks or t in insta_ticks,
+            "flag": float(flag_ticks.get(t, flag_ticks.get(str(t), 0)) or 0),
+        }
+    extra = flick_speed_bonus(m.get("flick_speed"))
+    if not hs_ticks:
+        # Older/merged moments may carry only the aggregate; keep the headshot
+        # credit rather than silently dropping it.
         try:
-            score += sum(float(v) for v in peek.values())
+            extra += float(m.get("hs_bonus") or 0.0)
         except (TypeError, ValueError):
             pass
-    # Verified insta kills pay a flat per-kill bonus (deduped per tick on
-    # merges — an insta kill folded into a 3k earns it exactly once).
-    insta = m.get("insta_ticks")
-    if isinstance(insta, dict):
-        try:
-            score += len(insta) * INSTA_QUALITY_BONUS
-        except (TypeError, ValueError):
-            pass
-    # Flag bonuses (punch-up / wallbang / noscope / through-smoke) stack
-    # per kill — sum across merged candidates.
-    flag = m.get("flag_ticks")
-    if isinstance(flag, dict):
-        try:
-            score += sum(float(v) for v in flag.values())
-        except (TypeError, ValueError):
-            pass
-    # Flick speed: the faster the crosshair was moving, the more quality.
-    score += flick_speed_bonus(m.get("flick_speed"))
     ttk = m.get("ttk")
     if ttk is not None:
         try:
-            score += max(0.0, 0.5 - float(ttk)) * 200.0
+            extra += max(0.0, 0.5 - float(ttk)) * 200.0
         except (TypeError, ValueError):
             pass
-    try:
-        score -= len(m.get("trade_ticks") or []) * TRADE_DETER_POINTS
-    except TypeError:
-        pass
-    return score
+    return _content_score(kills, per_tick, extra=extra)
 
 
 CHAIN_GAP_SECONDS = 5.0    # chain moments this close instead of cutting; cut at/above

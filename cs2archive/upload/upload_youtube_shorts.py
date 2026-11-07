@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -55,7 +56,36 @@ SHORTS_META_NAME = "upload_meta_shorts.json"
 SHORTS_VIDEO_NAME = "short.mp4"
 SHORTS_COVER_NAME = "cover.png"
 
-SOCIAL_UPLOAD_TIMEOUT_SECONDS = 1800
+# Partial uploads (dropping a platform) are an operator decision, not a default.
+# The --skip-* flags stay available for a genuinely broken platform, but they are
+# hidden from --help and inert unless this env var is set, so an agent cannot
+# narrow a Short to one platform on its own initiative. See
+# docs/agents/shorts-picker.md ("Uploading is all four platforms, always").
+PARTIAL_UPLOAD_ENV = "CS2ARCHIVE_ALLOW_PARTIAL_UPLOAD"
+PLATFORM_FLAGS = {
+    "tiktok": "--skip-tiktok",
+    "instagram": "--skip-instagram",
+    "facebook": "--skip-facebook",
+}
+
+
+def partial_upload_authorized() -> bool:
+    return os.environ.get(PARTIAL_UPLOAD_ENV, "").strip().lower() in {"1", "true", "yes"}
+
+
+def refuse_unauthorized_partial_upload(skipped: list[str]) -> None:
+    """Exit loudly when a platform is dropped without operator authorization."""
+    if not skipped or partial_upload_authorized():
+        return
+    flags = ", ".join(PLATFORM_FLAGS[name] for name in skipped)
+    print(
+        f"[ERROR] refusing a partial upload ({flags}).\n"
+        "  A Short is published to YouTube, TikTok, Instagram and Facebook; dropping\n"
+        "  a platform is an operator decision, not an agent one. Ask the user first.\n"
+        f"  If they approve, re-run with {PARTIAL_UPLOAD_ENV}=1 in the environment.",
+        flush=True,
+    )
+    sys.exit(2)
 
 
 def ensure_shorts_hashtag(title: str, description: str) -> tuple[str, str]:
@@ -66,6 +96,16 @@ def ensure_shorts_hashtag(title: str, description: str) -> tuple[str, str]:
     so we intentionally never append it here.
     """
     return title, description
+
+
+def shorts_occupied_dates(all_dates, long_form_dates) -> set[str]:
+    """Dates blocking a Shorts 18:00 slot: other Shorts only.
+
+    Long-form uploads (10:00/16:30 premieres) must never push a Short off
+    its day — they share no shelf and no audience window. The per-player
+    one-short-per-day rule lives separately in ``shorts_player_day``.
+    """
+    return set(all_dates or set()) - set(long_form_dates or set())
 
 
 def main() -> None:
@@ -81,19 +121,14 @@ def main() -> None:
     parser.add_argument("--tags", help="Comma-separated tags")
     parser.add_argument("--privacy", choices=["private", "unlisted", "public"], default="unlisted")
     parser.add_argument(
-        "--skip-tiktok",
-        action="store_true",
-        help="Skip the TikTok upload (default: upload to TikTok after YouTube)",
-    )
-    parser.add_argument(
-        "--skip-instagram",
-        action="store_true",
-        help="Skip the Instagram upload (default: upload to Instagram after YouTube)",
-    )
-    parser.add_argument(
-        "--skip-facebook",
-        action="store_true",
-        help="Skip the Facebook Page Reel upload (default: Graph publish after Instagram)",
+        "--tiktok-api",
+        choices=["web", "draft", "direct"],
+        default="web",
+        help="TikTok upload mode (default: web): 'web' drives TikTok Studio in "
+        "CloakBrowser (works while the Content Posting app is in review); "
+        "'draft' uploads to the TikTok app inbox via the API for manual "
+        "finishing; 'direct' publishes directly via the API (needs "
+        "video.publish audit; unaudited = private-only)",
     )
     parser.add_argument(
         "--publish-at",
@@ -104,7 +139,19 @@ def main() -> None:
         default=DEFAULT_PUBLISH_TZ,
         help=f"IANA timezone for --publish-at (default: {DEFAULT_PUBLISH_TZ})",
     )
+    # Hidden on purpose: dropping a platform needs operator authorization
+    # (PARTIAL_UPLOAD_ENV), so these must not read as ordinary options.
+    for _name, _flag in PLATFORM_FLAGS.items():
+        parser.add_argument(
+            _flag,
+            action="store_true",
+            help=argparse.SUPPRESS,
+            dest=f"skip_{_name}",
+        )
     args = parser.parse_args()
+
+    skipped_platforms = [name for name in PLATFORM_FLAGS if getattr(args, f"skip_{name}")]
+    refuse_unauthorized_partial_upload(skipped_platforms)
 
     if not args.video:
         print("[ERROR] <video> path required", flush=True)
@@ -156,7 +203,9 @@ def main() -> None:
         if publish_setting == "auto":
             print("Authenticating with Google...", flush=True)
             youtube_pre = get_authenticated_service()
-            occupied_dates = get_youtube_publish_dates(youtube_pre, exclude_shorts=False) or None
+            occupied_all = get_youtube_publish_dates(youtube_pre, exclude_shorts=False) or set()
+            long_form = get_youtube_publish_dates(youtube_pre, exclude_shorts=True) or set()
+            occupied_dates = shorts_occupied_dates(occupied_all, long_form)
             occupied_tuples = (
                 {(d.split("T")[0], d.split("T")[1][:5]) for d in occupied_dates if "T" in d}
                 if occupied_dates
@@ -238,6 +287,10 @@ def main() -> None:
     else:
         print(f"  [yt] already completed id={meta_now.get('youtube_id')}", flush=True)
 
+    # Durable short -> demo linkage, keyed by the platform post id. Instrumentation
+    # only: never fatal to the upload, retries capped at 3, loudly logged.
+    _record_linkage(video, meta_path)
+
     # YouTube is the master schedule. Whatever slot YouTube actually committed
     # (ground truth from the upload response publishAt) is the single source
     # of truth for every other platform. Re-derive the local wall-clock and
@@ -269,14 +322,52 @@ def main() -> None:
     meta_now = _read_meta(meta_path)
     slot_utc = meta_now.get("publish_at_utc") or publish_at_utc
 
-    if not args.skip_tiktok:
-        _run_tiktok(video, title, browser_date, browser_time, meta_file_path)
+    # Every Short goes to all four platforms. A platform is only dropped when the
+    # operator authorized it above; the drop is recorded in the meta so the
+    # pending runner treats it as settled and an audit can find it later.
+    social_failures: list[str] = []
+    for name, run in (
+        (
+            "tiktok",
+            lambda: _run_tiktok(
+                video,
+                title,
+                browser_date,
+                browser_time,
+                meta_file_path,
+                mode=args.tiktok_api,
+            ),
+        ),
+        (
+            "instagram",
+            lambda: _run_instagram(video, title, meta_file_path, publish_at_utc=slot_utc),
+        ),
+        (
+            "facebook",
+            lambda: _run_facebook(
+                video, title, description, meta_file_path, publish_at_utc=slot_utc
+            ),
+        ),
+    ):
+        if name in skipped_platforms:
+            print(f"  [{name}] skipped by operator ({PARTIAL_UPLOAD_ENV}=1)", flush=True)
+            continue
+        try:
+            run()
+        except Exception as exc:  # noqa: BLE001 - one platform must not block the rest
+            print(f"  [{name}][FAILED] {exc}", flush=True)
+            social_failures.append(name)
 
-    if not args.skip_instagram:
-        _run_instagram(video, title, meta_file_path, publish_at_utc=slot_utc)
+    if skipped_platforms:
+        _write_meta(meta_path, skipped_platforms=skipped_platforms)
 
-    if not args.skip_facebook:
-        _run_facebook(video, title, description, meta_file_path, publish_at_utc=slot_utc)
+    if social_failures:
+        print(
+            f"\n[ERROR] cross-post incomplete: {', '.join(social_failures)} failed. "
+            "Re-run this command to retry only the missing platforms.",
+            flush=True,
+        )
+        sys.exit(1)
 
 
 def _read_meta(meta_path: Path) -> dict:
@@ -284,6 +375,33 @@ def _read_meta(meta_path: Path) -> dict:
         return json.loads(meta_path.read_text(encoding="utf-8-sig"))
     except Exception:
         return {}
+
+
+def _record_linkage(video, meta_path) -> None:
+    """Attach the platform post id(s) to the staged demo linkage.
+
+    Non-fatal by design: a missing linkage record or a write failure logs loudly
+    and the upload continues (a backfill can recover the row later).
+    """
+    if os.environ.get("CS2ARCHIVE_NO_LINKAGE"):
+        return
+    try:
+        from cs2archive.shorts.social.linkage import record_upload_linkage
+    except Exception as exc:  # noqa: BLE001 - optional instrumentation
+        print(f"[linkage][WARN] import failed: {exc}", flush=True)
+        return
+    meta = _read_meta(meta_path)
+    pairs = [("youtube", meta.get("youtube_id"))]
+    if meta.get("instagram_id"):
+        pairs.append(("instagram", meta.get("instagram_id")))
+    if meta.get("facebook_id"):
+        pairs.append(("facebook", meta.get("facebook_id")))
+    for platform, post_id in pairs:
+        if not post_id:
+            continue
+        record_upload_linkage(video, platform=platform, post_id=str(post_id),
+                              meta_path=meta_path,
+                              log=lambda msg: print(msg, flush=True))
 
 
 def _write_meta(meta_path: Path, **fields) -> None:
@@ -313,56 +431,117 @@ _FB_SCHEDULE_MAX = timedelta(days=29)
 _IG_IMMEDIATE = timedelta(seconds=90)
 
 
+def _pin_tiktok_fingerprint(seed: int = 73491) -> None:
+    """Pin the CloakBrowser fingerprint seed for TikTok.
+
+    cloakbrowser randomizes ``--fingerprint`` per launch; TikTok binds the
+    session to the device fingerprint, so a fresh seed logs the account out
+    again. Pin one seed for both the login and every Studio run, so the
+    persisted session survives. No-op when the sibling module is absent.
+    """
+    try:
+        import cloakbrowser.browser as _cb_browser
+    except Exception:
+        return
+    real = _cb_browser.get_default_stealth_args
+
+    def _pinned() -> list[str]:
+        return [
+            (f"--fingerprint={seed}" if a.startswith("--fingerprint=") else a)
+            for a in real()
+        ]
+
+    _cb_browser.get_default_stealth_args = _pinned
+
+
 def _run_tiktok(
     video: Path,
     title: str,
     browser_date: str | None,
     browser_time: str | None,
     meta_file_path: str,
+    *,
+    mode: str = "web",
 ) -> None:
-    """Schedule the Short on TikTok Studio. Resume-safe."""
+    """Upload the Short to TikTok. Resume-safe.
+
+    ``web`` (default) drives TikTok Studio in CloakBrowser — the same system
+    as CS2UtilArchive's upload_short.py default, used while the Content
+    Posting app is still in review. ``draft``/``direct`` fall back to the
+    sibling ``tiktok_publish.run_tiktok`` API path (draft = app inbox for
+    manual finishing; direct = DIRECT_POST, future slots queue a Windows
+    task)."""
     meta_path = Path(meta_file_path)
+    # Slot: prefer the committed UTC slot, fall back to the local wall-clock.
+    slot = None
     meta_now = _read_meta(meta_path)
-    if meta_now.get("tiktok_status") == "scheduled":
-        print("  [tiktok] already scheduled", flush=True)
-        return
-    if not browser_date or not browser_time:
+    if meta_now.get("publish_at_utc"):
+        slot = _aware_utc(meta_now["publish_at_utc"])
+    if slot is None and browser_date and browser_time:
+        try:
+            tzname = meta_now.get("publish_timezone") or DEFAULT_PUBLISH_TZ
+            slot = datetime.strptime(f"{browser_date} {browser_time}", "%Y-%m-%d %H:%M").replace(
+                tzinfo=ZoneInfo(tzname)
+            )
+        except Exception as exc:
+            print(f"  [tiktok] could not parse slot ({exc}); skipping", flush=True)
+            return
+    if slot is None:
         print("  [tiktok] no schedule slot; skipping", flush=True)
         return
 
     from cs2archive.overlay._common import prefer_cs2util_scripts
+
     prefer_cs2util_scripts()
-    from tiktok_studio_navigator import (
-        DEFAULT_PROFILE_DIR as DEFAULT_TIKTOK_PROFILE_DIR,
-        run_schedule_flow as run_tiktok_schedule_flow,
-    )
-    profile_dir = _UTIL_ROOT / DEFAULT_TIKTOK_PROFILE_DIR
-    # preflight: fail fast if not logged in instead of hanging on upload
-    try:
-        from cs2archive.upload.social_session_check import check_tiktok
-        ok, msg = check_tiktok(profile_dir)
-        if not ok:
-            print(f"  [tiktok] {msg}", flush=True)
-            print("  [tiktok] skipping — fix login then re-run upload_pending_shorts", flush=True)
-            return
-        print(f"  [tiktok] preflight OK: {msg}", flush=True)
-    except Exception as e:
-        print(f"  [tiktok] preflight warn (continuing): {e}", flush=True)
-    print("Scheduling TikTok...", flush=True)
-    run_tiktok_schedule_flow(
-        video_path=video,
-        schedule_date=browser_date,
-        schedule_time=browser_time,
-        profile_dir=profile_dir,
-        headed=False,
-        hold_seconds=0,
-        upload_timeout_seconds=SOCIAL_UPLOAD_TIMEOUT_SECONDS,
-        submit=True,
-        caption=title,
-        output_path=None,
-    )
-    _write_meta(meta_path, tiktok_status="scheduled")
-    print("  TikTok scheduled", flush=True)
+
+    if mode == "web":
+        from tiktok_studio_navigator import (
+            DEFAULT_PROFILE_DIR as DEFAULT_TIKTOK_PROFILE_DIR,
+            run_schedule_flow as run_tiktok_schedule_flow,
+        )
+
+        _pin_tiktok_fingerprint()
+
+        tzname = meta_now.get("publish_timezone") or DEFAULT_PUBLISH_TZ
+        # Committed metadata stores UTC; TikTok's picker takes local wall time.
+        # Formatting UTC directly selected 07:00 instead of 18:00 Sydney.
+        slot = slot.astimezone(ZoneInfo(tzname))
+        now_local = datetime.now(ZoneInfo(tzname))
+        if slot <= now_local:
+            # Slot already passed (instant YouTube publish): schedule TikTok
+            # 25+ minutes out — Studio's scheduler requires a >=20 min lead
+            # and its time picker only accepts minute multiples of 5.
+            slot = now_local + timedelta(minutes=25)
+            print(f"  [tiktok] slot passed; scheduling web post at "
+                  f"{slot:%Y-%m-%d %H:%M} ({tzname})", flush=True)
+        # TikTok's time picker only accepts minute multiples of 5.
+        over = slot.minute % 5
+        if over or slot.second or slot.microsecond:
+            slot += timedelta(minutes=5 - over)
+        try:
+            run_tiktok_schedule_flow(
+                video_path=video,
+                schedule_date=f"{slot:%Y-%m-%d}",
+                schedule_time=f"{slot:%H:%M}",
+                profile_dir=Path(DEFAULT_TIKTOK_PROFILE_DIR),
+                headed=True,
+                hold_seconds=0,
+                upload_timeout_seconds=900,
+                submit=True,
+                caption=title,
+                output_path=None,
+            )
+        except Exception as exc:
+            print(f"  [tiktok] web flow failed: {exc}", flush=True)
+            raise
+        _write_meta(meta_path, tiktok_status="scheduled",
+                    tiktok_publish_at=f"{slot:%Y-%m-%d %H:%M} ({tzname})")
+        print("  [tiktok] web flow done — scheduled in TikTok Studio", flush=True)
+        return
+
+    from tiktok_publish import run_tiktok
+
+    run_tiktok(video=video, caption=title, slot=slot, meta_path=meta_path, mode=mode)
 
 
 def _run_instagram(

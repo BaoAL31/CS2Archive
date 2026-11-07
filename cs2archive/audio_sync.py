@@ -32,6 +32,21 @@ Historical observations on renders (flameZ / Dust2, 25 min POV):
 Short renders never showed it (200 ppm only becomes audible over 10+ minutes),
 which is why the muxing-drift fixes (1606d6e, cf263a2, c7e29a9, 2e5b6ab) never
 closed it.
+
+4. **The drift *fit* was the remaining defect (2026-10-11).** The slope was fit
+   from **6 latched marks** with plain least squares, and logs across nine
+   renders show what that produced::
+
+       +0.637 +0.294 +0.200 +0.076 -0.058 -0.253 -0.283 -0.474 -0.574  ms/s
+
+   random signs, against a real drift that is consistently *positive* (audio
+   progressively late). The onset finder also latched onto the window's edge:
+   when a louder sound sat earlier than the expected picture time the reported
+   offset came out as ``-(window - ~0.1)`` — the repeated ``-0.59 s`` cluster on
+   the donk Dust2 POV. A wrong-signed fit does not merely fail to help; slowing
+   the audio adds delay toward the end of the file (``-0.574 ms/s`` on 21 min =
+   ~+0.8 s). Fix: many marks (24+), edge-latch rejection, and a Theil-Sen
+   (median-of-pairwise-slopes) fit, which an outlier cannot move.
 """
 
 from __future__ import annotations
@@ -43,8 +58,16 @@ from pathlib import Path
 AAC_PRIMING_SAMPLES = 1024  # informational: tagged by this muxer, do not trim
 PROBE_RATE = 48000
 MIN_MARKS = 2
+# Fewer marks than this and no slope is trustworthy: with only a couple of
+# landmarks a single latched onset sets the correction (the 6-mark era).
+MIN_SLOPE_MARKS = 8
 # A drift beyond this is a measurement error, not a render: never "fix" it.
-MAX_TEMPO_DEVIATION = 0.02
+# 0.5 % is 5 ms/s — 4.5x the largest drift ever measured (1.1 ms/s, donk Dust2
+# 2026-10-11), and the old 2 % ceiling happily accepted garbage fits.
+MAX_TEMPO_DEVIATION = 0.005
+# Onsets this close to the window's leading edge mean the loudest sound sat
+# BEFORE the expected picture time (a previous engagement), not at it.
+EDGE_REJECT_SECONDS = 0.12
 
 
 def crossfade_pad_ms(fade_seconds: float) -> int:
@@ -75,6 +98,38 @@ def fit_drift(marks: list[tuple[float, float]]) -> tuple[float, float]:
         return 0.0, 0.0
     slope = sum((t - mean_t) * (o - mean_o) for t, o in samples) / denom
     return mean_o - slope * mean_t, slope
+
+
+def theil_sen_slope(marks: list[tuple[float, float]]) -> float:
+    """Median of pairwise slopes — the drift, unmovable by one bad mark.
+
+    Least squares gave a random-signed slope from 6 marks (see module
+    docstring): a single onset that latched onto the wrong sound could swing the
+    correction from "speed the audio up" to "slow it down", and a wrong-signed
+    correction makes the delivered delay grow instead of shrink.
+    """
+    samples = sorted((float(t), float(o)) for t, o in marks)
+    if len(samples) < MIN_SLOPE_MARKS:
+        return 0.0
+    slopes: list[float] = []
+    for i, (t_i, o_i) in enumerate(samples):
+        for t_j, o_j in samples[i + 1:]:
+            if t_j > t_i:
+                slopes.append((o_j - o_i) / (t_j - t_i))
+    if not slopes:
+        return 0.0
+    slopes.sort()
+    mid = len(slopes) // 2
+    return slopes[mid] if len(slopes) % 2 else 0.5 * (slopes[mid - 1] + slopes[mid])
+
+
+def robust_intercept(marks: list[tuple[float, float]], slope: float) -> float:
+    """Median residual offset — the constant part, outlier-proof."""
+    residuals = sorted(float(o) - slope * float(t) for t, o in marks)
+    if not residuals:
+        return 0.0
+    mid = len(residuals) // 2
+    return residuals[mid] if len(residuals) % 2 else 0.5 * (residuals[mid - 1] + residuals[mid])
 
 
 def atempo_for_slope(slope: float) -> float:
@@ -121,7 +176,14 @@ def _audio_onset_offset(video_path: Path, expected: float, window: float,
     limit = peak * threshold
     for index, value in enumerate(samples):
         if abs(value) >= limit:
-            return (start + index / float(PROBE_RATE)) - expected
+            offset = (start + index / float(PROBE_RATE)) - expected
+            # Onset hugging the leading edge = the loudest sound was BEFORE the
+            # expected picture time (a previous engagement, a teammate's shot).
+            # Those marks read as a constant -0.59 s on a 0.7 s window and were
+            # what poisoned the old fit.
+            if offset <= -(window - EDGE_REJECT_SECONDS):
+                return None
+            return offset
     return None
 
 
@@ -157,7 +219,7 @@ def measure_audio_drift(
     per_round_ticks: dict[int, tuple[int, int]] | None = None,
     *,
     tickrate: int = 64,
-    max_marks: int = 6,
+    max_marks: int = 24,
     window: float = 0.7,
 ) -> tuple[float, float, int]:
     """``(intercept, slope, n_marks)`` for the audio drift of an already-rendered POV.
@@ -166,6 +228,10 @@ def measure_audio_drift(
     kill we know where the *picture* should be, and the loudest sample nearby is
     where the *audio* is. Marks are spread across the file so the slope compares
     the start of the match against its end.
+
+    The slope is Theil-Sen and needs ``MIN_SLOPE_MARKS`` valid marks; a thin or
+    edge-latched sample returns slope 0.0, i.e. "no correction", because a
+    wrong-signed correction is worse than none (see module docstring).
     """
     if not round_offsets or not per_round_ticks:
         return 0.0, 0.0, 0
@@ -191,5 +257,5 @@ def measure_audio_drift(
         offset = _audio_onset_offset(Path(video_path), expected, window)
         if offset is not None:
             samples.append((expected, offset))
-    intercept, slope = fit_drift(samples)
-    return intercept, slope, len(samples)
+    slope = theil_sen_slope(samples)
+    return robust_intercept(samples, slope), slope, len(samples)

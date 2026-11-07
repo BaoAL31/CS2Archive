@@ -80,6 +80,13 @@ whenever CS2 moves the offsets:
 
 | CS2 build | Required HLAE |
 |---|---|
+| 1.41.9.5 | **HLAE 2.192.10** (AfxHookSource2 0.41.9, still the newest release as of 2026-11-04) — the .4→.5 gap assumed to move no hooked offsets, same as the verified .3→.4 pair. **Pending live verify**. |
+| 1.41.9.4 | **HLAE 2.192.10** (AfxHookSource2 0.41.9, still the newest release as of 2026-10-31) — the .3→.4 gap is assumed to move no hooked offsets, same as the .1→.2 pair. **Pending live verify**; if the hook misses, expect the vanilla "Raw files not found" signature and roll the pin row back. |
+| 1.41.9.3 | **HLAE 2.192.10** (AfxHookSource2 0.41.9). Shared rig pin matches CS2UtilArchive; 2026-10-30 ZywOo audio recovery capture validates this pair. |
+| 1.41.9.2 | **HLAE 2.192.8** (AfxHookSource2 0.41.8) — no newer upstream release existed when 1.41.9.2 shipped (checked 2026-10-25: latest release is still 2.192.8; the only fresh artifact was an explicitly-marked *old* 2.185.4 re-release for CS2 1.40.8.8). The .1→.2 gap therefore moved no hooked offsets, exactly like the 1.41.8.8/.9 pair below. Verified live 2026-10-25: hook engages in 4s, one-round render OK (999 MB, verify pass 95% weapon / 0% frozen, n=19). |
+| 1.41.9.1 | **HLAE 2.192.8** (AfxHookSource2 0.41.8, released 2026-10-14, same day as this patch) — verified live 2026-10-16: hook engages in 2s, one-round render OK (518 MB, verify pass 64% weapon / 0% frozen). Attempt 1 hit the known no-ffmpeg hook flake and attempt 2 succeeded, so `FFMPEG_GRACE` still applies. |
+| 1.41.9.0 | **HLAE 2.192.7** (AfxHookSource2 0.41.7, released 2026-10-08) — verified live 2026-10-10: hook engages in 4s, one-round render OK (504 MB, verify pass). |
+| 1.41.8.9 | **HLAE 2.192.6** (AfxHookSource2 0.41.6) — verified live 2026-10-08: hook engages in 3s, one-round render OK (244 MB, verify pass). 2.192.6 was already the newest release, so no HLAE upgrade existed for this patch; the `.8`→`.9` gap moved no hooked offsets. |
 | 1.41.8.8 | **HLAE 2.192.6** (AfxHookSource2 0.41.6) — verified live 2026-10-02: hook engages in 4s, one-round render OK (251 MB, verify pass). The .6→.8 gap moved no hooked offsets. |
 | 1.41.8.6 | **HLAE 2.192.6** (AfxHookSource2 0.41.6, 2026-09-26) — upstream hotfix, *not* a 1.41.8.6 offset adjustment |
 | 1.41.8.5 | **HLAE 2.192.5** (AfxHookSource2 0.41.5, 2026-09-26) |

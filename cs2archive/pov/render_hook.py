@@ -97,7 +97,11 @@ MIN_SEGMENT_BYTES = 1_048_576
 # 2 = also passed as `--cfg <file>`, the mechanism render_pov uses.
 # 3 = preserve fast multikills; invalidate already-prepended fragmented hooks
 # even when the new selection has the same number of identical player cfgs.
-HOOK_RENDER_VERSION = 3
+# v4: hook selection is content-scored (category no longer ranks), so a
+# prepended hook from the tier era must be rebuilt, not reused. Bumping this
+# changes the cfg hash the pipeline compares, which is what forces the
+# re-prepend (the cfg text itself is byte-identical).
+HOOK_RENDER_VERSION = 4
 
 
 def _pov_kill_ticks(demo_path: Path, sid: str) -> list[int]:
@@ -297,7 +301,14 @@ def render_hook(timeline_path: Path, width: int | None = None,
         from cs2archive.pov.render_version_check import (  # noqa: E402
             RenderVersionError,
             assert_render_versions,
+            ensure_hlae_for_cs2,
         )
+        if ensure_hlae_for_cs2() is None:
+            print("[PIPELINE_ERROR] {\"error\": true, \"step\": 5, \"step_name\": \"hook\", "
+                  "\"code\": \"RENDER_NO_HLAE_INSTALLED\", \"message\": \"No HLAE found under "
+                  "~/.csdm/hlae-versions — install one from "
+                  "https://github.com/advancedfx/advancedfx/releases\"}")
+            raise SystemExit(1)
         try:
             vers = assert_render_versions(demo_path)
             print(

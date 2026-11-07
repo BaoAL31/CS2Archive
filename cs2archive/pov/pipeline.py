@@ -130,6 +130,38 @@ def load_state(run_id: str) -> dict:
     return {"step": 1, "data": {}}
 
 
+GLOBAL_LOCK_PATH = STATE_DIR / "pipeline.lock"
+
+
+def acquire_global_lock() -> object:
+    """Fail fast if another pipeline run is already active.
+
+    Two pipelines sharing one CS2/HLAE (and one render dir) corrupt each
+    other into unusable outputs (57 GB duplicated concat, 2026-10-07 — two
+    overlapping resumes racing the same folder). The OS releases the
+    byte-range lock when the holder exits for ANY reason (clean exit, crash,
+    kill), so a stale lock is impossible and no override flag is needed.
+    """
+    fd = os.open(str(GLOBAL_LOCK_PATH),
+                 os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        import msvcrt
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    except (ImportError, OSError):
+        os.close(fd)
+        fail(0, "PIPELINE_ALREADY_RUNNING",
+             f"another pipeline run holds {GLOBAL_LOCK_PATH} — "
+             f"wait for it to finish instead of running two at once")
+    return fd
+
+
+def release_global_lock(fd: object) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
 def save_state(run_id: str, state: dict) -> None:
     (STATE_DIR / f"{run_id}.json").write_text(json.dumps(state, indent=2))
 
@@ -152,6 +184,40 @@ def run_id_from_name(name: str) -> str:
 
 def pov_render_dir(dem_stem: str, player: str) -> Path:
     return _pov_dir(dem_stem, player)
+
+
+# Fields that record a *finished* upload. Step 6 rewrites upload_meta.json on
+# every run, and hard-coding these to None/"pending" is what let the already
+# published sh1ro Anubis be uploaded a second time (2026-10-25): the rerun made
+# a published POV look like a brand-new pending upload.
+_UPLOAD_RECEIPT_FIELDS = (
+    "youtube_id",
+    "upload_status",
+    "bilibili_aid",
+    "bilibili_upload_status",
+)
+
+
+def merge_upload_meta(existing: object, fresh: dict) -> dict:
+    """Merge a freshly built upload_meta over the one already on disk (pure).
+
+    The fresh dict wins for everything it legitimately owns (title, paths, the
+    new render's own fields). A *published* upload receipt is carried forward
+    instead of being cleared, so a rebuild cannot silently re-upload a video
+    that is already live; ``rebuilt_after_upload`` records that the video file
+    was rebuilt after publication, which is the signal a human needs to decide
+    whether to publish the new render on purpose.
+    """
+    if not isinstance(existing, dict):
+        return dict(fresh)
+    merged = {**fresh}
+    prior_id = existing.get("youtube_id")
+    if existing.get("upload_status") == "completed" and prior_id:
+        for field in _UPLOAD_RECEIPT_FIELDS:
+            if existing.get(field) is not None:
+                merged[field] = existing[field]
+        merged["rebuilt_after_upload"] = True
+    return merged
 
 
 def _faceit_rename_map(demo_path: Path) -> dict:
@@ -471,7 +537,7 @@ class Pipeline:
         if not need_capture and not need_vm:
             return
         try:
-            from scrapers.prosettings import backlog_video_fields
+            from scrapers.prosettings import VideoSettingsUnresolved, backlog_video_fields
             lookup = str(acct.get("nickname") or "") if acct else ""
             fields = backlog_video_fields(lookup or self.meta.get("player", ""))
             if need_capture:
@@ -496,8 +562,20 @@ class Pipeline:
                           f"xyz=({self.meta.get('viewmodel_offset_x')},"
                           f"{self.meta.get('viewmodel_offset_y')},"
                           f"{self.meta.get('viewmodel_offset_z')})")
+        except VideoSettingsUnresolved as e:
+            # Was `print [WARN]` + continue, which shipped the card's stale/default
+            # values — the same silent-wrong-aspect class as render_pov.
+            print(f"[PIPELINE_ERROR] {{\"error\": true, \"step\": 0, "
+                  f"\"step_name\": \"preflight\", \"code\": "
+                  f"\"VIDEO_SETTINGS_UNRESOLVED\", "
+                  f"\"message\": \"{str(e).replace(chr(34), chr(39))}\"}}")
+            raise SystemExit(1)
         except Exception as e:
-            print(f"  [WARN] video settings lookup failed: {e}")
+            print(f"[PIPELINE_ERROR] {{\"error\": true, \"step\": 0, "
+                  f"\"step_name\": \"preflight\", \"code\": "
+                  f"\"VIDEO_SETTINGS_LOOKUP_FAILED\", "
+                  f"\"message\": \"{str(e).replace(chr(34), chr(39))}\"}}")
+            raise SystemExit(1)
 
     def _ensure_demo(self) -> None:
         if self.demo_path and self.demo_path.exists():
@@ -686,6 +764,13 @@ class Pipeline:
         log_path = PROJECT_ROOT / "logs" / f"{self.run_id}.log"
         print(f"Pipeline log -> {log_path.resolve()}")
         self._setup_logging()
+        lock_fd = acquire_global_lock()
+        try:
+            self._run_steps()
+        finally:
+            release_global_lock(lock_fd)
+
+    def _run_steps(self) -> None:
         if self.end_step < self.start_step:
             fail(0, "INVALID_STEP_RANGE", f"--until {self.end_step} is before --step {self.start_step}")
         self._ensure_demo()
@@ -838,7 +923,20 @@ class Pipeline:
         if not self.demo_path or not self.demo_path.exists():
             fail(2, "RENDER_DEMO_MISSING", f"demo not found: {self.demo_path}")
 
-        from cs2archive.pov.render_version_check import RenderVersionError, assert_render_versions
+        from cs2archive.pov.render_version_check import (
+            RenderVersionError,
+            assert_render_versions,
+            ensure_hlae_for_cs2,
+        )
+
+        # Adapt HLAE to the running CS2 BEFORE gating. render_pov does this too,
+        # but the gate below runs first and used to fail on a settings.json left
+        # over from a previous CS2 build — the auto-adapt sat one layer deeper
+        # and never executed (three wasted daemon cycles, 2026-11-05).
+        if ensure_hlae_for_cs2() is None:
+            fail(2, "RENDER_NO_HLAE_INSTALLED",
+                 "no HLAE under ~/.csdm/hlae-versions — install one from "
+                 "https://github.com/advancedfx/advancedfx/releases")
 
         try:
             vers = assert_render_versions(self.demo_path)
@@ -955,7 +1053,12 @@ class Pipeline:
         if round_files:
             nums = [int(round_re.match(f.name).group(1)) for f in round_files]
             voided = load_voided_rounds(self.render_dir)
-            missing = [n for n in range(1, (round_count or max(nums)) + 1)
+            # Split demos (p1/p2): step-1 analysis only covers the analyzed
+            # part, so round_count can be smaller than reality (12 vs 21
+            # here). Gate on the max of both so a missing later part can
+            # never pass as complete.
+            expected_total = max(round_count or 0, max(nums))
+            missing = [n for n in range(1, expected_total + 1)
                        if n not in set(nums) and n not in voided]
             total_mb = sum(f.stat().st_size for f in round_files) / 1024 / 1024
             if missing:
@@ -1178,6 +1281,15 @@ class Pipeline:
         # analyzed (e.g. p1), so actual concat rounds legitimately exceed the
         # analysis count. Only a *drop* (actual < expected) is an error; a
         # higher actual count is the normal split-demo case.
+        # Zero evidence is NOT ok: with neither a sidecar nor batch files we
+        # know nothing about the timeline, so step 4 will refuse (no tick->frame
+        # mapping) and HARD FAIL forever. Fail here, once, with the reason.
+        if not actual_rounds and expected_rounds:
+            fail(3, "CONCAT_SIDECAR_MISSING",
+                 f"neither a round-offset sidecar nor batch files in "
+                 f"{self.render_dir} ({expected_rounds} rounds expected) — the "
+                 f"overlay cannot map ticks to frames; re-run concat_rounds "
+                 f"(it rebuilds the sidecar from combined.sequence_ticks.json)")
         if actual_rounds and actual_rounds < expected_rounds:
             if skip_failed:
                 print(f"  [OK] {actual_rounds} of {expected_rounds} rounds "
@@ -1831,6 +1943,10 @@ class Pipeline:
             # crosshair now also handed to CS2 as --cfg) invalidate a prepend
             # whose cfg text is byte-identical but whose pixels are not.
             cfgs.append(f"render_version={HOOK_RENDER_VERSION}")
+            # Assembly-only blur changes must invalidate the delivered prepend,
+            # without invalidating expensive CS2 segment renders.
+            from cs2archive import hud_score_blur
+            cfgs.append(hashlib.sha256(Path(hud_score_blur.__file__).read_bytes()).hexdigest())
             current_cfg_hash = hashlib.sha256("\n".join(cfgs).encode()).hexdigest()[:16]
         except Exception as e:  # noqa: BLE001
             print(f"  [warn] could not hash hook cfg ({e}) — re-prepending")
@@ -2428,8 +2544,23 @@ class Pipeline:
         }
 
         meta_path = youtube_dir / "upload_meta.json"
+        existing = None
+        if meta_path.is_file():
+            try:
+                existing = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing = None
+        upload_meta = merge_upload_meta(existing, upload_meta)
         meta_path.write_text(json.dumps(upload_meta, indent=2))
         print(f"  [OK] upload_meta.json written [{variant}]")
+        if upload_meta.get("rebuilt_after_upload"):
+            # Re-running step 6 rewrites this file. Without the merge above it
+            # hard-coded youtube_id=None and the uploader re-uploaded an already
+            # published POV (sh1ro Anubis went up twice, 2026-10-25).
+            print(f"  [WARN] {youtube_dir.name} was already uploaded as "
+                  f"https://youtu.be/{upload_meta['youtube_id']} — the meta keeps "
+                  f"that id so this rebuild cannot re-upload it; clear "
+                  f"youtube_id to publish the new render.")
 
     # ── Step 7: Cleanup ────────────────────────────────────────────────
 

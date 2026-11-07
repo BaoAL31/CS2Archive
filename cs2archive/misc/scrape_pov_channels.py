@@ -2,7 +2,7 @@
 
 Uses the YouTube Data API v3 and upserts each run into video_history.csv
 (one row per video_id; newer captures replace older ones).
-Defaults to eight competitor POV channels plus @cs2povarchive.
+Defaults to nine competitor POV channels plus @cs2povarchive.
 """
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ DEFAULT_CHANNELS = (
     "https://www.youtube.com/watch?v=8GbocgSYv7w",
     "https://www.youtube.com/watch?v=G2wsicLJMnQ",
     "@cs2propovs",
+    "UCJO6WnoHNOk3ZaFzqvhtsjw",  # ravie: edited POVs with editorial titles
     "@cs2povarchive",
 )
 CS2_MAPS = (
@@ -87,6 +88,7 @@ VIDEO_FIELDS = (
     "description_characters",
     "tag_count",
     "primary_player",
+    "primary_player_source",
     "secondary_players",
     "secondary_player_count",
     "party_type",
@@ -121,6 +123,7 @@ def _load_pro_aliases(path: Path = ROOT / ".data" / "player_accounts.json") -> d
 
 
 PRO_ALIASES = _load_pro_aliases()
+EDITORIAL_LEADS = {"after", "he", "she", "when", "how", "why", "the", "this", "that", "watch", "what"}
 
 
 def _video_id(value: str) -> str | None:
@@ -248,7 +251,9 @@ def _player_features(title: str, aliases: dict[str, str] | None = None) -> dict:
     fallback_name = fallback.group(1) if fallback else None
     if fallback_name:
         fallback_name = aliases.get(fallback_name.casefold(), fallback_name)
-    if team_mentions and (not fallback_name or fallback_name.isdigit() or team_mentions[0][0] <= 12):
+    if team_mentions and (not fallback_name or fallback_name.isdigit()
+                          or fallback_name.casefold() in EDITORIAL_LEADS
+                          or team_mentions[0][0] <= 12):
         primary = team_mentions[0][1]
     else:
         primary = fallback_name
@@ -292,7 +297,7 @@ def _player_features(title: str, aliases: dict[str, str] | None = None) -> dict:
     }
 
 
-def _title_features(title: str) -> dict:
+def _title_features(title: str, aliases: dict[str, str] | None = None) -> dict:
     lower = title.lower()
     kd = re.search(r"(?:\(|\b)(\d{1,2})\s*[-:]\s*(\d{1,2})(?:\)|\b)", title)
     elo = re.search(r"\b(\d{3,5})\s*e[l1]o\b", lower)
@@ -305,7 +310,7 @@ def _title_features(title: str) -> dict:
         None,
     )
     return {
-        **_player_features(title),
+        **_player_features(title, aliases),
         "kills": int(kd.group(1)) if kd else None,
         "deaths": int(kd.group(2)) if kd else None,
         "elo": int(elo.group(1)) if elo else None,
@@ -316,6 +321,32 @@ def _title_features(title: str) -> dict:
             re.search(r"input overlay|keystrokes?|keyboard overlay", lower)
         ),
     }
+
+
+def _video_features(title: str, description: str,
+                    aliases: dict[str, str] | None = None) -> dict:
+    """Resolve editorial POV titles from explicit creator attribution.
+
+    Do not infer the POV from arbitrary description/tag mentions: teammates,
+    opponents and SEO names routinely appear there too. A clear recognised
+    title player takes precedence over conflicting description metadata.
+    """
+    aliases = PRO_ALIASES if aliases is None else aliases
+    features = _title_features(title, aliases)
+    old_primary = str(features.get("primary_player") or "")
+    features["primary_player_source"] = "title"
+    if old_primary.casefold() in aliases:
+        return features
+    label = re.search(r"^[^\w\r\n]*player\s*:\s*([^\r\n]+)", description,
+                      re.IGNORECASE | re.MULTILINE)
+    primary = aliases.get(label.group(1).strip().casefold()) if label else None
+    if primary:
+        features["primary_player"] = primary
+        features["primary_player_source"] = "description:player"
+        features["all_pro_players"] = json.dumps(_merge_names(
+            [primary], [name for name in json.loads(features["all_pro_players"])
+                        if name.casefold() != old_primary.casefold()]), ensure_ascii=False)
+    return features
 
 
 async def _get(
@@ -400,13 +431,21 @@ async def _recent_video_ids(
             pageToken=page_token or "",
         )
         for item in payload.get("items", []):
+            details = item.get("contentDetails", {})
+            published_at = details.get("videoPublishedAt")
+            video_id = details.get("videoId")
+            # Deleted/private playlist placeholders have no publication date.
+            # They must not abort the entire channel (or the daily refresh).
+            if not published_at or not video_id:
+                print(f"[POV scrape] skipping unavailable upload in {playlist_id}: "
+                      f"{video_id or 'no video id'}", file=sys.stderr)
+                continue
             published = datetime.fromisoformat(
-                item["contentDetails"]["videoPublishedAt"].replace("Z", "+00:00")
+                published_at.replace("Z", "+00:00")
             )
             if published < cutoff:
                 reached_cutoff = True
                 break
-            video_id = item["contentDetails"]["videoId"]
             if video_id in skip_ids:
                 continue
             ids.append(video_id)
@@ -483,7 +522,7 @@ def _metric_row(
         "title_words": len(title.split()),
         "description_characters": len(description),
         "tag_count": len(tags),
-        **_title_features(title),
+        **_video_features(title, description),
         "url": f"https://www.youtube.com/watch?v={item['id']}",
     }
 

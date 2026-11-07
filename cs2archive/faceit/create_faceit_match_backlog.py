@@ -176,7 +176,7 @@ def _write_card(pro: dict, *, demo: Path, map_name: str, match_slug: str,
 
 def run(demo: Path, *, map_override: str = "", tournament: str = "",
         match_id_arg: str = "", no_elo: bool = False,
-        no_shorts: bool = True) -> list[Path]:
+        no_shorts: bool = True, heuristic_shorts: bool = False) -> list[Path]:
     """Full FACEIT flow: analyze demo -> one card per Recognised Pro
     (+ optional shorts extraction). Callable entry used by the unified
     create_backlog.py dispatcher."""
@@ -268,16 +268,57 @@ def run(demo: Path, *, map_override: str = "", tournament: str = "",
         print(f"  [HINT] No cached avatar for: {', '.join(missing_avatars)}")
         print(f"         Fetch with: python cs2archive/faceit/faceit_avatar.py <nick>")
 
-    # Shorts extraction (same pass over the demo): Recognised-Pros-gated,
-    # one short_timeline.json per detected short, each under its own POV
-    # folder (renders/pov-{stem}_{nick}/shorts/shorts-{slug}/).
+    # Shorts extraction (same pass over the demo): the demo's top verified
+    # Allstar clip, kill-count-verified, under its own POV folder
+    # (renders/pov-{stem}_{nick}/shorts/shorts-{slug}/). The heuristic
+    # detector is WIP and opt-in only (--heuristic-shorts).
     if no_shorts:
         return written
+    if heuristic_shorts:
+        _extract_shorts_heuristic_match(demo)
+        return written
+    try:
+        from cs2archive._backlog_common import card_nicks_for_demo, persist_shorts_grouped
+        from cs2archive.shorts.extract_top_allstar import extract_top_allstar_short
+
+        print("[SHORTS] Extracting top Allstar short ...")
+        top = extract_top_allstar_short(demo)
+        if not top:
+            print("[SHORTS] no verified Allstar clip — no short")
+            return written
+        try:
+            from cs2archive.shorts.detect_team import detect_pov_opponent
+            pov, opp = detect_pov_opponent(demo, top["pov_steam_id"])
+            if pov:
+                top["pov_team"] = pov
+            if opp:
+                top["opponent"] = opp
+        except Exception:
+            pass
+        timeline = {"demo_path": str(demo), "map": top.get("map"),
+                    "shorts": [], "source": "allstar_top"}
+        nick = card_nicks_for_demo(demo).get(str(top.get("pov_steam_id")), "")
+        print(f"  [SHORTS] top Allstar = {top.get('pov_nick')} "
+              f"{top.get('short_type')} R{top.get('round')} "
+              f"{(top.get('allstar') or {}).get('views')} views "
+              f"({(top.get('allstar') or {}).get('confidence')})")
+        written_shorts = persist_shorts_grouped(demo, timeline, [top],
+                                                {str(top.get("pov_steam_id")): nick} if nick else None)
+        print(f"[SHORTS] {written_shorts} short -> POV shorts/ dir")
+    except Exception as e:
+        print(f"[WARN] Shorts extraction failed (backlog cards unaffected): "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+    return written
+
+
+def _extract_shorts_heuristic_match(demo: Path) -> None:
+    """WIP heuristic detector path (--heuristic-shorts). Emits unverified
+    cuts that never went through the Allstar picker — kept for development
+    of the detector only, not a shipping path."""
     try:
         from cs2archive.shorts.build_short_timeline import build_short_timeline
-        from cs2archive._backlog_common import persist_shorts_grouped
+        from cs2archive._backlog_common import card_nicks_for_demo, persist_shorts_grouped
 
-        print("[SHORTS] Extracting short timelines (Recognised Pros only)...")
         timeline = build_short_timeline(demo, pros_only=True)
         dropped_randos = timeline.get("_dropped_randos", 0)
         from cs2archive.shorts.demand_gate import (
@@ -290,8 +331,8 @@ def run(demo: Path, *, map_override: str = "", tournament: str = "",
         suffix = filter_suffix(dropped_randos, dropped_demand, source="faceit")
         if not shorts_list:
             print(f"[SHORTS] 0 shorts detected{suffix}")
-            return written
-        nick_by_sid = {p["steam_id"]: p["canonical_nick"] for p in pros}
+            return
+        nick_by_sid = card_nicks_for_demo(demo)
         written_shorts = persist_shorts_grouped(demo, timeline, shorts_list,
                                                 nick_by_sid)
         print(f"[SHORTS] {len(shorts_list)} shorts -> {written_shorts} files "
@@ -299,7 +340,6 @@ def run(demo: Path, *, map_override: str = "", tournament: str = "",
     except Exception as e:
         print(f"[WARN] Shorts extraction failed (backlog cards unaffected): "
               f"{type(e).__name__}: {e}", file=sys.stderr)
-    return written
 
 
 def main() -> None:
@@ -311,8 +351,11 @@ def main() -> None:
     ap.add_argument("--no-elo", action="store_true",
                     help="Skip FACEIT ELO fetch (title/thumbnail then omit the ELO line)")
     ap.add_argument("--shorts", action="store_true",
-                     help="Enable short-timeline extraction for Recognised Pros "
-                          "(off by default while the FACEIT shorts system is reworked)")
+                     help="Enable Shorts extraction (top verified Allstar clip "
+                          "for the demo; off by default)")
+    ap.add_argument("--heuristic-shorts", action="store_true",
+                    help="WIP: use the heuristic detector instead of the "
+                         "Allstar nomination (unverified cuts — not shipping)")
     args = ap.parse_args()
 
     demo = Path(args.demo_path).resolve()
@@ -321,7 +364,8 @@ def main() -> None:
         sys.exit(1)
 
     run(demo, map_override=args.map, tournament=args.tournament,
-        match_id_arg=args.match_id, no_elo=args.no_elo, no_shorts=not args.shorts)
+        match_id_arg=args.match_id, no_elo=args.no_elo, no_shorts=not args.shorts,
+                    heuristic_shorts=args.heuristic_shorts)
 
 
 if __name__ == "__main__":

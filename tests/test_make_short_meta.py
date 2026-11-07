@@ -1,81 +1,69 @@
-"""Shorts title opponent / top-10 display."""
-
+"""Title length + hand-edit preservation for shorts meta."""
 from __future__ import annotations
 
-import sys
+import json
 from pathlib import Path
 
-
-from cs2archive.shorts.make_short_meta import _is_top10_opponent, _make_title
-
-
-def test_vitality_is_top10():
-    assert _is_top10_opponent("Vitality")
+import cs2archive.shorts.make_short_meta as mm
 
 
-def test_onic_4k_title_names_vitality():
-    title, _fmt = _make_title(
-        "onic", "4k", "Vitality", "Cache", "#blastopenporto2026",
-        clutch=None, kills=4, punch_tags=[], start_tick=228005,
-    )
-    assert "Vitality" in title
-    assert "onic" in title
-    assert "Vita" not in title.replace("Vitality", "")
+def test_fit_title_trims_map_tag_first():
+    base = "ridiculous 4K from flameZ vs Falcons #cs2 #counterstrike"
+    out = mm._fit_title(base, "#eslproleague2026", "#flamez #vitality #falcons #dust2")
+    assert len(out) <= 100
+    assert out.startswith(base)
+    assert "#dust2" not in out
+    assert "#flamez" in out
 
 
-def test_wallbang_title_names_kind_and_opponent():
-    title, _fmt = _make_title(
-        "koala", "wallbang", "MOUZ", "Inferno", "",
-        clutch=None, kills=1, punch_tags=[], start_tick=1,
-    )
-    assert "koala" in title
-    assert "wallbang" in title.lower()
-    assert "MOUZ" in title
-    assert "4K" not in title
+def test_fit_title_keeps_short_titles_whole():
+    out = mm._fit_title("4K from flameZ vs Falcons #cs2 #counterstrike",
+                        "#eslproleague2026", "#flamez #falcons")
+    assert out == ("4K from flameZ vs Falcons #cs2 #counterstrike "
+                   "#eslproleague2026 #flamez #falcons")
 
 
-def test_knife_title_names_kind_and_opponent():
-    title, _fmt = _make_title(
-        "FalleN", "knife", "FaZe", "Mirage", "",
-        clutch=None, kills=1, punch_tags=[], start_tick=1,
-    )
-    assert "FalleN" in title
-    assert "knife" in title.lower()
-    assert "FaZe" in title
-    assert "4K" not in title
+def test_fit_title_raises_on_pathological_base():
+    import pytest
+    with pytest.raises(ValueError):
+        mm._fit_title("x" * 101, "", "")
 
 
-def test_defuse_title_names_kind_and_opponent():
-    title, _fmt = _make_title(
-        "bLitz", "defuse", "Vitality", "Mirage", "",
-        clutch=None, kills=0, punch_tags=[], start_tick=1,
-    )
-    assert "bLitz" in title
-    assert "defuse" in title.lower()
-    assert "Vitality" in title
-    assert "4K" not in title
+def _timeline(tmp_path: Path) -> Path:
+    folder = tmp_path / "shorts-x"
+    folder.mkdir()
+    (folder / "short_timeline.json").write_text(json.dumps({
+        "demo_path": "demos/hltv/x/y.dem",
+        "map": "de_dust2",
+        "shorts": [{
+            "short_type": "4k",
+            "pov_steam_id": "1",
+            "pov_nick": "flameZ",
+            "kill_ticks": [1, 2, 3, 4],
+            "start_tick": 0,
+        }],
+    }), encoding="utf-8")
+    return folder
 
 
-def test_perfect_shots_title_names_kind_and_opponent():
-    title, _fmt = _make_title(
-        "ZywOo", "perfect_shots", "NAVI", "Dust2", "",
-        clutch=None, kills=2, punch_tags=[], start_tick=1,
-    )
-    assert "ZywOo" in title
-    assert "perfect" in title.lower()
-    assert "NAVI" in title
-    assert "4K" not in title
+def test_make_meta_preserves_hand_edited_title(tmp_path: Path, monkeypatch):
+    folder = _timeline(tmp_path)
+    monkeypatch.setattr(mm, "detect_pov_opponent", lambda *a: ("Vitality", "Falcons"))
+    meta = mm.make_meta(str(folder))
+    assert len(meta["title"]) <= 100
+    hand = "4K from flameZ vs Falcons #cs2 #counterstrike"
+    prev = dict(meta, title=hand, title_format="custom")
+    (folder / "upload_meta_shorts.json").write_text(json.dumps(prev), encoding="utf-8")
+    meta2 = mm.make_meta(str(folder))
+    assert meta2["title"] == hand
+    assert meta2["title_format"] == "custom"
 
 
-def test_flick_title_names_kind_and_opponent():
-    title, _fmt = _make_title(
-        "m0NESY", "flick", "Vitality", "Mirage", "",
-        clutch=None, kills=1, punch_tags=[], start_tick=1,
-    )
-    assert "m0NESY" in title
-    assert "flick" in title.lower()
-    assert "Vitality" in title
-    assert "4K" not in title
-    assert "quickscope" not in title.lower()
-
-
+def test_make_meta_regenerates_blank_title(tmp_path: Path, monkeypatch):
+    folder = _timeline(tmp_path)
+    monkeypatch.setattr(mm, "detect_pov_opponent", lambda *a: ("Vitality", "Falcons"))
+    (folder / "upload_meta_shorts.json").write_text(
+        json.dumps({"title": "", "title_format": ""}), encoding="utf-8")
+    meta = mm.make_meta(str(folder))
+    assert meta["title"]
+    assert len(meta["title"]) <= 100

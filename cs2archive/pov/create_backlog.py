@@ -68,22 +68,55 @@ def _resolve_demo_for_map(match_slug: str, map_name: str) -> Path:
 
 
 def _resolve_steam_id(nickname: str, demo_steamids: dict[str, str] | None = None) -> str:
+    """Steam64 for *nickname*, preferring an account that is IN this demo.
+
+    ``demo_steamids`` (demo player name -> Steam64) is what settles a nickname
+    collision: two accounts can share a name through ``aliases`` (Senzu and
+    Senzu-, both registered), and the literal nickname match may not be a player
+    in the demo at all. Returning it renders the wrong (or a nonexistent)
+    player's POV and only fails much later — in the keyboard overlay's
+    button_extract ("no entry found for key") — after the render and the scale
+    are already paid for (2026-10-23, card 2399635, ~90 GB discarded).
+    """
     from cs2archive.player_accounts import _load_accounts, PlayerAccount, extract_steam_id
 
     lower = nickname.lower()
-    for rec in _load_accounts():
-        if rec["nickname"].lower() == lower:
-            acct = PlayerAccount(**rec)
-            # Prefer re-resolving from steam_url (canonical when it's a
-            # 17-digit numeric ID). acct.steam_id can be stale if the Steam
-            # profile URL redirect changed over — using it over the
-            # CSDM to the wrong player and silently render enemy POV.
-            resolved = extract_steam_id(acct.steam_url)
-            if resolved:
-                return resolved
-            return acct.steam_id or acct.steam_url or ""
+    roster = {str(v).strip() for v in (demo_steamids or {}).values() if v}
 
-    # Fallback: extract from the demo itself
+    def names_of(rec: dict) -> set[str]:
+        names = {str(rec.get("nickname") or "").lower()}
+        names.update(str(a).lower() for a in (rec.get("aliases") or []))
+        return names
+
+    def steam_of(rec: dict) -> str:
+        acct = PlayerAccount(**rec)
+        # Prefer re-resolving from steam_url (canonical when it's a
+        # 17-digit numeric ID). acct.steam_id can be stale if the Steam
+        # profile URL redirect changed over — using it over the
+        # CSDM to the wrong player and silently render enemy POV.
+        resolved = extract_steam_id(acct.steam_url)
+        return resolved or acct.steam_id or acct.steam_url or ""
+
+    matches: list[str] = []
+    for rec in _load_accounts():
+        if lower in names_of(rec):
+            sid = steam_of(rec)
+            if sid:
+                matches.append(sid)
+
+    # 1. An account that is demonstrably in this demo wins (nickname or alias).
+    if roster:
+        for sid in matches:
+            if sid in roster:
+                return sid
+    # 2. Otherwise keep the old nickname match (split demos: the roster may
+    #    only cover the analysed part), but say so when it looks suspicious.
+    if matches:
+        if roster and matches[0] not in roster:
+            print(f"  [STEAM] {nickname} -> {matches[0]} is not in this demo's "
+                  f"roster ({len(roster)} player(s)) — check the account mapping")
+        return matches[0]
+    # 3. Last resort: the demo's own player name.
     if demo_steamids:
         for player_name, sid in demo_steamids.items():
             if player_name.lower() == lower:
@@ -124,12 +157,21 @@ def _ensure_player_account(nickname: str, steam_id: str) -> None:
 
 
 def _ensure_video_settings(nickname: str) -> None:
-    """Sync video settings from prosettings.net onto the player account."""
-    from scrapers.prosettings import resolve_video_settings
+    """Sync video settings from prosettings.net onto the player account.
+
+    Hard-fails when prosettings cannot be resolved: writing a card with a
+    guessed aspect is how dem0n (4:3 player) got a 16:9 card, which then
+    rendered at the wrong aspect for two hours.
+    """
+    from scrapers.prosettings import VideoSettingsUnresolved, resolve_video_settings
     from cs2archive.player_accounts import _load_accounts, _save_accounts
     import datetime as _loc_dt
 
-    settings = resolve_video_settings(nickname)
+    try:
+        settings = resolve_video_settings(nickname)
+    except VideoSettingsUnresolved as e:
+        print(f"[ERR] {e}")
+        sys.exit(1)
     records = _load_accounts()
     now = _loc_dt.datetime.now()
     for r in records:
@@ -212,7 +254,15 @@ async def create_backlog_entry(
 
     hf_root = re.sub(r"[^\w]", "_", tournament.lower()).strip("_")
 
-    from scrapers.prosettings import backlog_video_fields
+    from scrapers.prosettings import VideoSettingsUnresolved, backlog_video_fields
+
+    try:
+        video_fields = backlog_video_fields(player_clean)
+    except VideoSettingsUnresolved as e:
+        # Never write a card with a guessed aspect: the wrong value propagates
+        # into a full render (dem0n, 2026-11-07).
+        print(f"[ERR] {e}")
+        sys.exit(1)
 
     meta = {
         "player": player_clean,
@@ -230,7 +280,7 @@ async def create_backlog_entry(
         "opponent": demo_opponent or "",
         "team_source": "demo" if demo_team else "hltv_ratings",
         "priority": priority,
-        **backlog_video_fields(player_clean),
+        **video_fields,
     }
     from cs2archive._backlog_common import write_card
     write_card(meta, backlog_file)
@@ -477,10 +527,12 @@ async def main() -> None:
         ns.add_argument("--map", default=""); ns.add_argument("--tournament", default="")
         ns.add_argument("--match-id", default=""); ns.add_argument("--no-elo", action="store_true")
         ns.add_argument("--shorts", action="store_true")
+        ns.add_argument("--heuristic-shorts", action="store_true")
         opts, _unknown = ns.parse_known_args(extra)
         run_faceit(demo, map_override=opts.map, tournament=opts.tournament,
                    match_id_arg=opts.match_id, no_elo=opts.no_elo,
-                   no_shorts=not opts.shorts)
+                   no_shorts=not opts.shorts,
+                   heuristic_shorts=opts.heuristic_shorts)
         return
     if source == "hltv":
         print("[ERR] HLTV .dem path given but the HLTV flow needs the match URL "
@@ -611,11 +663,15 @@ async def main() -> None:
 
     if "--no-ingest" not in sys.argv:
         print("[INGEST] Extracting CS2UtilArchive throw corpus...")
-        _ingest_corpus(existing_demos)
+        await asyncio.to_thread(_ingest_corpus, existing_demos)
 
     if "--no-shorts" not in sys.argv:
         print("[SHORTS] Extracting short timelines (Recognised Pros only)...")
-        _extract_shorts(existing_demos)
+        # Off the event loop: the Allstar nomination path launches CloakBrowser's
+        # *sync* Playwright API, which raises "Sync API inside the asyncio loop"
+        # when it runs on the loop thread. That silently turned every HLTV
+        # backlog creation into zero shorts (daemon log 2026-10-16).
+        await asyncio.to_thread(_extract_shorts, existing_demos)
 
     print("[OK] Backlog created")
 

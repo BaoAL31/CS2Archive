@@ -5,8 +5,9 @@ player it performs BOTH:
 
   1. FACEIT backlog extraction  -> single-POV backlog card
      (delegates to ``create_faceit_backlog.create_faceit_backlog``)
-  2. Shorts extraction         -> 4K / clutch short timelines for that POV
-     (delegates to ``scripts.shorts.build_short_timeline``)
+  2. Shorts extraction         -> the demo's top verified Allstar clip
+     (delegates to ``cs2archive.shorts.extract_top_allstar``; the WIP
+     heuristic detector is opt-in via --heuristic-shorts)
 
 Usage:
     python cs2archive/faceit/extract_backlogs.py <demo_path> --player <nick> --map <map>
@@ -30,8 +31,52 @@ ROOT = Path(__file__).resolve().parents[2]
 from cs2archive.faceit.create_faceit_backlog import create_faceit_backlog  # noqa: E402
 
 
-def _extract_shorts(demo: Path, steam_id: str, include_all_players: bool,
-                  player_nick: str = "") -> None:
+def _extract_shorts_allstar(demo: Path, player_nick: str = "") -> None:
+    """Allstar-anchored nomination: the demo's top verified Allstar clip.
+
+    Default path — one kill-count-verified short per demo, ranked by real
+    Allstar views. No heuristic detector output ever ships from here.
+    """
+    from cs2archive._backlog_common import card_nicks_for_demo, persist_shorts_grouped
+    from cs2archive.shorts.extract_top_allstar import extract_top_allstar_short
+
+    try:
+        top = extract_top_allstar_short(demo)
+    except Exception as e:
+        print(f"  [WARN] Allstar nominate failed for {demo.name}: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        return
+    if not top:
+        print(f"[OK] no verified Allstar clip for {demo.name} — no short")
+        return
+    try:
+        from cs2archive.shorts.detect_team import detect_pov_opponent
+        pov, opp = detect_pov_opponent(demo, top["pov_steam_id"])
+        if pov:
+            top["pov_team"] = pov
+        if opp:
+            top["opponent"] = opp
+    except Exception:
+        pass
+    timeline = {"demo_path": str(demo), "map": top.get("map"),
+                "shorts": [], "source": "allstar_top"}
+    nick = player_nick or ""
+    if not nick:
+        nick = card_nicks_for_demo(demo).get(str(top.get("pov_steam_id")), "")
+    print(f"  [SHORTS] top Allstar = {top.get('pov_nick')} "
+          f"{top.get('short_type')} R{top.get('round')} "
+          f"{(top.get('allstar') or {}).get('views')} views "
+          f"({(top.get('allstar') or {}).get('confidence')})")
+    written = persist_shorts_grouped(demo, timeline, [top],
+                                     {str(top.get("pov_steam_id")): nick} if nick else None)
+    print(f"[OK] {written} short -> POV shorts/ dir")
+
+
+def _extract_shorts_heuristic(demo: Path, steam_id: str, include_all_players: bool,
+                              player_nick: str = "") -> None:
+    """WIP heuristic detector (4K/clutch/wallbang/...). Opt-in only via
+    --heuristic-shorts; NOT the shipping path — it emits unverified cuts
+    that never went through the Allstar picker (see render_match_top.py)."""
     from cs2archive.shorts.build_short_timeline import build_short_timeline
     from cs2archive._backlog_common import persist_shorts_grouped
 
@@ -75,8 +120,11 @@ def main() -> None:
     ap.add_argument("--no-elo", action="store_true",
                     help="Skip FACEIT ELO fetch (title/thumbnail omit ELO line)")
     ap.add_argument("--shorts", action="store_true",
-                    help="Enable Shorts (4K/clutch) timeline extraction "
-                         "(off by default while the FACEIT shorts system is reworked)")
+                    help="Enable Shorts extraction (top verified Allstar clip "
+                         "for the demo; off by default)")
+    ap.add_argument("--heuristic-shorts", action="store_true",
+                    help="WIP: use the heuristic detector instead of the "
+                         "Allstar nomination (unverified cuts — not shipping)")
     ap.add_argument("--include-all-players", action="store_true",
                     help="Keep shorts for any player (default: Recognised Pros only)")
     args = ap.parse_args()
@@ -106,10 +154,16 @@ def main() -> None:
     if not steam_id:
         print("[WARN] no steam_id available; skipping shorts extraction")
         return
-    print("[SHORTS] Extracting 4K/clutch timelines ...")
-    _extract_shorts(Path(args.demo_path).resolve(), steam_id,
-                    args.include_all_players,
-                    player_nick=str(meta.get("player") or args.player or ""))
+    print("[SHORTS] Extracting top Allstar short ...")
+    demo = Path(args.demo_path).resolve()
+    nick = str(meta.get("player") or args.player or "")
+    if args.heuristic_shorts:
+        print("[SHORTS] --heuristic-shorts set: using WIP heuristic detector "
+              "(unverified cuts, not the shipping path)")
+        _extract_shorts_heuristic(demo, steam_id, args.include_all_players,
+                                  player_nick=nick)
+        return
+    _extract_shorts_allstar(demo, player_nick=nick)
 
 
 if __name__ == "__main__":

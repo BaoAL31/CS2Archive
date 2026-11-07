@@ -15,8 +15,11 @@ from __future__ import annotations
 import ctypes
 import json
 import re
+import shutil
+import sys
 from ctypes import wintypes
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from cs2archive.config import settings  # CR-07: module scope (was local-only)
@@ -30,6 +33,13 @@ MIN_CSDM = (3, 20, 0)
 # installing a new HLAE for a CS2 update. A CS2 newer than the top row hard-fails
 # with RENDER_CS2_UNPINNED so a game update never silently burns HLAE retries.
 CS2_MIN_HLAE: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...] = (
+    ((1, 41, 9, 5), (2, 192, 10)),  # 2.192.10 still the newest upstream (2026-11-04 check); the .4->.5 gap assumed to move no hooked offsets, same pattern as .3->.4 (which verified live). Pending live verify.
+    ((1, 41, 9, 4), (2, 192, 10)),  # 2.192.10 is still the newest upstream HLAE (2026-10-31 check); the .3->.4 gap moved no hooked offsets, same pattern as the .1->.2 pair. Verified live 2026-11-01 (one-round render: VERIFY-OK 95% weapon / 0% frozen).
+    ((1, 41, 9, 3), (2, 192, 10)),  # Installed current hook; shared rig pin also recorded in CS2UtilArchive/config/hlae_for_cs2.json.
+    ((1, 41, 9, 2), (2, 192, 8)),  # 1.41.9.2 is newer than the newest upstream HLAE: 2.192.8 (AfxHookSource2 0.41.8) is still the latest release, so the .1->.2 gap moved no hooked offsets, same as the 1.41.8.8/.9 pair. Verified live 2026-10-25 (one-round render).
+    ((1, 41, 9, 1), (2, 192, 8)),  # HLAE 2.192.8 (AfxHookSource2 0.41.8, released 2026-10-14 for this patch); hooks 1.41.9.1 fine (verified 2026-10-16 one-round render: hook 2s, verify pass 64% weapon / 0% frozen, 518 MB — attempt 1 hit the known no-ffmpeg hook flake, attempt 2 OK)
+    ((1, 41, 9, 0), (2, 192, 7)),  # HLAE 2.192.7 (released 2026-10-08 for this patch); hooks 1.41.9.0 fine (verified 2026-10-10 one-round render: hook 4s, verify pass, 504 MB)
+    ((1, 41, 8, 9), (2, 192, 6)),  # 2.192.6 is the newest upstream HLAE; hooks .9 fine (verified 2026-10-08 one-round render: hook 3s, verify pass, 244 MB)
     ((1, 41, 8, 8), (2, 192, 6)),  # HLAE 2.192.6 hooks .8 fine (verified 2026-10-02 one-round render)
     ((1, 41, 8, 6), (2, 192, 6)),  # HLAE 2.192.6 / AfxHookSource2 0.41.6
     ((1, 41, 8, 5), (2, 192, 5)),  # HLAE 2.192.5 / AfxHookSource2 0.41.5
@@ -178,6 +188,19 @@ def version_at_least(have: tuple[int, ...], need: tuple[int, ...]) -> bool:
     return tuple(have[: len(need)]) >= need
 
 
+def _width_padded(parts: tuple[int, ...], width: int) -> tuple[int, ...]:
+    """Zero-pad to *width* so prefix tuples compare numerically.
+
+    ``patch_tuple("1.41.9")`` is a 3-tuple and ``(1,41,9) >= (1,41,9,0)`` is
+    False, so a CS2 build reported without its trailing component skipped its
+    OWN pin row and fell back to the previous row's HLAE floor — 2.192.6
+    instead of 2.192.7 for the 1.41.9 row. That is the silent
+    under-requirement this table exists to prevent (too-old HLAE burns hook
+    retries), and it is reachable on any 3-part steam.inf PatchVersion.
+    """
+    return parts + (0,) * (width - len(parts))
+
+
 def hlae_bounds_for_cs2(cs2_patch: str) -> tuple[tuple[int, ...], tuple[int, ...] | None] | None:
     """(min HLAE inclusive, max HLAE exclusive) for *cs2_patch*.
 
@@ -185,8 +208,10 @@ def hlae_bounds_for_cs2(cs2_patch: str) -> tuple[tuple[int, ...], tuple[int, ...
     Max is the HLAE built for the next newer CS2 pin: that build's signatures
     are missing on the older game (e.g. ReplayName on 2.192.5 vs CS2 1.41.8.3).
     """
-    cs2 = patch_tuple(cs2_patch)
     rows = sorted(CS2_MIN_HLAE, key=lambda row: row[0])
+    width = max(len(bound) for bound, _ in rows)
+    rows = [(_width_padded(bound, width), hlae) for bound, hlae in rows]
+    cs2 = _width_padded(patch_tuple(cs2_patch), width)
     highest_bound = rows[-1][0]
     if cs2 > highest_bound:
         return None
@@ -196,6 +221,13 @@ def hlae_bounds_for_cs2(cs2_patch: str) -> tuple[tuple[int, ...], tuple[int, ...
         if cs2 >= bound:
             required = hlae
             ceiling = rows[i + 1][1] if i + 1 < len(rows) else None
+    if ceiling == required:
+        # Degenerate ceiling: the next row needs the SAME HLAE, so no "too new
+        # for this CS2" build exists to exclude. Without this, a CS2 patch
+        # whose successor shares its HLAE (1.41.8.6/.8, and now 1.41.9.1/.2)
+        # would flag its own required HLAE as too new — RENDER_HLAE_CS2_MISMATCH
+        # on the exact build the row mandates.
+        ceiling = None
     return required, ceiling
 
 
@@ -215,6 +247,120 @@ def resolve_hlae_exe(
     except (OSError, json.JSONDecodeError, TypeError, AttributeError):
         pass
     return fallback
+
+
+# ── HLAE auto-selection ─────────────────────────────────────────────────────
+#
+# CS2 updates (and Steam ROLLBACKS — 1.41.9.5 → 1.41.9.2 mid-hour, 2026-11-04)
+# kept invalidating one hard-coded customExecutableLocation. But this machine
+# keeps every HLAE ever installed under ~/.csdm/hlae-versions/, and the pin
+# table already knows which one fits which CS2. So selection is now automatic:
+# read steam.inf, pick the installed HLAE the pin table names (newest installed
+# when CS2 is newer than every pin — the only candidate anyway), and repoint
+# CSDM's settings.json before the render. The manual pin-row edit stays as the
+# KNOWLEDGE base; it no longer gates the machine.
+
+INSTALLED_HLAE_ROOT = Path.home() / ".csdm" / "hlae-versions"
+
+
+def installed_hlae_versions(
+    root: Path = INSTALLED_HLAE_ROOT,
+) -> list[tuple[tuple[int, ...], Path]]:
+    """(version, HLAE.exe path) for every installed HLAE, oldest first.
+
+    Version comes from the PE header when readable, else the directory name
+    (``HLAE-2.192.8``) — a copied tree with a stripped exe must still count.
+    """
+    found: list[tuple[tuple[int, ...], Path]] = []
+    if not root.is_dir():
+        return found
+    for d in sorted(root.iterdir()):
+        if not d.is_dir():
+            continue
+        exe = d / "HLAE.exe"
+        if not exe.is_file():
+            continue
+        ver: tuple[int, ...] | None = None
+        try:
+            ver = read_pe_version(exe)
+        except Exception:
+            ver = None
+        if ver is None:
+            m = re.search(r"HLAE-(\d+)\.(\d+)\.(\d+)", d.name)
+            if m:
+                ver = tuple(int(x) for x in m.groups())
+        if ver:
+            found.append((ver, exe))
+    return sorted(found, key=lambda item: item[0])
+
+
+def select_hlae_for_cs2(
+    cs2_patch: str,
+    root: Path = INSTALLED_HLAE_ROOT,
+) -> tuple[tuple[int, ...], Path, str] | None:
+    """Best installed HLAE for *cs2_patch*: (version, exe path, how-chosen).
+
+    ``how`` is ``"pin"`` when the pin table names it, ``"newest-installed"``
+    when CS2 is newer than every pin (or nothing fits the table's range) and
+    the newest installed HLAE is the only possible attempt. None when no HLAE
+    is installed at all — that is the only still-fatal case.
+    """
+    installed = installed_hlae_versions(root)
+    if not installed:
+        return None
+    bounds = hlae_bounds_for_cs2(cs2_patch)
+    if bounds is not None:
+        lo, hi = bounds
+        in_range = [
+            (ver, exe) for ver, exe in installed
+            if version_at_least(ver, lo)
+            and (hi is None or not version_at_least(ver, hi))
+        ]
+        if in_range:
+            ver, exe = max(in_range, key=lambda item: item[0])
+            return ver, exe, "pin"
+    ver, exe = max(installed, key=lambda item: item[0])
+    return ver, exe, "newest-installed"
+
+
+def ensure_hlae_for_cs2(
+    *,
+    steam_inf: Path = CS2_STEAM_INF,
+    installed_root: Path = INSTALLED_HLAE_ROOT,
+    csdm_settings: Path = CSDM_SETTINGS,
+) -> tuple[tuple[int, ...], Path, str] | None:
+    """Point CSDM at the right installed HLAE for the running CS2. Idempotent.
+
+    Rewrites ``video.hlae.customExecutableLocation`` in CSDM's settings.json
+    only when it differs from the selection, backing the file up first
+    (``settings.json.bak-hlae-auto-<ts>``). Returns the selection, or None
+    when no HLAE is installed (caller must hard-fail; there is nothing to
+    select).
+    """
+    cs2 = read_cs2_patch(steam_inf)
+    selection = select_hlae_for_cs2(cs2, installed_root)
+    if selection is None:
+        return None
+    ver, exe, how = selection
+    current = resolve_hlae_exe(csdm_settings=csdm_settings)
+    if current == exe:
+        return selection
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = csdm_settings.with_name(csdm_settings.name + f".bak-hlae-auto-{stamp}")
+    try:
+        shutil.copy2(csdm_settings, backup)
+        data = json.loads(csdm_settings.read_text(encoding="utf-8"))
+        hlae = data.setdefault("video", {}).setdefault("hlae", {})
+        hlae["customLocationEnabled"] = True
+        hlae["customExecutableLocation"] = str(exe)
+        csdm_settings.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError as exc:
+        print(f"  [WARN] could not repoint CSDM at {exe} ({exc}) — using "
+              f"whatever settings.json already names", flush=True)
+        return selection
+    print(f"  [HLAE] CS2 {cs2} -> HLAE {format_version(ver)} ({how}; was "
+          f"{current.name}); settings backed up to {backup.name}", flush=True)
+    return selection
 
 
 def check_render_versions(
@@ -260,7 +406,6 @@ def check_render_versions(
             elif cs2 is not None and demo_patch != cs2:
                 # Current CS2 can still record a few older patches at/above
                 # MIN_RENDERABLE_DEMO_PATCH. Hard-fail only when the demo is newer.
-                import sys
                 try:
                     demo_newer = patch_tuple(demo_patch) > patch_tuple(cs2)
                 except Exception:
@@ -283,18 +428,20 @@ def check_render_versions(
     if required_hlae is None and cs2 is not None:
         bounds = hlae_bounds_for_cs2(cs2)
         if bounds is None:
-            result.ok = False
+            # CS2 newer than every pin. Used to hard-fail (RENDER_CS2_UNPINNED),
+            # but three patches running the row-add dance proved the gate adds
+            # no information: the newest installed HLAE is the only candidate
+            # either way. Proceed loudly — ensure_hlae_for_cs2() has already
+            # selected it — so a game update no longer stalls the machine.
             top_cs2 = format_version(max(bound for bound, _ in CS2_MIN_HLAE))
-            top_hlae = format_version(next(
-                h for b, h in CS2_MIN_HLAE if b == max(bound for bound, _ in CS2_MIN_HLAE)
-            ))
-            result.errors.append((
-                "RENDER_CS2_UNPINNED",
-                f"CS2 {cs2} is newer than the HLAE compatibility table "
-                f"(last pin: CS2 {top_cs2} → HLAE {top_hlae}). "
-                f"Install matching HLAE from https://github.com/advancedfx/advancedfx/releases "
-                f"and add a CS2_MIN_HLAE row before rendering.",
-            ))
+            print(
+                f"[WARN] CS2 {cs2} is newer than the HLAE compatibility table "
+                f"(last pin: CS2 {top_cs2}). Proceeding with the newest "
+                f"installed HLAE — if the hook misses its offsets, expect the "
+                f"vanilla-viewer failure (Game error / Raw files not found) "
+                f"and wait for https://github.com/advancedfx/advancedfx/releases.",
+                file=sys.stderr,
+            )
             required_hlae = MIN_HLAE
         else:
             required_hlae, hlae_ceiling = bounds

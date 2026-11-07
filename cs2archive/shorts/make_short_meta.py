@@ -155,6 +155,34 @@ def _hashtag(word: str | None) -> str:
     return f"#{clean}" if clean else ""
 
 
+# YouTube rejects titles over 100 chars at the API. Trim hashtags only
+# (never the sentence): lowest-priority first (map, opponent, own org,
+# player nick), tournament tag last. A base sentence over 100 is
+# pathological — fail loudly instead of shipping a truncated sentence.
+_YT_TITLE_LIMIT = 100
+
+
+def _fit_title(base: str, tournament_tag: str, extra: str) -> str:
+    title = base
+    if tournament_tag:
+        title = f"{title} {tournament_tag}"
+    tags = extra.split() if extra else []
+    while tags and len(f"{title} {' '.join(tags)}") > _YT_TITLE_LIMIT:
+        tags.pop()
+    if tags:
+        title = f"{title} {' '.join(tags)}"
+    if tournament_tag and len(title) > _YT_TITLE_LIMIT:
+        title = base
+        tags = extra.split() if extra else []
+        while tags and len(f"{title} {' '.join(tags)}") > _YT_TITLE_LIMIT:
+            tags.pop()
+        if tags:
+            title = f"{title} {' '.join(tags)}"
+    if len(title) > _YT_TITLE_LIMIT:
+        raise ValueError(f"title base over YouTube limit ({len(title)}): {base!r}")
+    return title
+
+
 def _make_title(nick: str, short_type: str, opp: str | None, mname: str, tournament_tag: str = "", clutch: str | None = None, kills: int = 0, punch_tags: list[str] | None = None, start_tick: int = 0, pov_org: str | None = None) -> tuple[str, str]:
     # Format hash ignores the live opponent string so filling in a top-10 org
     # does not reshuffle the skeleton (onic stays hyphen-hook, Vitality is spliced in).
@@ -251,10 +279,8 @@ def _make_title(nick: str, short_type: str, opp: str | None, mname: str, tournam
     if opp and _is_top10_opponent(opp) and opp.lower() not in line.lower():
         line = f"{line} vs {opp}"
     base = f"{line} #cs2 #counterstrike"
-    title = f"{base} {tournament_tag}".strip() if tournament_tag else base
-    extra = " ".join(t for t in (_hashtag(nick), _hashtag(pov_org), _hashtag(opp)) if t)
-    if extra:
-        title = f"{title} {extra}"
+    extra = " ".join(t for t in (_hashtag(nick), _hashtag(pov_org), _hashtag(opp), _hashtag(mname)) if t)
+    title = _fit_title(base, tournament_tag, extra)
     return title, fmt
 
 
@@ -314,6 +340,19 @@ def make_meta(folder: str, tournament: str | None = None, year: str = "2026") ->
         start_tick=s.get("start_tick", 0), pov_org=pov_org,
     )
 
+    out = os.path.join(folder, "upload_meta_shorts.json")
+    # Re-renders must not clobber a hand-edited title: same timeline means
+    # same content, so an existing non-empty title wins. Delete the title to
+    # force regeneration.
+    try:
+        with open(out, encoding="utf-8") as fh:
+            prev = json.load(fh)
+    except (OSError, ValueError):
+        prev = {}
+    if str(prev.get("title") or "").strip():
+        title = str(prev["title"]).strip()
+        title_format = str(prev.get("title_format") or title_format)
+
     meta = {
         "video_path": video,
         "title": title,
@@ -324,7 +363,6 @@ def make_meta(folder: str, tournament: str | None = None, year: str = "2026") ->
         "tags": _TAGS,
         "upload_status": "pending",
     }
-    out = os.path.join(folder, "upload_meta_shorts.json")
     with open(out, "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=2)
     return meta

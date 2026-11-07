@@ -105,6 +105,16 @@ def test_dot_only_style_renders_lone_dot():
     assert "cl_crosshairdot 1" in cvars
 
 
+def test_legacy_dynamic_label_maps_to_style_5():
+    # Prosettings' display label for the legacy dynamic style (flameZ,
+    # Oct 2026). Previously unmapped, so the style line was silently
+    # dropped and renders fell back to the default dynamic style.
+    cvars = crosshair_convars({
+        "cl_crosshairstyle": "Dynamic Cross (Legacy/Shot Feedback)",
+        "cl_crosshairsize": "3"})
+    assert "cl_crosshairstyle 5" in cvars
+
+
 def test_rgb_without_color_name_is_emitted():
     # Some pages carry r/g/b components with no color-name field; the
     # components are the color (previously dropped → game default color).

@@ -42,7 +42,7 @@ def test_hook_keeps_its_hud_delta() -> None:
     assert "cl_drawhud 1" in hook
     assert "cl_showtextmsg 0" in hook  # CHAT_HIDE_CFG
     # The hook's HUD lines must not resurrect the wide avatar row.
-    assert "cl_teamcounter_playercount_instead_of_avatars true" in hook
+    assert "cl_teamcounter_playercount_instead_of_avatars 1" in hook
 
 
 def test_hook_cfg_carries_rename_lines_once() -> None:
@@ -65,3 +65,45 @@ def test_autoexec_disables_observer_crosshair(tmp_path, monkeypatch) -> None:
         text = path.read_text(encoding="utf-8")
         assert "cl_show_observer_crosshair 0" in text
         assert text.index("cl_show_observer_crosshair 0") < text.index("cl_crosshair_length 3")
+
+
+def test_pov_launch_cfg_asserts_the_full_team_bar(tmp_path, monkeypatch) -> None:
+    """The POV must assert its own team-bar HUD, not inherit the hook's.
+
+    Bug this pins: the POV launch cfg only ever wrote ``cl_hide_avatar_images``,
+    so it inherited whatever the last CS2 session left behind — and every
+    pipeline POV renders a hook in step 5 whose HUD is deliberately the compact
+    N-vs-N bar (``hud_score_blur.COMPACT_PLAYERCOUNT_CFG``). The next POV then
+    shipped with numbers instead of the avatar row (nocries + flameZ EPL
+    renders, 2026-10-10), while a hook-less bare render still looked right.
+    """
+    from cs2archive.pov import render_pov
+
+    autoexec = tmp_path / "autoexec_render.cfg"
+    monkeypatch.setattr(render_pov, "AUTOEXEC_RENDER", autoexec)
+    monkeypatch.setattr(render_pov, "RENDER_CROSSHAIR_CFG", tmp_path / "render_crosshair.cfg")
+
+    render_pov._write_render_autoexec(["cl_crosshair_length 3"])
+
+    text = autoexec.read_text(encoding="utf-8")
+    assert "cl_teamcounter_playercount_instead_of_avatars 0" in text
+    assert "cl_hud_playercount_showcount 0" in text
+    assert "cl_hide_avatar_images 0" in text
+    assert "cl_teamcounter_playercount_instead_of_avatars 1" not in text
+
+
+def test_hook_launch_cfg_reasserts_the_compact_bar_last(tmp_path, monkeypatch) -> None:
+    """The hook's compact bar must survive the POV's new reset."""
+    from cs2archive.hud_score_blur import COMPACT_PLAYERCOUNT_CFG
+    from cs2archive.pov import render_pov
+
+    autoexec = tmp_path / "autoexec_render.cfg"
+    monkeypatch.setattr(render_pov, "AUTOEXEC_RENDER", autoexec)
+    monkeypatch.setattr(render_pov, "RENDER_CROSSHAIR_CFG", tmp_path / "render_crosshair.cfg")
+
+    render_pov._write_render_autoexec([*COMPACT_PLAYERCOUNT_CFG, "cl_crosshair_length 3"])
+
+    lines = [ln.strip() for ln in autoexec.read_text(encoding="utf-8").splitlines()]
+    teamcounter = [ln for ln in lines
+                   if ln.startswith("cl_teamcounter_playercount_instead_of_avatars")]
+    assert teamcounter[-1] == "cl_teamcounter_playercount_instead_of_avatars 1"

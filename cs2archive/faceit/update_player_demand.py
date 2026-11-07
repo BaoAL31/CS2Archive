@@ -1,6 +1,6 @@
 """Refresh player demand weights from POV-channel YouTube scrapes.
 
-Includes the eight competitor channels plus @cs2povarchive.
+Includes the nine competitor channels plus @cs2povarchive.
 
 Keeps a deduped history (one row per video_id) under exports/pov_market/.
 Scores a rolling 180-day window, blended with a 30-day overlay (recent can
@@ -299,18 +299,27 @@ async def scrape_new(history: list[dict], days: int) -> list[dict]:
         raise RuntimeError("YOUTUBE_API_KEY is not configured in .env")
     now = datetime.now(timezone.utc)
     skip_ids = stale_video_ids(history, now, REFRESH_DAYS)
+    # Competitor discovery stays incremental. Our forward monitor needs current
+    # counts on older uploads too: re-aging a frozen view count is not an
+    # outcome measurement. Refresh the small own-channel window in full.
+    own_channels = [channel for channel in DEFAULT_CHANNELS if channel == "@cs2povarchive"]
+    competitors = [channel for channel in DEFAULT_CHANNELS if channel not in own_channels]
     _channels, rows = await collect(
-        list(DEFAULT_CHANNELS),
+        competitors,
         settings.youtube_api_key,
         days,
         2000,
         skip_ids=skip_ids,
     )
+    if own_channels:
+        _channels, own_rows = await collect(
+            own_channels, settings.youtube_api_key, WINDOW_DAYS, 2000,
+        )
+        rows.extend(own_rows)
     return rows
 
 
 def refresh(*, scrape: bool = True, days: int = REFRESH_DAYS) -> dict:
-    now = datetime.now(timezone.utc)
     history = upsert_history_rows(load_history(HISTORY_PATH), load_seed_rows())
     new_rows: list[dict] = []
     if scrape:
@@ -318,6 +327,9 @@ def refresh(*, scrape: bool = True, days: int = REFRESH_DAYS) -> dict:
         history = upsert_history_rows(history, new_rows)
     write_history(HISTORY_PATH, history)
 
+    # New captures are stamped during collection; evaluate only after that
+    # completes so valid observations are not mistaken for future data.
+    now = datetime.now(timezone.utc)
     aliases = recognised_aliases()
     aged = []
     for row in refresh_velocity(history, now):
@@ -330,6 +342,8 @@ def refresh(*, scrape: bool = True, days: int = REFRESH_DAYS) -> dict:
     recent_report = analyze_rows(in_window(aged, now, RECENT_DAYS), source="recent")
     index, details = build_index(long_report, recent_report, aliases)
     breakouts = breakout_map(in_window(aged, now, WINDOW_DAYS), aliases, now)
+    from cs2archive.faceit.pov_trends import find_early_trends, TREND_VERSION
+    early_trends = find_early_trends(aged, aliases, now)
     payload = {
         "updated_at": now.isoformat(),
         "window_days": WINDOW_DAYS,
@@ -340,8 +354,10 @@ def refresh(*, scrape: bool = True, days: int = REFRESH_DAYS) -> dict:
         "index": index,
         "players": details,
         "breakouts": breakouts,
+        "early_trends": early_trends,
         "method": {
             "rule_version": _DEMAND_RULE_VERSION,
+            "early_trend_version": TREND_VERSION,
             "performance_index": long_report["method"]["performance_index"],
             "min_videos": MIN_VIDEOS,
             "recent_min_videos": RECENT_MIN_VIDEOS,

@@ -23,8 +23,8 @@ instead of re-deriving the convention.
    - Opponent average ELO **< 3000** → "level 10" / "level 10 faceit players".
    - The label goes **in the title**, not just the description.
 4. **Hashtags** go in the TITLE: `#cs2 #counterstrike` (+ tournament hashtag
-   if any). Never a `tags` field, never `#csgo`, never `#Shorts`, no map
-   hashtags.
+   if any, then nick/org/opp tags, then the map tag, e.g. `#anubis`). Never a
+   `tags` field, never `#csgo`, never `#Shorts`.
 5. **No em-dashes** (`—` / `\u2014`). Use a plain hyphen `-` or restructure.
 6. Vary the format. For HLTV **clutches with a named org**, the title starts
    with the situation as a question, opponent in the hook, punchline after:

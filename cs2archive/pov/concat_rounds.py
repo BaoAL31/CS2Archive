@@ -39,27 +39,133 @@ def _batch_range(f: Path) -> tuple[int, int]:
     return (int(m.group(1)), int(m.group(2)))
 
 
+def _picture_duration(path: Path) -> float:
+    """Frame-exact picture length (``nb_frames / fps``), 0.0 when unknown.
+
+    This — not the container duration — is the sync reference: the audio of
+    every segment is trimmed/padded to it so the joined track cannot slip
+    against the picture.
+    """
+    try:
+        r = subprocess.run(
+            [FFPROBE, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=nb_frames,r_frame_rate,avg_frame_rate",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if r.returncode != 0:
+            return 0.0
+        streams = (json.loads(r.stdout or "{}").get("streams") or [])
+        if not streams:
+            return 0.0
+        s = streams[0]
+        fps_raw = s.get("avg_frame_rate") or s.get("r_frame_rate") or "0/1"
+        num, _, den = str(fps_raw).partition("/")
+        fps = float(num) / float(den or 1) if float(den or 1) else 0.0
+        frames = int(s.get("nb_frames") or 0)
+        if fps <= 0 or frames <= 0:
+            return 0.0
+        return frames / fps
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        return 0.0
+
+
+def _has_audio_stream(path: Path) -> bool:
+    try:
+        r = subprocess.run(
+            [FFPROBE, "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_type", "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if r.returncode != 0:
+            return False
+        return bool((json.loads(r.stdout or "{}").get("streams") or []))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+def _audio_join_graph(parts: list[Path], durations: list[float],
+                      has_audio: list[bool]) -> str:
+    """Filter graph that rebuilds the joined audio on the PICTURE timeline.
+
+    Every part's audio is decoded on its own (a standalone decode honours that
+    file's AAC edit list, i.e. its encoder delay is trimmed), trimmed/padded to
+    that part's exact picture length, then joined with the concat FILTER and
+    encoded once. Stream-copying AAC packets instead — what ``-c copy`` on the
+    concat demuxer does — re-inserts one primed AAC frame per join and lets each
+    clip's audio tail overhang do the same: measured +29.3 ms per join on
+    synthetic clips, and +26 ms per round here (18 rounds → the audio ends
+    ~0.44 s after the picture). That accumulation IS the recurring
+    "audio drifts later as the video goes on" report.
+    """
+    bits: list[str] = []
+    labels: list[str] = []
+    for i, dur in enumerate(durations):
+        label = f"[aj{i}]"
+        chain = (f"aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:"
+                 f"channel_layouts=stereo,atrim=end={dur:.6f},asetpts=PTS-STARTPTS,"
+                 f"apad=whole_dur={dur:.6f},atrim=end={dur:.6f}")
+        if has_audio[i]:
+            bits.append(f"[{i + 1}:a]{chain}{label}")
+        else:
+            # A silent part still has to occupy its own picture length.
+            bits.append(f"anullsrc=channel_layout=stereo:sample_rate=48000,"
+                        f"atrim=end={dur:.6f},asetpts=PTS-STARTPTS{label}")
+        labels.append(label)
+    bits.append(f"{''.join(labels)}concat=n={len(parts)}:v=0:a=1[aout]")
+    return ";".join(bits)
+
+
 def _concat_many(parts: list[Path], out: Path) -> None:
-    """Concat N files in ONE ffmpeg demuxer pass (stream copy, no re-encode).
+    """Concat N files in ONE ffmpeg demuxer pass: video copied, audio rebuilt.
 
     The old pairwise loop rewrote the growing combined.mp4 once per batch
     (quadratic disk I/O — hundreds of GB rewritten on a full map). One
     pass reads + writes the total bytes exactly once. Resume-safe: callers
     pass [existing combined.mp4, *leftover batch files].
+
+    VIDEO is still a stream copy (no re-encode, frame timestamps untouched).
+    AUDIO is NOT: see ``_audio_join_graph``. Copying each clip's AAC packets
+    onto the next clip's timeline shifts the audio later by one encoder delay
+    per join, which compounds over a map — the recurring late-audio report.
     """
     total_mb = sum(p.stat().st_size for p in parts) / 1024 / 1024
     print(f"\n  [Concat] {len(parts)} file(s), {total_mb:.0f} MB total "
-          f"(single pass, no re-encode)...", end=" ", flush=True)
+          f"(single pass, video copy + audio rejoin)...", end=" ", flush=True)
+    durations = [_picture_duration(p) for p in parts]
+    has_audio = [_has_audio_stream(p) for p in parts]
     with tempfile.TemporaryDirectory() as tmp:
         lst = Path(tmp) / "files.txt"
         with open(lst, "w") as f:
             for p in parts:
                 f.write(f"file '{p.resolve().as_posix()}'\n")
-        r = subprocess.run(
-            [FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
-             "-c", "copy", str(out)],
-            capture_output=True, text=True, timeout=36000,
-        )
+        if not any(has_audio):
+            # Silent parts cannot drift: nothing to rebuild, keep the plain copy.
+            cmd = [FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
+                   "-c", "copy", str(out)]
+        else:
+            unprobed = [p.name for p, d in zip(parts, durations) if d <= 0]
+            if unprobed:
+                # Never fall back to the stream-copy join here: it accumulates
+                # one encoder delay of audio lag per join (the drift bug).
+                raise SystemExit(
+                    "CONCAT_AUDIO_UNPROBED: cannot read nb_frames/fps for "
+                    + ", ".join(unprobed)
+                    + " — refusing the stream-copy audio join, which adds "
+                      "~21 ms of audio lag per part."
+                )
+            graph = _audio_join_graph(parts, durations, has_audio)
+            cmd = [FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", str(lst)]
+            for p in parts:
+                cmd += ["-i", str(p)]
+            cmd += [
+                "-filter_complex", graph,
+                "-map", "0:v", "-map", "[aout]",
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2",
+                str(out),
+            ]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=36000)
         if r.returncode != 0:
             print(f"\n  [CONCAT FAILED] {r.stderr[-300:]}")
             sys.exit(1)
@@ -501,6 +607,11 @@ def concat_rounds(folder: Path, allow_gaps: bool = False) -> Path:
             f"DISSOLVE_MARKER_CORRUPT: {_marker_path} unreadable — delete it "
             f"and {combined.name} to redo concat from clips"
         )
+    if not resuming:
+        # A fresh build from clips cannot have baked any dissolve yet: the
+        # marker belongs to a combined.mp4 that was deleted (re-render). Keeping
+        # it would silently skip the dissolve on the new file.
+        _done = set()
     if _requested and not set(_requested) >= _done:
         raise RuntimeError(
             f"DISSOLVE_MISMATCH: round_windows.json wants dissolves for "
@@ -602,18 +713,10 @@ def _check_gpu_available() -> bool:
                 return False
         return True
     except Exception:
-        return True  # optimistic if nvidia-smi fails
-
-
-def _scale_vf(w: int, h: int, scaling_mode: str = "") -> tuple[str, str]:
-    """One-pass scale to target WxH — always stretch (ignore Black Bars).
-
-    ``setsar=1`` is required: without it ffmpeg keeps the source DAR (e.g. 4:3)
-    by writing a non-square sample aspect ratio, so players display the file
-    pillarboxed/unsquished instead of anamorphically stretched to 16:9.
-    """
-    _ = scaling_mode
-    return f"scale={w}:{h}:flags=spline,setsar=1,format=nv12,fps=60", "stretch"
+        # Deliberate: this is a *scheduling* hint ("is another ffmpeg using the
+        # GPU?"), not a correctness gate. The encode fails loudly on its own if
+        # the GPU is really unavailable, and the old silent CPU fallback is gone.
+        return True
 
 
 def _scale_vf_gpu(w: int, h: int) -> str:
@@ -643,7 +746,6 @@ def _write_filter_script(filter_complex: str) -> str:
 def _encode_scaled(src: Path, dst: Path, w: int, h: int, scaling_mode: str) -> None:
     """Single encode: resample (stretch and/or upscale) straight to target WxH."""
     src_mb = src.stat().st_size / 1024 / 1024
-    vf, label = _scale_vf(w, h, scaling_mode)
     gpu_vf = _scale_vf_gpu(w, h)
 
     if not _check_gpu_available():
@@ -675,29 +777,82 @@ def _encode_scaled(src: Path, dst: Path, w: int, h: int, scaling_mode: str) -> N
         "-c:a", "copy", str(temp),
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=SCALE_TIMEOUT_S)
-    elapsed = time.time() - t0
+    if r.returncode != 0:
+        # Transient CUDA init failures are common (another process grabbing the
+        # context, VRAM pressure); one retry is cheap next to giving up.
+        temp.unlink(missing_ok=True)
+        print(f"\n[ERROR] GPU scale failed (rc={r.returncode}): {r.stderr[-300:]}")
+        print("  [Retry] second GPU attempt in 10s...", flush=True)
+        time.sleep(10)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=SCALE_TIMEOUT_S)
     if r.returncode != 0:
         temp.unlink(missing_ok=True)
-        print(f"\n[ERROR] Scale failed: {r.stderr[-300:]}")
-        print("  [Fallback] Retrying with CPU Lanczos + libx264...")
-        # Plain CPU fallback.
-        vf_cpu = vf.replace("flags=spline", "flags=lanczos")
-        cmd = [
-            FFMPEG, "-y", "-i", str(src),
-            "-vf", vf_cpu,
-            "-c:v", "libx264", "-crf", "15", "-preset", "slow",
-            "-profile:v", "high", "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            "-c:a", "copy", str(temp),
-        ]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=SCALE_TIMEOUT_S)
-        if r.returncode != 0:
-            temp.unlink(missing_ok=True)
-            print(f"\n[ERROR] Scale fallback also failed: {r.stderr[-300:]}")
-            sys.exit(1)
+        # NEVER fall back to libx264. A CPU Lanczos + libx264 -preset slow pass
+        # over a 32 GB mezzanine runs at ~2 MB/s: the 2026-10-23 Senzu Dust2
+        # run burned 115,000 s of CPU and would have needed ~2.5 h for a pass
+        # the GPU does in ~18 min. Fail loudly so the daemon surfaces it
+        # instead of silently spending an afternoon of CPU.
+        print(f"\n[ERROR] GPU scale failed twice (rc={r.returncode}): {r.stderr[-400:]}")
+        print("  No CPU fallback by design — check nvidia-smi / close GPU-holding apps.")
+        print(f"  elapsed {time.time() - t0:.0f}s")
+        sys.exit(1)
     temp.replace(dst)
     mb = dst.stat().st_size / 1024 / 1024
-    print(f"OK ({elapsed:.0f}s, {mb:.0f} MB)")
+    print(f"OK ({time.time() - t0:.0f}s, {mb:.0f} MB)")
+
+
+def ensure_round_offsets_sidecar(folder: Path) -> Path | None:
+    """Write combined.round_offsets.json if it is missing but reconstructible.
+
+    The resume path (combined.mp4 present, no clips left) used to scale and
+    return *without* writing the sidecar. A run that died between building
+    combined.mp4 and writing the sidecar therefore left the render permanently
+    unresumable: overlay_pov needs per-round tick spans to map ticks to frames,
+    refuses to guess without them, and HARD FAILs in a loop — 709 failures on
+    the ZywOo ESL Pro League grand final (2026-10-12), with a combined.mp4 that
+    was provably complete.
+
+    The per-round durations cached in combined.sequence_ticks.json are written
+    *before* the clips are consumed, so they are authoritative for the rounds
+    now inside combined.mp4: rebuild the timeline instead of losing the render.
+    """
+    combined = folder / "combined.mp4"
+    offset_path = folder / "combined.round_offsets.json"
+    if offset_path.is_file():
+        return offset_path
+    if not combined.is_file():
+        return None
+    cache = folder / "combined.sequence_ticks.json"
+    if not cache.is_file():
+        return None
+    try:
+        data = json.loads(cache.read_text(encoding="utf-8"))
+        durs = {int(k): float(v)
+                for k, v in (data.get("per_round_durations") or {}).items()}
+        ticks = {int(k): [int(v[0]), int(v[1])]
+                 for k, v in (data.get("per_round_ticks") or {}).items()}
+    except (OSError, json.JSONDecodeError, TypeError, ValueError, IndexError):
+        return None
+    if not durs:
+        return None
+    round_offsets: dict[int, float] = {}
+    cumulative = 0.0
+    for rn in sorted(durs):
+        round_offsets[rn] = round(cumulative, 3)
+        cumulative += durs[rn]
+    payload = {
+        "total_rounds": len(round_offsets),
+        "total_duration_seconds": round(_probe_duration(combined), 3),
+        "round_offsets": {str(k): v for k, v in round_offsets.items()},
+        "batches": [],
+        "per_round_ticks": {str(k): v for k, v in sorted(ticks.items())},
+        "per_round_durations": {str(k): round(v, 3)
+                                for k, v in sorted(durs.items())},
+    }
+    offset_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"  [sidecar] reconstructed {offset_path.name} from the tick cache "
+          f"({len(round_offsets)} rounds, {cumulative:.1f}s)")
+    return offset_path
 
 
 def main() -> None:
@@ -728,6 +883,10 @@ def main() -> None:
     combined = folder / "combined.mp4"
     has_clips = any(folder.glob("batch-*.mp4")) or any(folder.glob("round-*.mp4"))
     if combined.exists() and combined.stat().st_size >= 1_000_000 and not has_clips:
+        # Resume path: never leave without the tick->frame sidecar. Rebuild it
+        # from the tick cache when the run that built combined.mp4 died before
+        # writing it (otherwise the overlay refuses and the pipeline loops).
+        ensure_round_offsets_sidecar(folder)
         vid_w, vid_h = _get_resolution(combined)
         at_target = (vid_w, vid_h) == (args.width, args.height)
         if at_target:

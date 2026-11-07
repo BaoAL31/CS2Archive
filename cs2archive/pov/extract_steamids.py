@@ -33,7 +33,15 @@ def extract_steamids(demo_path: str) -> dict[str, str]:
     with tempfile.TemporaryDirectory(dir=TMP_DIR) as tmpdir:
         cmd = [csdm, "json", str(demo), "--output-folder", tmpdir]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0 and "unknown demo source" in (result.stderr or "").lower():
+        # csdm 3.20.1 can FAIL with `unknown demo source` while still exiting 0
+        # ("No demos to export"), so the exit code alone cannot gate the retry:
+        # an empty export with that stderr is also a source failure. Without the
+        # stderr check the PGL/PBDEMS2 fallback never fired and demos silently
+        # produced zero players (2026-10-31 grand-final backlog).
+        output_says_nothing = not list(Path(tmpdir).glob("*.json"))
+        needs_source = ("unknown demo source" in (result.stderr or "").lower()
+                        and (result.returncode != 0 or output_says_nothing))
+        if needs_source:
             cmd += ["--source", "challengermode"]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:

@@ -99,6 +99,18 @@ def _fetch_backfill(match_id: str, slug: str) -> str:
         return "error"
 
 
+def _is_quarantined(staging: Path, clip_id: str) -> bool:
+    if not clip_id:
+        return False
+    path = Path(staging) / "clips" / clip_id / "alignment.json"
+    if not path.is_file():
+        return False
+    try:
+        return bool(json.loads(path.read_text(encoding="utf-8")).get("quarantined"))
+    except (OSError, ValueError):
+        return False
+
+
 def build_one(demo: Path, staging: Path, *, fetch: bool = True) -> dict:
     import demoparser2 as dp
     import pandas as pd
@@ -142,6 +154,8 @@ def build_one(demo: Path, staging: Path, *, fetch: bool = True) -> dict:
         slug = map_slug_from_title(str(clip.get("title") or ""))
         if slug and slug.replace("dust_2", "dust2") not in demo_map and demo_map not in slug:
             continue
+        if _is_quarantined(staging, str(clip.get("clip_id") or "")):
+            continue  # unanimous 2026-10-07: quarantined clips never nominate
         scored.append(clip)
     if not scored:
         return {"demo": str(demo), "status": "unresolved", "reason": "no-player-map-match"}
@@ -176,9 +190,13 @@ def build_one(demo: Path, staging: Path, *, fetch: bool = True) -> dict:
     want_kills = _explicit_kills(str(clip.get("title")))
     confidence = "exact" if (want_kills is not None and len(demo_kills) == want_kills) else "partial"
     kill_ticks = sorted(int(k["tick"]) for k in demo_kills)
+    # Unanimous 2026-10-07: the shipped artifact represents the clip
+    # (kill-anchored window), with round bounds preserved alongside.
+    clip_start = max(start, kill_ticks[0] - 320) if kill_ticks else start
+    clip_end = min(end, kill_ticks[-1] + 128) if kill_ticks else end
 
     parser = dp.DemoParser(str(demo))
-    ticks = list(range(start, end + 1, STATE_EVERY_TICKS))
+    ticks = list(range(clip_start, clip_end + 1, STATE_EVERY_TICKS))
     try:
         snap = parser.parse_ticks(STATE_PROPS, ticks=ticks)
         state = snap.to_dict(orient="records") if snap is not None else []
@@ -191,7 +209,7 @@ def build_one(demo: Path, staging: Path, *, fetch: bool = True) -> dict:
     raw = tl.get("raw_events") or {}
     for key in ("player_death", "player_hurt", "weapon_fire"):
         rows = (raw.get(key) or {}).get("rows") or []
-        events[key] = [r for r in rows if start <= int(r.get("tick", -1)) <= end]
+        events[key] = [r for r in rows if clip_start <= int(r.get("tick", -1)) <= clip_end]
 
     clip_id = str(clip.get("clip_id") or "")
     out = staging / "clips" / clip_id
@@ -204,7 +222,10 @@ def build_one(demo: Path, staging: Path, *, fetch: bool = True) -> dict:
     (out / "alignment.json").write_text(json.dumps({
         "clip_id": clip_id, "demo": str(demo), "match_id": match_id,
         "steamid": sid, "player": clip.get("player"),
-        "round": rnd, "tick_start": start, "tick_end": end,
+        "round": rnd,
+        "tick_start": clip_start, "tick_end": clip_end,
+        "round_tick_start": start, "round_tick_end": end,
+        "kill_ticks": kill_ticks,
         "title": clip.get("title"), "views": clip.get("views"),
         "explicit_kills": want_kills, "demo_kills": len(demo_kills),
         "confidence": confidence, "method": "steamid+map+round+kills",
@@ -283,6 +304,72 @@ def nominate_demo_short(demo: Path, staging: Path,
     return tl, short
 
 
+def recut_staged(staging: Path) -> dict:
+    """Re-cut staged clips to kill-anchored windows without demo re-parses.
+
+    Reads each clip's alignment + cached timeline, filters events/state
+    parquets to [first_kill-320, last_kill+128], and records both spans in
+    alignment.json. Quarantined clips are re-cut identically (still excluded
+    from nomination); unresolved/missing pieces are reported, not deleted.
+    """
+    import pandas as pd
+
+    staging = Path(staging)
+    stats = {"recut": 0, "skipped": 0, "errors": []}
+    for clip_dir in sorted((staging / "clips").iterdir()):
+        align_path = clip_dir / "alignment.json"
+        if not align_path.is_file():
+            stats["skipped"] += 1
+            continue
+        try:
+            align = json.loads(align_path.read_text(encoding="utf-8"))
+            demo = Path(align["demo"])
+            tmp = staging / "_timelines" / f"{demo.parent.name}__{demo.stem}.json"
+            tl = json.loads(tmp.read_text(encoding="utf-8"))
+            sid, rnd = str(align["steamid"]), int(align["round"])
+            ticks = sorted(int(k["tick"]) for k in tl.get("kills_all") or []
+                           if str(k.get("attacker_steam_id")) == sid and k.get("round") == rnd)
+            if not ticks:
+                stats["errors"].append(f"{clip_dir.name}: no kill ticks in timeline")
+                continue
+            rstart = align.get("tick_start", ticks[0])
+            rend = align.get("tick_end", ticks[-1])
+            cstart = max(rstart, ticks[0] - 320)
+            cend = min(rend, ticks[-1] + 128)
+            state_path = clip_dir / "state.parquet"
+            if state_path.is_file():
+                df = pd.read_parquet(state_path)
+                if "tick" in df.columns:
+                    df = df[(df["tick"] >= cstart) & (df["tick"] <= cend)]
+                    df.to_parquet(state_path, index=False)
+            events_path = clip_dir / "events.parquet"
+            if events_path.is_file():
+                rows = pd.read_parquet(events_path).to_dict(orient="records")
+                kept = []
+                for row in rows:
+                    try:
+                        payload = json.loads(row["payload"]) if isinstance(row.get("payload"), str) else row["payload"]
+                    except (TypeError, ValueError):
+                        continue
+                    items = payload if isinstance(payload, list) else [payload]
+                    items = [p for p in items
+                             if not isinstance(p, dict) or "tick" not in p
+                             or (cstart <= int(p["tick"]) <= cend)]
+                    if not items and isinstance(payload, list):
+                        continue
+                    row["payload"] = json.dumps(items if isinstance(payload, list) else (items[0] if items else {}))
+                    kept.append(row)
+                pd.DataFrame(kept).to_parquet(events_path, index=False)
+            align.update(tick_start=cstart, tick_end=cend,
+                         round_tick_start=rstart, round_tick_end=rend,
+                         kill_ticks=ticks, window="kill-anchored")
+            align_path.write_text(json.dumps(align, indent=2), encoding="utf-8")
+            stats["recut"] += 1
+        except Exception as e:
+            stats["errors"].append(f"{clip_dir.name}: {type(e).__name__}: {e}")
+    return stats
+
+
 def main(argv: list[str] | None = None) -> int:
     from cs2archive.config import settings
 
@@ -292,8 +379,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--no-fetch", action="store_true",
                     help="Skip fresh Allstar backfill; stored clips only")
+    ap.add_argument("--recut", action="store_true",
+                    help="Re-cut staged clips to kill-anchored windows (no demo re-parse)")
     ap.add_argument("--staging", type=Path, default=settings.shorts_foundation_dir)
     args = ap.parse_args(argv)
+
+    staging = Path(args.staging)
+    if args.recut:
+        stats = recut_staged(staging)
+        print(json.dumps({k: (len(v) if isinstance(v, list) else v)
+                          for k, v in stats.items()}, indent=2))
+        if stats["errors"]:
+            for e in stats["errors"][:10]:
+                print(f"  [ERR] {e}")
+        return 0 if not stats["errors"] else 1
 
     if args.demo:
         demos = [Path(args.demo)]
