@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import tempfile
 from pathlib import Path
 
@@ -176,6 +177,7 @@ def _ffmpeg_encode(
     loop_inputs: set[str] | None = None,
     raw_inputs: list[tuple[Path, list[str]]] | None = None,
     include_audio: bool = True,
+    hwaccel_decode: bool = False,
 ) -> None:
     """Run ffmpeg with h264_nvenc. No CPU fallback (libx forbidden by user).
 
@@ -237,6 +239,13 @@ def _ffmpeg_encode(
             cmd.extend(["-ss", f"{start_sec:.6f}"])
         duration_sec = max(0.0, end_sec - start_sec)
         cmd.extend(["-t", f"{duration_sec:.6f}"])
+    if hwaccel_decode:
+        # The main input is decoded on the GPU so the graph's leading
+        # ``scale_cuda`` (the deferred native->export upscale) runs in VRAM.
+        # Frames are brought back with an explicit ``hwdownload,format=nv12``
+        # in the caller's graph before any CPU filter (overlay/alphamerge)
+        # touches them — ffmpeg's implicit auto_scale cannot convert CUDA->sw.
+        cmd.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
     cmd.extend(["-i", main_input])
     loop_set = loop_inputs or set()
     for inp in extra_inputs:
@@ -281,10 +290,40 @@ def _ffmpeg_encode(
         "-f", "mp4", str(tmp_path),
     ])
     _log(f"  [ffmpeg] nvenc preset p7 cq 15 maxrate 60M (final export -> uploaded verbatim)")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=21600)  # 6h
-    if result.returncode != 0 or not tmp_path.is_file():
+    # Retry policy (repo rule: cap 3, each attempt logged, exhaustion is
+    # terminal). The overlay graph is VRAM-heavy on this 4 GB laptop GPU and
+    # ffmpeg can die mid-encode with rc=1 and NO stderr — a hard kill, not an
+    # ffmpeg error — so a single attempt turned a transient GPU pressure spike
+    # into a lost pipeline step.
+    result = None
+    for attempt in range(1, 4):
+        if attempt > 1:
+            _log(f"  [ffmpeg] retry {attempt}/3 after rc={result.returncode} "
+                 f"(no ffmpeg error output — GPU/encoder kill)")
+            tmp_path.unlink(missing_ok=True)
+            time.sleep(5 * (attempt - 1))
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=21600)  # 6h
+        if result.returncode == 0 and tmp_path.is_file() and tmp_path.stat().st_size > 0:
+            break
+    if result is None or result.returncode != 0 or not tmp_path.is_file():
+        # Keep the REAL error. ffmpeg writes progress ("frame=… speed=…") on
+        # stderr continuously, so the last 400 chars are always progress lines
+        # and the actual cause was being thrown away — three failed wicadia
+        # encodes were undiagnosable because of it.
+        err_path = tmp_path.with_suffix(".ffmpeg-stderr.log")
+        try:
+            err_path.write_text(result.stderr or "", encoding="utf-8")
+        except OSError:
+            err_path = None
         _log(f"[ERROR] nvenc ffmpeg failed: rc={result.returncode}")
-        _log(f"  stderr: {(result.stderr or '')[-400:]}")
+        if err_path:
+            _log(f"  full stderr: {err_path}")
+        meaningful = [
+            ln for ln in (result.stderr or "").splitlines()
+            if ln.strip() and not ln.startswith(("frame=", "size=", "video:", "  "))
+        ]
+        for ln in meaningful[-8:]:
+            _log(f"  ffmpeg: {ln[:300]}")
         tmp_path.unlink(missing_ok=True)
         sys.exit(1)
     os.replace(tmp_path, out_path)
@@ -400,15 +439,22 @@ def _remux_source_audio(overlay_path: Path, source_path: Path,
     os.replace(tmp, overlay_path)
 
 
-def _concat_overlay_batches(batch_files: list[Path], output_path: Path) -> None:
+def _concat_overlay_batches(batch_files: list[Path], output_path: Path,
+                            source_audio: Path | None = None) -> None:
     """Concat batch-overlay-*.mp4 files via ffmpeg stream copy (no re-encode).
 
     Validates the merged file is non-empty. Raises ``SystemExit`` on ffmpeg
     failure. Stream copy requires all inputs to share codec params (same
     _ffmpeg_encode call produces all batches, so this holds). Batches are
     video-only (``-an`` at encode); ``-an`` here too so a stale pre-change
-    batch with an audio track can never sneak audio into the concat — the
-    source audio is muxed back exactly once by ``_remux_source_audio``.
+    batch with an audio track can never sneak audio into the concat.
+
+    ``source_audio`` folds the source-audio mux into this same pass: the
+    picture is still a stream copy, and the audio is normalized to AAC 48k
+    stereo with the exact filter chain ``_remux_source_audio`` uses for the
+    no-correction case (``asetpts`` -> ``volume=0.85`` -> ``apad``, no priming
+    trim). Without it the caller has to read and rewrite the whole overlay a
+    second time just to attach audio.
     """
     if not batch_files:
         _log("[ERROR] no batch files to concat")
@@ -422,8 +468,22 @@ def _concat_overlay_batches(batch_files: list[Path], output_path: Path) -> None:
         tmp_path.unlink(missing_ok=True)
         cmd = [
             "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
-            "-c", "copy", "-an", "-movflags", "+faststart", "-f", "mp4", str(tmp_path),
         ]
+        if source_audio is not None:
+            cmd += [
+                "-i", str(source_audio),
+                "-map", "0:v", "-map", "1:a",
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2",
+                # Identical to _remux_source_audio's no-correction chain. The
+                # AAC priming is gapless-tagged by this muxer, so it must NOT
+                # be trimmed (trimming measured +23.2 ms late).
+                "-af", "asetpts=PTS-STARTPTS,volume=0.85,apad",
+                "-shortest",
+            ]
+        else:
+            cmd += ["-c", "copy", "-an"]
+        cmd += ["-movflags", "+faststart", "-f", "mp4", str(tmp_path)]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
         if result.returncode != 0 or not tmp_path.is_file():
             _log(f"[ERROR] ffmpeg batch concat failed: rc={result.returncode}")
@@ -434,6 +494,8 @@ def _concat_overlay_batches(batch_files: list[Path], output_path: Path) -> None:
     if not _overlay_output_valid(output_path):
         _log(f"[ERROR] concat output too small: {output_path}")
         sys.exit(1)
+    if source_audio is not None:
+        _require_overlay_audio(output_path)
     # A mixed-GOP concat (re-encoded + stream-copied batches) can carry
     # multi-second keyframe gaps and PTS wrinkles that decode in ffmpeg but
     # smear in seeky players — fail loudly instead of shipping silence.

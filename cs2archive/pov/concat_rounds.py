@@ -173,6 +173,70 @@ def _concat_many(parts: list[Path], out: Path) -> None:
     print(f"OK ({out_mb:.0f} MB)")
 
 
+def _probe_durations_strict(files: list[Path], probe=None) -> list[float]:
+    """Duration per clip, HARD-FAILING on anything unprobeable or <= 0.
+
+    A truncated clip (the render was killed mid-write) probes as 0s. The old
+    code warned and appended nothing, so the run still claimed "N rounds
+    concat'd" while that round contributed zero seconds — a whole round silently
+    missing from the POV (wicadia r24, 2026-11-08). Missing footage is not a
+    warning: re-render the round.
+    """
+    probe = probe or _probe_duration
+    out: list[float] = []
+    bad: list[str] = []
+    for f in files:
+        dur = probe(f)
+        if dur is None or dur <= 0:
+            bad.append(f.name)
+        else:
+            out.append(float(dur))
+    if bad:
+        print("[ERROR] CONCAT_CLIP_UNREADABLE: " + ", ".join(bad)
+              + " — clip is truncated/empty (usually a render killed mid-write). "
+                "Delete those clips and re-render those rounds; refusing to "
+                "concat a POV with missing footage.")
+        raise SystemExit(1)
+    return out
+
+
+def repair_round_spans(per_round_ticks: dict, per_round_durations: dict,
+                       shortened_rounds, *, tickrate: int = 64,
+                       tolerance: float = 0.15) -> tuple[dict, list[int]]:
+    """Make every round's tick span agree with its video duration (pure).
+
+    A junction dissolve deepens the join by ``DISSOLVE_FADE_SECONDS``: the round
+    loses that much footage from its tail. Older sidecars were written with the
+    duration shortened but the span untouched, so the overlay mapped N ticks of
+    input over N-fade seconds of video and every key press inside that round ran
+    early. Repair trims the span tail instead of touching the (already baked)
+    video, which makes existing renders correct without a re-concat.
+
+    Returns ``(fixed_ticks, [rounds repaired])``.
+    """
+    out = {k: tuple(v) for k, v in (per_round_ticks or {}).items()}
+    fixed: list[int] = []
+    for raw_rn in shortened_rounds or []:
+        try:
+            rn = int(raw_rn)
+            a, b = out[rn]
+            dur = float(per_round_durations.get(rn) or per_round_durations.get(str(rn)) or 0.0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if dur <= 0:
+            continue
+        implied = (b - a) / float(tickrate or 64)
+        excess = implied - dur                      # positive when the span is too long
+        if abs(excess) <= tolerance:
+            continue
+        trim = int(round(excess * tickrate))
+        if trim <= 0:
+            continue
+        out[rn] = (a, max(a + 1, b - trim))
+        fixed.append(rn)
+    return out, fixed
+
+
 def _parse_batches(
     folder: Path,
     combined_exists: bool = False,
@@ -481,12 +545,7 @@ def concat_rounds(folder: Path, allow_gaps: bool = False) -> Path:
     # for batch N>1 double-counts earlier batches into total_duration_seconds
     # and pushes later round_offsets past the end of the video
     # (e.g. round 22 at 3093s in a 2202s POV).
-    durations: list[float] = []
-    for f in files:
-        dur = _probe_duration(f)
-        if dur <= 0:
-            print(f"  [warn] ffprobe returned 0 duration for {f.name}")
-        durations.append(dur)
+    durations = _probe_durations_strict(files)
 
     for f, dur in zip(files, durations):
         s, e = _batch_range(f)
@@ -632,6 +691,21 @@ def concat_rounds(folder: Path, allow_gaps: bool = False) -> Path:
         _kept_rounds = [_new_rounds[_times.index(t)] for t in _kept]
         for r in _kept_rounds:
             final_prd[r] -= DISSOLVE_FADE_SECONDS
+            # The xfade removed DISSOLVE_FADE_SECONDS from this round's tail, so
+            # its playable tick span shrinks by the same amount. Leaving the span
+            # untouched made the overlay map N ticks of input over N-fade seconds
+            # of video: every key press inside the round ran early (up to 1.2 s),
+            # which is what "the input overlay is not synced" was (2026-11-13,
+            # rounds 1 and 5 of YEKINDAR Cache).
+            if seq_fields:
+                try:
+                    a, b = seq_fields["per_round_ticks"][r]
+                    # 64 tick/s is the CS2 demo rate; the span trim only needs
+                    # to match the fade in ticks.
+                    trim = int(round(DISSOLVE_FADE_SECONDS * 64))
+                    seq_fields["per_round_ticks"][r] = (a, max(a + 1, b - trim))
+                except (KeyError, TypeError, ValueError):
+                    pass
         cumulative = 0.0
         for _rn in _srs:
             round_offsets[_rn] = cumulative
@@ -873,6 +947,18 @@ def main() -> None:
         help="Allow non-contiguous round ranges (for --skip-failed-rounds). "
              "Gaps in round numbers are logged but do not abort.",
     )
+    parser.add_argument(
+        "--defer-scale",
+        action="store_true",
+        default=False,
+        help="Leave combined.mp4 at the native capture resolution and let the "
+             "overlay encode do the upscale inside its own pass. Saves one full "
+             "encode of the mezzanine (the overlay re-encodes the whole video "
+             "anyway). The overlay step detects the resolution mismatch and "
+             "scales while compositing. NEVER set this for a raw-only run: "
+             "nothing downstream would scale, so the raw variant would ship at "
+             "capture resolution.",
+    )
     args = parser.parse_args()
 
     folder = Path(args.folder)
@@ -891,6 +977,12 @@ def main() -> None:
         at_target = (vid_w, vid_h) == (args.width, args.height)
         if at_target:
             print(f"  [Skip] combined.mp4 already {vid_w}x{vid_h}, no clips left")
+            mb = combined.stat().st_size / 1024 / 1024
+            print(f"\nDone. {combined} ({mb:.0f} MB)")
+            return
+        if args.defer_scale:
+            print(f"  [Skip scale] combined.mp4 stays {vid_w}x{vid_h} — the "
+                  f"overlay encode scales to {args.width}x{args.height}")
             mb = combined.stat().st_size / 1024 / 1024
             print(f"\nDone. {combined} ({mb:.0f} MB)")
             return
@@ -917,6 +1009,11 @@ def main() -> None:
     vid_w, vid_h = _get_resolution(combined)
     if (vid_w, vid_h) == (args.width, args.height):
         print(f"\n  [Skip scale] Already {vid_w}x{vid_h}")
+    elif args.defer_scale:
+        # The overlay encode re-encodes the whole video anyway, so it can do the
+        # upscale in the same pass — one full encode of the mezzanine saved.
+        print(f"\n  [Skip scale] {vid_w}x{vid_h} kept native — the overlay "
+              f"encode scales to {args.width}x{args.height}")
     else:
         scaled = folder / "_scaled.mp4"
         if scaled.exists() and not _is_valid_video(scaled):

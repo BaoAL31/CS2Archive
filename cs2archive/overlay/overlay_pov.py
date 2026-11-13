@@ -117,7 +117,6 @@ from cs2archive.overlay.overlay_encode import (
     _ffmpeg_encode,
     _ffmpeg_segment_copy,
     _concat_overlay_batches,
-    _remux_source_audio,
     _compute_batch_boundaries,
 )
 # -- Constants -----------------------------------------------------------
@@ -283,6 +282,36 @@ def _probe_video_info(video_path: Path) -> tuple[int, int, float, int]:
 
 
 # -- CS2UtilArchive data dir lookup --------------------------------------
+def round_mapping_errors(play_ticks: dict, durations: dict, *,
+                         tickrate: int = 64, tolerance: float = 0.15) -> list[str]:
+    """Rounds whose tick span and video duration disagree (pure).
+
+    The overlay maps input ticks to video frames as
+    ``tick = rs + (offset_sec / duration) * (re - rs)``, so a round whose
+    duration does not equal its tick span maps every key press wrong. Concat
+    used to shorten a round's duration for a junction dissolve without shrinking
+    its tick span: 1.2 s of drift inside that round, which is exactly how "the
+    input overlay is not synced" happened (2026-11-13). A disagreement beyond
+    *tolerance* is a hard error, never a silent guess.
+    """
+    errors: list[str] = []
+    for rn, span in sorted(play_ticks.items()):
+        try:
+            a, b = int(span[0]), int(span[1])
+            dur = float(durations.get(rn, 0.0))
+        except (TypeError, ValueError, IndexError):
+            continue
+        if dur <= 0:
+            continue
+        implied = (b - a) / float(tickrate or 64)
+        if abs(implied - dur) > tolerance:
+            errors.append(
+                f"round {rn}: tick span implies {implied:.2f}s but the video "
+                f"duration is {dur:.2f}s (delta {dur - implied:+.2f}s) — input "
+                f"would drift inside this round")
+    return errors
+
+
 def _load_round_tick_ranges(demo_path: Path) -> dict[int, tuple[int, int]]:
     """Load round (start_tick, end_tick) pairs.
 
@@ -1037,6 +1066,8 @@ def run_overlay(
     overlay_style: str = "auto",
     overlay_anim: str = "instant",
     map_name: str | None = None,
+    force_rebuild: bool = False,
+    target_size: tuple[int, int] | None = None,
 ) -> None:
     """Apply utility throw flight PiP (plus optional keyboard overlay) onto video_path (in place).
 
@@ -1059,6 +1090,15 @@ def run_overlay(
     lineup — first-per-util selection PiPs each distinct lineup once.
     Pass ``include_straightforward=False`` (or ``--straightforward-filter``)
     to re-enable the straightforward-toss gate while it is fragile.
+
+    ``target_size=(w, h)`` folds the native-capture -> export upscale into this
+    encode instead of a separate full-video pass (``concat_rounds
+    --defer-scale``). The scale runs on the GPU (``scale_cuda`` lanczos, the
+    same filter ``concat_rounds._scale_vf_gpu`` uses) and is downloaded to
+    system memory before the CPU overlay filters. PiP/keyboard geometry is
+    computed against the TARGET canvas, so the composite is pixel-identical to
+    the old "scale first, then overlay at export size" chain. ``None`` (the
+    default) keeps the input resolution.
     """
     if not video_path.exists():
         _log(f"[ERROR] Video not found: {video_path}")
@@ -1147,6 +1187,14 @@ def run_overlay(
             _log(f"[warn] sidecar per_round parse failed: {e}")
 
     if sidecar_play_ticks and sidecar_play_durations:
+        _map_errs = round_mapping_errors(sidecar_play_ticks, sidecar_play_durations)
+        if _map_errs:
+            for _e in _map_errs:
+                _log(f"[ERROR] ROUND_MAPPING_MISMATCH: {_e}")
+            _log("[ERROR] refusing to composite an input overlay on a round it "
+                 "cannot map exactly. Re-run the concat step so the sidecar's "
+                 "tick spans and durations agree (dissolves shorten both).")
+            sys.exit(1)
         round_tick_ranges = sidecar_play_ticks
         sorted_rns = sorted(round_offsets.keys())
         cumulative = 0.0
@@ -1236,6 +1284,32 @@ def run_overlay(
         round_frame_ranges = _build_round_frame_ranges(
             round_offsets, round_tick_ranges, fps, frame_count,
         )
+
+    # -- Deferred upscale: composite on the EXPORT canvas -------------------
+    # concat_rounds --defer-scale leaves the mezzanine at capture resolution so
+    # this encode can do the upscale in the same pass (one full encode saved).
+    # Geometry must be computed against the canvas the frames end up on, not
+    # the input: that is what makes the composite identical to the old
+    # "scale first, then overlay at export size" chain.
+    canvas_w, canvas_h = (int(target_size[0]), int(target_size[1])) if target_size \
+        else (width, height)
+    needs_scale = (canvas_w, canvas_h) != (width, height)
+    scale_head = ""
+    base_label = "[0:v]"
+    if needs_scale:
+        scale_head = (
+            f"[0:v]scale_cuda={canvas_w}:{canvas_h}:interp_algo=lanczos:"
+            f"format=nv12,hwdownload,format=nv12[__base]"
+        )
+        base_label = "[__base]"
+        _log(f"  [scale] {width}x{height} -> {canvas_w}x{canvas_h} folded into "
+             f"the overlay encode (GPU lanczos)")
+
+    def _graph(fc: str) -> str:
+        """Prepend the deferred-upscale head to a filter graph."""
+        if not scale_head:
+            return fc
+        return f"{scale_head};{fc}" if fc else scale_head
 
     # Determine round_start_tick (needed for legacy single-round mode)
     round_start_tick = 0
@@ -1328,7 +1402,7 @@ def run_overlay(
         if keyboard:
             t2 = time.time()
             _log(f"Generating key cap sprites...")
-            assets = generate_key_assets(work_dir / "sprites", video_height=height,
+            assets = generate_key_assets(work_dir / "sprites", video_height=canvas_h,
                                            style=kb_style)
             png_inputs = overlay_png_input_paths(assets)
             _log(f"{len(png_inputs)} PNGs ({time.time()-t2:.1f}s)")
@@ -1348,7 +1422,11 @@ def run_overlay(
         # Both are looped PNGs fed to ffmpeg as extra inputs.
         pip_inner_mask: Path | None = None
         pip_shadow: Path | None = None
-        body_size = _pip_body(height)
+        # Sized against the CANVAS, not the input: with the deferred upscale
+        # the input is still at capture resolution while the PiP content is
+        # composited at export size, so an input-sized mask would not match the
+        # scaled clip and alphamerge would fail on the size mismatch.
+        body_size = _pip_body(canvas_h)
         inner_size = max(1, body_size - 2 * PIP_OUTLINE_THICKNESS)
         if PIP_CORNER_RADIUS > 0:
             pip_inner_mask = work_dir / f"pip_mask_inner_{inner_size}.png"
@@ -1436,22 +1514,30 @@ def run_overlay(
                 per_sig,
                 assets=assets,
                 placement="bottom-center",
-                video_width=width,
-                video_height=height,
+                video_width=canvas_w,
+                video_height=canvas_h,
                 pressed_release_fade_frames=fade_frames,
                 pressed_release_fade_steps=fade_steps,
-                video_label="[0:v]",
+                video_label=base_label,
                 png_input_offset=1,
             )
         else:
-            keyboard_fc, keyboard_out_label = "", "[0:v]"
+            keyboard_fc, keyboard_out_label = "", base_label
         if not keyboard_fc:
             keyboard_fc = ""
-            keyboard_out_label = "[0:v]"
+            keyboard_out_label = base_label
 
         if batches > 0 and round_offsets:
             _log(f"Batched overlay: {batches} round(s) per batch")
-            if _resume_overlay_output(output_path, video_path):
+            if force_rebuild:
+                # The caller changed something the existing composite was not
+                # built with (the overlay look). Resuming here would remux the
+                # source audio into the OLD picture and hand it back as if it
+                # were the new one. Batches still self-invalidate through their
+                # own stamps, so only the final concat is forced.
+                _log("  [rebuild] forced rebuild — not resuming the existing "
+                     f"{output_path.name}")
+            elif _resume_overlay_output(output_path, video_path):
                 # Concat writes video-only output before audio remuxing. A
                 # failed remux must be resumed, never accepted by file size.
                 _log(f"  [skip] Overlay video exists; source audio restored: {output_path.name}")
@@ -1505,6 +1591,12 @@ def run_overlay(
                         "src_mtime": _src_id[0],
                         "src_size": _src_id[1],
                     }
+                    if needs_scale:
+                        # A batch encoded at capture resolution must never be
+                        # reused for a scaled output — the concat would mix
+                        # resolutions. Only stamped when scaling, so legacy
+                        # (already-scaled) batch caches stay valid.
+                        batch_spec["canvas"] = [canvas_w, canvas_h]
                     if _batch_stamp_matches(batch_path, batch_spec):
                         _log(f"  [batch] {batch_name} exists, skipping")
                         continue
@@ -1524,18 +1616,18 @@ def run_overlay(
                             batch_per_sig,
                             assets=assets,
                             placement="bottom-center",
-                            video_width=width,
-                            video_height=height,
+                            video_width=canvas_w,
+                            video_height=canvas_h,
                             pressed_release_fade_frames=fade_frames,
                             pressed_release_fade_steps=fade_steps,
-                            video_label="[0:v]",
+                            video_label=base_label,
                             png_input_offset=1,
                         )
                     else:
-                        batch_kb_fc, batch_kb_label = "", "[0:v]"
+                        batch_kb_fc, batch_kb_label = "", base_label
                     if not batch_kb_fc:
                         batch_kb_fc = ""
-                        batch_kb_label = "[0:v]"
+                        batch_kb_label = base_label
 
                     # (batch_pips computed above, before the stamp check).
                     pip_fc = ""
@@ -1551,7 +1643,7 @@ def run_overlay(
                         if pip_shadow is not None:
                             shadow_idx = next_idx
                         pip_parts, pip_label, sorted_batch_pips = _build_pip_chain(
-                            batch_pips, width, height, fps,
+                            batch_pips, canvas_w, canvas_h, fps,
                             start_label=batch_kb_label,
                             pip_input_offset=pip_input_offset,
                             inner_mask_idx=inner_idx,
@@ -1573,29 +1665,34 @@ def run_overlay(
                         # Fast path first: stream copy (no re-encode). Falls
                         # back to null re-encode when the copy is inexact
                         # (keyframe snap) so downstream batch sync never drifts.
-                        _ffmpeg_segment_copy(
-                            Path(video_path), batch_start_sec, batch_end_sec,
-                            batch_path,
-                        )
-                        if _segment_copy_exact(batch_path, batch_end_sec - batch_start_sec):
-                            _log(f"  [batch] {batch_name} no overlay, stream-copied")
-                            _batch_stamp(batch_path, batch_spec)
-                            continue
-                        _log(f"  [batch] {batch_name} copy inexact "
-                             f"(keyframe snap), re-encoding for exact sync")
-                        batch_path.unlink(missing_ok=True)
+                        # A deferred upscale makes the copy unusable: it would
+                        # emit a capture-resolution batch into an export-size
+                        # concat, so go straight to the scale encode.
+                        if not needs_scale:
+                            _ffmpeg_segment_copy(
+                                Path(video_path), batch_start_sec, batch_end_sec,
+                                batch_path,
+                            )
+                            if _segment_copy_exact(batch_path, batch_end_sec - batch_start_sec):
+                                _log(f"  [batch] {batch_name} no overlay, stream-copied")
+                                _batch_stamp(batch_path, batch_spec)
+                                continue
+                            _log(f"  [batch] {batch_name} copy inexact "
+                                 f"(keyframe snap), re-encoding for exact sync")
+                            batch_path.unlink(missing_ok=True)
                         _ffmpeg_encode(
                             str(video_path), [],
-                            ["-filter_complex", "[0:v]null[outv]"],
+                            ["-filter_complex", _graph(f"{base_label}null[outv]")],
                             "[outv]", str(batch_path),
                             segment=(batch_start_sec, batch_end_sec),
                             include_audio=False,
+                            hwaccel_decode=needs_scale,
                         )
                         _batch_stamp(batch_path, batch_spec)
                         continue
 
                     fc_script = work_dir / f"batch_{batch_start_rn:03d}_{batch_end_rn:03d}.txt"
-                    fc_script.write_text(combined_fc, encoding="utf-8")
+                    fc_script.write_text(_graph(combined_fc), encoding="utf-8")
                     extra = list(png_inputs) + [c.clip_path for c in sorted_batch_pips]
                     loops = None
                     if pip_inner_mask is not None:
@@ -1611,6 +1708,7 @@ def run_overlay(
                         segment=(batch_start_sec, batch_end_sec),
                         loop_inputs=loops,
                         include_audio=False,
+                        hwaccel_decode=needs_scale,
                     )
                     _batch_stamp(batch_path, batch_spec)
 
@@ -1624,16 +1722,13 @@ def run_overlay(
                     sys.exit(1)
                 _log(f"  [concat] {len(batch_files)} batch files -> {output_path.name}")
                 t6 = time.time()
-                _concat_overlay_batches(batch_files, output_path)
-                _log(f"  [concat] OK in {time.time()-t6:.1f}s")
-                for bf in batch_files:
-                    bf.unlink(missing_ok=True)
-                # Re-attach source audio: batch encodes are video-only (`-an`),
-                # so the concat has no audio track. Mux the ORIGINAL source
-                # audio back, normalized to AAC 48k stereo (CSDM captures mux
-                # MP3 44.1k, which breaks downstream `-c copy` audio joins).
-                # The overlay adds no audio, so the source audio is the
-                # correct sync reference.
+                # Re-attach source audio IN the concat pass: batch encodes are
+                # video-only (`-an`), so the concat has no audio track. Muxing
+                # the ORIGINAL source audio here (normalized to AAC 48k stereo;
+                # CSDM captures mux MP3 44.1k, which breaks downstream `-c copy`
+                # audio joins) avoids reading and rewriting the whole overlay a
+                # second time. The overlay adds no audio, so the source audio is
+                # the correct sync reference.
                 #
                 # Kill-tick/first-threshold fits are not verified A/V landmarks:
                 # they can pad already-late audio or slow it further. Preserve
@@ -1642,7 +1737,11 @@ def run_overlay(
                 # retained ZywOo audio. See docs/bugs/audio-sync-atempo-drift.md.
                 _log("  [audio-sync] preserving source timing; automatic "
                      "kill-onset corrections disabled (unvalidated landmarks)")
-                _remux_source_audio(output_path, video_path)
+                _concat_overlay_batches(batch_files, output_path,
+                                        source_audio=video_path)
+                _log(f"  [concat] OK in {time.time()-t6:.1f}s")
+                for bf in batch_files:
+                    bf.unlink(missing_ok=True)
                 mb = output_path.stat().st_size / 1024 / 1024
                 _log(f"Overlay: {output_path.name} ({mb:.0f} MB) in {time.time()-t4:.1f}s")
                 return
@@ -1650,14 +1749,16 @@ def run_overlay(
         if keyboard_fc and flight_clips:
             # 2-pass: keyboard then PiP
             kb_temp = work_dir / "kb_temp.mp4"
+            kb_graph = _graph(keyboard_fc)
             fc_script = work_dir / "kb_fc.txt"
-            fc_script.write_text(keyboard_fc, encoding="utf-8")
+            fc_script.write_text(kb_graph, encoding="utf-8")
             fc_args = ["-filter_complex_script", str(fc_script.resolve())]
-            if len(keyboard_fc) <= 6000:
-                fc_args = ["-filter_complex", keyboard_fc]
+            if len(kb_graph) <= 6000:
+                fc_args = ["-filter_complex", kb_graph]
             _log(f"Pass 1: keyboard overlay (1 vid + {len(png_inputs)} sprites)...")
             _ffmpeg_encode(str(video_path), png_inputs, fc_args,
-                           keyboard_out_label, str(kb_temp))
+                           keyboard_out_label, str(kb_temp),
+                           hwaccel_decode=needs_scale)
             _log(f"  ({time.time()-t4:.1f}s)")
 
             pass2_next = 1 + len(flight_clips)
@@ -1665,7 +1766,7 @@ def run_overlay(
             pass2_next += 1 if pip_inner_mask is not None else 0
             pass2_shadow = pass2_next if pip_shadow is not None else None
             pip_parts, pip_current, sorted_clips = _build_pip_chain(
-                flight_clips, width, height, fps,
+                flight_clips, canvas_w, canvas_h, fps,
                 inner_mask_idx=pass2_inner,
                 shadow_idx=pass2_shadow)
             pip_fc = ";".join(pip_parts)
@@ -1687,14 +1788,16 @@ def run_overlay(
 
         elif keyboard_fc:
             # Keyboard only
+            kb_graph = _graph(keyboard_fc)
             fc_script = work_dir / "kb_fc.txt"
-            fc_script.write_text(keyboard_fc, encoding="utf-8")
+            fc_script.write_text(kb_graph, encoding="utf-8")
             fc_args = ["-filter_complex_script", str(fc_script.resolve())]
-            if len(keyboard_fc) <= 6000:
-                fc_args = ["-filter_complex", keyboard_fc]
+            if len(kb_graph) <= 6000:
+                fc_args = ["-filter_complex", kb_graph]
             _log(f"Keyboard overlay (1 vid + {len(png_inputs)} sprites)...")
             _ffmpeg_encode(str(video_path), png_inputs, fc_args,
-                           keyboard_out_label, str(output_path))
+                           keyboard_out_label, str(output_path),
+                           hwaccel_decode=needs_scale)
 
         elif flight_clips:
             # PiP only
@@ -1703,12 +1806,13 @@ def run_overlay(
             only_next += 1 if pip_inner_mask is not None else 0
             only_shadow = only_next if pip_shadow is not None else None
             pip_parts, pip_current, sorted_clips = _build_pip_chain(
-                flight_clips, width, height, fps,
+                flight_clips, canvas_w, canvas_h, fps,
+                start_label=base_label,
                 inner_mask_idx=only_inner,
                 shadow_idx=only_shadow)
             pip_fc = ";".join(pip_parts)
             fc_script = work_dir / "pip_fc.txt"
-            fc_script.write_text(pip_fc, encoding="utf-8")
+            fc_script.write_text(_graph(pip_fc), encoding="utf-8")
             _log(f"PiP composite (1 vid + {len(flight_clips)} flight clips)...")
             pip_only_inputs: list[Path] = [c.clip_path for c in sorted_clips]
             pip_only_loops = None
@@ -1721,7 +1825,8 @@ def run_overlay(
             _ffmpeg_encode(str(video_path), pip_only_inputs,
                            ["-filter_complex_script", str(fc_script.resolve())],
                            pip_current, str(output_path),
-                           loop_inputs=pip_only_loops)
+                           loop_inputs=pip_only_loops,
+                           hwaccel_decode=needs_scale)
 
         else:
             _log("No overlay to apply.")

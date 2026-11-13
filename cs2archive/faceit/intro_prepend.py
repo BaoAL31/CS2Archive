@@ -673,8 +673,14 @@ def main() -> None:
     ap.add_argument("--intro", required=True, help="intro.png (transparent card)")
     ap.add_argument("--round-offsets", required=True,
                     help="combined.round_offsets.json sidecar")
-    ap.add_argument("--output", required=True,
-                    help="Final video (intro prepended)")
+    ap.add_argument("--output", default=None,
+                    help="Final video (intro prepended). Required unless "
+                         "--segment-only is set.")
+    ap.add_argument("--segment-only", action="store_true", default=False,
+                    help="Stop after composing the intro segment: write nothing "
+                         "to --output and leave the composed clip at "
+                         "<render-dir>/intro_segment.mp4. The caller joins it "
+                         "itself (the pipeline's single final assembly pass).")
     ap.add_argument("--render-dir", default=None,
                     help="Where to put the rendered footage clip "
                          "(default: alongside --intro in a footage/ subdir)")
@@ -716,7 +722,7 @@ def main() -> None:
     video = Path(args.video)
     intro = Path(args.intro)
     offsets = Path(args.round_offsets)
-    out = Path(args.output)
+    out = Path(args.output) if args.output else None
 
     if not demo.is_file():
         raise SystemExit(f"[ERROR] demo not found: {demo}")
@@ -726,6 +732,8 @@ def main() -> None:
         raise SystemExit(f"[ERROR] intro not found: {intro}")
     if not offsets.is_file():
         raise SystemExit(f"[ERROR] round offsets not found: {offsets}")
+    if out is None and not args.segment_only:
+        raise SystemExit("[ERROR] --output is required unless --segment-only is set")
 
     render_dir = (Path(args.render_dir) if args.render_dir
                   else intro.parent / "footage")
@@ -759,6 +767,11 @@ def main() -> None:
                             args.pop_in, args.pop_out,
                             fade_in=args.fade_in,
                             cut_sec=cut_sec)
+    if args.segment_only:
+        # The caller joins the components itself (one final assembly pass), so
+        # stop here and leave the composed clip in place.
+        print(f"  [segment-only] composed {segment}")
+        return
     prepend(segment, video, out)
 
 

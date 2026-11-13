@@ -559,16 +559,13 @@ def _render_throw_flight_clips(
     throws = keep_first_per_util(throws)
     if not throws:
         return []
-    traj_by_throw: dict[str, Any] = {}
+    # Trajectories are NOT loaded here: the batched renderer subprocess loads
+    # them itself, and split_straightforward above already reads the same
+    # parquet. This function only needs to know whether the file exists, so a
+    # missing one is reported instead of silently yielding no flight cams.
     if data_dir is not None:
         traj_path = data_dir / "trajectories.parquet"
-        if traj_path.is_file():
-            import pandas as _pd
-            _traj_df = _pd.read_parquet(traj_path)
-            for tid, sub in _traj_df.groupby("throw_id"):
-                traj_by_throw[str(tid)] = sub.sort_values("tick").copy()
-            _log(f"  [flight] Loaded {len(traj_by_throw)} trajectories")
-        else:
+        if not traj_path.is_file():
             _log(f"  [flight] WARN: {traj_path.name} missing — flight cams will be skipped")
     else:
         _log(f"  [flight] WARN: no CS2UtilArchive data dir — flight cams will be skipped")

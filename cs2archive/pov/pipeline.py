@@ -408,6 +408,130 @@ def flag_round_risks(data: dict, pov_names: set[str]) -> list[str]:
                     f"tech attempt, review trim_manifest")
     return warns
 
+def _harden_stdio() -> None:
+    """Console encoding must never be able to kill a render."""
+    from cs2archive.safe_stdio import safe_stdio
+
+    safe_stdio()
+
+
+def _overlay_inputs_hash(render_dir: Path) -> str:
+    """Hash the inputs that decide where input-overlay frames land.
+
+    combined.mp4's size plus the full sidecar contents: the sidecar carries the
+    per-round tick spans and durations the compositor maps with, so ANY edit to
+    it must invalidate a previously composited overlay.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    combined = render_dir / "combined.mp4"
+    if combined.is_file():
+        h.update(str(combined.stat().st_size).encode())
+    for name in ("combined.round_offsets.json", "combined.sequence_ticks.json"):
+        p = render_dir / name
+        if p.is_file():
+            h.update(name.encode())
+            h.update(p.read_bytes())
+    return h.hexdigest()
+
+
+# The look an overlay is rendered with when nothing is pinned.
+_DEFAULT_OVERLAY_LOOK = {
+    "style": "auto",
+    "anim": "instant",
+    "keyboard": True,
+    "freeze": False,
+    "straightforward_filter": False,
+}
+
+
+def _overlay_look(args) -> dict:
+    """The overlay-render inputs that change what the composite LOOKS like.
+
+    These are not sync inputs — ``_overlay_inputs_hash`` covers those — but
+    they still decide whether an existing overlay video is the one that was
+    asked for: a different button preset, press animation, keyboard on/off,
+    freeze pass or straightforward-throw filter produces a different picture
+    from the same combined.mp4. Values mirror exactly what ``step_overlay``
+    passes to ``run_overlay``.
+    """
+    return {
+        "style": getattr(args, "overlay_style", None) or _DEFAULT_OVERLAY_LOOK["style"],
+        "anim": getattr(args, "overlay_anim", None) or _DEFAULT_OVERLAY_LOOK["anim"],
+        "keyboard": bool(getattr(args, "keyboard", _DEFAULT_OVERLAY_LOOK["keyboard"])),
+        "freeze": bool(getattr(args, "freeze", _DEFAULT_OVERLAY_LOOK["freeze"])),
+        "straightforward_filter": bool(getattr(
+            args, "straightforward_filter",
+            _DEFAULT_OVERLAY_LOOK["straightforward_filter"])),
+    }
+
+
+def _overlay_look_matches(youtube_dir: Path, look: dict) -> bool:
+    """True only when the overlay in ``youtube_dir`` is recorded as rendered
+    with exactly ``look``.
+
+    Fails CLOSED. A missing or unreadable record means the look is unknown, and
+    an unknown look must not be assumed to be the default one: a directory
+    stamped before this record existed may hold a composite rendered with an
+    explicit ``--overlay-style``, so reading it as ``auto`` would reuse the
+    wrong picture. Failing closed costs one re-overlay (PiP clips and overlay
+    batches are cached); failing open ships the wrong look.
+    """
+    stamp = youtube_dir / ".overlay_look.json"
+    try:
+        recorded = json.loads(stamp.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return recorded == look
+
+
+# Provenance of the overlay work input (``.overlay_work/video.mp4``). The work
+# copy is either the raw ``combined.mp4`` (hardlinked or copied) or a recovered
+# overlay that was already composited. Re-running the overlay on a recovered
+# composite double-composites it, so a rebuild must be able to tell the two
+# apart — and must refuse to reuse a work copy whose provenance is unknown.
+_WORK_PROVENANCE = "video.provenance.json"
+
+
+def _write_work_provenance(work_dir: Path, kind: str, source: str, path: Path) -> None:
+    """Record what ``.overlay_work/video.mp4`` actually is."""
+    try:
+        st = path.stat()
+        (work_dir / _WORK_PROVENANCE).write_text(json.dumps({
+            "kind": kind,
+            "source": source,
+            "size": st.st_size,
+            "mtime": st.st_mtime,
+        }, indent=2), encoding="utf-8")
+    except OSError as e:
+        print(f"  [warn] could not record overlay work provenance ({e})")
+
+
+def _read_work_provenance(work_dir: Path, path: Path) -> dict | None:
+    """Provenance of ``path``, or ``None`` when unknown or stale.
+
+    Stale means the recorded size/mtime no longer match the file on disk: the
+    work copy was replaced by something the record does not describe, so the
+    record cannot be trusted to say what it is.
+    """
+    try:
+        rec = json.loads((work_dir / _WORK_PROVENANCE).read_text(encoding="utf-8"))
+        st = path.stat()
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(rec, dict):
+        return None
+    try:
+        if int(rec.get("size", -1)) != st.st_size:
+            return None
+        if abs(float(rec.get("mtime", -1.0)) - st.st_mtime) > 1e-3:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return rec
+
+
 class Pipeline:
     def __init__(self, args):
         self.args = args
@@ -761,6 +885,8 @@ class Pipeline:
         return self.end_step >= 6 and not getattr(self.args, "no_cleanup", True)
 
     def run(self) -> None:
+        _harden_stdio()
+        self._start_resource_monitor()
         log_path = PROJECT_ROOT / "logs" / f"{self.run_id}.log"
         print(f"Pipeline log -> {log_path.resolve()}")
         self._setup_logging()
@@ -768,7 +894,45 @@ class Pipeline:
         try:
             self._run_steps()
         finally:
+            self._stop_resource_monitor()
             release_global_lock(lock_fd)
+
+    # ── Resource recording ────────────────────────────────────────────
+    # A render is GPU-bound on a shared box; without a record, "why was this
+    # slow / was it throttled?" is unanswerable after the fact. Enabled by
+    # default, opt out with --no-resource-log, sample interval via
+    # --resource-interval.
+    def _start_resource_monitor(self) -> None:
+        if getattr(self.args, "resource_log", True) is False:
+            return
+        try:
+            from cs2archive.resource_monitor import ResourceMonitor
+        except Exception:
+            return
+        out = Path(self.state.get("data", {}).get("render_dir")
+                   or getattr(self, "render_dir", "")) / "resource_log.jsonl"
+        try:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            monitor = ResourceMonitor(
+                out, interval=float(getattr(self.args, "resource_interval", 5.0)),
+                disk_path=PROJECT_ROOT,
+                process_interval=float(getattr(self.args, "resource_process_interval", 60.0)))
+            monitor.start()
+            self._resource_monitor = monitor
+            print(f"  [resources] recording GPU/CPU/disk -> {out}")
+        except Exception as e:  # noqa: BLE001
+            print(f"  [warn] resource monitor disabled ({e})")
+
+    def _stop_resource_monitor(self) -> None:
+        monitor = getattr(self, "_resource_monitor", None)
+        if monitor is None:
+            return
+        try:
+            monitor.stop()
+            monitor.report()
+        except Exception as e:  # noqa: BLE001
+            print(f"  [warn] resource report failed ({e})")
+        self._resource_monitor = None
 
     def _run_steps(self) -> None:
         if self.end_step < self.start_step:
@@ -780,6 +944,9 @@ class Pipeline:
             print(f"\n{'='*60}")
             print(f"  Step {step_num}/{max(STEPS.keys())}: {step_name}")
             print(f"{'='*60}")
+            monitor = getattr(self, "_resource_monitor", None)
+            if monitor is not None:
+                monitor.set_phase(step_name)
             try:
                 getattr(self, f"step_{step_name}")()
                 self.state["step"] = step_num + 1
@@ -1435,19 +1602,72 @@ class Pipeline:
                   f"({target.stat().st_size / 1e9:.1f} GB) <- "
                   f"{overlay.name} ({overlay.stat().st_size / 1e9:.1f} GB)")
             target.unlink()
-        shutil.copy2(str(overlay), str(target))
-        print(f"  [OK] Copied overlay video.mp4 "
+        # Hardlink instead of copy: the overlay result is a multi-GB file and
+        # the render dir sits on the same volume, so a link avoids both the
+        # copy and a transient duplicate of the whole file. Safe because every
+        # later write to youtube/video.mp4 replaces the file (temp +
+        # os.replace) rather than writing through it, and the one in-place
+        # restore in _prepend_hook unlinks first. Falls back to a copy across
+        # volumes / on filesystems without hardlinks.
+        try:
+            os.link(str(overlay), str(target))
+            verb = "Linked"
+        except OSError:
+            shutil.copy2(str(overlay), str(target))
+            verb = "Copied"
+        print(f"  [OK] {verb} overlay video.mp4 "
               f"({target.stat().st_size / 1e9:.1f} GB)")
+        # Keep a pristine, un-assembled copy of the body for the single-pass
+        # final assembly. It is a second hardlink to the same inode, so it
+        # costs no disk; every later write to video.mp4 replaces the directory
+        # entry (temp + os.replace) and leaves this one untouched.
+        body = self.youtube_dir / "video.body.mp4"
+        if body.exists():
+            body.unlink()
+        try:
+            os.link(str(target), str(body))
+        except OSError:
+            shutil.copy2(str(target), str(body))
+        # Record WHICH tick/frame inputs produced this overlay, so a later sidecar
+        # edit re-runs step 4 instead of silently reusing a stale composite.
+        try:
+            (self.youtube_dir / ".overlay_inputs.sha256").write_text(
+                _overlay_inputs_hash(self.render_dir), encoding="utf-8")
+        except OSError as e:
+            print(f"  [warn] could not stamp overlay inputs ({e})")
+        # Record the look this composite was rendered with, so a later run with
+        # a different --overlay-style/--overlay-anim/--keyboard/--freeze
+        # re-renders instead of reusing a video that looks wrong.
+        try:
+            (self.youtube_dir / ".overlay_look.json").write_text(
+                json.dumps(_overlay_look(self.args), sort_keys=True),
+                encoding="utf-8")
+        except OSError as e:
+            print(f"  [warn] could not stamp overlay look ({e})")
         # The overlay timeline includes freeze holds — the work dir's sidecar
         # is the expanded one. The render-dir original (unexpanded) must NOT
         # win: downstream tick mapping (thumbnail kill frame) would drift.
         work_sidecar = overlay.parent / "video.round_offsets.json"
+        body_sidecar = self.youtube_dir / "video.body.round_offsets.json"
+        # A stale body sidecar would describe the PREVIOUS overlay's timeline,
+        # so it is dropped before anything is written.
+        body_sidecar.unlink(missing_ok=True)
         if work_sidecar.is_file():
-            shutil.copy2(str(work_sidecar), str(self.youtube_dir / "video.round_offsets.json"))
+            shutil.copy2(str(work_sidecar), str(body_sidecar))
             print(f"  [OK] Copied expanded video.round_offsets.json "
                   f"(freeze windows included)")
         else:
             self._copy_round_offsets(self.youtube_dir)
+            if (self.youtube_dir / "video.round_offsets.json").is_file():
+                shutil.copy2(str(self.youtube_dir / "video.round_offsets.json"),
+                             str(body_sidecar))
+        # The body sidecar is the pristine (un-hooked) timeline the final
+        # assembly rebuilds from. The delivered sidecar starts as a copy of it,
+        # so a re-copied overlay can never inherit a previous run's hook/intro
+        # offsets.
+        if body_sidecar.is_file():
+            shutil.copy2(str(body_sidecar),
+                         str(self.youtube_dir / "video.round_offsets.json"))
         self._clear_hook_marker(self.youtube_dir)
 
     def _clear_hook_marker(self, youtube_dir: Path) -> None:
@@ -1498,6 +1718,12 @@ class Pipeline:
             concat_args += ["--scaling-mode", scaling]
         if skip_failed or load_voided_rounds(self.render_dir):
             concat_args += ["--allow-gaps"]
+        # Fold the native -> export upscale into the overlay encode instead of a
+        # separate full-video pass. Only when an overlay will actually run: a
+        # raw-only variant has nothing downstream to scale it, so it must be
+        # scaled here.
+        if not self.skip_overlay:
+            concat_args += ["--defer-scale"]
         # Swift indicators are already in the captured frames — concat is a
         # plain concat + scale, no voice work here.
         r = self._run_py(concat_args, timeout=36000)
@@ -1519,6 +1745,178 @@ class Pipeline:
 
     # ── Step 4: Overlay ───────────────────────────────────────────────────
 
+    def _overlay_provenance(self, look_ok: bool) -> dict:
+        """Whether the overlay in ``youtube/`` is the one this run would produce.
+
+        Every input that decides the composite's CONTENT is checked, not just
+        the look: a re-baked ``combined.mp4`` or an edited tick/frame sidecar
+        makes an existing overlay stale even when the look is unchanged. The
+        result drives ALL resume decisions (youtube skip, render-side recovery,
+        work-input re-establishment, forced rebuild) so they cannot disagree —
+        the previous code gated the rebuild on the look alone, so a re-baked
+        source or a mismatched sync stamp still reused the stale composite.
+        """
+        dst = self.youtube_dir / "video.mp4"
+        src = self.render_dir / "combined.mp4"
+        have_output = dst.is_file() and dst.stat().st_size > 100_000
+        re_baked = bool(
+            have_output and src.is_file()
+            and src.stat().st_mtime > dst.stat().st_mtime
+        )
+        stamp = self.youtube_dir / ".overlay_inputs.sha256"
+        mine = _overlay_inputs_hash(self.render_dir)
+        stamp_ok = False
+        if stamp.is_file():
+            try:
+                stamp_ok = stamp.read_text(encoding="utf-8").strip() == mine
+            except OSError:
+                stamp_ok = False
+        reasons: list[str] = []
+        if not have_output:
+            reasons.append("no overlay output")
+        if re_baked:
+            reasons.append("combined.mp4 re-baked")
+        if not stamp_ok:
+            reasons.append("tick/frame inputs changed")
+        if not look_ok:
+            reasons.append("overlay look changed")
+        return {
+            "ok": have_output and not re_baked and stamp_ok and look_ok,
+            "have_output": have_output,
+            "re_baked": re_baked,
+            "stamp_ok": stamp_ok,
+            "look_ok": look_ok,
+            "reasons": reasons,
+        }
+
+    def _overlay_target_size(self, video_path: Path) -> tuple[int, int] | None:
+        """Export size the overlay encode must scale to, or None if already there.
+
+        ``concat_rounds --defer-scale`` leaves the mezzanine at capture
+        resolution so the overlay encode can do the upscale in its own pass.
+        Probing is authoritative: a legacy (already-scaled) mezzanine returns
+        None and the overlay composites at its input size, exactly as before.
+        """
+        export_w = int(getattr(self.args, "width", None) or 2560)
+        export_h = int(getattr(self.args, "height", None) or 1440)
+        try:
+            r = subprocess.run(
+                [settings.ffprobe_exe, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height", "-of", "csv=p=0",
+                 str(video_path)],
+                capture_output=True, text=True, timeout=60,
+            )
+            parts = (r.stdout or "").strip().split(",")
+            src_w, src_h = int(parts[0]), int(parts[1])
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            return None
+        if (src_w, src_h) == (export_w, export_h):
+            return None
+        print(f"  [scale] {src_w}x{src_h} -> {export_w}x{export_h} folded into "
+              f"the overlay encode")
+        return (export_w, export_h)
+
+    def _establish_overlay_work_input(
+        self,
+        target_dir: Path,
+        video_path: Path,
+        prov: dict,
+        recover_ok: bool,
+    ) -> bool:
+        """Make ``.overlay_work/video.mp4`` the input a rebuild must start from.
+
+        Returns True when a render-side overlay was recovered and copied to
+        youtube/ (the caller is done), False when the caller must run
+        ``overlay_pov.py``.
+
+        Two failure modes this closes:
+
+        * A recovered overlay left in the work dir would be composited a SECOND
+          time on a rebuild, then stamped as the requested look.
+        * ``combined.mp4`` missing used to warn and reuse whatever work copy was
+          there — which may itself be an old recovered overlay. Reuse now
+          requires recorded provenance proving the file is the raw input.
+        """
+        # Auto-recover from render-side overlay artifacts only.
+        # Do NOT treat youtube/..._overlay/video.mp4 as a resume source —
+        # that is the destination we may be intentionally regenerating.
+        src = self.render_dir / "combined.mp4"
+        have_src = src.is_file() and src.stat().st_size >= 100_000
+        external = self._find_overlay_video(include_youtube=False)
+        if external is not None and not recover_ok:
+            print(f"  [recover] ignoring stale render-side overlay "
+                  f"{external.name} ({', '.join(prov['reasons'])}) — re-rendering")
+            external = None
+        if external is not None and have_src and (
+                external.stat().st_mtime < src.stat().st_mtime):
+            # The composite predates the source it was built from, so it cannot
+            # describe the current combined.mp4 even in the right look.
+            print(f"  [recover] ignoring stale render-side overlay "
+                  f"{external.name} (older than combined.mp4) — re-rendering")
+            external = None
+        if external is not None and external.exists():
+            target_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(external), str(video_path))
+            _write_work_provenance(target_dir, "recovered_overlay",
+                                   str(external), video_path)
+            print(f"  [recover] copied pre-rendered overlay "
+                  f"({external.stat().st_size / 1e9:.1f} GB) from "
+                  f"{external.parent.name}/{external.name} -> overlay work dir; "
+                  f"skipping overlay_pov.py (already overlaid)")
+            self._copy_overlay_result_to_youtube(overlay=video_path)
+            return True
+
+        if not have_src:
+            # No source to rebuild from. Reusing the work copy is only safe
+            # when its provenance proves it is the RAW input: a recovered
+            # overlay would be composited a second time and then stamped as
+            # the requested look.
+            rec = (_read_work_provenance(target_dir, video_path)
+                   if video_path.exists() else None)
+            if rec is not None and rec.get("kind") == "raw":
+                print("  [warn] combined.mp4 missing — reusing the work copy "
+                      "recorded as the raw input (cannot rebuild)")
+                return False
+            kind = rec.get("kind") if rec else "unknown"
+            fail(4, "OVERLAY_NO_INPUT",
+                 f"combined.mp4 missing/empty in {self.render_dir} and the "
+                 f"overlay work copy is not a recorded raw input "
+                 f"(provenance: {kind}) — refusing to rebuild from a "
+                 f"possibly-composited file")
+            return False
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        if video_path.exists():
+            # Drop the stale work copy so the raw combined.mp4 is the input.
+            # combined.mp4 keeps its own link.
+            video_path.unlink()
+            print(f"  [setup] discarded stale work copy {video_path.name} "
+                  f"({', '.join(prov['reasons'])})")
+        # Hardlink instead of copy: combined.mp4 can be 30+ GB after the 1440p
+        # scale, and a full copy doubles disk usage (and fails outright when the
+        # disk is nearly full). Same volume => hardlink costs nothing;
+        # overlay_pov.py only READS the input and writes video.overlay.mp4
+        # separately.
+        try:
+            os.link(str(src), str(video_path))
+            linked = True
+        except OSError:
+            # Cross-volume or filesystem without hardlinks -> copy.
+            shutil.copy2(str(src), str(video_path))
+            linked = False
+        _write_work_provenance(target_dir, "raw", str(src), video_path)
+        # Copy sidecar (round_offsets.json) alongside video.mp4 —
+        # overlay_pov.py looks for <video>.round_offsets.json next to video.mp4.
+        sidecar_src = self.render_dir / "combined.round_offsets.json"
+        if sidecar_src.is_file():
+            sidecar_dst = target_dir / "video.round_offsets.json"
+            shutil.copy2(str(sidecar_src), str(sidecar_dst))
+            print(f"  [setup] copied sidecar to {sidecar_dst.name}")
+        verb = "hardlinked" if linked else "copied"
+        print(f"  [setup] {verb} combined.mp4 into renders/.overlay_work/ "
+              f"for overlay_pov.py")
+        return False
+
     def step_overlay(self) -> None:
         """Apply util-cam PiP overlay (+ optional keyboard). Skipped in --raw-only mode."""
         # Skip in raw-only mode
@@ -1532,31 +1930,36 @@ class Pipeline:
 
         # Skip if the overlay variant already has a valid video (resume from
         # a previous successful run where .overlay_work was cleaned).
-        # An explicitly passed --overlay-style/--overlay-anim forces a
-        # re-render in the requested look even when a video exists.
-        overlay_look_pinned = (
-            getattr(self.args, "overlay_style", None) not in (None, "auto")
-            or getattr(self.args, "overlay_anim", "instant") != "instant"
-        )
-        if not self.skip_overlay and not overlay_look_pinned:
-            dst = self.youtube_dir / "video.mp4"
-            if dst.is_file() and dst.stat().st_size > 100_000:
-                # Re-overlay if the source combined.mp4 was re-baked after this
-                # overlay was last produced; otherwise stale voice would ship as-is.
-                src = self.render_dir / "combined.mp4"
-                re_baked = src.is_file() and src.stat().st_mtime > dst.stat().st_mtime
-                if not re_baked:
-                    from cs2archive.overlay.overlay_encode import _require_overlay_audio
-                    body = self.youtube_dir / "video.nohook.mp4"
-                    try:
-                        _require_overlay_audio(body if body.is_file() else dst)
-                    except (RuntimeError, ValueError, subprocess.SubprocessError) as exc:
-                        fail(4, "OVERLAY_AUDIO_MISSING", str(exc))
-                    print(f"  [skip] Overlay video already exists in "
-                          f"{self.youtube_dir.name}/video.mp4")
-                    return
-                print(f"  [re-overlay] combined.mp4 is newer than the existing "
-                      f"overlay; re-running overlay_pov.py")
+        # The requested look (button preset / press animation / keyboard /
+        # freeze / straightforward filter) is part of the resume fingerprint: a
+        # matching look reuses the existing composite, a different one
+        # re-renders. Previously ANY explicit --overlay-style/--overlay-anim
+        # bypassed the cache outright, so re-running with the same pinned look
+        # re-ran the overlay for an identical result — and toggling --keyboard
+        # did NOT invalidate the cache at all, shipping a stale overlay.
+        look = _overlay_look(self.args)
+        look_ok = _overlay_look_matches(self.youtube_dir, look)
+        prov = self._overlay_provenance(look_ok)
+        if prov["ok"]:
+            from cs2archive.overlay.overlay_encode import _require_overlay_audio
+            body = self.youtube_dir / "video.nohook.mp4"
+            try:
+                _require_overlay_audio(
+                    body if body.is_file() else self.youtube_dir / "video.mp4")
+            except (RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+                fail(4, "OVERLAY_AUDIO_MISSING", str(exc))
+            print(f"  [skip] Overlay video already exists in "
+                  f"{self.youtube_dir.name}/video.mp4")
+            return
+        print(f"  [re-overlay] {', '.join(prov['reasons'])} — "
+              f"re-running overlay_pov.py")
+        # A render-side overlay carries no look/input record of its own, so it
+        # can only be trusted when the requested look AND the sync inputs are
+        # the ones it was built from. Recovering it otherwise copies the OLD
+        # composite into youtube/ and stamps it with the NEW look — the exact
+        # stale reuse this fingerprint exists to prevent.
+        recover_ok = prov["look_ok"] and prov["stamp_ok"] and not prov["re_baked"]
+        rebuild = True
 
         # Work under renders/ so intermediate files (batches, sidecar)
         # don't clutter youtube/. Only copy final result to youtube/.
@@ -1574,49 +1977,15 @@ class Pipeline:
             target_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(sidecar_src), str(sidecar_dst))
             print(f"  [setup] re-copied missing sidecar to {sidecar_dst.name}")
-        if not video_path.exists():
-            # Auto-recover from render-side overlay artifacts only.
-            # Do NOT treat youtube/..._overlay/video.mp4 as a resume source —
-            # that is the destination we may be intentionally regenerating.
-            external = self._find_overlay_video(include_youtube=False)
-            if external is not None and external.exists():
-                target_dir.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(external), str(video_path))
-                print(f"  [recover] copied pre-rendered overlay "
-                      f"({external.stat().st_size / 1e9:.1f} GB) from "
-                  f"{external.parent.name}/{external.name} -> overlay work dir; "
-                      f"skipping overlay_pov.py (already overlaid)")
-                self._copy_overlay_result_to_youtube(overlay=video_path)
-                return
-            else:
-                # Copy raw combined.mp4 to renders/.overlay_work/ as working file.
-                src = self.render_dir / "combined.mp4"
-                if not src.exists() or src.stat().st_size < 100_000:
-                    fail(4, "OVERLAY_NO_INPUT",
-                         f"combined.mp4 missing/empty in render_dir")
-                target_dir.mkdir(parents=True, exist_ok=True)
-                # Hardlink instead of copy: combined.mp4 can be 30+ GB after
-                # the 1440p scale, and a full copy doubles disk usage (and
-                # fails outright when the disk is nearly full). Same volume
-                # => hardlink costs nothing; overlay_pov.py only READS the
-                # input and writes video.overlay.mp4 separately.
-                try:
-                    os.link(str(src), str(video_path))
-                    linked = True
-                except OSError:
-                    # Cross-volume or filesystem without hardlinks -> copy.
-                    shutil.copy2(str(src), str(video_path))
-                    linked = False
-                # Copy sidecar (round_offsets.json) alongside video.mp4
-                # overlay_pov.py looks for <video>.round_offsets.json next to video
-                sidecar_src = self.render_dir / "combined.round_offsets.json"
-                if sidecar_src.is_file():
-                    sidecar_dst = target_dir / "video.round_offsets.json"
-                    shutil.copy2(str(sidecar_src), str(sidecar_dst))
-                    print(f"  [setup] copied sidecar to {sidecar_dst.name}")
-                verb = "hardlinked" if linked else "copied"
-                print(f"  [setup] {verb} combined.mp4 into renders/.overlay_work/ "
-                      f"for overlay_pov.py")
+        # A failed provenance check invalidates the work dir's GENERATED output
+        # too, not just the youtube copy: .overlay_work/video.overlay.mp4 is the
+        # composite run_overlay would otherwise resume from (remuxing audio into
+        # the old picture), and .overlay_work/video.mp4 may be a recovered
+        # overlay rather than the raw input. Re-establish the raw input and
+        # force a rebuild. combined.mp4 itself is never touched.
+        if self._establish_overlay_work_input(
+                target_dir, video_path, prov, recover_ok):
+            return
         if not self.demo_path or not self.demo_path.exists():
             fail(4, "OVERLAY_NO_DEMO",
                  f"demo required for overlay but not found: {self.demo_path}")
@@ -1628,6 +1997,11 @@ class Pipeline:
 
         work_dir = self.render_dir / ".overlay_work"
         work_dir.mkdir(parents=True, exist_ok=True)
+        # Deferred upscale: concat left combined.mp4 at capture resolution, so
+        # this encode must scale to the export size. Probe rather than trust a
+        # flag — a legacy (already-scaled) mezzanine needs no scale, and the
+        # probe is what the overlay itself uses to size its canvas.
+        target_size = self._overlay_target_size(video_path)
         from cs2archive.overlay.overlay_pov import run_overlay
         from cs2archive.overlay.overlay_utilcams import _ensure_cs2util_data
         try:
@@ -1647,6 +2021,8 @@ class Pipeline:
                 overlay_style=getattr(self.args, "overlay_style", None) or "auto",
                 overlay_anim=getattr(self.args, "overlay_anim", "instant") or "instant",
                 map_name=getattr(self, "map_name", None),
+                force_rebuild=rebuild,
+                target_size=target_size,
             )
         except SystemExit as exc:
             code = exc.code if isinstance(exc.code, int) else 1
@@ -1708,6 +2084,7 @@ class Pipeline:
             fail(step_num, "OUTRO_TOO_SMALL", f"outro.mp4 too small: {outro.stat().st_size} bytes")
 
         temp = youtube_dir / "video.temp.mp4"
+        outro_dur = self._probe_duration(outro)
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             f.write(f"file '{video.resolve()}'\n")
             f.write(f"file '{outro.resolve()}'\n")
@@ -1726,6 +2103,17 @@ class Pipeline:
 
         temp.replace(video)
         outro.unlink()
+        # Record the outro length so a later run can tell this video already
+        # has something appended and must not be adopted as the raw body.
+        if outro_dur > 0:
+            sidecar = youtube_dir / "video.round_offsets.json"
+            try:
+                data = json.loads(sidecar.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                data = None
+            if data is not None:
+                data["outro_seconds"] = outro_dur
+                sidecar.write_text(json.dumps(data, indent=2), encoding="utf-8")
         vid_mb = video.stat().st_size / 1024 / 1024
         print(f"  [OK] Outro appended in {youtube_dir.name}/ ({vid_mb:.0f} MB)")
 
@@ -1782,12 +2170,12 @@ class Pipeline:
         except OSError as e:
             print(f"  [WARN] intermediate cleanup failed (non-fatal): {e}")
 
-    def _prepend_hook(self, youtube_dir: Path, step_num: int = 5) -> None:
-        """Prepend a no-spoiler highlight cold open to video.mp4.
+    def _ensure_hook(self, pov_video: Path) -> tuple[Path | None, str]:
+        """Render/assemble the hook cold open. ``(None, "")`` when there is none.
 
-        Runs LAST in step 5 (after ``_prepend_intro``) — both are
-        front-prepends, so the delivered order is:
-        hook -> intro card + buy phase -> POV -> outro.
+        Generation only — the caller decides how the hook is joined, so
+        re-rendering a hook never rewrites the delivered video. ``pov_video``
+        supplies the resolution/fps the hook must match.
 
         Hook moments join with jump cuts; the hook tail is faded to black at
         assembly and the intro head fades back in, so the hook->intro boundary
@@ -1798,41 +2186,22 @@ class Pipeline:
         carries the full HUD (scores/round timer = spoilers). Hook segments are
         rendered with the full HUD but the compact alive-count team bar and
         the score digits blurred at assembly (the Shorts HUD policy) and
-        re-encoded with the overlay final-export profile, so the
-        prepend is a plain stream copy.
+        re-encoded with the overlay final-export profile, so the join is a
+        plain stream copy.
 
         A demo with no qualifying moment is a normal skip (not an error) — the
         video simply ships without a hook. Raw-only skips (raw stays raw).
         """
         if getattr(self.args, "no_hook", False):
             print("  [skip] --no-hook: no hook cold open")
-            return
+            return None, ""
         if self.skip_overlay:
             print("  [skip] raw-only: no hook")
-            return
-
-        video = youtube_dir / "video.mp4"
-        if not video.exists():
-            fail(step_num, "HOOK_VIDEO_MISSING", f"video.mp4 not found in {youtube_dir}")
-        sidecar = youtube_dir / "video.round_offsets.json"
-        sidecar_hook_s = 0.0
-        prepended_cfg_hash = ""
-        if sidecar.is_file():
-            try:
-                sidecar_data = json.loads(sidecar.read_text())
-            except Exception:
-                sidecar_data = {}
-            sidecar_hook_s = float(sidecar_data.get("hook_seconds", 0) or 0)
-            prepended_cfg_hash = str(sidecar_data.get("hook_cfg_hash") or "")
-            # NOTE: no early return here. The hook's own cfg is only known after
-            # render_hook/build_config runs, and a changed cfg/plan must re-render
-            # the hook before the prepend decision — an early return on
-            # `hook_seconds` is what let fixed hook code never reach videos that
-            # already had a hook. The skip happens below, after the hash check.
+            return None, ""
         if not self.demo_path or not self.demo_path.exists():
-            fail(step_num, "HOOK_NO_DEMO", f"demo required for hook: {self.demo_path}")
+            fail(5, "HOOK_NO_DEMO", f"demo required for hook: {self.demo_path}")
         if not self.steam_id:
-            fail(step_num, "HOOK_NO_STEAM_ID", "no steam_id for hook")
+            fail(5, "HOOK_NO_STEAM_ID", "no steam_id for hook")
 
         hook_dir = _hook_dir(self.render_dir)
         timeline = hook_dir / "hook_timeline.json"
@@ -1882,11 +2251,11 @@ class Pipeline:
                 args += ["--tiers", str(self.args.hook_tiers)]
             r = self._run_py(args, timeout=3600)
             if r.returncode != 0:
-                fail(step_num, "HOOK_TIMELINE_FAILED",
+                fail(5, "HOOK_TIMELINE_FAILED",
                      f"build_hook_timeline.py exited {r.returncode}")
             if not timeline.is_file():
                 print("  [skip] no qualifying hook moment for this POV")
-                return
+                return None, ""
 
         # 2. Render the planned windows (CSDM, killfeed-only HUD).
         # Same cfg inputs as the POV render (canonical nick + rename map) so
@@ -1905,32 +2274,32 @@ class Pipeline:
                 hook_args += ["--rename", json.dumps(rename_map)]
         r = self._run_py(hook_args, timeout=14400)
         if r.returncode != 0:
-            fail(step_num, "HOOK_RENDER_FAILED", f"render_hook.py exited {r.returncode}")
+            fail(5, "HOOK_RENDER_FAILED", f"render_hook.py exited {r.returncode}")
         render_json = hook_dir / "hook_render.json"
         if not render_json.is_file():
             # render_hook exits 0 without a render JSON when the planned hook
             # is below --hook-min-seconds: a lone 3s flash into the intro is
             # disorienting, so the video ships with no hook (normal skip).
             print("  [skip] hook below minimum length for this POV")
-            return
+            return None, ""
 
         # 3. Join the clips with jump cuts at the POV's resolution/fps,
         # fading the tail to black (dip-to-black into the intro head's fade-in).
         hook_mp4 = hook_dir / "hook.mp4"
         r = self._run_py([
             "cs2archive/pov/assemble_hook.py", str(render_json),
-            "--pov-video", str(video),
+            "--pov-video", str(pov_video),
             "--end-fade", str(float(getattr(self.args, "hook_fade", 0.5))),
         ], timeout=7200)
         if r.returncode != 0:
-            fail(step_num, "HOOK_ASSEMBLE_FAILED", f"assemble_hook.py exited {r.returncode}")
+            fail(5, "HOOK_ASSEMBLE_FAILED", f"assemble_hook.py exited {r.returncode}")
         if not hook_mp4.is_file() or hook_mp4.stat().st_size < 1_000_000:
-            fail(step_num, "HOOK_NO_OUTPUT", f"hook missing or tiny: {hook_mp4}")
+            fail(5, "HOOK_NO_OUTPUT", f"hook missing or tiny: {hook_mp4}")
 
         # The cfg render_hook just built (it re-renders segments whenever the
         # plan/cfg/avatar policy changed — see its stale guard). Hashing the cfg
         # that actually reached CSDM is what makes a hook-code change invalidate
-        # an existing prepend: `hook_seconds` alone cannot tell whether the
+        # an existing assembly: `hook_seconds` alone cannot tell whether the
         # pixels in video.mp4 still match the code.
         current_cfg_hash = ""
         try:
@@ -1940,16 +2309,42 @@ class Pipeline:
             cfgs = [s.get("cfg", "").strip()
                     for s in (cfg_doc.get("sequences") or [])]
             # The version token is what makes a *mechanism* change (e.g. the
-            # crosshair now also handed to CS2 as --cfg) invalidate a prepend
+            # crosshair now also handed to CS2 as --cfg) invalidate an assembly
             # whose cfg text is byte-identical but whose pixels are not.
             cfgs.append(f"render_version={HOOK_RENDER_VERSION}")
-            # Assembly-only blur changes must invalidate the delivered prepend,
+            # Assembly-only blur changes must invalidate the delivered video,
             # without invalidating expensive CS2 segment renders.
             from cs2archive import hud_score_blur
             cfgs.append(hashlib.sha256(Path(hud_score_blur.__file__).read_bytes()).hexdigest())
             current_cfg_hash = hashlib.sha256("\n".join(cfgs).encode()).hexdigest()[:16]
         except Exception as e:  # noqa: BLE001
-            print(f"  [warn] could not hash hook cfg ({e}) — re-prepending")
+            print(f"  [warn] could not hash hook cfg ({e}) — re-assembling")
+        return hook_mp4, current_cfg_hash
+
+    def _prepend_hook(self, youtube_dir: Path, step_num: int = 5) -> None:
+        """LEGACY incremental hook prepend (no un-assembled body available).
+
+        Only used for directories assembled by the old three-pass flow, where
+        the body cannot be recovered. New runs go through ``step_outro``'s
+        single assembly pass.
+        """
+        video = youtube_dir / "video.mp4"
+        if not video.exists():
+            fail(step_num, "HOOK_VIDEO_MISSING", f"video.mp4 not found in {youtube_dir}")
+        sidecar = youtube_dir / "video.round_offsets.json"
+        sidecar_hook_s = 0.0
+        prepended_cfg_hash = ""
+        if sidecar.is_file():
+            try:
+                sidecar_data = json.loads(sidecar.read_text())
+            except Exception:
+                sidecar_data = {}
+            sidecar_hook_s = float(sidecar_data.get("hook_seconds", 0) or 0)
+            prepended_cfg_hash = str(sidecar_data.get("hook_cfg_hash") or "")
+
+        hook_mp4, current_cfg_hash = self._ensure_hook(video)
+        if hook_mp4 is None:
+            return
 
         nohook_video = youtube_dir / "video.nohook.mp4"
         nohook_sidecar = youtube_dir / "video.round_offsets.nohook.json"
@@ -1966,6 +2361,9 @@ class Pipeline:
                 # stale one.
                 print(f"  [stale] hook cfg changed — re-prepending from "
                       f"{nohook_video.name}")
+                # Unlink first: video.mp4 can be a hardlink to a render-dir
+                # work copy, and copy2 would write THROUGH that shared inode.
+                video.unlink(missing_ok=True)
                 shutil.copy2(nohook_video, video)
                 if nohook_sidecar.is_file():
                     shutil.copy2(nohook_sidecar, sidecar)
@@ -1974,23 +2372,13 @@ class Pipeline:
                       "rebuild from; re-run --step 4 to redo the hook)")
                 return
 
-        # 4. Prepend: video stream-copy + audio decoded per-segment, joined
-        # with the concat filter and encoded once to AAC 48k (mixed-encoder
-        # segments can't share a `-c copy` audio join — the packets after the
-        # join don't decode).
-        # The dip-to-black lives in the baked fades: hook tail fades out,
-        # hard cut on black, intro head (or the POV itself) fades back in.
         try:
             from cs2archive.faceit.intro_prepend import prepend as _prepend_segment
         except Exception as e:  # noqa: BLE001
             fail(step_num, "HOOK_IMPORT_FAILED", f"intro_prepend.prepend: {e}")
         out = youtube_dir / "video.hook.mp4"
         # Keep the un-hooked video + sidecar so a changed hook (crosshair/cfg/HUD)
-        # can be re-prepended without re-running the overlay. Without this the
-        # sidecar's `hook_seconds` marker made every later run skip the hook
-        # entirely, so fixed hook code never reached videos that already had one.
-        nohook_video = youtube_dir / "video.nohook.mp4"
-        nohook_sidecar = youtube_dir / "video.round_offsets.nohook.json"
+        # can be re-prepended without re-running the overlay.
         if not nohook_video.exists():
             try:
                 os.link(video, nohook_video)
@@ -2005,60 +2393,51 @@ class Pipeline:
 
         hook_dur = self._probe_duration(hook_mp4)
         print(f"  [OK] Hook prepended in {youtube_dir.name}/ ({hook_dur:.2f}s)")
+        self._shift_sidecar_offsets(sidecar, hook_dur, step_num=step_num,
+                                    hook_seconds=hook_dur,
+                                    hook_cfg_hash=current_cfg_hash)
 
-        # 5. Shift every downstream timestamp by the hook duration.
-        if sidecar.is_file():
-            try:
-                data = json.loads(sidecar.read_text(encoding="utf-8"))
-            except Exception as e:
-                fail(step_num, "HOOK_SIDECAR_UNREADABLE", f"{sidecar.name}: {e}")
-            data["round_offsets"] = {k: float(v) + hook_dur
-                                     for k, v in (data.get("round_offsets") or {}).items()}
-            data["total_duration_seconds"] = float(data.get("total_duration_seconds", 0) or 0) + hook_dur
-            data["hook_seconds"] = hook_dur
-            data["hook_cfg_hash"] = current_cfg_hash
-            fps = self._probe_fps(video) or 60.0
-            if isinstance(data.get("freeze_windows"), list):
-                for w in data["freeze_windows"]:
-                    try:
-                        w["frame"] = float(w.get("frame", 0)) + hook_dur * fps
-                    except Exception:
-                        pass
-            sidecar.write_text(json.dumps(data, indent=2))
-            print(f"  [OK] sidecar shifted +{hook_dur:.2f}s (hook)")
+    def _shift_sidecar_offsets(self, sidecar: Path, delta: float, *,
+                               step_num: int = 5, **fields) -> None:
+        """Shift every downstream timestamp by ``delta`` and record ``fields``."""
+        if not sidecar.is_file():
+            return
+        try:
+            data = json.loads(sidecar.read_text(encoding="utf-8"))
+        except Exception as e:  # noqa: BLE001
+            fail(step_num, "SIDECAR_UNREADABLE", f"{sidecar.name}: {e}")
+            return
+        data["round_offsets"] = {k: float(v) + delta
+                                 for k, v in (data.get("round_offsets") or {}).items()}
+        data["total_duration_seconds"] = float(
+            data.get("total_duration_seconds", 0) or 0) + delta
+        data.update(fields)
+        fps = self._probe_fps(self.youtube_dir / "video.mp4") or 60.0
+        if isinstance(data.get("freeze_windows"), list):
+            for w in data["freeze_windows"]:
+                try:
+                    w["frame"] = float(w.get("frame", 0)) + delta * fps
+                except Exception:
+                    pass
+        sidecar.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
-    def _prepend_intro(self, youtube_dir: Path, step_num: int = 5) -> None:
-        """Prepend the match intro card + buy-phase lead-in to video.mp4.
+    def _ensure_intro_segment(self, pov_video: Path) -> Path | None:
+        """Compose the match intro card + buy-phase lead-in. None when N/A.
 
-        Runs inside step 5 (before the outro append) so step numbering is
-        untouched. FACEIT cards only — the intro card generator needs a
-        FACEIT match. Raw-only skips (raw stays raw).
-
-        The prepend shifts every downstream timestamp, so the youtube
-        sidecar offsets shift by the segment duration (and ``intro_seconds``
-        records it for resume).
+        Generation only — the caller decides how the segment is joined. FACEIT
+        cards only: the intro card generator needs a FACEIT match. Raw-only
+        skips (raw stays raw).
         """
         if self.skip_overlay:
             print("  [skip] raw-only: no intro")
-            return
+            return None
         if not self.is_faceit:
             print("  [skip] intro card needs a FACEIT match (HLTV TODO)")
-            return
-        video = youtube_dir / "video.mp4"
-        if not video.exists():
-            fail(step_num, "INTRO_VIDEO_MISSING", f"video.mp4 not found in {youtube_dir}")
-        sidecar = youtube_dir / "video.round_offsets.json"
-        if sidecar.is_file():
-            try:
-                if float(json.loads(sidecar.read_text()).get("intro_seconds", 0) or 0) > 0:
-                    print("  [skip] intro already prepended (sidecar intro_seconds set)")
-                    return
-            except Exception:
-                pass
+            return None
         if not self.demo_path or not self.demo_path.exists():
-            fail(step_num, "INTRO_NO_DEMO", f"demo required for intro: {self.demo_path}")
+            fail(5, "INTRO_NO_DEMO", f"demo required for intro: {self.demo_path}")
         if not self.steam_id:
-            fail(step_num, "INTRO_NO_STEAM_ID", "no steam_id for intro")
+            fail(5, "INTRO_NO_STEAM_ID", "no steam_id for intro")
 
         intro_dir = _intro_dir(self.render_dir)
         intro_png = intro_dir / "intro.png"
@@ -2085,29 +2464,28 @@ class Pipeline:
                 "--strips-dir", str(self.render_dir / "stat-strips"),
             ], timeout=1800)
             if r.returncode != 0:
-                fail(step_num, "INTRO_CARD_FAILED",
+                fail(5, "INTRO_CARD_FAILED",
                      f"create_repeek_intro.py exited {r.returncode}")
             if not intro_png.is_file():
                 cands = sorted(intro_dir.rglob("intro.png"))
                 if cands:
                     intro_png = cands[0]
             if not intro_png.is_file():
-                fail(step_num, "INTRO_CARD_MISSING",
-                     f"no intro.png under {intro_dir}")
+                fail(5, "INTRO_CARD_MISSING", f"no intro.png under {intro_dir}")
 
         render_sidecar = self.render_dir / "combined.round_offsets.json"
         if not render_sidecar.is_file():
-            fail(step_num, "INTRO_NO_SIDECAR",
+            fail(5, "INTRO_NO_SIDECAR",
                  f"combined sidecar missing: {render_sidecar}")
-        intro_out = youtube_dir / "video.intro.mp4"
+        segment = intro_dir / "footage" / "intro_segment.mp4"
         r_args = [
             "cs2archive/faceit/intro_prepend.py",
             "--demo", str(self.demo_path),
             "--steam-id", self.steam_id,
-            "--video", str(video),
+            "--video", str(pov_video),
             "--intro", str(intro_png),
             "--round-offsets", str(render_sidecar),
-            "--output", str(intro_out),
+            "--segment-only",
             "--render-dir", str(intro_dir / "footage"),
             "--player", (self.meta.get("player") or "").strip(),
             # Head fade-in completes the hook's dip-to-black (hook tail fades
@@ -2134,48 +2512,177 @@ class Pipeline:
             # warning instead of failing the run. The segment shows buy-phase
             # footage, which never exhibits the round-end avatar defect, so a
             # pre-avatar-policy segment is visually fine.
-            stale_segment = intro_dir / "footage" / "intro_segment.mp4"
-            if stale_segment.is_file() and stale_segment.stat().st_size >= 1_000_000:
+            if segment.is_file() and segment.stat().st_size >= 1_000_000:
                 print(f"  [WARN] intro footage render failed (rc={r.returncode}) — "
-                      f"reusing existing {stale_segment.name} "
-                      f"({stale_segment.stat().st_size / 1e6:.1f} MB). The intro "
+                      f"reusing existing {segment.name} "
+                      f"({segment.stat().st_size / 1e6:.1f} MB). The intro "
                       f"shows buy-phase footage only; investigate the CSDM "
                       f"'Game error' separately.")
-                try:
-                    from cs2archive.faceit.intro_prepend import prepend as _prepend_segment
-                except Exception as e:  # noqa: BLE001
-                    fail(step_num, "INTRO_IMPORT_FAILED", f"intro_prepend.prepend: {e}")
-                _prepend_segment(stale_segment, video, intro_out)
             else:
-                fail(step_num, "INTRO_FAILED", f"intro_prepend.py exited {r.returncode}")
+                fail(5, "INTRO_FAILED", f"intro_prepend.py exited {r.returncode}")
+        if not segment.is_file() or segment.stat().st_size < 1_000_000:
+            fail(5, "INTRO_NO_OUTPUT", f"intro segment missing: {segment}")
+        return segment
+
+    def _prepend_intro(self, youtube_dir: Path, step_num: int = 5) -> None:
+        """LEGACY incremental intro prepend (no un-assembled body available)."""
+        video = youtube_dir / "video.mp4"
+        if not video.exists():
+            fail(step_num, "INTRO_VIDEO_MISSING", f"video.mp4 not found in {youtube_dir}")
+        sidecar = youtube_dir / "video.round_offsets.json"
+        if sidecar.is_file():
+            try:
+                if float(json.loads(sidecar.read_text()).get("intro_seconds", 0) or 0) > 0:
+                    print("  [skip] intro already prepended (sidecar intro_seconds set)")
+                    return
+            except Exception:
+                pass
+        segment = self._ensure_intro_segment(video)
+        if segment is None:
+            return
+        try:
+            from cs2archive.faceit.intro_prepend import prepend as _prepend_segment
+        except Exception as e:  # noqa: BLE001
+            fail(step_num, "INTRO_IMPORT_FAILED", f"intro_prepend.prepend: {e}")
+        intro_out = youtube_dir / "video.intro.mp4"
+        _prepend_segment(segment, video, intro_out)
         if not intro_out.is_file() or intro_out.stat().st_size < 1_000_000:
             fail(step_num, "INTRO_NO_OUTPUT", f"intro segment missing: {intro_out}")
         intro_out.replace(video)
         print(f"  [OK] Intro prepended in {youtube_dir.name}/")
-
-        # Shift the youtube sidecar past the intro segment.
-        dur = self._probe_duration(video)
-        seg_dur = self._probe_duration(intro_dir / "footage" / "intro_segment.mp4") \
-            if (intro_dir / "footage" / "intro_segment.mp4").is_file() else 0.0
+        seg_dur = self._probe_duration(segment)
         if seg_dur <= 0:
-            seg_dur = dur
-        if sidecar.is_file():
-            try:
-                data = json.loads(sidecar.read_text(encoding="utf-8"))
-            except Exception as e:
-                fail(step_num, "INTRO_SIDECAR_UNREADABLE", f"{sidecar.name}: {e}")
-            data["round_offsets"] = {k: float(v) + seg_dur for k, v in data.get("round_offsets", {}).items()}
-            data["total_duration_seconds"] = float(data.get("total_duration_seconds", 0) or 0) + seg_dur
-            data["intro_seconds"] = seg_dur
-            if isinstance(data.get("freeze_windows"), list):
-                fps = self._probe_fps(video)
-                for w in data["freeze_windows"]:
-                    try:
-                        w["frame"] = float(w.get("frame", 0)) + seg_dur * fps
-                    except Exception:
-                        pass
-            sidecar.write_text(json.dumps(data, indent=2))
-            print(f"  [OK] sidecar shifted +{seg_dur:.2f}s (intro)")
+            seg_dur = self._probe_duration(video)
+        self._shift_sidecar_offsets(sidecar, seg_dur, step_num=step_num,
+                                    intro_seconds=seg_dur)
+
+    def _ensure_outro(self, pov_video: Path) -> Path:
+        """Generate the 5s silent outro clip (idempotent)."""
+        outro = self.youtube_dir / "outro.mp4"
+        if outro.is_file() and outro.stat().st_size >= 1000:
+            return outro
+        self._run_py(["cs2archive/pov/generate_outro.py", str(pov_video)], timeout=120)
+        if not outro.is_file():
+            fail(5, "OUTRO_CLIP_MISSING", f"outro.mp4 not generated in {self.youtube_dir}")
+        if outro.stat().st_size < 1000:
+            fail(5, "OUTRO_TOO_SMALL", f"outro.mp4 too small: {outro.stat().st_size} bytes")
+        return outro
+
+    # ── Final assembly ───────────────────────────────────────────────────
+
+    def _resolve_body(self) -> Path | None:
+        """The un-assembled POV body (overlay output, no hook/intro/outro).
+
+        ``video.body.mp4`` is a hardlink to the overlay result, so it costs no
+        disk. A directory produced by the old three-pass flow has no such copy;
+        the current ``video.mp4`` is adopted only when nothing has been
+        assembled onto it yet (no hook/intro/outro marker AND no longer than
+        the raw body), otherwise the caller falls back to the incremental path.
+        """
+        body = self.youtube_dir / "video.body.mp4"
+        if body.is_file() and body.stat().st_size > 100_000:
+            return body
+        video = self.youtube_dir / "video.mp4"
+        if not video.is_file() or video.stat().st_size <= 100_000:
+            return None
+        sidecar = self.youtube_dir / "video.round_offsets.json"
+        try:
+            data = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        if (float(data.get("hook_seconds") or 0) > 0
+                or float(data.get("intro_seconds") or 0) > 0
+                or float(data.get("outro_seconds") or 0) > 0):
+            return None
+        # Duration is the backstop for markers the old flow never wrote (the
+        # outro had none): a delivered video longer than the raw body has
+        # something baked in and must not be adopted as the body.
+        body_total = 0.0
+        try:
+            body_total = float(json.loads(
+                (self.render_dir / "combined.round_offsets.json")
+                .read_text(encoding="utf-8")
+            ).get("total_duration_seconds") or 0)
+        except (OSError, json.JSONDecodeError):
+            body_total = 0.0
+        if body_total > 0 and self._probe_duration(video) > body_total + 1.0:
+            return None
+        self.youtube_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(video, body)
+        except OSError:
+            shutil.copy2(video, body)
+        body_sidecar = self.youtube_dir / "video.body.round_offsets.json"
+        if sidecar.is_file() and not body_sidecar.exists():
+            shutil.copy2(sidecar, body_sidecar)
+        print(f"  [assemble] adopted {video.name} as the un-assembled body")
+        return body
+
+    def _assembly_stamp(self, parts: list[Path], hook_cfg_hash: str) -> dict:
+        """Identity of the exact part set that should be joined."""
+        return {
+            "version": 1,
+            "hook_cfg_hash": hook_cfg_hash,
+            "parts": [
+                {"name": p.name, "size": p.stat().st_size,
+                 "mtime": round(p.stat().st_mtime, 3)}
+                for p in parts
+            ],
+        }
+
+    def _assembly_matches(self, stamp: dict) -> bool:
+        """True when the delivered video was assembled from exactly ``stamp``."""
+        video = self.youtube_dir / "video.mp4"
+        if not video.is_file() or video.stat().st_size <= 100_000:
+            return False
+        try:
+            recorded = json.loads(
+                (self.youtube_dir / ".assembly.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return recorded == stamp
+
+    def _write_assembly_sidecar(self, body: Path, hook: Path | None,
+                                intro: Path | None, outro: Path | None,
+                                hook_cfg_hash: str) -> None:
+        """Rebuild the delivered sidecar from the BODY sidecar + part durations.
+
+        Deterministic and idempotent: offsets are recomputed from the body
+        timeline every time instead of being shifted in place, so re-assembling
+        cannot accumulate drift.
+        """
+        sidecar = self.youtube_dir / "video.round_offsets.json"
+        body_sidecar = self.youtube_dir / "video.body.round_offsets.json"
+        if not body_sidecar.is_file():
+            body_sidecar = self.render_dir / "combined.round_offsets.json"
+        try:
+            data = json.loads(body_sidecar.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            fail(5, "ASSEMBLY_SIDECAR_UNREADABLE", f"{body_sidecar.name}: {e}")
+            return
+        hook_dur = self._probe_duration(hook) if hook else 0.0
+        intro_dur = self._probe_duration(intro) if intro else 0.0
+        outro_dur = self._probe_duration(outro) if outro else 0.0
+        lead = hook_dur + intro_dur
+        data["round_offsets"] = {k: float(v) + lead
+                                 for k, v in (data.get("round_offsets") or {}).items()}
+        data["total_duration_seconds"] = (
+            float(data.get("total_duration_seconds", 0) or 0) + lead + outro_dur)
+        data["hook_seconds"] = hook_dur
+        data["intro_seconds"] = intro_dur
+        data["outro_seconds"] = outro_dur
+        if hook_cfg_hash:
+            data["hook_cfg_hash"] = hook_cfg_hash
+        fps = self._probe_fps(self.youtube_dir / "video.mp4") or 60.0
+        if isinstance(data.get("freeze_windows"), list):
+            for w in data["freeze_windows"]:
+                try:
+                    w["frame"] = float(w.get("frame", 0)) + lead * fps
+                except Exception:
+                    pass
+        sidecar.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        print(f"  [OK] sidecar rebuilt (hook {hook_dur:.2f}s, intro "
+              f"{intro_dur:.2f}s, outro {outro_dur:.2f}s)")
 
     @staticmethod
     def _probe_duration(video: Path) -> float:
@@ -2203,14 +2710,48 @@ class Pipeline:
             return 60.0
 
     def step_outro(self) -> None:
-        # Intro first, hook last: both are front-prepends, so the delivered
-        # order is hook -> intro card + buy phase -> POV -> outro. The intro
-        # stays adjacent to the POV (its buy-phase footage ends at round-1
-        # start, a seamless lead-in), and the hook meets the intro across a
-        # dip-to-black (hook tail fade-out + intro head fade-in).
-        self._prepend_intro(self.youtube_dir, step_num=5)
-        self._prepend_hook(self.youtube_dir, step_num=5)
-        self._append_outro(self.youtube_dir, step_num=5)
+        """Assemble hook + intro + POV body + outro in ONE pass.
+
+        Component generation stays independent and resumable (each helper
+        renders only what is missing); this step only decides the delivered
+        order — hook -> intro card + buy phase -> POV -> outro — and joins once.
+        The old flow ran three separate full-file passes over the multi-GB body
+        (intro prepend, hook prepend, outro append), each reading and rewriting
+        the whole file.
+        """
+        body = self._resolve_body()
+        if body is None:
+            # A directory assembled by the old three-pass flow has no
+            # un-assembled body, so the components cannot be re-joined from
+            # scratch. Fall back to the incremental path rather than guessing.
+            print("  [assemble] no un-assembled body — using the incremental "
+                  "prepend/append path")
+            self._prepend_intro(self.youtube_dir, step_num=5)
+            self._prepend_hook(self.youtube_dir, step_num=5)
+            self._append_outro(self.youtube_dir, step_num=5)
+            return
+
+        hook, hook_cfg_hash = self._ensure_hook(body)
+        intro = self._ensure_intro_segment(body)
+        outro = self._ensure_outro(body)
+
+        parts = [p for p in (hook, intro, body, outro) if p is not None]
+        stamp = self._assembly_stamp(parts, hook_cfg_hash)
+        if self._assembly_matches(stamp):
+            print("  [skip] final assembly already matches its components")
+            return
+
+        from cs2archive.pov.assemble_final import concat_parts
+        out = self.youtube_dir / "video.assembled.mp4"
+        concat_parts(parts, out)
+        out.replace(self.youtube_dir / "video.mp4")
+        self._write_assembly_sidecar(body, hook, intro, outro, hook_cfg_hash)
+        try:
+            (self.youtube_dir / ".assembly.json").write_text(
+                json.dumps(stamp, indent=2), encoding="utf-8")
+        except OSError as e:
+            print(f"  [warn] could not record assembly stamp ({e})")
+        print(f"  [OK] Assembled {len(parts)} part(s) in {self.youtube_dir.name}/")
 
     # ── Step 6: Thumbnail ────────────────────────────────────────────────
 
@@ -2231,11 +2772,13 @@ class Pipeline:
         if self.render_dir:
             candidates.append(self.render_dir / ".overlay_work" / "video.overlay.mp4")
             candidates.append(self.render_dir / "combined.overlay.mp4")
-        if self.demo_path and self.steam_id:
-            dem_stem = self.demo_path.stem
+        demo_path = getattr(self, "demo_path", None)
+        steam_id = getattr(self, "steam_id", None)
+        if demo_path and steam_id:
+            dem_stem = demo_path.stem
             player_slug = run_id_from_name(self.player)
             candidates.extend([
-                PROJECT_ROOT / "renders" / f"pov-{dem_stem}_{self.steam_id}_full" / "combined.overlay.mp4",
+                PROJECT_ROOT / "renders" / f"pov-{dem_stem}_{steam_id}_full" / "combined.overlay.mp4",
                 PROJECT_ROOT / "renders" / f"pov-{dem_stem}_{self.player}_full" / "combined.overlay.mp4",
                 PROJECT_ROOT / "renders" / f"pov-{dem_stem}_{player_slug}" / "combined.overlay.mp4",
             ])
@@ -2631,6 +3174,36 @@ def main() -> None:
         default=150.0,
         help="Seconds to wait for a new >=1 MB sequence file before declaring a failed HLAE "
              "hook (default: 150). The vanilla-viewer failure produces nothing.",
+    )
+    parser.add_argument(
+        "--resource-log",
+        dest="resource_log",
+        action="store_true",
+        default=True,
+        help="Record GPU/CPU/RAM/disk/top-process samples for the whole run into "
+             "renders/<pov>/resource_log.jsonl plus resource_summary.json "
+             "(throttle reasons, peaks, busiest processes). Default: on.",
+    )
+    parser.add_argument(
+        "--no-resource-log",
+        dest="resource_log",
+        action="store_false",
+        help="Disable the per-render resource recording.",
+    )
+    parser.add_argument(
+        "--resource-interval",
+        type=float,
+        default=5.0,
+        help="Seconds between resource samples (default: 5). GPU/CPU samples are "
+             "~2 ms via NVML; the expensive part is the process scan.",
+    )
+    parser.add_argument(
+        "--resource-process-interval",
+        type=float,
+        default=60.0,
+        help="Seconds between process scans (default: 60). A full scan opens a "
+             "handle per process (~1.3 s with 370 processes), so it runs on a "
+             "slower cadence than the other metrics.",
     )
     parser.add_argument(
         "--hook-retries",

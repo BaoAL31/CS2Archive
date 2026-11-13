@@ -1,10 +1,15 @@
 """A failed audio remux must never promote video-only output to youtube/."""
+import json
 import subprocess
 from types import SimpleNamespace
 
 import pytest
 
-from cs2archive.pov.pipeline import Pipeline
+from cs2archive.pov.pipeline import (
+    Pipeline,
+    _overlay_inputs_hash,
+    _overlay_look,
+)
 
 
 @pytest.fixture
@@ -37,10 +42,15 @@ def test_resume_checks_body_audio_even_when_hook_has_audio(tmp_path, silent_vide
     pipeline.args = SimpleNamespace(overlay_style="auto", overlay_anim="instant")
     pipeline._voice_enabled = lambda: False
     pipeline._check_voice_capture = lambda _step: None
-    # Existing final is large enough for the resume fast path. The separate
-    # body captures the production failure: a hook track cannot hide its loss.
+    # Existing final is large enough for the resume fast path, and both stamps
+    # match, so the resume branch is the one under test. The separate body
+    # captures the production failure: a hook track cannot hide its loss.
     (pipeline.youtube_dir / "video.mp4").write_bytes(b"v" * 100_001)
     (pipeline.youtube_dir / "video.nohook.mp4").write_bytes(silent_video.read_bytes())
+    (pipeline.youtube_dir / ".overlay_look.json").write_text(
+        json.dumps(_overlay_look(pipeline.args)), encoding="utf-8")
+    (pipeline.youtube_dir / ".overlay_inputs.sha256").write_text(
+        _overlay_inputs_hash(pipeline.render_dir), encoding="utf-8")
     with pytest.raises(SystemExit):
         pipeline.step_overlay()
     assert "OVERLAY_AUDIO_MISSING" in capsys.readouterr().out
